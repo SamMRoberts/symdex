@@ -42,6 +42,7 @@ cargo run -p symdex-cli -- symbol . "my_symbol"
 cargo run -p symdex-cli -- callers . "my_symbol"
 cargo run -p symdex-cli -- callees . "my_symbol"
 cargo run -p symdex-cli -- impact . "my_symbol"
+cargo run -p symdex-cli -- context-pack . "my_symbol"
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- serve-mcp
 ```
@@ -67,6 +68,10 @@ Implemented CLI commands currently include:
   call relationships from the local SQLite index.
 - `impact <repo> <symbol>`: prints direct callers and direct callees as a basic
   impact view.
+- `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
+  context. The current format is `symdex.context_pack.v1` and includes focus
+  symbols, direct callers, direct callees, involved files, section limits, and
+  notes. It does not include source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, and symbol names.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes

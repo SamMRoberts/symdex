@@ -57,6 +57,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let query = args.get(2).map(String::as_str).unwrap_or("");
             impact(repo, query)
         }
+        "context-pack" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let query = args.get(2).map(String::as_str).unwrap_or("");
+            context_pack(repo, query)
+        }
         "search" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query_parts = if args.len() > 2 { &args[2..] } else { &[] };
@@ -299,6 +304,20 @@ fn impact(repo: &str, query: &str) -> Result<(), String> {
     callers(repo, query)?;
     println!("direct_callees");
     callees(repo, query)?;
+    Ok(())
+}
+
+fn context_pack(repo: &str, query: &str) -> Result<(), String> {
+    if query.is_empty() {
+        return Err("context-pack requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let pack = sqlite
+        .context_pack(root.id(), query, 8)
+        .map_err(|error| error.to_string())?;
+    let json = serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())?;
+    println!("{json}");
     Ok(())
 }
 
@@ -678,7 +697,7 @@ fn report_qdrant(config: &StoreConfig) {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

@@ -39,6 +39,7 @@ symdex symbol <repo> <symbol>
 symdex callers <repo> <symbol>
 symdex callees <repo> <symbol>
 symdex impact <repo> <symbol>
+symdex context-pack <repo> <symbol>
 symdex doctor
 symdex serve-mcp
 ```

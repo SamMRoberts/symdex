@@ -12,17 +12,19 @@ pub const TOOL_FIND_SYMBOL: &str = "symdex.find_symbol";
 pub const TOOL_CALLERS: &str = "symdex.callers";
 pub const TOOL_CALLEES: &str = "symdex.callees";
 pub const TOOL_IMPACT: &str = "symdex.impact";
+pub const TOOL_CONTEXT_PACK: &str = "symdex.context_pack";
 pub const TOOL_INDEX_STATUS: &str = "symdex.index_status";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub fn tool_names() -> [&'static str; 6] {
+pub fn tool_names() -> [&'static str; 7] {
     [
         TOOL_SEARCH,
         TOOL_FIND_SYMBOL,
         TOOL_CALLERS,
         TOOL_CALLEES,
         TOOL_IMPACT,
+        TOOL_CONTEXT_PACK,
         TOOL_INDEX_STATUS,
     ]
 }
@@ -131,6 +133,7 @@ fn dispatch_tool(name: &str, arguments: &Value) -> Result<Value, String> {
         TOOL_CALLERS => tool_callers(arguments),
         TOOL_CALLEES => tool_callees(arguments),
         TOOL_IMPACT => tool_impact(arguments),
+        TOOL_CONTEXT_PACK => tool_context_pack(arguments),
         TOOL_INDEX_STATUS => tool_index_status(arguments),
         _ => Err(format!("Unknown tool: {name}")),
     }
@@ -233,6 +236,17 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         "tests_likely": [],
         "unresolved_candidates": []
     }))
+}
+
+fn tool_context_pack(arguments: &Value) -> Result<Value, String> {
+    let repo = required_string(arguments, "repo")?;
+    let symbol = required_string(arguments, "symbol")?;
+    let limit = optional_usize(arguments, "limit", 8).min(25);
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let pack = sqlite()?
+        .context_pack(root.id(), symbol, limit)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(pack).map_err(|error| error.to_string())
 }
 
 fn tool_index_status(arguments: &Value) -> Result<Value, String> {
@@ -378,6 +392,21 @@ fn tool_definitions() -> Vec<Value> {
             ],
         ),
         tool_definition(
+            TOOL_CONTEXT_PACK,
+            "Context Pack",
+            "Return compact metadata-only evidence for an editing context.",
+            &["repo", "symbol"],
+            vec![
+                ("repo", "string", "Repository root path"),
+                ("symbol", "string", "Symbol id, name, or qualified name"),
+                (
+                    "limit",
+                    "integer",
+                    "Maximum rows per evidence section, capped at 25",
+                ),
+            ],
+        ),
+        tool_definition(
             TOOL_INDEX_STATUS,
             "Index Status",
             "Return local SQLite index counts for a repository.",
@@ -428,7 +457,7 @@ fn tool_definition(
 mod tests {
     use serde_json::json;
 
-    use crate::{TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve};
+    use crate::{TOOL_CONTEXT_PACK, TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve};
 
     #[test]
     fn lists_tools_after_initialize() {
@@ -467,6 +496,7 @@ mod tests {
             .as_array()
             .expect("tools should be an array");
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_FIND_SYMBOL));
+        assert!(tools.iter().any(|tool| tool["name"] == TOOL_CONTEXT_PACK));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_INDEX_STATUS));
     }
 

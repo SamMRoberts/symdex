@@ -458,6 +458,50 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn context_pack(
+        &self,
+        repository_id: &str,
+        symbol_query: &str,
+        limit: usize,
+    ) -> Result<ContextPack> {
+        let limit = limit.clamp(1, 25);
+        let mut focus_symbols = self.find_symbols(repository_id, symbol_query)?;
+        focus_symbols.truncate(limit);
+        let mut direct_callers = self.callers(repository_id, symbol_query)?;
+        direct_callers.truncate(limit);
+        let mut direct_callees = self.callees(repository_id, symbol_query)?;
+        direct_callees.truncate(limit);
+
+        let mut files = std::collections::BTreeSet::new();
+        for symbol in &focus_symbols {
+            files.insert(symbol.path.clone());
+        }
+        for row in direct_callers.iter().chain(direct_callees.iter()) {
+            if let Some(path) = &row.path {
+                files.insert(path.clone());
+            }
+        }
+
+        Ok(ContextPack {
+            format: "symdex.context_pack.v1".to_owned(),
+            repository_id: repository_id.to_owned(),
+            query: symbol_query.to_owned(),
+            focus_symbols,
+            direct_callers,
+            direct_callees,
+            files: files.into_iter().collect(),
+            limits: ContextPackLimits {
+                max_symbols: limit,
+                max_callers: limit,
+                max_callees: limit,
+            },
+            notes: vec![
+                "metadata_only_no_source_text".to_owned(),
+                "direct_relationships_only".to_owned(),
+            ],
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -634,7 +678,7 @@ pub struct EmbeddingIndexMetadata {
     pub chunks_embedded: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SymbolSearchRow {
     pub id: String,
     pub name: String,
@@ -645,7 +689,7 @@ pub struct SymbolSearchRow {
     pub end_line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CallSearchRow {
     pub callee_text: String,
     pub call_line: usize,
@@ -658,6 +702,26 @@ pub struct CallSearchRow {
     pub path: Option<String>,
     pub start_line: Option<usize>,
     pub end_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextPack {
+    pub format: String,
+    pub repository_id: String,
+    pub query: String,
+    pub focus_symbols: Vec<SymbolSearchRow>,
+    pub direct_callers: Vec<CallSearchRow>,
+    pub direct_callees: Vec<CallSearchRow>,
+    pub files: Vec<String>,
+    pub limits: ContextPackLimits,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContextPackLimits {
+    pub max_symbols: usize,
+    pub max_callers: usize,
+    pub max_callees: usize,
 }
 
 fn env_path(upper: &str, legacy: &str) -> Option<PathBuf> {
@@ -1395,6 +1459,54 @@ mod tests {
         let callees = store.callees("repo", "caller").expect("callees query");
         assert_eq!(callees.len(), 1);
         assert_eq!(callees[0].symbol_qualified_name.as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn sqlite_builds_compact_context_pack() {
+        let db = TestDb::new("context-pack");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![
+            sample_symbol("caller-symbol", "caller", "caller"),
+            sample_symbol("callee-symbol", "helper", "helper"),
+        ];
+        let calls = vec![CallRecord {
+            id: "call-1".to_owned(),
+            caller_symbol_id: "caller-symbol".to_owned(),
+            callee_text: "helper".to_owned(),
+            callee_symbol_id: Some("callee-symbol".to_owned()),
+            call_line: 4,
+            confidence: 1.0,
+            resolution_status: "resolved_exact".to_owned(),
+        }];
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &symbols,
+                &[sample_chunk("chunk-1")],
+                &calls,
+            )
+            .expect("facts should persist");
+
+        let pack = store
+            .context_pack("repo", "helper", 5)
+            .expect("context pack should build");
+
+        assert_eq!(pack.format, "symdex.context_pack.v1");
+        assert_eq!(pack.focus_symbols.len(), 1);
+        assert_eq!(pack.direct_callers.len(), 1);
+        assert!(pack.direct_callees.is_empty());
+        assert_eq!(pack.files, vec!["src/lib.rs"]);
+        let json = serde_json::to_value(&pack).expect("pack should serialize");
+        assert_eq!(json["notes"][0], "metadata_only_no_source_text");
+        assert!(json.get("source_text").is_none());
     }
 
     #[test]

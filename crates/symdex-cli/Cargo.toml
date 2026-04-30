@@ -13,6 +13,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+serde_json = "1.0.149"
 symdex-core = { path = "../symdex-core" }
 symdex-embed = { path = "../symdex-embed" }
 symdex-mcp = { path = "../symdex-mcp" }

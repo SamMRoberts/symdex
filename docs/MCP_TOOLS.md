@@ -117,6 +117,47 @@ Output should separate:
 The current MVP fills direct callers and direct callees. The other buckets are
 present but empty until deeper impact analysis is implemented.
 
+### `symdex.context_pack`
+
+Return compact metadata-only evidence for editing context.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "foo::retry::run_with_backoff",
+  "limit": 8
+}
+```
+
+Output:
+
+```json
+{
+  "format": "symdex.context_pack.v1",
+  "repository_id": "stable-repo-id",
+  "query": "foo::retry::run_with_backoff",
+  "focus_symbols": [],
+  "direct_callers": [],
+  "direct_callees": [],
+  "files": [],
+  "limits": {
+    "max_symbols": 8,
+    "max_callers": 8,
+    "max_callees": 8
+  },
+  "notes": [
+    "metadata_only_no_source_text",
+    "direct_relationships_only"
+  ]
+}
+```
+
+The context pack is intentionally compact and does not return source text. It is
+currently structural only; semantic hits can be combined by calling
+`symdex.search` separately.
+
 ### `symdex.index_status`
 
 Return local SQLite index counts.
@@ -150,4 +191,4 @@ Do not add mutation tools until a dedicated design doc exists. Candidate future 
 
 - request reindex
 - clear index
-- generate context pack
+- persist context pack

@@ -55,7 +55,7 @@
 - [x] path boundary tests.
 - [x] model/dimension migration behavior.
 - [x] large repo performance pass.
-- compact context pack format.
+- [x] compact context pack format.
 
 ## Do not start yet
 

@@ -23,4 +23,4 @@ Do not treat this folder as optional. If a code change modifies behavior describ
 
 ## Project summary
 
-symdex is a local-only code intelligence backend for AI coding agents. It combines syntax-aware indexing, semantic search, call/callee relationships, and MCP tools so agents can ground code edits in repository evidence instead of guessing.
+symdex is a local-only code intelligence backend for AI coding agents. It combines syntax-aware indexing, semantic search, call/callee relationships, compact context packs, and MCP tools so agents can ground code edits in repository evidence instead of guessing.
