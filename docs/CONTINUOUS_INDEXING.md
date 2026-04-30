@@ -76,7 +76,9 @@ Current implementation status:
   the shared indexing APIs directly.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
-- TUI toggle controls remain planned work.
+- The TUI Indexing view exposes a `c` toggle with first-enable confirmation,
+  explicit `on` / `off` labels, pending debounce state, queued event count,
+  last reindexed file, and latest error display.
 
 ## Observability
 

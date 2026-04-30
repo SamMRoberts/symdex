@@ -115,9 +115,9 @@
 - [x] Offline continuous indexing path that updates SQLite without Ollama or Qdrant.
 - [x] Semantic continuous indexing path that updates Qdrant when local services are available.
 - [x] CLI launch path such as `symdex index --watch <repo>`.
-- [ ] TUI continuous indexing toggle with explicit on/off labels and first-enable confirmation.
-- [ ] TUI watch status showing pending debounce state, queued event count, last reindexed file, and latest error.
-- [ ] TUI toggle state tests.
+- [x] TUI continuous indexing toggle with explicit on/off labels and first-enable confirmation.
+- [x] TUI watch status showing pending debounce state, queued event count, last reindexed file, and latest error.
+- [x] TUI toggle state tests.
 - [x] Tests for event coalescing, ignored paths, created-file indexing, modified-file reindexing, and unchanged-content skips.
 
 ## Do not start yet

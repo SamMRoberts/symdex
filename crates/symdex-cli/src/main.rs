@@ -413,6 +413,9 @@ fn print_continuous_index_event(event: ContinuousIndexEvent) {
             println!("watch_started repository_id={repository_id} files_seen={files_seen}");
         }
         ContinuousIndexEvent::Idle { .. } => {}
+        ContinuousIndexEvent::ChangesPending { changes } => {
+            println!("watch_pending {}", continuous_change_summary(&changes));
+        }
         ContinuousIndexEvent::ChangesDetected { changes } => {
             println!("watch_changes {}", continuous_change_summary(&changes));
         }

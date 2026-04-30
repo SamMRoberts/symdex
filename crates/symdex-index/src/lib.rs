@@ -161,6 +161,9 @@ pub enum ContinuousIndexEvent {
     Idle {
         files_seen: usize,
     },
+    ChangesPending {
+        changes: WatchChangeSet,
+    },
     ChangesDetected {
         changes: WatchChangeSet,
     },
@@ -195,6 +198,14 @@ pub fn run_continuous_index(
     options: &ContinuousIndexOptions,
     mut on_event: impl FnMut(ContinuousIndexEvent),
 ) -> Result<(), String> {
+    run_continuous_index_until(options, &mut on_event, || true)
+}
+
+pub fn run_continuous_index_until(
+    options: &ContinuousIndexOptions,
+    mut on_event: impl FnMut(ContinuousIndexEvent),
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<(), String> {
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let mut snapshot = watch_snapshot(&root)?;
     on_event(ContinuousIndexEvent::Started {
@@ -202,8 +213,11 @@ pub fn run_continuous_index(
         files_seen: snapshot.len(),
     });
 
-    loop {
+    while should_continue() {
         thread::sleep(options.poll_interval);
+        if !should_continue() {
+            break;
+        }
         let (next_snapshot, first_changes) = detect_watch_changes(&root, &snapshot)?;
         if first_changes.is_empty() {
             snapshot = next_snapshot;
@@ -213,7 +227,13 @@ pub fn run_continuous_index(
             continue;
         }
 
+        on_event(ContinuousIndexEvent::ChangesPending {
+            changes: first_changes.clone(),
+        });
         thread::sleep(options.debounce);
+        if !should_continue() {
+            break;
+        }
         let (debounced_snapshot, changes) = detect_watch_changes(&root, &snapshot)?;
         let changes = if changes.is_empty() {
             first_changes
@@ -238,6 +258,7 @@ pub fn run_continuous_index(
             }
         }
     }
+    Ok(())
 }
 
 pub fn watch_snapshot(root: &RepoRoot) -> Result<WatchSnapshot, String> {

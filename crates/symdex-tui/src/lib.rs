@@ -1,6 +1,8 @@
 //! Terminal UI state, rendering, events, and terminal lifecycle.
 
 use std::io::{self, Stdout};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -21,7 +23,8 @@ use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
 use symdex_index::{
-    EmbeddingSummary, IndexOptions, IndexProgress, IndexSummary, run_index_with_progress,
+    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexProgress,
+    IndexSummary, run_continuous_index_until, run_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
@@ -52,7 +55,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next mode in the active view\n    Shift+Tab Switch to the previous mode in the active view\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next mode in the active view\n    Shift+Tab Switch to the previous mode in the active view\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    c         Toggle continuous indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -69,6 +72,7 @@ pub struct App {
     screen: Screen,
     last_index_summary: Option<IndexSummary>,
     index_progress: Option<IndexProgress>,
+    continuous: ContinuousIndexState,
     diagnostics: DiagnosticsState,
     diagnostics_selection: usize,
     diagnostics_details_expanded: bool,
@@ -78,6 +82,8 @@ pub struct App {
     evidence: EvidenceViewerState,
     last_error: Option<String>,
     index_receiver: Option<Receiver<IndexJobMessage>>,
+    continuous_receiver: Option<Receiver<ContinuousIndexMessage>>,
+    continuous_stop: Option<Arc<AtomicBool>>,
     diagnostics_receiver: Option<Receiver<Result<DiagnosticReport, String>>>,
     query_receiver: Option<Receiver<Result<QueryResult, String>>>,
     graph_receiver: Option<Receiver<Result<CallGraphSummary, String>>>,
@@ -133,6 +139,7 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             index_progress: None,
+            continuous: ContinuousIndexState::default(),
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
@@ -151,6 +158,8 @@ impl App {
             evidence: EvidenceViewerState::default(),
             last_error: None,
             index_receiver: None,
+            continuous_receiver: None,
+            continuous_stop: None,
             diagnostics_receiver: None,
             query_receiver: None,
             graph_receiver: None,
@@ -188,6 +197,7 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             index_progress: None,
+            continuous: ContinuousIndexState::default(),
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
@@ -206,6 +216,8 @@ impl App {
             evidence: EvidenceViewerState::default(),
             last_error: None,
             index_receiver: None,
+            continuous_receiver: None,
+            continuous_stop: None,
             diagnostics_receiver: None,
             query_receiver: None,
             graph_receiver: None,
@@ -228,10 +240,25 @@ impl App {
             ]),
             Line::from(vec![
                 Span::styled(
+                    "Continuous index: ",
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                status_span(
+                    self.continuous.status_label(),
+                    self.continuous.status_tone(),
+                ),
+                Span::raw(" press c"),
+            ]),
+            Line::from(vec![
+                Span::styled(
                     "Refresh status: ",
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("press r"),
+            ]),
+            Line::from(vec![
+                Span::styled("Watch: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(self.continuous.summary()),
             ]),
             Line::from(""),
         ];
@@ -252,6 +279,16 @@ impl App {
                         mode.label()
                     )),
                 ]));
+                lines.push(Line::from("Press y to start, n or Esc to cancel."));
+            }
+            Screen::ConfirmContinuous => {
+                lines.push(Line::from(vec![
+                    status_span("confirm", StatusTone::Warning),
+                    Span::raw(" Enable continuous semantic indexing?"),
+                ]));
+                lines.push(Line::from(
+                    "The TUI will watch changed Rust files until toggled off.",
+                ));
                 lines.push(Line::from("Press y to start, n or Esc to cancel."));
             }
             Screen::IndexRunning(mode) => {
@@ -631,9 +668,14 @@ impl App {
 
         match code {
             KeyCode::Char('q') => return true,
-            KeyCode::Esc if matches!(self.screen, Screen::ConfirmIndex(_)) => {
+            KeyCode::Esc
+                if matches!(
+                    self.screen,
+                    Screen::ConfirmIndex(_) | Screen::ConfirmContinuous
+                ) =>
+            {
                 self.screen = reduce_screen(self.screen, UiAction::Cancel);
-                self.message = "Indexing cancelled before start.".to_owned();
+                self.message = "Indexing action cancelled before start.".to_owned();
             }
             KeyCode::Esc => return true,
             KeyCode::Up if self.view == View::Storage && self.storage_row_count() > 0 => {
@@ -676,14 +718,32 @@ impl App {
                     reduce_screen(self.screen, UiAction::RequestIndex(IndexMode::Semantic));
                 self.message = "Confirm semantic indexing before starting.".to_owned();
             }
+            KeyCode::Char('c') if self.continuous.enabled => {
+                self.stop_continuous_index();
+            }
+            KeyCode::Char('c') if matches!(self.screen, Screen::IndexRunning(_)) => {
+                self.message =
+                    "Continuous indexing cannot start while a manual index is running.".to_owned();
+            }
+            KeyCode::Char('c') if self.screen.accepts_new_index_request() => {
+                self.screen = reduce_screen(self.screen, UiAction::RequestContinuous);
+                self.message = "Confirm continuous indexing before starting.".to_owned();
+            }
             KeyCode::Char('y') => {
                 if let Screen::ConfirmIndex(mode) = self.screen {
                     self.start_index_job(mode);
+                } else if matches!(self.screen, Screen::ConfirmContinuous) {
+                    self.start_continuous_index();
                 }
             }
-            KeyCode::Char('n') if matches!(self.screen, Screen::ConfirmIndex(_)) => {
+            KeyCode::Char('n')
+                if matches!(
+                    self.screen,
+                    Screen::ConfirmIndex(_) | Screen::ConfirmContinuous
+                ) =>
+            {
                 self.screen = reduce_screen(self.screen, UiAction::Cancel);
-                self.message = "Indexing cancelled before start.".to_owned();
+                self.message = "Indexing action cancelled before start.".to_owned();
             }
             KeyCode::Enter if self.screen.is_terminal_job_state() => {
                 self.screen = reduce_screen(self.screen, UiAction::Dismiss);
@@ -892,6 +952,54 @@ impl App {
         self.message = format!("{} indexing started.", mode.label());
     }
 
+    fn start_continuous_index(&mut self) {
+        let repo = self.repo_input.clone();
+        let active = Arc::new(AtomicBool::new(true));
+        let worker_active = Arc::clone(&active);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_continuous_index_until(
+                &ContinuousIndexOptions::new(repo, false),
+                |event| {
+                    let _ = sender.send(ContinuousIndexMessage::Event(Box::new(event)));
+                },
+                || worker_active.load(Ordering::SeqCst),
+            );
+            match result {
+                Ok(()) => {
+                    let _ = sender.send(ContinuousIndexMessage::Stopped);
+                }
+                Err(error) => {
+                    let _ = sender.send(ContinuousIndexMessage::Failed(error));
+                }
+            }
+        });
+        self.continuous = ContinuousIndexState {
+            enabled: true,
+            status: ContinuousIndexStatus::Starting,
+            files_seen: 0,
+            queued_events: 0,
+            last_reindexed_file: None,
+            latest_error: None,
+        };
+        self.continuous_receiver = Some(receiver);
+        self.continuous_stop = Some(active);
+        self.screen = reduce_screen(self.screen, UiAction::Confirm);
+        self.message = "Continuous indexing started.".to_owned();
+    }
+
+    fn stop_continuous_index(&mut self) {
+        if let Some(active) = &self.continuous_stop {
+            active.store(false, Ordering::SeqCst);
+        }
+        self.continuous.enabled = false;
+        self.continuous.status = ContinuousIndexStatus::Off;
+        self.continuous.queued_events = 0;
+        self.continuous_receiver = None;
+        self.continuous_stop = None;
+        self.message = "Continuous indexing stopped.".to_owned();
+    }
+
     fn start_diagnostics(&mut self) {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -1016,6 +1124,112 @@ impl App {
                 self.last_error = Some("indexing worker disconnected".to_owned());
                 self.screen = reduce_screen(self.screen, UiAction::JobFailed);
                 self.message = "Indexing failed.".to_owned();
+            }
+        }
+    }
+
+    fn poll_continuous_index(&mut self) {
+        let Some(receiver) = &self.continuous_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(ContinuousIndexMessage::Event(event)) => {
+                self.apply_continuous_event(*event);
+            }
+            Ok(ContinuousIndexMessage::Stopped) => {
+                self.continuous_receiver = None;
+                self.continuous_stop = None;
+                if self.continuous.enabled {
+                    self.continuous.enabled = false;
+                    self.continuous.status = ContinuousIndexStatus::Off;
+                    self.message = "Continuous indexing stopped.".to_owned();
+                }
+            }
+            Ok(ContinuousIndexMessage::Failed(error)) => {
+                self.continuous_receiver = None;
+                self.continuous_stop = None;
+                self.continuous.enabled = false;
+                self.continuous.status = ContinuousIndexStatus::Failed;
+                self.continuous.latest_error = Some(error);
+                self.message = "Continuous indexing failed.".to_owned();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.continuous_receiver = None;
+                self.continuous_stop = None;
+                if self.continuous.enabled {
+                    self.continuous.enabled = false;
+                    self.continuous.status = ContinuousIndexStatus::Failed;
+                    self.continuous.latest_error =
+                        Some("continuous indexing worker disconnected".to_owned());
+                    self.message = "Continuous indexing failed.".to_owned();
+                }
+            }
+        }
+    }
+
+    fn apply_continuous_event(&mut self, event: ContinuousIndexEvent) {
+        match event {
+            ContinuousIndexEvent::Started { files_seen, .. } => {
+                self.continuous.enabled = true;
+                self.continuous.status = ContinuousIndexStatus::Watching;
+                self.continuous.files_seen = files_seen;
+                self.continuous.latest_error = None;
+                self.message = format!("Continuous indexing on: watching {files_seen} files.");
+            }
+            ContinuousIndexEvent::Idle { files_seen } => {
+                self.continuous.files_seen = files_seen;
+                if self.continuous.enabled
+                    && matches!(
+                        self.continuous.status,
+                        ContinuousIndexStatus::Starting
+                            | ContinuousIndexStatus::Pending
+                            | ContinuousIndexStatus::Indexing
+                    )
+                {
+                    self.continuous.status = ContinuousIndexStatus::Watching;
+                }
+            }
+            ContinuousIndexEvent::ChangesPending { changes } => {
+                self.continuous.status = ContinuousIndexStatus::Pending;
+                self.continuous.queued_events = changes.event_count();
+                self.continuous.latest_error = None;
+                self.message = format!(
+                    "Continuous indexing debounce pending: {} events.",
+                    changes.event_count()
+                );
+            }
+            ContinuousIndexEvent::ChangesDetected { changes } => {
+                self.continuous.status = ContinuousIndexStatus::Indexing;
+                self.continuous.queued_events = changes.event_count();
+                self.continuous.latest_error = None;
+                self.message = format!(
+                    "Continuous indexing {} changed paths.",
+                    changes.event_count()
+                );
+            }
+            ContinuousIndexEvent::BatchCompleted { changes, summary } => {
+                self.continuous.status = ContinuousIndexStatus::Watching;
+                self.continuous.queued_events = 0;
+                self.continuous.last_reindexed_file =
+                    changes.paths().first().map(|path| (*path).to_owned());
+                self.continuous.latest_error = None;
+                self.last_index_summary = Some(summary);
+                if let Err(error) = self.refresh_status() {
+                    self.message =
+                        format!("Continuous indexing completed, but refresh failed: {error}");
+                } else {
+                    self.message = format!(
+                        "Continuous indexing updated {} file events.",
+                        changes.event_count()
+                    );
+                }
+            }
+            ContinuousIndexEvent::BatchFailed { changes, error } => {
+                self.continuous.status = ContinuousIndexStatus::Failed;
+                self.continuous.queued_events = changes.event_count();
+                self.continuous.latest_error = Some(error);
+                self.message = "Continuous indexing batch failed.".to_owned();
             }
         }
     }
@@ -1504,6 +1718,7 @@ fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let (title, tone) = match app.screen {
         Screen::Dashboard => ("Indexing", StatusTone::Info),
         Screen::ConfirmIndex(_) => ("Confirm Indexing", StatusTone::Warning),
+        Screen::ConfirmContinuous => ("Confirm Continuous Indexing", StatusTone::Warning),
         Screen::IndexRunning(_) => ("Indexing Running", StatusTone::Info),
         Screen::IndexCompleted(_) => ("Indexing Complete", StatusTone::Success),
         Screen::IndexFailed(_) => ("Indexing Failed", StatusTone::Error),
@@ -1570,6 +1785,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
     let mut app = app;
     loop {
         app.poll_index_job();
+        app.poll_continuous_index();
         app.poll_diagnostics();
         app.poll_query();
         app.poll_graph();
@@ -3835,7 +4051,7 @@ impl View {
     fn footer_help(self) -> &'static str {
         match self {
             Self::Indexing => {
-                "i index | x storage | d doctor | w query | g calls | p impact | o offline | s semantic | r refresh | q quit"
+                "i index | x storage | d doctor | w query | g calls | p impact | o offline | s semantic | c continuous | r refresh | q quit"
             }
             Self::Storage => {
                 "Tab/Shift+Tab storage tabs | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
@@ -4188,6 +4404,88 @@ enum IndexJobMessage {
     Finished(Result<IndexSummary, String>),
 }
 
+enum ContinuousIndexMessage {
+    Event(Box<ContinuousIndexEvent>),
+    Failed(String),
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuousIndexState {
+    enabled: bool,
+    status: ContinuousIndexStatus,
+    files_seen: usize,
+    queued_events: usize,
+    last_reindexed_file: Option<String>,
+    latest_error: Option<String>,
+}
+
+impl Default for ContinuousIndexState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            status: ContinuousIndexStatus::Off,
+            files_seen: 0,
+            queued_events: 0,
+            last_reindexed_file: None,
+            latest_error: None,
+        }
+    }
+}
+
+impl ContinuousIndexState {
+    fn status_label(&self) -> &'static str {
+        self.status.label()
+    }
+
+    fn status_tone(&self) -> StatusTone {
+        self.status.tone()
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "state={} files_seen={} queued={} last={} error={}",
+            self.status.label(),
+            self.files_seen,
+            self.queued_events,
+            self.last_reindexed_file.as_deref().unwrap_or("<none>"),
+            self.latest_error.as_deref().unwrap_or("<none>")
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuousIndexStatus {
+    Off,
+    Starting,
+    Watching,
+    Pending,
+    Indexing,
+    Failed,
+}
+
+impl ContinuousIndexStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Starting => "starting",
+            Self::Watching => "on",
+            Self::Pending => "pending",
+            Self::Indexing => "indexing",
+            Self::Failed => "error",
+        }
+    }
+
+    fn tone(self) -> StatusTone {
+        match self {
+            Self::Off => StatusTone::Dim,
+            Self::Starting | Self::Watching | Self::Indexing => StatusTone::Info,
+            Self::Pending => StatusTone::Warning,
+            Self::Failed => StatusTone::Error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexMode {
     Offline,
@@ -4207,6 +4505,7 @@ impl IndexMode {
 enum Screen {
     Dashboard,
     ConfirmIndex(IndexMode),
+    ConfirmContinuous,
     IndexRunning(IndexMode),
     IndexCompleted(IndexMode),
     IndexFailed(IndexMode),
@@ -4230,7 +4529,7 @@ impl Screen {
             | Self::IndexRunning(mode)
             | Self::IndexCompleted(mode)
             | Self::IndexFailed(mode) => Some(mode),
-            Self::Dashboard => None,
+            Self::Dashboard | Self::ConfirmContinuous => None,
         }
     }
 }
@@ -4238,6 +4537,7 @@ impl Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiAction {
     RequestIndex(IndexMode),
+    RequestContinuous,
     Confirm,
     Cancel,
     JobSucceeded,
@@ -4250,8 +4550,14 @@ fn reduce_screen(screen: Screen, action: UiAction) -> Screen {
         (screen, UiAction::RequestIndex(mode)) if screen.accepts_new_index_request() => {
             Screen::ConfirmIndex(mode)
         }
+        (screen, UiAction::RequestContinuous) if screen.accepts_new_index_request() => {
+            Screen::ConfirmContinuous
+        }
         (Screen::ConfirmIndex(mode), UiAction::Confirm) => Screen::IndexRunning(mode),
-        (Screen::ConfirmIndex(_), UiAction::Cancel) => Screen::Dashboard,
+        (Screen::ConfirmContinuous, UiAction::Confirm) => Screen::Dashboard,
+        (Screen::ConfirmIndex(_) | Screen::ConfirmContinuous, UiAction::Cancel) => {
+            Screen::Dashboard
+        }
         (Screen::IndexRunning(mode), UiAction::JobSucceeded) => Screen::IndexCompleted(mode),
         (Screen::IndexRunning(mode), UiAction::JobFailed) => Screen::IndexFailed(mode),
         (screen, UiAction::Dismiss) if screen.is_terminal_job_state() => Screen::Dashboard,
@@ -4283,9 +4589,9 @@ mod tests {
     };
 
     use crate::{
-        App, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus, GraphStatus,
-        IndexMode, QueryStatus, Screen, StorageExplorerState, StorageMode, UiAction, View,
-        progress_percent, reduce_screen, render,
+        App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
+        GraphStatus, IndexMode, QueryStatus, Screen, StorageExplorerState, StorageMode, UiAction,
+        View, progress_percent, reduce_screen, render,
     };
 
     #[test]
@@ -5356,6 +5662,100 @@ mod tests {
         assert!(rendered.contains("Press y to start"));
         assert_eq!(
             cell_fg_for_text(buffer, "Confirm Indexing", None),
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn continuous_indexing_toggle_requires_confirmation() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+
+        assert!(!app.handle_key(KeyCode::Char('c')));
+        assert_eq!(app.screen, Screen::ConfirmContinuous);
+        assert_eq!(app.message, "Confirm continuous indexing before starting.");
+
+        assert!(!app.handle_key(KeyCode::Char('n')));
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert_eq!(app.message, "Indexing action cancelled before start.");
+    }
+
+    #[test]
+    fn continuous_indexing_toggle_stops_when_enabled() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.continuous.enabled = true;
+        app.continuous.status = ContinuousIndexStatus::Watching;
+        app.continuous.queued_events = 2;
+
+        assert!(!app.handle_key(KeyCode::Char('c')));
+
+        assert!(!app.continuous.enabled);
+        assert_eq!(app.continuous.status, ContinuousIndexStatus::Off);
+        assert_eq!(app.continuous.queued_events, 0);
+        assert_eq!(app.message, "Continuous indexing stopped.");
+    }
+
+    #[test]
+    fn continuous_indexing_events_update_status() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::Started {
+            repository_id: "repo".to_owned(),
+            files_seen: 3,
+        });
+        assert!(app.continuous.enabled);
+        assert_eq!(app.continuous.status, ContinuousIndexStatus::Watching);
+        assert_eq!(app.continuous.files_seen, 3);
+
+        let changes = symdex_index::WatchChangeSet {
+            created: vec!["src/new.rs".to_owned()],
+            modified: vec!["src/lib.rs".to_owned()],
+            deleted: Vec::new(),
+        };
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::ChangesPending {
+            changes: changes.clone(),
+        });
+        assert_eq!(app.continuous.status, ContinuousIndexStatus::Pending);
+        assert_eq!(app.continuous.queued_events, 2);
+        assert_eq!(
+            app.message,
+            "Continuous indexing debounce pending: 2 events."
+        );
+
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::BatchFailed {
+            changes,
+            error: "ollama unavailable".to_owned(),
+        });
+        assert_eq!(app.continuous.status, ContinuousIndexStatus::Failed);
+        assert_eq!(app.continuous.queued_events, 2);
+        assert_eq!(
+            app.continuous.latest_error.as_deref(),
+            Some("ollama unavailable")
+        );
+        assert_eq!(app.message, "Continuous indexing batch failed.");
+    }
+
+    #[test]
+    fn renders_continuous_indexing_status() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.continuous.enabled = true;
+        app.continuous.status = ContinuousIndexStatus::Pending;
+        app.continuous.files_seen = 3;
+        app.continuous.queued_events = 2;
+        app.continuous.last_reindexed_file = Some("src/lib.rs".to_owned());
+        app.continuous.latest_error = Some("ollama unavailable".to_owned());
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Continuous index"));
+        assert!(rendered.contains("pending"));
+        assert!(rendered.contains("queued=2"));
+        assert!(rendered.contains("src/lib.rs"));
+        assert!(rendered.contains("ollama unavailable"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "pending", None),
             Some(Color::Yellow)
         );
     }

@@ -63,7 +63,9 @@ flags.
 
 Current continuous indexing tests cover snapshot diff coalescing, created-file
 and modified-file detection, ignored path skips, non-Rust path skips, and
-unchanged-content skips.
+unchanged-content skips. TUI state/render tests cover continuous-indexing
+toggle confirmation, stopping an active watcher, pending debounce display,
+queued event count, and latest error rendering.
 
 ## Test commands
 
@@ -102,10 +104,10 @@ selected-run detail panel, semantic neighborhood payload table and selected-row
 detail panel, cross-store health warning table and selected-warning detail
 panel, selected table rows, Doctor selected-check detail behavior, two-row
 footer rendering for shortcut hints plus status messages, 80x24 narrow-terminal
-rendering, and the indexing confirmation reducer. Future TUI continuous
-indexing work should add reducer and render coverage for toggle confirmation,
+rendering, the indexing confirmation reducer, and continuous-indexing reducer
+and render coverage for toggle confirmation, stopping an active watcher,
 on/off labels, pending debounce, queued event count, latest reindexed file, and
-watch errors before being marked complete.
+watch errors.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic
