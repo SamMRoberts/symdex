@@ -101,6 +101,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Design for keyboard-first use; mouse support is optional and must not be required.
 - Show visible loading, empty, error, and confirmation states.
 - Show compact evidence by default: paths, line ranges, scores, confidence, resolution status, symbols, and context-pack metadata.
+- Visualize SQLite as the structural source of truth: repositories, files, chunks, symbols, calls, and index runs.
+- Visualize Qdrant as the semantic projection of embeddable chunks: collection, vector model/dimension, point payload metadata, and semantic coverage.
+- Prefer tables, split panes, gauges, and compact relationship views over prose-only summaries.
+- Cross-store visualizations must make mismatches obvious, such as chunks with no vector point, excluded chunks, missing collections, or model/dimension drift.
 - Do not show source text by default; source previews require a future explicit design.
 - Require confirmation before starting long-running local jobs such as indexing.
 - Do not add reset/delete actions until matching CLI support exists.

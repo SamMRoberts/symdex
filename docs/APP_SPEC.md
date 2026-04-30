@@ -11,6 +11,8 @@ It answers questions such as:
 - Which functions call or are called by this symbol?
 - What files and tests are likely affected?
 - What compact context should an AI agent receive before editing?
+- How complete and healthy is the local structural and semantic index?
+- Which files, chunks, symbols, calls, and embeddings explain the evidence?
 
 ## Non-goals for MVP
 
@@ -28,7 +30,8 @@ It answers questions such as:
 3. User runs `symdex index /path/to/repo`.
 4. User asks semantic or structural questions through CLI, TUI, or MCP.
 5. User can inspect local status, diagnostics, indexing controls, queries, and context packs in the TUI.
-6. Agent receives compact ranked evidence with file paths and line ranges.
+6. User can visualize SQLite structural data and Qdrant semantic coverage in the TUI without exposing source text.
+7. Agent receives compact ranked evidence with file paths and line ranges.
 
 ## Primary commands
 
@@ -54,4 +57,5 @@ symdex serve-mcp
 - Call graph records direct calls where syntax makes them obvious.
 - MCP tools return compact JSON evidence that a coding agent can use immediately.
 - TUI provides a local keyboard-first control panel for indexing, diagnostics, queries, impact, and context packs.
+- TUI makes index health inspectable with local visualizations for coverage, file details, symbol outlines, call resolution, embedding coverage, and index runs.
 - Unresolved or ambiguous relationships are labeled instead of fabricated.

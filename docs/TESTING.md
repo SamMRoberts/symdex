@@ -38,6 +38,9 @@ Fixtures should be tiny and purpose-built.
 - TUI navigation and confirmation flows
 - TUI loading, empty, and error states
 - TUI render snapshots or buffer assertions for key screens
+- TUI storage visualization state and render coverage for SQLite/Qdrant
+  metadata, selected-row drill-down, empty stores, missing vectors, excluded
+  chunks, and model/dimension drift
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -77,6 +80,10 @@ state, impact/context-pack rendering and input state, selected table rows,
 Doctor selected-check detail behavior, 80x24 narrow-terminal rendering, and the
 indexing confirmation reducer. Future TUI views should add similar reducer and
 render coverage before being marked complete.
+
+Future TUI storage visualizations should use SQLite fixtures for deterministic
+structural data and mocked or adapter-level Qdrant metadata for semantic
+coverage checks. Tests should assert labels and counts instead of source text.
 
 ## Agent expectation
 

@@ -149,6 +149,101 @@ repository and embedding model. If the vector dimension changed, indexing fails
 closed with a reset/reindex message instead of mixing incompatible points in the
 same Qdrant collection. Different model names use different collection names.
 
+## TUI visualization mapping
+
+The TUI should visualize storage metadata without showing source text by
+default. Treat SQLite as the structural source of truth and Qdrant as the
+semantic projection of embeddable chunks.
+
+### Storage explorer
+
+Use SQLite tables to show repository structure:
+
+- `repositories`: selected repository identity and root metadata.
+- `index_runs`: latest and historical indexing status.
+- `files`: indexed paths, languages, content hashes, and indexed timestamps.
+- `symbols`: symbol names, qualified names, kinds, nesting, and line ranges.
+- `chunks`: chunk kinds, line ranges, text hashes, vector point IDs, and
+  exclusion reasons.
+- `calls`: caller/callee links, call lines, confidence, and resolution status.
+
+Use Qdrant metadata to show semantic storage:
+
+- collection name and expected embedding model/dimension
+- point counts for the selected repository collection
+- payload fields for selected points, excluding source text
+
+### Index coverage view
+
+Group by `files.path` and aggregate:
+
+- chunk count from `chunks`
+- symbol count from `symbols`
+- call count from `calls` joined through caller symbols
+- embeddable chunk count from chunks where `excluded_reason IS NULL`
+- vector-backed chunk count from chunks with `qdrant_point_id IS NOT NULL`
+- excluded chunk count grouped by `excluded_reason`
+
+Use status labels such as `covered`, `metadata-only`, `excluded`, `stale`, and
+`missing-vector` when the counts expose gaps.
+
+### File detail drawer
+
+For the selected file, show metadata rows from:
+
+- `chunks`: kind, line range, text hash, vector point ID, exclusion reason
+- `symbols`: kind, qualified name, parent symbol, line range
+- `calls`: call line, callee text, resolved callee symbol, confidence, status
+
+Do not show source previews unless a future source-preview design explicitly
+allows it.
+
+### Symbol outline view
+
+Use `symbols.parent_symbol_id` to render nested symbol outlines. Rows should
+show symbol kind, qualified name or display name, line range, and whether
+related chunks/calls exist.
+
+### Call resolution dashboard
+
+Use `calls.resolution_status` and `calls.confidence` to group call edges into
+resolved, unresolved, ambiguous, and low-confidence buckets. Rows should include
+caller symbol, callee text, call line, path, confidence, and resolution status.
+
+### Embedding coverage view
+
+Compare SQLite chunk metadata with Qdrant collection metadata:
+
+- chunks with `excluded_reason` are metadata-only and intentionally unembedded
+- chunks with `qdrant_point_id` should have matching Qdrant points
+- chunks without `qdrant_point_id` and without `excluded_reason` are missing
+  vectors
+- latest successful `index_runs.embedding_model` and `embedding_dimension`
+  should match the selected Qdrant collection metadata
+
+Surface missing collections, missing points, model drift, and dimension drift
+as warning or error rows.
+
+### Index runs timeline
+
+Use `index_runs.started_at`, `finished_at`, `status`, `files_seen`,
+`files_indexed`, `chunks_embedded`, `embedding_model`, `embedding_dimension`,
+and `error_summary` for a compact run timeline.
+
+### Semantic neighborhood view
+
+When visualizing nearby Qdrant points, show payload metadata only:
+
+- path
+- line range
+- symbol name
+- chunk kind
+- language
+- score
+- text hash
+
+Do not show full chunk text in semantic-neighborhood rows.
+
 ## ID strategy
 
 Use deterministic IDs where possible:

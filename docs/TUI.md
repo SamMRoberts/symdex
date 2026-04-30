@@ -63,6 +63,10 @@ terminal panes.
   - `Sparkline` or `BarChart` only when backed by real metrics, not decoration.
 - Use `TableState`, `ListState`, or equivalent stateful widgets for
   focused/selected rows.
+- Use split panes for drill-down visualizations: a selectable list/table on one
+  side and detail rows, relationship summaries, or health notes on the other.
+- Use gauges or ratio labels only when backed by real counts, such as embedded
+  chunks divided by embeddable chunks.
 - Prefer split panes for workflows that compare data:
   - repository/status summary on the left
   - active view details on the right
@@ -115,6 +119,109 @@ terminal panes.
   plain paragraphs.
 - Keep repository identity, index freshness, counts, service targets, and
   embedding readiness visually grouped inside the status pane.
+
+### Storage Explorer
+
+The TUI should add a storage-focused view for inspecting how SQLite and Qdrant
+represent the indexed repository.
+
+- Treat SQLite as the structural source of truth:
+  - `repositories`
+  - `index_runs`
+  - `files`
+  - `symbols`
+  - `chunks`
+  - `calls`
+- Treat Qdrant as the semantic projection of eligible chunks:
+  - collection name
+  - embedding model
+  - vector dimension
+  - point count when available
+  - payload fields: repository, file, chunk, symbol, path, language, kind, line
+    range, and text hash
+- Do not display source text.
+- Keep collection and point inspection metadata-only.
+- Surface cross-store mismatches as warning/error rows rather than hidden
+  implementation details.
+
+### Index Coverage View
+
+- Show a selectable file table with:
+  - path
+  - language
+  - chunks
+  - symbols
+  - calls
+  - embeddable chunks
+  - embedded/vector-backed chunks
+  - excluded chunks
+- Use status labels such as `covered`, `metadata-only`, `excluded`, `stale`, and
+  `missing-vector`.
+- Selecting a file should drive a detail pane with chunk, symbol, call, and
+  exclusion summaries for that file.
+- Use gauges only for real ratios, such as embedded chunks over embeddable
+  chunks.
+
+### File Detail Drawer
+
+- For the selected file, show separate compact sections for:
+  - chunks with kind, line range, symbol, vector point status, and exclusion
+    reason
+  - symbols with kind, qualified name, parent relationship, and line range
+  - calls with caller symbol, callee text, call line, confidence, and resolution
+    status
+- Preserve metadata-only behavior. Do not show source previews unless a future
+  source-preview design explicitly adds them.
+
+### Symbol Outline View
+
+- Render `symbols.parent_symbol_id` relationships as a keyboard-navigable
+  outline when parent data exists.
+- Show symbol kind, qualified name, and line range.
+- Selecting a symbol should allow jumping to callers/callees, impact, and
+  context-pack views using the symbol query.
+
+### Call Resolution Dashboard
+
+- Summarize calls by `resolution_status` and confidence buckets.
+- Show direct counts for resolved, unresolved, and ambiguous/future statuses.
+- Selecting a bucket should show rows with caller symbol, callee text, call line,
+  path, confidence, and resolution status.
+- Highlight unresolved or low-confidence call evidence with warning colors.
+
+### Embedding Coverage View
+
+- Compare SQLite chunks against Qdrant-backed semantic coverage:
+  - total chunks
+  - chunks excluded from embedding
+  - chunks with `qdrant_point_id`
+  - chunks missing vector metadata
+  - latest model and dimension
+  - Qdrant collection name
+- Show model or dimension drift as an error state.
+- Show excluded chunks by reason so secret filtering remains auditable without
+  exposing source text.
+
+### Index Runs Timeline
+
+- Render `index_runs` as a compact table:
+  - started/finished time
+  - status
+  - files seen/indexed
+  - chunks embedded
+  - model
+  - dimension
+  - error summary
+- Selecting a run should show detailed counts and any error summary.
+- Failed or partial runs should be visually distinct from successful runs.
+
+### Semantic Neighborhood View
+
+- Future semantic-neighborhood features may use Qdrant metadata to inspect
+  semantically related chunks, but must remain metadata-first.
+- The first version should show path, line range, symbol, chunk kind, score, and
+  text hash only.
+- Do not fetch or display full source text as part of this view.
 
 ### Indexing Controls
 

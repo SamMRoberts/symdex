@@ -80,6 +80,8 @@ Query orchestration:
 - semantic query embedding
 - Qdrant vector search
 - compact query result summaries without source text
+- storage-visualization summaries that combine SQLite structural metadata with
+  Qdrant semantic coverage metadata
 
 Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
 
@@ -112,6 +114,7 @@ Terminal UI:
 - `ratatui` layouts and widgets
 - `crossterm` input and terminal lifecycle
 - view orchestration for dashboard, indexing controls, diagnostics, queries, impact, and context packs
+- metadata-only storage visualizations for index coverage, file details, symbol outlines, call resolution, embedding coverage, and index runs
 
 Do not shell out to the `symdex` binary. Call Rust library APIs directly.
 
@@ -131,6 +134,9 @@ MCP server:
 - Never let MCP invoke indexing side effects until a write-capable design is approved.
 - Require TUI confirmation before long-running jobs such as indexing.
 - Keep TUI rendering and event types out of core, store, embed, and MCP crates.
+- Keep storage visualization queries outside `symdex-tui` when they require
+  nontrivial SQLite/Qdrant aggregation; expose typed summaries from shared
+  library crates instead.
 - Prefer stable serialized structs for MCP outputs.
 - Keep all path normalization centralized.
 - Do not expose absolute paths unless user configuration allows it.
