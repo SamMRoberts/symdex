@@ -1,0 +1,57 @@
+# Testing
+
+## Test pyramid
+
+1. Unit tests for parsing, chunking, hashing, path normalization, and secret detection.
+2. Integration tests for SQLite migrations and query behavior.
+3. Integration tests for Qdrant adapter behind an opt-in feature or environment flag.
+4. Integration tests for Ollama adapter behind an opt-in feature or environment flag.
+5. MCP contract tests for input validation and output shape.
+
+## Fixtures
+
+Store under:
+
+```text
+tests/fixtures/
+  rust_basic/
+  rust_calls/
+  rust_ignore/
+  rust_secrets/
+```
+
+Fixtures should be tiny and purpose-built.
+
+## Required test areas
+
+- syntax chunk line ranges
+- stable IDs across repeated runs
+- changed file reindex
+- deleted file cleanup
+- unresolved calls preserved
+- ambiguous calls labeled
+- repo-root path enforcement
+- ignored files not indexed
+- likely secrets excluded from embeddings
+- MCP tools reject invalid paths
+
+## Test commands
+
+Default local checks:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Service-dependent checks:
+
+```bash
+symdex_TEST_QDRANT=1 cargo test -p symdex-store qdrant
+symdex_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
+```
+
+## Agent expectation
+
+When changing behavior, add tests. When unable to run service-dependent tests, run unit tests and state which integration checks remain unverified.
