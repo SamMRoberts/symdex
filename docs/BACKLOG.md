@@ -71,6 +71,18 @@
 - [x] `ratatui` render tests.
 - [x] CLI launch smoke.
 
+## Phase 7 — TUI visual polish
+
+- ratatui `Tabs` for major views.
+- status-colored labels for service health, job state, confidence, and resolution.
+- `Table` widgets for diagnostics, query evidence, call graph rows, impact rows, and context-pack metadata.
+- stateful selection/focus for result lists and tables.
+- per-view footer help text.
+- confirmation panel styling for long-running jobs.
+- progress `Gauge` for indexing when progress reporting exists.
+- narrow-terminal render tests for 80x24 layout.
+- render tests for active tabs, status colors, selected rows, and table headers.
+
 ## Do not start yet
 
 - web UI
