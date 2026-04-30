@@ -8,8 +8,8 @@ use symdex_core::{
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_mcp::tool_names;
 use symdex_store::{
-    PointPayload, QdrantClient, StoreConfig, VectorPoint, qdrant_collection_name, qdrant_point_id,
-    sqlite_parent,
+    ChunkRecord, FileRecord, PointPayload, QdrantClient, RepositoryRecord, SqliteStore,
+    StoreConfig, VectorPoint, qdrant_collection_name, qdrant_point_id, sqlite_parent,
 };
 
 fn main() {
@@ -31,6 +31,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "index" => {
             let index_args = parse_index_args(&args[1..]);
             index(&index_args)
+        }
+        "index-status" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            index_status(repo)
         }
         "search" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -79,32 +83,48 @@ fn init() -> Result<(), String> {
             .map_err(|error| format!("create sqlite directory {}: {error}", parent.display()))?;
         println!("created {}", parent.display());
     }
+    let sqlite = SqliteStore::open(&store).map_err(|error| error.to_string())?;
+    sqlite.migrate().map_err(|error| error.to_string())?;
     println!("initialized symdex local state");
     Ok(())
 }
 
 fn index(args: &IndexArgs) -> Result<(), String> {
     let root = RepoRoot::open(&args.repo).map_err(|error| error.to_string())?;
-    let reports = collect_index_reports(&root)?;
+    let store_config = StoreConfig::from_env();
+    let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    sqlite.migrate().map_err(|error| error.to_string())?;
+    sqlite
+        .upsert_repository(&RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+
+    let collection = collect_index_reports(&root, if args.offline { Some(&sqlite) } else { None })?;
 
     println!("repository_id: {}", root.id());
     println!("repository_root: {}", root.path().display());
-    println!("rust_files_seen: {}", reports.len());
-    print_index_reports(&reports);
+    println!("rust_files_seen: {}", collection.files_seen);
+    println!(
+        "files_skipped_unchanged: {}",
+        collection.files_skipped_unchanged
+    );
+    print_index_reports(&collection.reports);
+
+    persist_structural_index(&mut sqlite, &root, &collection)?;
 
     if args.offline {
         println!("embedding: skipped (--offline)");
         println!("qdrant: skipped (--offline)");
-        println!("sqlite_persistence: skipped (SQLite adapter pending)");
         return Ok(());
     }
 
     let embed_config = EmbedConfig::from_env();
-    let chunk_texts = chunk_texts(&reports);
+    let chunk_texts = chunk_texts(&collection.reports);
     if chunk_texts.is_empty() {
         println!("chunks_embedded: 0");
         println!("qdrant: skipped (no chunks)");
-        println!("sqlite_persistence: skipped (SQLite adapter pending)");
         return Ok(());
     }
 
@@ -130,7 +150,6 @@ fn index(args: &IndexArgs) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let dimension = embeddings.dimension().unwrap_or(0);
 
-    let store_config = StoreConfig::from_env();
     let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
     let collection = qdrant_collection_name(root.id(), &embed_config.model);
     qdrant
@@ -150,7 +169,25 @@ fn index(args: &IndexArgs) -> Result<(), String> {
     println!("embedding_dimension: {dimension}");
     println!("qdrant_collection: {collection}");
     println!("chunks_embedded: {}", points.len());
-    println!("sqlite_persistence: skipped (SQLite adapter pending)");
+    Ok(())
+}
+
+fn index_status(repo: &str) -> Result<(), String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let store_config = StoreConfig::from_env();
+    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    sqlite.migrate().map_err(|error| error.to_string())?;
+    let status = sqlite
+        .repository_status(root.id())
+        .map_err(|error| error.to_string())?;
+
+    println!("repository_id: {}", status.repository_id);
+    println!("files_indexed: {}", status.files_indexed);
+    println!("chunks_indexed: {}", status.chunks_indexed);
+    println!(
+        "last_indexed_at: {}",
+        status.last_indexed_at.as_deref().unwrap_or("<never>")
+    );
     Ok(())
 }
 
@@ -195,12 +232,29 @@ fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_index_reports(root: &RepoRoot) -> Result<Vec<IndexReport>, String> {
+fn collect_index_reports(
+    root: &RepoRoot,
+    sqlite: Option<&SqliteStore>,
+) -> Result<IndexCollection, String> {
     let files = discover_rust_files(root, &DiscoveryOptions::default())
         .map_err(|error| error.to_string())?;
 
     let mut reports = Vec::new();
+    let mut files_skipped_unchanged = 0usize;
     for file in &files {
+        if let Some(sqlite) = sqlite
+            && sqlite
+                .file_unchanged(
+                    root.id(),
+                    &file.facts.relative_path,
+                    &file.facts.content_hash,
+                )
+                .map_err(|error| error.to_string())?
+        {
+            files_skipped_unchanged += 1;
+            continue;
+        }
+
         let source = fs::read_to_string(&file.absolute_path)
             .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
         let chunks =
@@ -211,7 +265,15 @@ fn collect_index_reports(root: &RepoRoot) -> Result<Vec<IndexReport>, String> {
             source,
         });
     }
-    Ok(reports)
+    Ok(IndexCollection {
+        files_seen: files.len(),
+        files_skipped_unchanged,
+        active_paths: files
+            .iter()
+            .map(|file| file.facts.relative_path.clone())
+            .collect(),
+        reports,
+    })
 }
 
 fn print_index_reports(reports: &[IndexReport]) {
@@ -277,6 +339,56 @@ fn vector_point(
     })
 }
 
+fn persist_structural_index(
+    sqlite: &mut SqliteStore,
+    root: &RepoRoot,
+    collection: &IndexCollection,
+) -> Result<(), String> {
+    let mut chunks_persisted = 0usize;
+    for report in &collection.reports {
+        let file = FileRecord {
+            id: report.file.id.clone(),
+            repository_id: root.id().to_owned(),
+            path: report.file.relative_path.clone(),
+            language: report.file.language.as_str().to_owned(),
+            content_hash: report.file.content_hash.clone(),
+        };
+        let chunks = report
+            .chunks
+            .iter()
+            .map(chunk_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        chunks_persisted += chunks.len();
+        sqlite
+            .replace_file_chunks(&file, &chunks)
+            .map_err(|error| error.to_string())?;
+    }
+
+    let files_removed = sqlite
+        .remove_missing_files(root.id(), &collection.active_paths)
+        .map_err(|error| error.to_string())?;
+    println!("sqlite_files_indexed: {}", collection.reports.len());
+    println!("sqlite_chunks_indexed: {chunks_persisted}");
+    println!("sqlite_files_removed: {files_removed}");
+    Ok(())
+}
+
+fn chunk_record(chunk: &CodeChunk) -> Result<ChunkRecord, String> {
+    Ok(ChunkRecord {
+        id: chunk.id.clone(),
+        file_id: chunk.file_id.clone(),
+        symbol_id: chunk.symbol_id.clone(),
+        kind: chunk.kind.as_str().to_owned(),
+        text_hash: chunk.text_hash.clone(),
+        start_line: chunk.line_range.start,
+        end_line: chunk.line_range.end,
+        start_byte: chunk.byte_range.start,
+        end_byte: chunk.byte_range.end,
+        qdrant_point_id: Some(qdrant_point_id(&chunk.id).map_err(|error| error.to_string())?),
+        excluded_reason: None,
+    })
+}
+
 fn parse_index_args(args: &[String]) -> IndexArgs {
     let mut repo = ".".to_owned();
     let mut offline = false;
@@ -288,6 +400,13 @@ fn parse_index_args(args: &[String]) -> IndexArgs {
         }
     }
     IndexArgs { repo, offline }
+}
+
+struct IndexCollection {
+    files_seen: usize,
+    files_skipped_unchanged: usize,
+    active_paths: Vec<String>,
+    reports: Vec<IndexReport>,
 }
 
 struct IndexReport {
@@ -376,7 +495,7 @@ fn report_qdrant(config: &StoreConfig) {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Preview planned read-only MCP tools\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Preview planned read-only MCP tools\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

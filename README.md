@@ -13,8 +13,10 @@ initial semantic search CLI.
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- index --offline tests/fixtures/rust_basic
+cargo run -p symdex-cli -- index-status tests/fixtures/rust_basic
 ```
 
 With Ollama and Qdrant running locally, `index <repo>` embeds Rust chunks and
 upserts vectors, and `search <repo> <query>` returns ranked path and line-range
-evidence. SQLite persistence and the MCP server remain later slices.
+evidence. SQLite persistence stores repository, file, and chunk facts locally.
+The MCP server remains a later slice.

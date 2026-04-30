@@ -22,12 +22,12 @@
 
 ## Phase 2 — SQLite structural index
 
-- migrations.
-- repositories/files/chunks tables.
-- stable IDs.
-- incremental indexing.
-- deleted file cleanup.
-- index status command.
+- [x] migrations.
+- [x] repositories/files/chunks tables.
+- [x] stable IDs.
+- [x] incremental structural indexing by content hash.
+- [x] deleted file cleanup.
+- [x] index status command.
 
 ## Phase 3 — Symbols and calls
 

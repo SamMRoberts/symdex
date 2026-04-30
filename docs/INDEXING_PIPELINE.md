@@ -128,3 +128,10 @@ A file can be skipped only when:
 - embedding model and dimension are unchanged
 
 Changed files should replace their SQLite facts and Qdrant points atomically where practical.
+
+Current implementation skips unchanged files by path plus content hash for
+`symdex index --offline`, persists changed file/chunk facts to SQLite, and
+removes SQLite rows for deleted files. Semantic `symdex index` currently parses
+and embeds all discovered chunks so Qdrant can be rebuilt even when SQLite
+already has matching structural facts. Model/dimension-aware incremental
+semantic indexing remains future hardening.

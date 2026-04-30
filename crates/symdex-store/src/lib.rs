@@ -3,8 +3,9 @@
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,258 @@ impl StoreConfig {
 
 pub fn sqlite_parent(config: &StoreConfig) -> Option<PathBuf> {
     config.sqlite_path.parent().map(PathBuf::from)
+}
+
+#[derive(Debug)]
+pub struct SqliteStore {
+    connection: Connection,
+}
+
+impl SqliteStore {
+    pub fn open(config: &StoreConfig) -> Result<Self> {
+        if let Some(parent) = sqlite_parent(config) {
+            std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
+        }
+        let connection = Connection::open(&config.sqlite_path).map_err(StoreError::Sqlite)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(StoreError::Sqlite)?;
+        Ok(Self { connection })
+    }
+
+    pub fn migrate(&self) -> Result<()> {
+        self.connection
+            .execute_batch(SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn upsert_repository(&self, repository: &RepositoryRecord) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO repositories (id, root_path, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                   root_path = excluded.root_path,
+                   updated_at = excluded.updated_at",
+                params![repository.id, repository.root_path, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn file_unchanged(
+        &self,
+        repository_id: &str,
+        path: &str,
+        content_hash: &str,
+    ) -> Result<bool> {
+        let stored_hash: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT content_hash FROM files WHERE repository_id = ?1 AND path = ?2",
+                params![repository_id, path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(stored_hash.as_deref() == Some(content_hash))
+    }
+
+    pub fn replace_file_chunks(&mut self, file: &FileRecord, chunks: &[ChunkRecord]) -> Result<()> {
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO files (id, repository_id, path, language, content_hash, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(repository_id, path) DO UPDATE SET
+                   id = excluded.id,
+                   language = excluded.language,
+                   content_hash = excluded.content_hash,
+                   indexed_at = excluded.indexed_at",
+                params![
+                    file.id,
+                    file.repository_id,
+                    file.path,
+                    file.language,
+                    file.content_hash,
+                    timestamp()
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute("DELETE FROM chunks WHERE file_id = ?1", params![file.id])
+            .map_err(StoreError::Sqlite)?;
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO chunks (
+                       id, file_id, symbol_id, kind, text_hash,
+                       start_line, end_line, start_byte, end_byte,
+                       qdrant_point_id, excluded_reason
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for chunk in chunks {
+                statement
+                    .execute(params![
+                        chunk.id,
+                        chunk.file_id,
+                        chunk.symbol_id,
+                        chunk.kind,
+                        chunk.text_hash,
+                        chunk.start_line as i64,
+                        chunk.end_line as i64,
+                        chunk.start_byte as i64,
+                        chunk.end_byte as i64,
+                        chunk.qdrant_point_id,
+                        chunk.excluded_reason,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn remove_missing_files(
+        &mut self,
+        repository_id: &str,
+        active_paths: &[String],
+    ) -> Result<usize> {
+        let existing = self.file_paths(repository_id)?;
+        let active: std::collections::BTreeSet<&str> =
+            active_paths.iter().map(String::as_str).collect();
+        let missing: Vec<String> = existing
+            .into_iter()
+            .filter(|path| !active.contains(path.as_str()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        for path in &missing {
+            let file_id: Option<String> = transaction
+                .query_row(
+                    "SELECT id FROM files WHERE repository_id = ?1 AND path = ?2",
+                    params![repository_id, path],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?;
+            if let Some(file_id) = file_id {
+                transaction
+                    .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
+                    .map_err(StoreError::Sqlite)?;
+            }
+            transaction
+                .execute(
+                    "DELETE FROM files WHERE repository_id = ?1 AND path = ?2",
+                    params![repository_id, path],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(missing.len())
+    }
+
+    pub fn repository_status(&self, repository_id: &str) -> Result<RepositoryStatus> {
+        let files_indexed: usize = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE repository_id = ?1",
+                params![repository_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::Sqlite)?
+            .try_into()
+            .map_err(|_| StoreError::UnexpectedResponse("negative file count".to_owned()))?;
+        let chunks_indexed: usize = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM chunks
+                 JOIN files ON chunks.file_id = files.id
+                 WHERE files.repository_id = ?1",
+                params![repository_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::Sqlite)?
+            .try_into()
+            .map_err(|_| StoreError::UnexpectedResponse("negative chunk count".to_owned()))?;
+        let last_indexed_at: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT MAX(indexed_at) FROM files WHERE repository_id = ?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(RepositoryStatus {
+            repository_id: repository_id.to_owned(),
+            files_indexed,
+            chunks_indexed,
+            last_indexed_at,
+        })
+    }
+
+    fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path FROM files WHERE repository_id = ?1")
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row.map_err(StoreError::Sqlite)?);
+        }
+        Ok(paths)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRecord {
+    pub id: String,
+    pub root_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub path: String,
+    pub language: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRecord {
+    pub id: String,
+    pub file_id: String,
+    pub symbol_id: Option<String>,
+    pub kind: String,
+    pub text_hash: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub qdrant_point_id: Option<String>,
+    pub excluded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryStatus {
+    pub repository_id: String,
+    pub files_indexed: usize,
+    pub chunks_indexed: usize,
+    pub last_indexed_at: Option<String>,
 }
 
 fn env_path(upper: &str, legacy: &str) -> Option<PathBuf> {
@@ -330,6 +583,8 @@ pub struct ScoredPoint {
 
 #[derive(Debug)]
 pub enum StoreError {
+    Io(std::io::Error),
+    Sqlite(rusqlite::Error),
     HttpClient(reqwest::Error),
     HttpRequest(reqwest::Error),
     HttpStatus(reqwest::Error),
@@ -345,6 +600,8 @@ pub enum StoreError {
 impl Display for StoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Io(error) => write!(f, "filesystem error: {error}"),
+            Self::Sqlite(error) => write!(f, "SQLite error: {error}"),
             Self::HttpClient(error) => write!(f, "failed to create HTTP client: {error}"),
             Self::HttpRequest(error) => write!(f, "Qdrant request failed: {error}"),
             Self::HttpStatus(error) => write!(f, "Qdrant returned an error status: {error}"),
@@ -367,12 +624,102 @@ impl std::error::Error for StoreError {}
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS repositories (
+  id TEXT PRIMARY KEY,
+  root_path TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS index_runs (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  embedding_dimension INTEGER,
+  files_seen INTEGER DEFAULT 0,
+  files_indexed INTEGER DEFAULT 0,
+  chunks_embedded INTEGER DEFAULT 0,
+  error_summary TEXT
+);
+
+CREATE TABLE IF NOT EXISTS files (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  language TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  indexed_at TEXT NOT NULL,
+  UNIQUE(repository_id, path),
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS symbols (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  parent_symbol_id TEXT,
+  name TEXT NOT NULL,
+  qualified_name TEXT,
+  kind TEXT NOT NULL,
+  signature TEXT,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  start_byte INTEGER NOT NULL,
+  end_byte INTEGER NOT NULL,
+  FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS chunks (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  symbol_id TEXT,
+  kind TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  start_byte INTEGER NOT NULL,
+  end_byte INTEGER NOT NULL,
+  qdrant_point_id TEXT,
+  excluded_reason TEXT,
+  FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS calls (
+  id TEXT PRIMARY KEY,
+  caller_symbol_id TEXT NOT NULL,
+  callee_text TEXT NOT NULL,
+  callee_symbol_id TEXT,
+  call_line INTEGER NOT NULL,
+  confidence REAL NOT NULL,
+  resolution_status TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
+CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+"#;
+
+fn timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    seconds.to_string()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use crate::{
-        CreateCollectionRequest, Distance, PointPayload, QdrantClient, QueryPointsRequest,
-        StoreConfig, UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name,
-        qdrant_point_id, validate_collection_name,
+        ChunkRecord, CreateCollectionRequest, Distance, FileRecord, PointPayload, QdrantClient,
+        QueryPointsRequest, RepositoryRecord, SqliteStore, StoreConfig, UpsertPointsRequest,
+        VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
+        validate_collection_name,
     };
 
     #[test]
@@ -462,6 +809,72 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_migrates_and_persists_file_chunks() {
+        let db = TestDb::new("persist");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        store
+            .replace_file_chunks(&sample_file("hash-1"), &[sample_chunk("chunk-1")])
+            .expect("file chunks should persist");
+
+        assert!(
+            store
+                .file_unchanged("repo", "src/lib.rs", "hash-1")
+                .expect("unchanged check should run")
+        );
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.files_indexed, 1);
+        assert_eq!(status.chunks_indexed, 1);
+        assert!(status.last_indexed_at.is_some());
+    }
+
+    #[test]
+    fn sqlite_replaces_chunks_and_removes_deleted_files() {
+        let db = TestDb::new("cleanup");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_chunks(&sample_file("hash-1"), &[sample_chunk("chunk-1")])
+            .expect("initial chunks should persist");
+        store
+            .replace_file_chunks(
+                &sample_file("hash-2"),
+                &[sample_chunk("chunk-2"), sample_chunk("chunk-3")],
+            )
+            .expect("replacement chunks should persist");
+
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.files_indexed, 1);
+        assert_eq!(status.chunks_indexed, 2);
+        assert!(
+            !store
+                .file_unchanged("repo", "src/lib.rs", "hash-1")
+                .expect("unchanged check should run")
+        );
+
+        let removed = store
+            .remove_missing_files("repo", &[])
+            .expect("cleanup should run");
+        assert_eq!(removed, 1);
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.files_indexed, 0);
+        assert_eq!(status.chunks_indexed, 0);
+    }
+
+    #[test]
     fn live_qdrant_health_is_opt_in() {
         if std::env::var("SYMDEX_TEST_QDRANT").ok().as_deref() != Some("1") {
             return;
@@ -484,6 +897,64 @@ mod tests {
             start_line: 1,
             end_line: 3,
             text_hash: "hash".to_owned(),
+        }
+    }
+
+    fn sample_file(content_hash: &str) -> FileRecord {
+        FileRecord {
+            id: "file".to_owned(),
+            repository_id: "repo".to_owned(),
+            path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            content_hash: content_hash.to_owned(),
+        }
+    }
+
+    fn sample_chunk(id: &str) -> ChunkRecord {
+        ChunkRecord {
+            id: id.to_owned(),
+            file_id: "file".to_owned(),
+            symbol_id: Some("symbol".to_owned()),
+            kind: "function".to_owned(),
+            text_hash: format!("text-{id}"),
+            start_line: 1,
+            end_line: 3,
+            start_byte: 0,
+            end_byte: 32,
+            qdrant_point_id: Some("01234567-89ab-cdef-fedc-ba9876543210".to_owned()),
+            excluded_reason: None,
+        }
+    }
+
+    struct TestDb {
+        dir: PathBuf,
+    }
+
+    impl TestDb {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "symdex-store-test-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("test db dir should exist");
+            Self { dir }
+        }
+
+        fn config(&self) -> StoreConfig {
+            StoreConfig {
+                sqlite_path: self.dir.join("symdex.sqlite"),
+                qdrant_url: "http://localhost:6333".to_owned(),
+            }
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(Path::new(&self.dir));
         }
     }
 }
