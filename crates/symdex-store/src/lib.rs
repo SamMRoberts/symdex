@@ -502,6 +502,46 @@ impl SqliteStore {
         })
     }
 
+    pub fn storage_explorer_summary(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+    ) -> Result<StorageExplorerSummary> {
+        let status = self.repository_status(repository_id)?;
+        let sqlite = SqliteStorageSummary {
+            repositories: self.count_repositories(repository_id)?,
+            files: status.files_indexed,
+            chunks: status.chunks_indexed,
+            symbols: status.symbols_indexed,
+            calls: status.calls_indexed,
+            index_runs: self.count_index_runs(repository_id)?,
+        };
+        let chunk_projection = self.chunk_projection(repository_id)?;
+        let latest_embedding = self.latest_embedding_run(repository_id)?;
+        let projected_model = latest_embedding
+            .as_ref()
+            .map(|run| run.embedding_model.as_str())
+            .unwrap_or(embedding_model);
+        let qdrant = QdrantStorageProjection {
+            collection_name: qdrant_collection_name(repository_id, projected_model),
+            embedding_model: projected_model.to_owned(),
+            embedding_dimension: latest_embedding
+                .as_ref()
+                .and_then(|run| run.embedding_dimension),
+            embeddable_chunks: chunk_projection.embeddable_chunks,
+            vector_backed_chunks: chunk_projection.vector_backed_chunks,
+            excluded_chunks: chunk_projection.excluded_chunks,
+            missing_vector_chunks: chunk_projection.missing_vector_chunks,
+        };
+        let warnings = storage_warnings(&sqlite, &qdrant);
+        Ok(StorageExplorerSummary {
+            repository_id: repository_id.to_owned(),
+            sqlite,
+            qdrant,
+            warnings,
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -549,6 +589,58 @@ impl SqliteStore {
         count
             .try_into()
             .map_err(|_| StoreError::UnexpectedResponse("negative call count".to_owned()))
+    }
+
+    fn count_repositories(&self, repository_id: &str) -> Result<usize> {
+        self.count_scalar(
+            "SELECT COUNT(*) FROM repositories WHERE id = ?1",
+            repository_id,
+            "repository",
+        )
+    }
+
+    fn count_index_runs(&self, repository_id: &str) -> Result<usize> {
+        self.count_scalar(
+            "SELECT COUNT(*) FROM index_runs WHERE repository_id = ?1",
+            repository_id,
+            "index run",
+        )
+    }
+
+    fn count_scalar(&self, sql: &str, repository_id: &str, label: &str) -> Result<usize> {
+        let count: i64 = self
+            .connection
+            .query_row(sql, params![repository_id], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        count
+            .try_into()
+            .map_err(|_| StoreError::UnexpectedResponse(format!("negative {label} count")))
+    }
+
+    fn chunk_projection(&self, repository_id: &str) -> Result<ChunkProjectionCounts> {
+        self.connection
+            .query_row(
+                "SELECT
+                   COALESCE(SUM(CASE WHEN chunks.excluded_reason IS NULL THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN chunks.qdrant_point_id IS NOT NULL THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN chunks.excluded_reason IS NOT NULL THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE
+                     WHEN chunks.excluded_reason IS NULL AND chunks.qdrant_point_id IS NULL
+                     THEN 1 ELSE 0 END), 0)
+                 FROM chunks
+                 JOIN files ON chunks.file_id = files.id
+                 WHERE files.repository_id = ?1",
+                params![repository_id],
+                |row| {
+                    Ok(ChunkProjectionCounts {
+                        embeddable_chunks: row.get::<_, i64>(0)? as usize,
+                        vector_backed_chunks: row.get::<_, i64>(1)? as usize,
+                        excluded_chunks: row.get::<_, i64>(2)? as usize,
+                        missing_vector_chunks: row.get::<_, i64>(3)? as usize,
+                    })
+                },
+            )
+            .map_err(StoreError::Sqlite)
     }
 
     fn latest_embedding_run(&self, repository_id: &str) -> Result<Option<EmbeddingIndexMetadata>> {
@@ -676,6 +768,49 @@ pub struct EmbeddingIndexMetadata {
     pub embedding_model: String,
     pub embedding_dimension: Option<usize>,
     pub chunks_embedded: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageExplorerSummary {
+    pub repository_id: String,
+    pub sqlite: SqliteStorageSummary,
+    pub qdrant: QdrantStorageProjection,
+    pub warnings: Vec<StorageHealthRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteStorageSummary {
+    pub repositories: usize,
+    pub files: usize,
+    pub chunks: usize,
+    pub symbols: usize,
+    pub calls: usize,
+    pub index_runs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QdrantStorageProjection {
+    pub collection_name: String,
+    pub embedding_model: String,
+    pub embedding_dimension: Option<usize>,
+    pub embeddable_chunks: usize,
+    pub vector_backed_chunks: usize,
+    pub excluded_chunks: usize,
+    pub missing_vector_chunks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageHealthRow {
+    pub status: StorageHealthStatus,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageHealthStatus {
+    Ok,
+    Warning,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1118,6 +1253,63 @@ fn embedding_index_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<Embeddi
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ChunkProjectionCounts {
+    embeddable_chunks: usize,
+    vector_backed_chunks: usize,
+    excluded_chunks: usize,
+    missing_vector_chunks: usize,
+}
+
+fn storage_warnings(
+    sqlite: &SqliteStorageSummary,
+    qdrant: &QdrantStorageProjection,
+) -> Vec<StorageHealthRow> {
+    let mut rows = Vec::new();
+    if sqlite.repositories == 0 {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Error,
+            label: "repository_missing".to_owned(),
+            detail: "SQLite has no repository row for the selected root.".to_owned(),
+        });
+    }
+    if sqlite.index_runs == 0 {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Warning,
+            label: "no_index_runs".to_owned(),
+            detail: "No index run metadata has been recorded yet.".to_owned(),
+        });
+    }
+    if qdrant.missing_vector_chunks > 0 {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Warning,
+            label: "missing_vectors".to_owned(),
+            detail: format!(
+                "{} embeddable chunks do not have Qdrant point IDs.",
+                qdrant.missing_vector_chunks
+            ),
+        });
+    }
+    if qdrant.excluded_chunks > 0 {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Warning,
+            label: "excluded_chunks".to_owned(),
+            detail: format!(
+                "{} chunks are intentionally metadata-only.",
+                qdrant.excluded_chunks
+            ),
+        });
+    }
+    if rows.is_empty() {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Ok,
+            label: "coverage_ok".to_owned(),
+            detail: "SQLite metadata and vector-backed chunk counts are aligned.".to_owned(),
+        });
+    }
+    rows
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repositories (
   id TEXT PRIMARY KEY,
@@ -1225,9 +1417,9 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkRecord, CreateCollectionRequest, Distance, FileRecord, PointPayload,
-        QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore, StoreConfig, StoreError,
-        SymbolRecord, UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name,
-        qdrant_point_id, validate_collection_name,
+        QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore, StorageHealthStatus,
+        StoreConfig, StoreError, SymbolRecord, UpsertPointsRequest, VectorParams, VectorPoint,
+        qdrant_collection_name, qdrant_point_id, validate_collection_name,
     };
 
     #[test]
@@ -1604,6 +1796,58 @@ mod tests {
         store
             .ensure_embedding_compatible("repo", "different-model", 1024)
             .expect("different model writes to a different collection");
+    }
+
+    #[test]
+    fn sqlite_builds_storage_explorer_summary_without_source_text() {
+        let db = TestDb::new("storage-explorer");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let mut missing_vector = sample_chunk("chunk-missing-vector");
+        missing_vector.qdrant_point_id = None;
+        let mut excluded = sample_chunk("chunk-excluded");
+        excluded.qdrant_point_id = None;
+        excluded.excluded_reason = Some("secret_detected".to_owned());
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &[sample_symbol("symbol", "add", "crate::add")],
+                &[sample_chunk("chunk-vector"), missing_vector, excluded],
+                &[],
+            )
+            .expect("facts should persist");
+        store
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .expect("index run should persist");
+
+        let summary = store
+            .storage_explorer_summary("repo", "nomic-embed-text")
+            .expect("storage summary should build");
+
+        assert_eq!(summary.sqlite.repositories, 1);
+        assert_eq!(summary.sqlite.files, 1);
+        assert_eq!(summary.sqlite.chunks, 3);
+        assert_eq!(summary.sqlite.symbols, 1);
+        assert_eq!(summary.sqlite.index_runs, 1);
+        assert_eq!(summary.qdrant.embedding_model, "nomic-embed-text");
+        assert_eq!(summary.qdrant.embedding_dimension, Some(768));
+        assert_eq!(summary.qdrant.embeddable_chunks, 2);
+        assert_eq!(summary.qdrant.vector_backed_chunks, 1);
+        assert_eq!(summary.qdrant.excluded_chunks, 1);
+        assert_eq!(summary.qdrant.missing_vector_chunks, 1);
+        assert!(summary.qdrant.collection_name.starts_with("symdex_repo_"));
+        assert!(summary.warnings.iter().any(
+            |row| row.status == StorageHealthStatus::Warning && row.label == "missing_vectors"
+        ));
+        let debug = format!("{summary:?}");
+        assert!(!debug.contains("source_text"));
     }
 
     #[test]

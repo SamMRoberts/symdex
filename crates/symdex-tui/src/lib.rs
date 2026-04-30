@@ -26,9 +26,13 @@ use symdex_index::{
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
     SymbolSearchSummary, run_call_graph, run_context_pack, run_impact, run_semantic_search,
-    run_symbol_search,
+    run_storage_explorer, run_symbol_search,
 };
-use symdex_store::{ContextPack, RepositoryStatus, SqliteStore, StoreConfig};
+use symdex_store::{
+    ContextPack, QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, SqliteStore,
+    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    qdrant_collection_name,
+};
 
 pub struct TuiOptions {
     pub repo: String,
@@ -43,7 +47,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle mode in query, graph, and impact/context views\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle mode in query, graph, and impact/context views\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -63,6 +67,7 @@ pub struct App {
     diagnostics: DiagnosticsState,
     diagnostics_selection: usize,
     diagnostics_details_expanded: bool,
+    storage: StorageExplorerState,
     query: QueryWorkbenchState,
     graph: GraphBrowserState,
     evidence: EvidenceViewerState,
@@ -84,6 +89,9 @@ impl App {
         let status = sqlite
             .repository_status(root.id())
             .map_err(|error| error.to_string())?;
+        let storage = sqlite
+            .storage_explorer_summary(root.id(), &embed_config.model)
+            .map_err(|error| error.to_string())?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -102,6 +110,7 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
+            storage: StorageExplorerState::completed(storage),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -120,10 +129,12 @@ impl App {
         status: RepositoryStatus,
     ) -> Self {
         let repo_root = repo_root.into();
+        let repository_id = repository_id.into();
+        let storage = storage_summary_from_status(&repository_id, &status);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
-            repository_id: repository_id.into(),
+            repository_id,
             sqlite_path: ".symdex/symdex.sqlite".to_owned(),
             qdrant_url: "http://localhost:6333".to_owned(),
             ollama_url: "http://localhost:11434".to_owned(),
@@ -137,6 +148,7 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
+            storage: StorageExplorerState::completed(storage),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -426,7 +438,12 @@ impl App {
         self.status = sqlite
             .repository_status(&self.repository_id)
             .map_err(|error| error.to_string())?;
-        self.message = "Repository status refreshed.".to_owned();
+        self.storage.status = match run_storage_explorer(&self.repo_input) {
+            Ok(summary) => StorageStatus::Completed(summary),
+            Err(error) => StorageStatus::Failed(error),
+        };
+        self.storage.selection = 0;
+        self.message = "Repository and storage status refreshed.".to_owned();
         Ok(())
     }
 
@@ -434,6 +451,13 @@ impl App {
         match &self.diagnostics {
             DiagnosticsState::Completed(report) => report.checks.len(),
             _ => 0,
+        }
+    }
+
+    fn storage_row_count(&self) -> usize {
+        match &self.storage.status {
+            StorageStatus::Completed(summary) => storage_row_count(summary),
+            StorageStatus::Failed(_) => 1,
         }
     }
 
@@ -472,6 +496,20 @@ impl App {
             KeyCode::Char('i') => {
                 self.view = View::Indexing;
                 self.message = "Indexing controls selected.".to_owned();
+            }
+            KeyCode::Char('x') => {
+                self.view = View::Storage;
+                self.message = "Storage explorer selected.".to_owned();
+            }
+            KeyCode::Up if self.view == View::Storage && self.storage_row_count() > 0 => {
+                self.storage.selection =
+                    previous_selection(self.storage.selection, self.storage_row_count());
+                self.message = "Storage row selection moved.".to_owned();
+            }
+            KeyCode::Down if self.view == View::Storage && self.storage_row_count() > 0 => {
+                self.storage.selection =
+                    next_selection(self.storage.selection, self.storage_row_count());
+                self.message = "Storage row selection moved.".to_owned();
             }
             KeyCode::Up if self.view == View::Diagnostics && self.diagnostics_row_count() > 0 => {
                 self.diagnostics_selection =
@@ -992,6 +1030,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
 
 fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     match app.view {
+        View::Storage => render_storage_panel(frame, area, app),
         View::Diagnostics => match &app.diagnostics {
             DiagnosticsState::Completed(report) => {
                 render_diagnostics_panel(frame, area, app, report);
@@ -1089,6 +1128,40 @@ fn render_repository_status_panel(frame: &mut ratatui::Frame<'_>, area: Rect, ap
 
     frame.render_widget(index_counts_table(app), chunks[1]);
     frame.render_widget(local_services_table(app), chunks[2]);
+}
+
+fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    match &app.storage.status {
+        StorageStatus::Completed(summary) => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(9), Constraint::Length(8)])
+                .split(area);
+            render_selectable_table(
+                frame,
+                chunks[0],
+                storage_table(summary),
+                app.storage.selection,
+                storage_row_count(summary),
+            );
+            frame.render_widget(
+                storage_detail_panel(summary, app.storage.selection),
+                chunks[1],
+            );
+        }
+        StorageStatus::Failed(error) => {
+            render_line_panel(
+                frame,
+                area,
+                "Storage Explorer",
+                vec![Line::from(vec![
+                    status_span("failed", StatusTone::Error),
+                    Span::raw(" "),
+                    Span::raw(error.as_str()),
+                ])],
+            );
+        }
+    }
 }
 
 fn render_diagnostics_panel(
@@ -1248,6 +1321,63 @@ fn index_embedding_status_span(status: &RepositoryStatus) -> Span<'static> {
         status_span("ready", StatusTone::Success)
     } else {
         status_span("none", StatusTone::Warning)
+    }
+}
+
+fn storage_summary_from_status(
+    repository_id: &str,
+    status: &RepositoryStatus,
+) -> StorageExplorerSummary {
+    let embedding_model = status
+        .embedding_model
+        .as_deref()
+        .unwrap_or("nomic-embed-text")
+        .to_owned();
+    StorageExplorerSummary {
+        repository_id: repository_id.to_owned(),
+        sqlite: SqliteStorageSummary {
+            repositories: 1,
+            files: status.files_indexed,
+            chunks: status.chunks_indexed,
+            symbols: status.symbols_indexed,
+            calls: status.calls_indexed,
+            index_runs: usize::from(status.embedding_model.is_some()),
+        },
+        qdrant: QdrantStorageProjection {
+            collection_name: qdrant_collection_name(repository_id, &embedding_model),
+            embedding_model,
+            embedding_dimension: status.embedding_dimension,
+            embeddable_chunks: status.chunks_indexed,
+            vector_backed_chunks: if status.embedding_model.is_some() {
+                status.chunks_indexed
+            } else {
+                0
+            },
+            excluded_chunks: 0,
+            missing_vector_chunks: if status.embedding_model.is_some() {
+                0
+            } else {
+                status.chunks_indexed
+            },
+        },
+        warnings: vec![StorageHealthRow {
+            status: if status.embedding_model.is_some() {
+                StorageHealthStatus::Ok
+            } else {
+                StorageHealthStatus::Warning
+            },
+            label: if status.embedding_model.is_some() {
+                "coverage_ok".to_owned()
+            } else {
+                "metadata_only".to_owned()
+            },
+            detail: if status.embedding_model.is_some() {
+                "SQLite metadata and vector-backed chunk counts are aligned.".to_owned()
+            } else {
+                "Sample TUI state has structural metadata but no semantic embedding metadata."
+                    .to_owned()
+            },
+        }],
     }
 }
 
@@ -1569,6 +1699,233 @@ fn local_services_table(app: &App) -> Table<'_> {
     )
     .header(table_header(["Service", "State", "Target"]))
     .column_spacing(1)
+}
+
+fn storage_table(summary: &StorageExplorerSummary) -> Table<'_> {
+    let rows = storage_rows(summary).into_iter().map(|row| {
+        Row::new(vec![
+            Cell::from(row.layer),
+            Cell::from(row.metric),
+            Cell::from(row.value),
+            Cell::from(status_span(row.status, row.tone)),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Percentage(32),
+            Constraint::Percentage(42),
+            Constraint::Length(14),
+        ],
+    )
+    .header(table_header(["Layer", "Metric", "Value", "Status"]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Storage Explorer | {}", summary.repository_id)),
+    )
+    .column_spacing(1)
+}
+
+fn storage_detail_panel(summary: &StorageExplorerSummary, selection: usize) -> Paragraph<'_> {
+    let rows = storage_rows(summary);
+    let row = rows.get(selection.min(rows.len().saturating_sub(1)));
+    let mut lines = Vec::new();
+    if let Some(row) = row {
+        lines.push(Line::from(vec![
+            Span::styled("Selected: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(row.layer),
+            Span::raw(" / "),
+            Span::raw(row.metric),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Status: ", Style::new().add_modifier(Modifier::BOLD)),
+            status_span(row.status, row.tone),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Detail: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(row.detail),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Health: ",
+        Style::new().add_modifier(Modifier::BOLD),
+    )]));
+    lines.extend(summary.warnings.iter().take(3).map(|warning| {
+        let tone = storage_health_tone(warning.status);
+        Line::from(vec![
+            status_span(warning.label.as_str(), tone),
+            Span::raw(" "),
+            Span::raw(warning.detail.as_str()),
+        ])
+    }));
+
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Storage Detail"),
+    )
+}
+
+fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
+    let sqlite_status = if summary.sqlite.repositories == 0 {
+        ("missing", StatusTone::Error)
+    } else {
+        ("ok", StatusTone::Success)
+    };
+    let qdrant_status = if summary.qdrant.missing_vector_chunks > 0 {
+        ("missing-vector", StatusTone::Warning)
+    } else if summary.qdrant.vector_backed_chunks > 0 {
+        ("covered", StatusTone::Success)
+    } else {
+        ("metadata-only", StatusTone::Warning)
+    };
+
+    vec![
+        storage_row(
+            "SQLite",
+            "repositories",
+            summary.sqlite.repositories.to_string(),
+            sqlite_status,
+            "Repository rows for the selected root.",
+        ),
+        storage_row(
+            "SQLite",
+            "files",
+            summary.sqlite.files.to_string(),
+            ("indexed", StatusTone::Success),
+            "Indexed file rows in SQLite.",
+        ),
+        storage_row(
+            "SQLite",
+            "chunks",
+            summary.sqlite.chunks.to_string(),
+            ("indexed", StatusTone::Success),
+            "Syntax-aware chunk metadata rows.",
+        ),
+        storage_row(
+            "SQLite",
+            "symbols",
+            summary.sqlite.symbols.to_string(),
+            ("indexed", StatusTone::Success),
+            "Extracted symbol rows with line ranges.",
+        ),
+        storage_row(
+            "SQLite",
+            "calls",
+            summary.sqlite.calls.to_string(),
+            ("indexed", StatusTone::Success),
+            "Call edge rows with confidence and resolution status.",
+        ),
+        storage_row(
+            "SQLite",
+            "index runs",
+            summary.sqlite.index_runs.to_string(),
+            if summary.sqlite.index_runs == 0 {
+                ("missing", StatusTone::Warning)
+            } else {
+                ("recorded", StatusTone::Success)
+            },
+            "Historical index run metadata.",
+        ),
+        storage_row(
+            "Qdrant",
+            "collection",
+            summary.qdrant.collection_name.clone(),
+            qdrant_status,
+            "Expected local vector collection for the selected repository and model.",
+        ),
+        storage_row(
+            "Qdrant",
+            "model",
+            summary.qdrant.embedding_model.clone(),
+            ("metadata", StatusTone::Info),
+            "Embedding model used to derive the collection name.",
+        ),
+        storage_row(
+            "Qdrant",
+            "dimension",
+            summary
+                .qdrant
+                .embedding_dimension
+                .map(|dimension| dimension.to_string())
+                .unwrap_or_else(|| "<unknown>".to_owned()),
+            if summary.qdrant.embedding_dimension.is_some() {
+                ("recorded", StatusTone::Success)
+            } else {
+                ("unknown", StatusTone::Warning)
+            },
+            "Latest recorded vector dimension for successful semantic indexing.",
+        ),
+        storage_row(
+            "Qdrant",
+            "embeddable",
+            summary.qdrant.embeddable_chunks.to_string(),
+            ("metadata", StatusTone::Info),
+            "Chunks eligible for semantic embedding.",
+        ),
+        storage_row(
+            "Qdrant",
+            "vector-backed",
+            summary.qdrant.vector_backed_chunks.to_string(),
+            qdrant_status,
+            "SQLite chunks with Qdrant point IDs.",
+        ),
+        storage_row(
+            "Qdrant",
+            "excluded",
+            summary.qdrant.excluded_chunks.to_string(),
+            if summary.qdrant.excluded_chunks == 0 {
+                ("none", StatusTone::Success)
+            } else {
+                ("metadata-only", StatusTone::Warning)
+            },
+            "Chunks intentionally excluded from embeddings.",
+        ),
+        storage_row(
+            "Qdrant",
+            "missing vectors",
+            summary.qdrant.missing_vector_chunks.to_string(),
+            if summary.qdrant.missing_vector_chunks == 0 {
+                ("ok", StatusTone::Success)
+            } else {
+                ("warning", StatusTone::Warning)
+            },
+            "Embeddable chunks without recorded Qdrant point IDs.",
+        ),
+    ]
+}
+
+fn storage_row(
+    layer: &'static str,
+    metric: &'static str,
+    value: String,
+    status: (&'static str, StatusTone),
+    detail: &'static str,
+) -> StorageDisplayRow {
+    StorageDisplayRow {
+        layer,
+        metric,
+        value,
+        status: status.0,
+        tone: status.1,
+        detail,
+    }
+}
+
+fn storage_row_count(summary: &StorageExplorerSummary) -> usize {
+    storage_rows(summary).len()
+}
+
+fn storage_health_tone(status: StorageHealthStatus) -> StatusTone {
+    match status {
+        StorageHealthStatus::Ok => StatusTone::Success,
+        StorageHealthStatus::Warning => StatusTone::Warning,
+        StorageHealthStatus::Error => StatusTone::Error,
+    }
 }
 
 fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
@@ -1975,6 +2332,7 @@ fn optional_line_range(start: Option<usize>, end: Option<usize>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Indexing,
+    Storage,
     Diagnostics,
     Query,
     Graph,
@@ -1982,23 +2340,25 @@ enum View {
 }
 
 impl View {
-    fn tabs() -> [&'static str; 5] {
-        ["Index", "Doctor", "Query", "Calls", "Impact"]
+    fn tabs() -> [&'static str; 6] {
+        ["Index", "Storage", "Doctor", "Query", "Calls", "Impact"]
     }
 
     fn tab_index(self) -> usize {
         match self {
             Self::Indexing => 0,
-            Self::Diagnostics => 1,
-            Self::Query => 2,
-            Self::Graph => 3,
-            Self::Evidence => 4,
+            Self::Storage => 1,
+            Self::Diagnostics => 2,
+            Self::Query => 3,
+            Self::Graph => 4,
+            Self::Evidence => 5,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Indexing => "Indexing",
+            Self::Storage => "Storage Explorer",
             Self::Diagnostics => "Doctor Diagnostics",
             Self::Query => "Query Workbench",
             Self::Graph => "Symbol/Call Graph",
@@ -2008,7 +2368,8 @@ impl View {
 
     fn next(self) -> Self {
         match self {
-            Self::Indexing => Self::Diagnostics,
+            Self::Indexing => Self::Storage,
+            Self::Storage => Self::Diagnostics,
             Self::Diagnostics => Self::Query,
             Self::Query => Self::Graph,
             Self::Graph => Self::Evidence,
@@ -2019,7 +2380,8 @@ impl View {
     fn previous(self) -> Self {
         match self {
             Self::Indexing => Self::Evidence,
-            Self::Diagnostics => Self::Indexing,
+            Self::Storage => Self::Indexing,
+            Self::Diagnostics => Self::Storage,
             Self::Query => Self::Diagnostics,
             Self::Graph => Self::Query,
             Self::Evidence => Self::Graph,
@@ -2029,6 +2391,7 @@ impl View {
     fn footer_label(self) -> &'static str {
         match self {
             Self::Indexing => "index",
+            Self::Storage => "storage",
             Self::Diagnostics => "doctor",
             Self::Query => "query",
             Self::Graph => "calls",
@@ -2039,10 +2402,13 @@ impl View {
     fn footer_help(self) -> &'static str {
         match self {
             Self::Indexing => {
-                "Tab next view | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
+            }
+            Self::Storage => {
+                "Tab next view | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
-                "Tab next view | Up/Down select | Enter details | d rerun | i index | w query | g calls | p impact | q quit"
+                "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
             }
             Self::Query => {
                 "Tab next view | type query | Up/Down select | F2 mode | Enter run | Esc clear/back | q quit"
@@ -2086,6 +2452,35 @@ enum DiagnosticsState {
     Running,
     Completed(DiagnosticReport),
     Failed(String),
+}
+
+struct StorageExplorerState {
+    status: StorageStatus,
+    selection: usize,
+}
+
+impl StorageExplorerState {
+    fn completed(summary: StorageExplorerSummary) -> Self {
+        Self {
+            status: StorageStatus::Completed(summary),
+            selection: 0,
+        }
+    }
+}
+
+enum StorageStatus {
+    Completed(StorageExplorerSummary),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct StorageDisplayRow {
+    layer: &'static str,
+    metric: &'static str,
+    value: String,
+    status: &'static str,
+    tone: StatusTone,
+    detail: &'static str,
 }
 
 struct QueryWorkbenchState {
@@ -2310,12 +2705,15 @@ mod tests {
         CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
     };
     use symdex_store::{
-        CallSearchRow, ContextPack, ContextPackLimits, RepositoryStatus, SymbolSearchRow,
+        CallSearchRow, ContextPack, ContextPackLimits, QdrantStorageProjection, RepositoryStatus,
+        SqliteStorageSummary, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus,
+        SymbolSearchRow,
     };
 
     use crate::{
         App, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus, GraphStatus,
-        IndexMode, QueryStatus, Screen, UiAction, View, progress_percent, reduce_screen, render,
+        IndexMode, QueryStatus, Screen, StorageExplorerState, UiAction, View, progress_percent,
+        reduce_screen, render,
     };
 
     #[test]
@@ -2365,6 +2763,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Index"));
+        assert!(rendered.contains("Storage"));
         assert!(rendered.contains("Doctor"));
         assert!(rendered.contains("Query"));
         assert!(rendered.contains("Calls"));
@@ -2426,6 +2825,70 @@ mod tests {
 
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Enter details"));
+    }
+
+    #[test]
+    fn renders_storage_explorer_metadata_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(sample_storage_summary());
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Storage Explorer"));
+        assert!(rendered.contains("SQLite"));
+        assert!(rendered.contains("Qdrant"));
+        assert!(rendered.contains("missing-vector"));
+        assert!(rendered.contains("Storage Detail"));
+        assert!(rendered.contains("Health"));
+        assert!(!rendered.contains("source_text"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "missing-vector", None),
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn storage_explorer_selection_drives_detail_panel() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(sample_storage_summary());
+
+        assert_eq!(app.storage.selection, 0);
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.storage.selection, 1);
+        assert_eq!(app.message, "Storage row selection moved.");
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Selected"));
+        assert!(rendered.contains("SQLite / files"));
+        assert!(rendered.contains("Indexed file rows in SQLite."));
+    }
+
+    #[test]
+    fn renders_storage_explorer_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(sample_storage_summary());
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Storage"));
+        assert!(rendered.contains("Layer"));
+        assert!(rendered.contains("Metric"));
+        assert!(rendered.contains("Status"));
     }
 
     #[test]
@@ -2900,6 +3363,41 @@ mod tests {
             last_indexed_at: Some("123".to_owned()),
             embedding_model: Some("nomic-embed-text".to_owned()),
             embedding_dimension: Some(768),
+        }
+    }
+
+    fn sample_storage_summary() -> StorageExplorerSummary {
+        StorageExplorerSummary {
+            repository_id: "repo".to_owned(),
+            sqlite: SqliteStorageSummary {
+                repositories: 1,
+                files: 2,
+                chunks: 4,
+                symbols: 3,
+                calls: 1,
+                index_runs: 1,
+            },
+            qdrant: QdrantStorageProjection {
+                collection_name: "symdex_repo_nomic_embed_text".to_owned(),
+                embedding_model: "nomic-embed-text".to_owned(),
+                embedding_dimension: Some(768),
+                embeddable_chunks: 3,
+                vector_backed_chunks: 2,
+                excluded_chunks: 1,
+                missing_vector_chunks: 1,
+            },
+            warnings: vec![
+                StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "missing_vectors".to_owned(),
+                    detail: "1 embeddable chunks do not have Qdrant point IDs.".to_owned(),
+                },
+                StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "excluded_chunks".to_owned(),
+                    detail: "1 chunks are intentionally metadata-only.".to_owned(),
+                },
+            ],
         }
     }
 

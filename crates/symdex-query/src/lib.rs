@@ -3,8 +3,8 @@
 use symdex_core::RepoRoot;
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    CallSearchRow, ContextPack, QdrantClient, SqliteStore, StoreConfig, SymbolSearchRow,
-    qdrant_collection_name,
+    CallSearchRow, ContextPack, QdrantClient, SqliteStore, StorageExplorerSummary, StoreConfig,
+    SymbolSearchRow, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +171,15 @@ pub fn run_context_pack(repo: &str, query: &str, limit: usize) -> Result<Context
     let sqlite = sqlite_for_read()?;
     sqlite
         .context_pack(root.id(), query, limit)
+        .map_err(|error| error.to_string())
+}
+
+pub fn run_storage_explorer(repo: &str) -> Result<StorageExplorerSummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let embed_config = EmbedConfig::from_env();
+    sqlite
+        .storage_explorer_summary(root.id(), &embed_config.model)
         .map_err(|error| error.to_string())
 }
 

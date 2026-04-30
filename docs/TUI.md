@@ -53,7 +53,8 @@ terminal panes.
 
 - Use `ratatui` widgets instead of hand-formatted text whenever they provide
   clearer structure:
-  - `Tabs` for major views: Dashboard, Index, Doctor, Query, Calls, Impact.
+  - `Tabs` for major views: Dashboard, Index, Storage, Doctor, Query, Calls,
+    Impact.
   - `Block` with styled borders and titles for each focused panel.
   - `Table` for evidence lists with columns for path, line range, score,
     confidence, kind, status, and symbol.
@@ -82,7 +83,9 @@ terminal panes.
 
 - Highlight the active tab and focused input/list row.
 - Use `Up` and `Down` to move the selected evidence row in completed diagnostic,
-  query, call graph, impact, and context-pack tables.
+  storage, query, call graph, impact, and context-pack tables.
+- In the Storage view, row selection should drive a visible detail panel for
+  the selected SQLite/Qdrant metric and nearby storage health notes.
 - In the Doctor view, row selection must drive visible detail output for the
   selected check rather than highlight-only behavior.
 - In the Doctor view, `Enter` should toggle an expanded selected-check detail
@@ -143,6 +146,8 @@ represent the indexed repository.
 - Keep collection and point inspection metadata-only.
 - Surface cross-store mismatches as warning/error rows rather than hidden
   implementation details.
+- The first implementation is a Storage tab that renders a selectable
+  SQLite/Qdrant metric table plus a detail/health panel.
 
 ### Index Coverage View
 
@@ -300,6 +305,7 @@ Current dashboard keys:
 - `s`: request semantic indexing confirmation
 - `d`: run doctor diagnostics
 - `i`: return to indexing controls
+- `x`: open the storage explorer
 - `w`: open the query workbench
 - `g`: open the symbol/call graph browser
 - `p`: open the impact/context-pack viewer
@@ -308,7 +314,7 @@ Current dashboard keys:
 - `F2`: toggle symbol and semantic query modes in the query workbench
 - `F2`: toggle callers and callees in the symbol/call graph browser
 - `F2`: toggle impact and context-pack modes in the impact/context-pack viewer
-- `Up` / `Down`: move the selected row in completed result tables
+- `Up` / `Down`: move the selected row in completed result and storage tables
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
@@ -319,7 +325,7 @@ Current dashboard keys:
 - `Enter`: run the current query workbench query
 - `Enter`: run the current symbol/call graph lookup
 - `Enter`: run the current impact/context-pack lookup
-- `r`: refresh repository status
+- `r`: refresh repository and storage status
 - `y`: confirm a pending indexing job
 - `n` or `Esc`: cancel a pending indexing job
 - `Enter`: dismiss completed or failed job state

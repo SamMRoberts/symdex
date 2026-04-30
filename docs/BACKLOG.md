@@ -95,7 +95,7 @@
 
 ## Phase 9 — TUI storage visualizations
 
-- [ ] storage explorer view for SQLite structural data and Qdrant semantic projection.
+- [x] storage explorer view for SQLite structural data and Qdrant semantic projection.
 - [ ] index coverage view grouped by file with chunk, symbol, call, embedding, and exclusion counts.
 - [ ] selected-file detail drawer for chunks, symbols, calls, vector status, and exclusion reasons.
 - [ ] symbol outline view using `symbols.parent_symbol_id`.
@@ -104,7 +104,7 @@
 - [ ] index runs timeline using `index_runs` metadata.
 - [ ] semantic neighborhood view using Qdrant metadata only.
 - [ ] cross-store health warnings for missing vectors, missing collections, excluded chunks, and model/dimension drift.
-- [ ] TUI state/render tests for storage visualizations, including 80x24 layouts and selected-row drill-down behavior.
+- [x] TUI state/render tests for the first storage visualization, including 80x24 layout and selected-row drill-down behavior.
 
 ## Do not start yet
 
