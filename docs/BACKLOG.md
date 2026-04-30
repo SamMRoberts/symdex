@@ -86,6 +86,13 @@
 - [x] render tests for table headers.
 - [x] render tests for selected rows.
 
+## Phase 8 — Doctor diagnostics interaction
+
+- [ ] actionable Doctor row selection with selected-check details panel.
+- [ ] `Enter` toggle/focus behavior for selected-check details in Doctor view.
+- [ ] footer help update for Doctor `Enter` action.
+- [ ] TUI reducer/render tests for Doctor selected-check detail behavior.
+
 ## Do not start yet
 
 - web UI
