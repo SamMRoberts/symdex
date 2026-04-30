@@ -18,7 +18,7 @@
 - [x] function-level chunk extraction.
 - [x] Ollama embedding client.
 - [x] Qdrant collection creation.
-- semantic search CLI.
+- [x] semantic search CLI.
 
 ## Phase 2 — SQLite structural index
 

@@ -119,6 +119,80 @@ impl QdrantClient {
         Ok(true)
     }
 
+    pub fn upsert_points(&self, collection_name: &str, points: &[VectorPoint]) -> Result<()> {
+        validate_collection_name(collection_name)?;
+        if points.is_empty() {
+            return Ok(());
+        }
+        let dimension = points[0].vector.len();
+        if dimension == 0 {
+            return Err(StoreError::InvalidVectorSize(dimension));
+        }
+        if points.iter().any(|point| point.vector.len() != dimension) {
+            return Err(StoreError::InconsistentVectorDimensions);
+        }
+
+        let request = UpsertPointsRequest { points };
+        let response: QdrantResponse<OperationResult> = self
+            .http
+            .put(self.endpoint(&format!("/collections/{collection_name}/points?wait=true")))
+            .json(&request)
+            .send()
+            .map_err(StoreError::HttpRequest)?
+            .error_for_status()
+            .map_err(StoreError::HttpStatus)?
+            .json()
+            .map_err(StoreError::Decode)?;
+
+        if response.status != "ok" {
+            return Err(StoreError::UnexpectedResponse(format!(
+                "status={} operation_status={}",
+                response.status, response.result.status
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn query_points(
+        &self,
+        collection_name: &str,
+        vector: Vec<f32>,
+        limit: usize,
+    ) -> Result<Vec<ScoredPoint>> {
+        validate_collection_name(collection_name)?;
+        if vector.is_empty() {
+            return Err(StoreError::InvalidVectorSize(0));
+        }
+        if limit == 0 {
+            return Err(StoreError::InvalidLimit(limit));
+        }
+
+        let request = QueryPointsRequest {
+            query: vector,
+            limit,
+            with_payload: true,
+            with_vector: false,
+        };
+        let response: QdrantResponse<QueryPointsResult> = self
+            .http
+            .post(self.endpoint(&format!("/collections/{collection_name}/points/query")))
+            .json(&request)
+            .send()
+            .map_err(StoreError::HttpRequest)?
+            .error_for_status()
+            .map_err(StoreError::HttpStatus)?
+            .json()
+            .map_err(StoreError::Decode)?;
+
+        if response.status != "ok" {
+            return Err(StoreError::UnexpectedResponse(format!(
+                "status={}",
+                response.status
+            )));
+        }
+        Ok(response.result.points)
+    }
+
     fn endpoint(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path.trim_start_matches('/'))
     }
@@ -130,6 +204,25 @@ pub fn qdrant_collection_name(repository_id: &str, embedding_model: &str) -> Str
         slug_component(repository_id),
         slug_component(embedding_model)
     )
+}
+
+pub fn qdrant_point_id(stable_hash: &str) -> Result<String> {
+    let hex: String = stable_hash
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    if hex.len() != 32 {
+        return Err(StoreError::InvalidPointId(stable_hash.to_owned()));
+    }
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 fn slug_component(input: &str) -> String {
@@ -183,6 +276,58 @@ struct QdrantResponse<T> {
     result: T,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct VectorPoint {
+    pub id: String,
+    pub vector: Vec<f32>,
+    pub payload: PointPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PointPayload {
+    pub repository_id: String,
+    pub file_id: String,
+    pub chunk_id: String,
+    pub symbol_id: Option<String>,
+    pub symbol_name: Option<String>,
+    pub path: String,
+    pub language: String,
+    pub chunk_kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpsertPointsRequest<'a> {
+    points: &'a [VectorPoint],
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationResult {
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryPointsRequest {
+    query: Vec<f32>,
+    limit: usize,
+    with_payload: bool,
+    with_vector: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryPointsResult {
+    points: Vec<ScoredPoint>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ScoredPoint {
+    pub id: serde_json::Value,
+    pub score: f64,
+    pub payload: PointPayload,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     HttpClient(reqwest::Error),
@@ -190,7 +335,10 @@ pub enum StoreError {
     HttpStatus(reqwest::Error),
     Decode(reqwest::Error),
     InvalidCollectionName(String),
+    InvalidPointId(String),
     InvalidVectorSize(usize),
+    InvalidLimit(usize),
+    InconsistentVectorDimensions,
     UnexpectedResponse(String),
 }
 
@@ -204,7 +352,12 @@ impl Display for StoreError {
             Self::InvalidCollectionName(name) => {
                 write!(f, "invalid Qdrant collection name `{name}`")
             }
+            Self::InvalidPointId(id) => write!(f, "invalid Qdrant point id source `{id}`"),
             Self::InvalidVectorSize(size) => write!(f, "invalid Qdrant vector size `{size}`"),
+            Self::InvalidLimit(limit) => write!(f, "invalid Qdrant query limit `{limit}`"),
+            Self::InconsistentVectorDimensions => {
+                write!(f, "Qdrant points have inconsistent vector dimensions")
+            }
             Self::UnexpectedResponse(message) => write!(f, "unexpected Qdrant response: {message}"),
         }
     }
@@ -217,8 +370,9 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[cfg(test)]
 mod tests {
     use crate::{
-        CreateCollectionRequest, Distance, QdrantClient, StoreConfig, VectorParams,
-        qdrant_collection_name, validate_collection_name,
+        CreateCollectionRequest, Distance, PointPayload, QdrantClient, QueryPointsRequest,
+        StoreConfig, UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name,
+        qdrant_point_id, validate_collection_name,
     };
 
     #[test]
@@ -251,6 +405,63 @@ mod tests {
     }
 
     #[test]
+    fn qdrant_point_id_formats_stable_hash_as_uuid() {
+        assert_eq!(
+            qdrant_point_id("0123456789abcdeffedcba9876543210").expect("point id should format"),
+            "01234567-89ab-cdef-fedc-ba9876543210"
+        );
+        assert!(qdrant_point_id("not-hex").is_err());
+    }
+
+    #[test]
+    fn upsert_points_request_uses_payload_without_source_text() {
+        let point = VectorPoint {
+            id: "01234567-89ab-cdef-fedc-ba9876543210".to_owned(),
+            vector: vec![0.1, 0.2],
+            payload: sample_payload(),
+        };
+        let points = vec![point];
+        let request = UpsertPointsRequest { points: &points };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json["points"][0]["id"],
+            "01234567-89ab-cdef-fedc-ba9876543210"
+        );
+        assert_eq!(
+            json["points"][0]["vector"].as_array().expect("vector")[0]
+                .as_f64()
+                .expect("number") as f32,
+            0.1
+        );
+        assert_eq!(json["points"][0]["payload"]["path"], "src/lib.rs");
+        assert!(json["points"][0]["payload"].get("source_text").is_none());
+    }
+
+    #[test]
+    fn query_points_request_asks_for_payload_not_vectors() {
+        let request = QueryPointsRequest {
+            query: vec![0.1, 0.2],
+            limit: 5,
+            with_payload: true,
+            with_vector: false,
+        };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json["query"].as_array().expect("query")[1]
+                .as_f64()
+                .expect("number") as f32,
+            0.2
+        );
+        assert_eq!(json["limit"], 5);
+        assert_eq!(json["with_payload"], true);
+        assert_eq!(json["with_vector"], false);
+    }
+
+    #[test]
     fn live_qdrant_health_is_opt_in() {
         if std::env::var("SYMDEX_TEST_QDRANT").ok().as_deref() != Some("1") {
             return;
@@ -258,5 +469,21 @@ mod tests {
 
         let client = QdrantClient::new(&StoreConfig::from_env()).expect("client should build");
         client.health_check().expect("qdrant should be reachable");
+    }
+
+    fn sample_payload() -> PointPayload {
+        PointPayload {
+            repository_id: "repo".to_owned(),
+            file_id: "file".to_owned(),
+            chunk_id: "chunk".to_owned(),
+            symbol_id: Some("symbol".to_owned()),
+            symbol_name: Some("add".to_owned()),
+            path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            chunk_kind: "function".to_owned(),
+            start_line: 1,
+            end_line: 3,
+            text_hash: "hash".to_owned(),
+        }
     }
 }

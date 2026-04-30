@@ -12,6 +12,8 @@ Verified sources for the chosen stack.
 - Qdrant docs: https://qdrant.tech/documentation/
 - Qdrant local quickstart: https://qdrant.tech/documentation/quickstart/
 - Qdrant create collection API: https://api.qdrant.tech/api-reference/collections/create-collection
+- Qdrant upsert points API: https://api.qdrant.tech/api-reference/points/upsert-points
+- Qdrant query points API: https://api.qdrant.tech/api-reference/search/query-points
 - Qdrant Rust client: https://docs.rs/qdrant-client
 
 ## Local embeddings

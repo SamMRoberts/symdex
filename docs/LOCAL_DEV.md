@@ -36,6 +36,7 @@ cargo test --workspace
 cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- index .
+cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- serve-mcp
 ```
@@ -46,7 +47,11 @@ Implemented CLI commands currently include:
 - `doctor`: prints local configuration and basic filesystem diagnostics.
 - `index <repo>`: discovers Rust files, applies built-in excludes and scoped
   simple `.gitignore` rules, hashes file contents, extracts tree-sitter
-  function and method chunks, and prints deterministic file and chunk facts.
+  function and method chunks, embeds chunk text with local Ollama, creates the
+  Qdrant collection if needed, and upserts semantic vectors. Use
+  `index --offline <repo>` for discovery and chunking without service calls.
+- `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
+  matches with scores, paths, line ranges, and symbol names.
 - `serve-mcp`: previews the planned read-only tool names while the MCP server is
   still pending.
 

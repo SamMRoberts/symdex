@@ -114,12 +114,15 @@ Payload fields:
 - `file_id`
 - `chunk_id`
 - `symbol_id`
+- `symbol_name`
 - `path`
 - `language`
 - `chunk_kind`
 - `start_line`
 - `end_line`
 - `text_hash`
+
+Do not store source text in Qdrant payloads.
 
 Use cosine distance unless a selected embedding model requires otherwise.
 

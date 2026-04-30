@@ -87,6 +87,15 @@ configured `SYMDEX_QDRANT_URL`, defaulting to `http://localhost:6333`. Collectio
 creation uses dense vectors with cosine distance and validates generated
 collection names before sending requests.
 
+Vector upserts use Qdrant `PUT /collections/:collection_name/points?wait=true`.
+Point IDs are deterministic UUID strings derived from chunk stable hashes.
+Payloads include repository, file, chunk, symbol, path, language, line range,
+chunk kind, and text hash metadata. Payloads intentionally do not include source
+text.
+
+Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
+with the embedded query vector, `with_payload: true`, and `with_vector: false`.
+
 ## Call extraction
 
 Start conservative.

@@ -7,7 +7,10 @@ use symdex_core::{
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_mcp::tool_names;
-use symdex_store::{QdrantClient, StoreConfig, sqlite_parent};
+use symdex_store::{
+    PointPayload, QdrantClient, StoreConfig, VectorPoint, qdrant_collection_name, qdrant_point_id,
+    sqlite_parent,
+};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -26,8 +29,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "doctor" => doctor(),
         "init" => init(),
         "index" => {
+            let index_args = parse_index_args(&args[1..]);
+            index(&index_args)
+        }
+        "search" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            index(repo)
+            let query_parts = if args.len() > 2 { &args[2..] } else { &[] };
+            search(repo, query_parts)
         }
         "serve-mcp" => serve_mcp_preview(),
         "help" | "--help" | "-h" => {
@@ -75,14 +83,121 @@ fn init() -> Result<(), String> {
     Ok(())
 }
 
-fn index(repo: &str) -> Result<(), String> {
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let files = discover_rust_files(&root, &DiscoveryOptions::default())
-        .map_err(|error| error.to_string())?;
+fn index(args: &IndexArgs) -> Result<(), String> {
+    let root = RepoRoot::open(&args.repo).map_err(|error| error.to_string())?;
+    let reports = collect_index_reports(&root)?;
 
     println!("repository_id: {}", root.id());
     println!("repository_root: {}", root.path().display());
-    println!("rust_files_seen: {}", files.len());
+    println!("rust_files_seen: {}", reports.len());
+    print_index_reports(&reports);
+
+    if args.offline {
+        println!("embedding: skipped (--offline)");
+        println!("qdrant: skipped (--offline)");
+        println!("sqlite_persistence: skipped (SQLite adapter pending)");
+        return Ok(());
+    }
+
+    let embed_config = EmbedConfig::from_env();
+    let chunk_texts = chunk_texts(&reports);
+    if chunk_texts.is_empty() {
+        println!("chunks_embedded: 0");
+        println!("qdrant: skipped (no chunks)");
+        println!("sqlite_persistence: skipped (SQLite adapter pending)");
+        return Ok(());
+    }
+
+    let embed_client =
+        OllamaClient::new(embed_config.clone()).map_err(|error| error.to_string())?;
+    if !embed_client
+        .model_available()
+        .map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "embedding model `{}` is not available",
+            embed_config.model
+        ));
+    }
+
+    let embeddings = embed_client
+        .embed_batch(
+            &chunk_texts
+                .iter()
+                .map(|chunk| chunk.text.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| error.to_string())?;
+    let dimension = embeddings.dimension().unwrap_or(0);
+
+    let store_config = StoreConfig::from_env();
+    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
+    let collection = qdrant_collection_name(root.id(), &embed_config.model);
+    qdrant
+        .ensure_collection(&collection, dimension)
+        .map_err(|error| error.to_string())?;
+
+    let points = chunk_texts
+        .iter()
+        .zip(embeddings.embeddings)
+        .map(|(chunk, vector)| vector_point(root.id(), chunk, vector))
+        .collect::<Result<Vec<_>, _>>()?;
+    qdrant
+        .upsert_points(&collection, &points)
+        .map_err(|error| error.to_string())?;
+
+    println!("embedding_model: {}", embeddings.model);
+    println!("embedding_dimension: {dimension}");
+    println!("qdrant_collection: {collection}");
+    println!("chunks_embedded: {}", points.len());
+    println!("sqlite_persistence: skipped (SQLite adapter pending)");
+    Ok(())
+}
+
+fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {
+    let query = query_parts.join(" ");
+    if query.trim().is_empty() {
+        return Err("search requires a query".to_owned());
+    }
+
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let embed_config = EmbedConfig::from_env();
+    let embed_client =
+        OllamaClient::new(embed_config.clone()).map_err(|error| error.to_string())?;
+    let query_embedding = embed_client
+        .embed_batch(&[query])
+        .map_err(|error| error.to_string())?;
+    let Some(vector) = query_embedding.embeddings.into_iter().next() else {
+        return Err("embedding query returned no vector".to_owned());
+    };
+
+    let store_config = StoreConfig::from_env();
+    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
+    let collection = qdrant_collection_name(root.id(), &embed_config.model);
+    let results = qdrant
+        .query_points(&collection, vector, 10)
+        .map_err(|error| error.to_string())?;
+
+    println!("repository_id: {}", root.id());
+    println!("qdrant_collection: {collection}");
+    println!("results: {}", results.len());
+    for result in results {
+        let payload = result.payload;
+        println!(
+            "{:.4} {}:{}-{} {}",
+            result.score,
+            payload.path,
+            payload.start_line,
+            payload.end_line,
+            payload.symbol_name.as_deref().unwrap_or("<none>")
+        );
+    }
+    Ok(())
+}
+
+fn collect_index_reports(root: &RepoRoot) -> Result<Vec<IndexReport>, String> {
+    let files = discover_rust_files(root, &DiscoveryOptions::default())
+        .map_err(|error| error.to_string())?;
 
     let mut reports = Vec::new();
     for file in &files {
@@ -93,9 +208,13 @@ fn index(repo: &str) -> Result<(), String> {
         reports.push(IndexReport {
             file: file.facts.clone(),
             chunks,
+            source,
         });
     }
+    Ok(reports)
+}
 
+fn print_index_reports(reports: &[IndexReport]) {
     let chunks_seen: usize = reports.iter().map(|report| report.chunks.len()).sum();
     for report in reports.iter().take(20) {
         println!(
@@ -115,18 +234,77 @@ fn index(repo: &str) -> Result<(), String> {
             );
         }
     }
-    if files.len() > 20 {
-        println!("... {} more files", files.len() - 20);
+    if reports.len() > 20 {
+        println!("... {} more files", reports.len() - 20);
     }
     println!("chunks_seen: {chunks_seen}");
-    println!("embedding: skipped (offline discovery slice)");
-    println!("persistence: skipped (SQLite adapter pending)");
-    Ok(())
+}
+
+fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
+    reports
+        .iter()
+        .flat_map(|report| {
+            report.chunks.iter().map(|chunk| ChunkText {
+                file: &report.file,
+                chunk,
+                text: report.source[chunk.byte_range.start..chunk.byte_range.end].to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn vector_point(
+    repository_id: &str,
+    chunk: &ChunkText<'_>,
+    vector: Vec<f32>,
+) -> Result<VectorPoint, String> {
+    Ok(VectorPoint {
+        id: qdrant_point_id(&chunk.chunk.id).map_err(|error| error.to_string())?,
+        vector,
+        payload: PointPayload {
+            repository_id: repository_id.to_owned(),
+            file_id: chunk.file.id.clone(),
+            chunk_id: chunk.chunk.id.clone(),
+            symbol_id: chunk.chunk.symbol_id.clone(),
+            symbol_name: chunk.chunk.symbol_name.clone(),
+            path: chunk.chunk.relative_path.clone(),
+            language: chunk.file.language.as_str().to_owned(),
+            chunk_kind: chunk.chunk.kind.as_str().to_owned(),
+            start_line: chunk.chunk.line_range.start,
+            end_line: chunk.chunk.line_range.end,
+            text_hash: chunk.chunk.text_hash.clone(),
+        },
+    })
+}
+
+fn parse_index_args(args: &[String]) -> IndexArgs {
+    let mut repo = ".".to_owned();
+    let mut offline = false;
+    for arg in args {
+        if arg == "--offline" {
+            offline = true;
+        } else {
+            repo = arg.clone();
+        }
+    }
+    IndexArgs { repo, offline }
 }
 
 struct IndexReport {
     file: FileFacts,
     chunks: Vec<CodeChunk>,
+    source: String,
+}
+
+struct ChunkText<'a> {
+    file: &'a FileFacts,
+    chunk: &'a CodeChunk,
+    text: String,
+}
+
+struct IndexArgs {
+    repo: String,
+    offline: bool,
 }
 
 fn serve_mcp_preview() -> Result<(), String> {
@@ -198,7 +376,7 @@ fn report_qdrant(config: &StoreConfig) {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init          Create local symdex state directories\n    doctor        Print local configuration and basic diagnostics\n    index <repo>  Discover Rust files and print deterministic file facts\n    serve-mcp     Preview planned read-only MCP tools\n    help          Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Preview planned read-only MCP tools\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }
