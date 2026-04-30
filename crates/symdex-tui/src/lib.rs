@@ -52,7 +52,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings/runs/neighborhood/health or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next mode in the active view\n    Shift+Tab Switch to the previous mode in the active view\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -337,7 +337,7 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{} (F2 toggles)", self.query.mode.label())),
+                Span::raw(format!("{} (Tab toggles)", self.query.mode.label())),
             ]),
             Line::from(vec![
                 Span::styled("Query: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -385,7 +385,7 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{} (F2 toggles)", self.graph.direction.label())),
+                Span::raw(format!("{} (Tab toggles)", self.graph.direction.label())),
             ]),
             Line::from(vec![
                 Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -435,7 +435,7 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{} (F2 toggles)", self.evidence.mode.label())),
+                Span::raw(format!("{} (Tab toggles)", self.evidence.mode.label())),
             ]),
             Line::from(vec![
                 Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -580,13 +580,40 @@ impl App {
     fn handle_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Tab => {
-                self.view = self.view.next();
-                self.message = format!("{} view selected.", self.view.label());
+                self.toggle_active_mode(false);
                 return false;
             }
             KeyCode::BackTab => {
-                self.view = self.view.previous();
-                self.message = format!("{} view selected.", self.view.label());
+                self.toggle_active_mode(true);
+                return false;
+            }
+            KeyCode::Char('i') => {
+                self.view = View::Indexing;
+                self.message = "Indexing controls selected.".to_owned();
+                return false;
+            }
+            KeyCode::Char('x') => {
+                self.view = View::Storage;
+                self.message = "Storage explorer selected.".to_owned();
+                return false;
+            }
+            KeyCode::Char('d') => {
+                self.start_diagnostics();
+                return false;
+            }
+            KeyCode::Char('w') => {
+                self.view = View::Query;
+                self.message = "Query workbench selected.".to_owned();
+                return false;
+            }
+            KeyCode::Char('g') => {
+                self.view = View::Graph;
+                self.message = "Symbol/call graph browser selected.".to_owned();
+                return false;
+            }
+            KeyCode::Char('p') => {
+                self.view = View::Evidence;
+                self.message = "Impact/context-pack viewer selected.".to_owned();
                 return false;
             }
             _ => {}
@@ -609,19 +636,6 @@ impl App {
                 self.message = "Indexing cancelled before start.".to_owned();
             }
             KeyCode::Esc => return true,
-            KeyCode::Char('i') => {
-                self.view = View::Indexing;
-                self.message = "Indexing controls selected.".to_owned();
-            }
-            KeyCode::Char('x') => {
-                self.view = View::Storage;
-                self.message = "Storage explorer selected.".to_owned();
-            }
-            KeyCode::F(2) if self.view == View::Storage => {
-                self.storage.mode = self.storage.mode.toggled();
-                self.storage.selection = 0;
-                self.message = format!("Storage mode set to {}.", self.storage.mode.label());
-            }
             KeyCode::Up if self.view == View::Storage && self.storage_row_count() > 0 => {
                 self.storage.selection =
                     previous_selection(self.storage.selection, self.storage_row_count());
@@ -651,21 +665,6 @@ impl App {
                 } else {
                     "Doctor selected-check details collapsed.".to_owned()
                 };
-            }
-            KeyCode::Char('d') => {
-                self.start_diagnostics();
-            }
-            KeyCode::Char('w') => {
-                self.view = View::Query;
-                self.message = "Query workbench selected.".to_owned();
-            }
-            KeyCode::Char('g') => {
-                self.view = View::Graph;
-                self.message = "Symbol/call graph browser selected.".to_owned();
-            }
-            KeyCode::Char('p') => {
-                self.view = View::Evidence;
-                self.message = "Impact/context-pack viewer selected.".to_owned();
             }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
                 self.screen =
@@ -700,6 +699,44 @@ impl App {
         false
     }
 
+    fn toggle_active_mode(&mut self, reverse: bool) {
+        match self.view {
+            View::Storage => {
+                self.storage.mode = if reverse {
+                    self.storage.mode.previous()
+                } else {
+                    self.storage.mode.toggled()
+                };
+                self.storage.selection = 0;
+                self.message = format!("Storage mode set to {}.", self.storage.mode.label());
+            }
+            View::Query => {
+                self.query.mode = self.query.mode.toggled();
+                self.query.status = QueryStatus::Idle;
+                self.query.selection = 0;
+                self.message = format!("Query mode set to {}.", self.query.mode.label());
+            }
+            View::Graph => {
+                self.graph.direction = self.graph.direction.toggled();
+                self.graph.status = GraphStatus::Idle;
+                self.graph.selection = 0;
+                self.message = format!("Graph mode set to {}.", self.graph.direction.label());
+            }
+            View::Evidence => {
+                self.evidence.mode = self.evidence.mode.toggled();
+                self.evidence.status = EvidenceStatus::Idle;
+                self.evidence.selection = 0;
+                self.message = format!("Evidence mode set to {}.", self.evidence.mode.label());
+            }
+            View::Indexing => {
+                self.message = "No alternate indexing mode is selected with Tab.".to_owned();
+            }
+            View::Diagnostics => {
+                self.message = "No alternate doctor mode is selected with Tab.".to_owned();
+            }
+        }
+    }
+
     fn handle_query_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') if self.query.input.is_empty() => return true,
@@ -722,12 +759,6 @@ impl App {
                 self.query.status = QueryStatus::Idle;
                 self.query.selection = 0;
                 self.message = "Query input cleared.".to_owned();
-            }
-            KeyCode::F(2) => {
-                self.query.mode = self.query.mode.toggled();
-                self.query.status = QueryStatus::Idle;
-                self.query.selection = 0;
-                self.message = format!("Query mode set to {}.", self.query.mode.label());
             }
             KeyCode::Enter => {
                 self.start_query();
@@ -771,12 +802,6 @@ impl App {
                 self.graph.selection = 0;
                 self.message = "Graph input cleared.".to_owned();
             }
-            KeyCode::F(2) => {
-                self.graph.direction = self.graph.direction.toggled();
-                self.graph.status = GraphStatus::Idle;
-                self.graph.selection = 0;
-                self.message = format!("Graph mode set to {}.", self.graph.direction.label());
-            }
             KeyCode::Enter => {
                 self.start_graph_lookup();
             }
@@ -818,12 +843,6 @@ impl App {
                 self.evidence.status = EvidenceStatus::Idle;
                 self.evidence.selection = 0;
                 self.message = "Evidence input cleared.".to_owned();
-            }
-            KeyCode::F(2) => {
-                self.evidence.mode = self.evidence.mode.toggled();
-                self.evidence.status = EvidenceStatus::Idle;
-                self.evidence.selection = 0;
-                self.message = format!("Evidence mode set to {}.", self.evidence.mode.label());
             }
             KeyCode::Enter => {
                 self.start_evidence_lookup();
@@ -2432,7 +2451,7 @@ fn coverage_table(summary: &IndexCoverageSummary) -> Table<'_> {
         "Path", "Chk", "Sym", "Call", "Vec", "Ex", "Status",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Index Coverage | Files: {} | F2 storage overview",
+        "Index Coverage | Files: {} | Tab next storage mode",
         summary.files.len()
     )))
     .column_spacing(1)
@@ -2635,7 +2654,7 @@ fn outline_table(summary: &SymbolOutlineSummary) -> Table<'_> {
     )
     .header(table_header(["Symbol", "Kind", "Path", "Lines", "Kids"]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Symbol Outline | Symbols: {} | F2 next storage mode",
+        "Symbol Outline | Symbols: {} | Tab next storage mode",
         summary.symbols.len()
     )))
     .column_spacing(1)
@@ -2727,7 +2746,7 @@ fn call_resolution_table(summary: &CallResolutionSummary) -> Table<'_> {
     )
     .header(table_header(["Resolution", "Conf", "Calls", "Avg"]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Call Resolution | Buckets: {} | F2 next storage mode",
+        "Call Resolution | Buckets: {} | Tab next storage mode",
         summary.buckets.len()
     )))
     .column_spacing(1)
@@ -2839,7 +2858,7 @@ fn embedding_coverage_table(summary: &EmbeddingCoverageSummary) -> Table<'_> {
     )
     .header(table_header(["Metric", "Value", "Status"]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Embedding Coverage | {} | F2 next storage mode",
+        "Embedding Coverage | {} | Tab next storage mode",
         summary.repository_id
     )))
     .column_spacing(1)
@@ -3048,7 +3067,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         "Started", "Status", "Seen", "Idx", "Emb", "Model", "Dim",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Index Runs Timeline | Runs: {} | F2 next storage mode",
+        "Index Runs Timeline | Runs: {} | Tab next storage mode",
         summary.runs.len()
     )))
     .column_spacing(1)
@@ -3166,7 +3185,7 @@ fn semantic_neighborhood_table(summary: &SemanticNeighborhoodSummary) -> Table<'
         "Text Hash",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Semantic Neighborhood | Payloads: {} | F2 next storage mode",
+        "Semantic Neighborhood | Payloads: {} | Tab next storage mode",
         summary.rows.len()
     )))
     .column_spacing(1)
@@ -3280,7 +3299,7 @@ fn cross_store_health_table(summary: &CrossStoreHealthSummary) -> Table<'_> {
     )
     .header(table_header(["Check", "Status", "Detail"]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Cross-Store Health | Checks: {} | F2 next storage mode",
+        "Cross-Store Health | Checks: {} | Tab next storage mode",
         summary.rows.len()
     )))
     .column_spacing(1)
@@ -3778,39 +3797,6 @@ impl View {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Indexing => "Indexing",
-            Self::Storage => "Storage Explorer",
-            Self::Diagnostics => "Doctor Diagnostics",
-            Self::Query => "Query Workbench",
-            Self::Graph => "Symbol/Call Graph",
-            Self::Evidence => "Impact/Context Pack",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Indexing => Self::Storage,
-            Self::Storage => Self::Diagnostics,
-            Self::Diagnostics => Self::Query,
-            Self::Query => Self::Graph,
-            Self::Graph => Self::Evidence,
-            Self::Evidence => Self::Indexing,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Indexing => Self::Evidence,
-            Self::Storage => Self::Indexing,
-            Self::Diagnostics => Self::Storage,
-            Self::Query => Self::Diagnostics,
-            Self::Graph => Self::Query,
-            Self::Evidence => Self::Graph,
-        }
-    }
-
     fn footer_label(self) -> &'static str {
         match self {
             Self::Indexing => "index",
@@ -3825,22 +3811,22 @@ impl View {
     fn footer_help(self) -> &'static str {
         match self {
             Self::Indexing => {
-                "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "i index | x storage | d doctor | w query | g calls | p impact | o offline | s semantic | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab next view | F2 overview/coverage/outline/calls/embeddings/runs/neighborhood/health | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab/Shift+Tab mode | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
-                "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
+                "Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
             }
             Self::Query => {
-                "Tab next view | type query | Up/Down select | F2 mode | Enter run | Esc clear/back | q quit"
+                "Tab/Shift+Tab mode | type query | Up/Down select | Enter run | Esc clear/back | q quit"
             }
             Self::Graph => {
-                "Tab next view | type symbol | Up/Down select | F2 callers/callees | Enter run | Esc clear/back | q quit"
+                "Tab/Shift+Tab callers/callees | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
             }
             Self::Evidence => {
-                "Tab next view | type symbol | Up/Down select | F2 impact/context | Enter run | Esc clear/back | q quit"
+                "Tab/Shift+Tab impact/context | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
             }
         }
     }
@@ -3953,6 +3939,19 @@ impl StorageMode {
             Self::Runs => Self::Neighborhood,
             Self::Neighborhood => Self::Health,
             Self::Health => Self::Explorer,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Explorer => Self::Health,
+            Self::Coverage => Self::Explorer,
+            Self::Outline => Self::Coverage,
+            Self::Calls => Self::Outline,
+            Self::Embeddings => Self::Calls,
+            Self::Runs => Self::Embeddings,
+            Self::Neighborhood => Self::Runs,
+            Self::Health => Self::Neighborhood,
         }
     }
 }
@@ -4315,33 +4314,46 @@ mod tests {
 
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("query"));
-        assert!(rendered.contains("Tab next view"));
-        assert!(rendered.contains("F2 mode"));
+        assert!(rendered.contains("Tab/Shift+Tab mode"));
         assert!(rendered.contains("Enter run"));
     }
 
     #[test]
-    fn tab_switches_major_views_from_query_without_toggling_mode() {
+    fn tab_toggles_query_mode_without_switching_major_view() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Query;
         app.query.mode = QueryMode::Symbol;
 
         assert!(!app.handle_key(KeyCode::Tab));
 
-        assert_eq!(app.view, View::Graph);
-        assert_eq!(app.query.mode, QueryMode::Symbol);
-        assert_eq!(app.message, "Symbol/Call Graph view selected.");
+        assert_eq!(app.view, View::Query);
+        assert_eq!(app.query.mode, QueryMode::Semantic);
+        assert_eq!(app.message, "Query mode set to semantic.");
     }
 
     #[test]
-    fn shift_tab_switches_to_previous_major_view() {
+    fn primary_tab_letters_switch_views_from_text_entry_views() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Query;
+        app.query.input = "retry".to_owned();
+
+        assert!(!app.handle_key(KeyCode::Char('g')));
+
+        assert_eq!(app.view, View::Graph);
+        assert_eq!(app.query.input, "retry");
+        assert_eq!(app.message, "Symbol/call graph browser selected.");
+    }
+
+    #[test]
+    fn shift_tab_toggles_storage_to_previous_mode() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
 
         assert!(!app.handle_key(KeyCode::BackTab));
 
-        assert_eq!(app.view, View::Diagnostics);
-        assert_eq!(app.message, "Doctor Diagnostics view selected.");
+        assert_eq!(app.view, View::Storage);
+        assert_eq!(app.storage.mode, StorageMode::Health);
+        assert_eq!(app.message, "Storage mode set to cross-store health.");
     }
 
     #[test]
@@ -4449,7 +4461,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_f2_toggles_to_index_coverage() {
+    fn storage_tab_toggles_to_index_coverage() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
@@ -4465,7 +4477,7 @@ mod tests {
         app.storage.selection = 2;
 
         assert_eq!(app.storage.mode, StorageMode::Explorer);
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
 
         assert_eq!(app.storage.mode, StorageMode::Coverage);
         assert_eq!(app.storage.selection, 0);
@@ -4473,7 +4485,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_f2_cycles_to_symbol_outline() {
+    fn storage_tab_cycles_to_symbol_outline() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
@@ -4487,16 +4499,16 @@ mod tests {
             sample_cross_store_health_summary(),
         );
 
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
         assert_eq!(app.storage.mode, StorageMode::Coverage);
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
 
         assert_eq!(app.storage.mode, StorageMode::Outline);
         assert_eq!(app.message, "Storage mode set to symbol outline.");
     }
 
     #[test]
-    fn storage_f2_cycles_to_call_resolution() {
+    fn storage_tab_cycles_to_call_resolution() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
@@ -4510,17 +4522,17 @@ mod tests {
             sample_cross_store_health_summary(),
         );
 
-        assert!(!app.handle_key(KeyCode::F(2)));
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert!(!app.handle_key(KeyCode::Tab));
         assert_eq!(app.storage.mode, StorageMode::Outline);
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
 
         assert_eq!(app.storage.mode, StorageMode::Calls);
         assert_eq!(app.message, "Storage mode set to call resolution.");
     }
 
     #[test]
-    fn storage_f2_cycles_to_embedding_coverage() {
+    fn storage_tab_cycles_to_embedding_coverage() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
@@ -4534,18 +4546,18 @@ mod tests {
             sample_cross_store_health_summary(),
         );
 
-        assert!(!app.handle_key(KeyCode::F(2)));
-        assert!(!app.handle_key(KeyCode::F(2)));
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert!(!app.handle_key(KeyCode::Tab));
         assert_eq!(app.storage.mode, StorageMode::Calls);
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
 
         assert_eq!(app.storage.mode, StorageMode::Embeddings);
         assert_eq!(app.message, "Storage mode set to embedding coverage.");
     }
 
     #[test]
-    fn storage_f2_cycles_to_index_runs_timeline() {
+    fn storage_tab_cycles_to_index_runs_timeline() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
@@ -4559,19 +4571,19 @@ mod tests {
             sample_cross_store_health_summary(),
         );
 
-        assert!(!app.handle_key(KeyCode::F(2)));
-        assert!(!app.handle_key(KeyCode::F(2)));
-        assert!(!app.handle_key(KeyCode::F(2)));
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert!(!app.handle_key(KeyCode::Tab));
         assert_eq!(app.storage.mode, StorageMode::Embeddings);
-        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
 
         assert_eq!(app.storage.mode, StorageMode::Runs);
         assert_eq!(app.message, "Storage mode set to index runs timeline.");
     }
 
     #[test]
-    fn storage_f2_cycles_to_semantic_neighborhood() {
+    fn storage_tab_cycles_to_semantic_neighborhood() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
@@ -4586,7 +4598,7 @@ mod tests {
         );
 
         for _ in 0..6 {
-            assert!(!app.handle_key(KeyCode::F(2)));
+            assert!(!app.handle_key(KeyCode::Tab));
         }
 
         assert_eq!(app.storage.mode, StorageMode::Neighborhood);
@@ -4594,7 +4606,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_f2_cycles_to_cross_store_health() {
+    fn storage_tab_cycles_to_cross_store_health() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
@@ -4609,7 +4621,7 @@ mod tests {
         );
 
         for _ in 0..7 {
-            assert!(!app.handle_key(KeyCode::F(2)));
+            assert!(!app.handle_key(KeyCode::Tab));
         }
 
         assert_eq!(app.storage.mode, StorageMode::Health);
@@ -5445,7 +5457,8 @@ mod tests {
         app.view = View::Query;
         assert_eq!(app.query.mode, QueryMode::Symbol);
 
-        assert!(!app.handle_query_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert_eq!(app.view, View::Query);
         assert_eq!(app.query.mode, QueryMode::Semantic);
     }
 
@@ -5595,7 +5608,8 @@ mod tests {
         app.view = View::Graph;
         assert_eq!(app.graph.direction, CallDirection::Callers);
 
-        assert!(!app.handle_graph_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert_eq!(app.view, View::Graph);
         assert_eq!(app.graph.direction, CallDirection::Callees);
     }
 
@@ -5678,7 +5692,8 @@ mod tests {
         assert!(!app.handle_evidence_key(KeyCode::Char('d')));
         assert_eq!(app.evidence.input, "add");
 
-        assert!(!app.handle_evidence_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert_eq!(app.view, View::Evidence);
         assert_eq!(app.evidence.mode, EvidenceMode::ContextPack);
 
         assert!(!app.handle_evidence_key(KeyCode::Backspace));

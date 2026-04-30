@@ -86,9 +86,10 @@ terminal panes.
   storage, query, call graph, impact, and context-pack tables.
 - In the Storage view, row selection should drive a visible detail panel for
   the selected SQLite/Qdrant metric and nearby storage health notes.
-- In the Storage view, `F2` toggles between storage overview, index coverage,
-  symbol outline, call resolution, embedding coverage, and index runs timeline
-  modes, plus semantic neighborhood payload and cross-store health views.
+- In the Storage view, `Tab` and `Shift+Tab` cycle between storage overview,
+  index coverage, symbol outline, call resolution, embedding coverage, and
+  index runs timeline modes, plus semantic neighborhood payload and cross-store
+  health views.
 - In the Doctor view, row selection must drive visible detail output for the
   selected check rather than highlight-only behavior.
 - In the Doctor view, `Enter` should toggle an expanded selected-check detail
@@ -151,10 +152,10 @@ represent the indexed repository.
   implementation details.
 - The first implementation is a Storage tab that renders a selectable
   SQLite/Qdrant metric table plus a detail/health panel.
-- The Storage tab also includes `F2` modes for file-grouped index coverage,
-  symbol outlines, call resolution, embedding coverage, and index runs
-  timeline, plus semantic neighborhood payload metadata and cross-store health
-  warnings.
+- The Storage tab also includes `Tab` / `Shift+Tab` modes for file-grouped
+  index coverage, symbol outlines, call resolution, embedding coverage, and
+  index runs timeline, plus semantic neighborhood payload metadata and
+  cross-store health warnings.
 
 ### Index Coverage View
 
@@ -173,7 +174,7 @@ represent the indexed repository.
   exclusion summaries for that file.
 - Use gauges only for real ratios, such as embedded chunks over embeddable
   chunks.
-- The first implementation lives in the Storage tab behind `F2` and renders a
+- The first implementation lives in the Storage tab mode cycle and renders a
   compact `Table` plus a selected-file coverage detail panel.
 
 ### File Detail Drawer
@@ -196,7 +197,7 @@ represent the indexed repository.
 - Show symbol kind, qualified name, and line range.
 - Selecting a symbol should allow jumping to callers/callees, impact, and
   context-pack views using the symbol query.
-- The first implementation lives in the Storage tab behind `F2` and shows
+- The first implementation lives in the Storage tab mode cycle and shows
   symbol depth, child count, path, line range, and selected-symbol detail.
 
 ### Call Resolution Dashboard
@@ -206,7 +207,7 @@ represent the indexed repository.
 - Selecting a bucket should show rows with caller symbol, callee text, call line,
   path, confidence, and resolution status.
 - Highlight unresolved or low-confidence call evidence with warning colors.
-- The first implementation lives in the Storage tab behind `F2` and shows
+- The first implementation lives in the Storage tab mode cycle and shows
   bucket counts, average confidence, and representative call rows.
 
 ### Embedding Coverage View
@@ -221,7 +222,7 @@ represent the indexed repository.
 - Show model or dimension drift as an error state.
 - Show excluded chunks by reason so secret filtering remains auditable without
   exposing source text.
-- The first implementation lives in the Storage tab behind `F2` and shows a
+- The first implementation lives in the Storage tab mode cycle and shows a
   compact metric table plus a selected-metric detail panel with collection,
   exclusion-reason, and health summaries.
 
@@ -237,7 +238,7 @@ represent the indexed repository.
   - error summary
 - Selecting a run should show detailed counts and any error summary.
 - Failed or partial runs should be visually distinct from successful runs.
-- The first implementation lives in the Storage tab behind `F2` and shows a
+- The first implementation lives in the Storage tab mode cycle and shows a
   compact timeline table plus a selected-run detail panel with status, counts,
   model, dimension, timestamps, and error summary.
 
@@ -247,7 +248,7 @@ represent the indexed repository.
   semantically related chunks, but must remain metadata-first.
 - The first version should show path, line range, symbol, chunk kind, score, and
   text hash only.
-- The first implementation lives in the Storage tab behind `F2` and shows
+- The first implementation lives in the Storage tab mode cycle and shows
   vector-backed chunk payload metadata from the Qdrant projection: path, line
   range, symbol, chunk kind, language, text hash, point ID, collection, and a
   `metadata` score label when no live nearest-neighbor score is available.
@@ -263,7 +264,7 @@ represent the indexed repository.
   - inconsistent recorded vector dimensions across successful runs
 - Selecting a health row should show the expected collection name, status, and
   detailed warning text.
-- The first implementation lives in the Storage tab behind `F2` and uses
+- The first implementation lives in the Storage tab mode cycle and uses
   SQLite metadata plus recorded Qdrant point IDs. It does not require live
   Qdrant service checks.
 
@@ -302,7 +303,8 @@ represent the indexed repository.
 
 ### Query Workbench
 
-- Support semantic search input with `w`, `F2`, typed query text, and `Enter`.
+- Support semantic search input with `w`, `Tab` / `Shift+Tab`, typed query
+  text, and `Enter`.
 - Support symbol search input with the same workbench controls.
 - Display compact ranked evidence with path, line range, symbol, score, and kind.
 - Show empty and error states.
@@ -312,7 +314,8 @@ represent the indexed repository.
 
 ### Symbol and Call Browser
 
-- Show direct callers and callees with `g`, typed symbol text, `F2`, and `Enter`.
+- Show direct callers and callees with `g`, typed symbol text,
+  `Tab` / `Shift+Tab`, and `Enter`.
 - Preserve resolution status, confidence, and unresolved/ambiguous labels.
 - Render callers/callees as tabs or a segmented control.
 - Use a table for symbol, path, line range, confidence, callee text, and
@@ -321,7 +324,7 @@ represent the indexed repository.
 ### Impact and Context Pack Viewer
 
 - Show the basic impact view using direct callers and callees with `p`, typed
-  symbol text, `F2`, and `Enter`.
+  symbol text, `Tab` / `Shift+Tab`, and `Enter`.
 - Show `symdex.context_pack.v1` metadata with the same viewer controls.
 - Do not include source text by default.
 - Render impact sections as separate panels or tables for direct callers and
@@ -332,7 +335,11 @@ represent the indexed repository.
 ## Interaction Rules
 
 - Keyboard-first; no mouse requirement.
-- Use predictable keys for navigation, tabs, refresh, confirmation, cancel, and quit.
+- Use predictable keys for navigation, view selection, mode switching, refresh,
+  confirmation, cancel, and quit.
+- Primary views are selected by their mnemonic letter keys (`i`, `x`, `d`,
+  `w`, `g`, `p`) instead of `Tab`. These view keys remain reserved while typing
+  in query, graph, impact, and context-pack inputs.
 - Keep visible focus state.
 - Keep views compact enough for agent-facing evidence review.
 - Never hide long-running work; show loading/running/completed/failed states.
@@ -348,12 +355,14 @@ Current dashboard keys:
 - `w`: open the query workbench
 - `g`: open the symbol/call graph browser
 - `p`: open the impact/context-pack viewer
-- `Tab`: switch to the next major TUI view
-- `Shift+Tab`: switch to the previous major TUI view
-- `F2`: toggle storage overview, index coverage, symbol outline, call resolution, embedding coverage, index runs timeline, semantic neighborhood, and cross-store health in the storage explorer
-- `F2`: toggle symbol and semantic query modes in the query workbench
-- `F2`: toggle callers and callees in the symbol/call graph browser
-- `F2`: toggle impact and context-pack modes in the impact/context-pack viewer
+- `Tab`: switch to the next mode in the active view
+- `Shift+Tab`: switch to the previous mode in the active view
+- `Tab` / `Shift+Tab`: cycle storage overview, index coverage, symbol outline,
+  call resolution, embedding coverage, index runs timeline, semantic
+  neighborhood, and cross-store health in the storage explorer
+- `Tab` / `Shift+Tab`: toggle symbol and semantic query modes in the query workbench
+- `Tab` / `Shift+Tab`: toggle callers and callees in the symbol/call graph browser
+- `Tab` / `Shift+Tab`: toggle impact and context-pack modes in the impact/context-pack viewer
 - `Up` / `Down`: move the selected row in completed result and storage tables
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
 - typed text: edit the query workbench input
