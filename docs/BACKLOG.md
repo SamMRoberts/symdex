@@ -80,7 +80,7 @@
 - [x] stateful selection/focus for result lists and tables.
 - [x] per-view footer help text.
 - [x] confirmation panel styling for long-running jobs.
-- progress `Gauge` for indexing when progress reporting exists.
+- [x] progress `Gauge` for indexing when progress reporting exists.
 - [x] narrow-terminal render tests for 80x24 layout.
 - [x] render tests for active tabs and status colors.
 - [x] render tests for table headers.

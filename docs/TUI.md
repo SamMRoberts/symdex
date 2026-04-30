@@ -116,8 +116,11 @@ terminal panes.
 - Show final counts for files, chunks, symbols, calls, excluded chunks, and
   embedding status.
 - Use a confirmation panel styled as a warning state.
-- Use a progress gauge when indexing can report progress; until then show a
-  running status panel and final summary table.
+- Use a progress gauge while indexing is running, backed by local indexing
+  progress events.
+- The first progress gauge is phase-based: discovery/parsing, SQLite
+  persistence, embedding, and Qdrant upload. It must show the phase name and
+  completed/total counts so the gauge is not color-only.
 - Do not add reset/delete actions until matching CLI support exists.
 
 ### Doctor Diagnostics

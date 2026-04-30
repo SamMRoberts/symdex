@@ -19,6 +19,30 @@ pub struct IndexOptions {
     pub offline: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexProgress {
+    pub phase: &'static str,
+    pub completed: usize,
+    pub total: usize,
+    pub message: String,
+}
+
+impl IndexProgress {
+    fn new(
+        phase: &'static str,
+        completed: usize,
+        total: usize,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase,
+            completed,
+            total: total.max(1),
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSummary {
     pub repository_id: String,
@@ -75,6 +99,19 @@ struct PersistenceSummary {
 }
 
 pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
+    run_index_with_progress(options, |_| {})
+}
+
+pub fn run_index_with_progress(
+    options: &IndexOptions,
+    mut on_progress: impl FnMut(IndexProgress),
+) -> Result<IndexSummary, String> {
+    on_progress(IndexProgress::new(
+        "open",
+        0,
+        1,
+        "Opening repository and local stores",
+    ));
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
     let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
@@ -85,9 +122,18 @@ pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
             root_path: root.path().display().to_string(),
         })
         .map_err(|error| error.to_string())?;
+    on_progress(IndexProgress::new(
+        "open",
+        1,
+        1,
+        "Repository and SQLite store ready",
+    ));
 
-    let collection =
-        collect_index_reports(&root, if options.offline { Some(&sqlite) } else { None })?;
+    let collection = collect_index_reports(
+        &root,
+        if options.offline { Some(&sqlite) } else { None },
+        &mut on_progress,
+    )?;
     let files = file_summaries(&collection.reports);
     let chunks_seen = collection
         .reports
@@ -100,12 +146,18 @@ pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
         .flat_map(|report| report.chunks.iter())
         .filter(|chunk| chunk.excluded_reason.is_some())
         .count();
-    let persistence = persist_structural_index(&mut sqlite, &root, &collection)?;
+    let persistence = persist_structural_index(&mut sqlite, &root, &collection, &mut on_progress)?;
 
     let embedding = if options.offline {
+        on_progress(IndexProgress::new(
+            "embedding",
+            1,
+            1,
+            "Embedding skipped for offline indexing",
+        ));
         EmbeddingSummary::SkippedOffline
     } else {
-        persist_semantic_index(&sqlite, &root, &store_config, &collection)?
+        persist_semantic_index(&sqlite, &root, &store_config, &collection, &mut on_progress)?
     };
 
     Ok(IndexSummary {
@@ -128,13 +180,20 @@ pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
 fn collect_index_reports(
     root: &RepoRoot,
     sqlite: Option<&SqliteStore>,
+    on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<IndexCollection, String> {
     let files = discover_rust_files(root, &DiscoveryOptions::default())
         .map_err(|error| error.to_string())?;
+    on_progress(IndexProgress::new(
+        "discover",
+        0,
+        files.len(),
+        format!("Discovered {} Rust files", files.len()),
+    ));
 
     let mut reports = Vec::new();
     let mut files_skipped_unchanged = 0usize;
-    for file in &files {
+    for (index, file) in files.iter().enumerate() {
         if let Some(sqlite) = sqlite
             && sqlite
                 .file_unchanged(
@@ -145,19 +204,32 @@ fn collect_index_reports(
                 .map_err(|error| error.to_string())?
         {
             files_skipped_unchanged += 1;
+            on_progress(IndexProgress::new(
+                "parse",
+                index + 1,
+                files.len(),
+                format!("Skipped unchanged {}", file.facts.relative_path),
+            ));
             continue;
         }
 
         let source = fs::read_to_string(&file.absolute_path)
             .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
-        let index = index_rust_file(&file.facts, &source).map_err(|error| error.to_string())?;
+        let file_index =
+            index_rust_file(&file.facts, &source).map_err(|error| error.to_string())?;
         reports.push(IndexReport {
             file: file.facts.clone(),
-            chunks: index.chunks,
-            symbols: index.symbols,
-            calls: index.calls,
+            chunks: file_index.chunks,
+            symbols: file_index.symbols,
+            calls: file_index.calls,
             source,
         });
+        on_progress(IndexProgress::new(
+            "parse",
+            index + 1,
+            files.len(),
+            format!("Parsed {}", file.facts.relative_path),
+        ));
     }
     Ok(IndexCollection {
         files_seen: files.len(),
@@ -196,11 +268,12 @@ fn persist_structural_index(
     sqlite: &mut SqliteStore,
     root: &RepoRoot,
     collection: &IndexCollection,
+    on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<PersistenceSummary, String> {
     let mut chunks_indexed = 0usize;
     let mut symbols_indexed = 0usize;
     let mut calls_indexed = 0usize;
-    for report in &collection.reports {
+    for (index, report) in collection.reports.iter().enumerate() {
         let file = FileRecord {
             id: report.file.id.clone(),
             repository_id: root.id().to_owned(),
@@ -221,11 +294,23 @@ fn persist_structural_index(
         sqlite
             .replace_file_facts(&file, &symbols, &chunks, &calls)
             .map_err(|error| error.to_string())?;
+        on_progress(IndexProgress::new(
+            "sqlite",
+            index + 1,
+            collection.reports.len(),
+            format!("Persisted {}", report.file.relative_path),
+        ));
     }
 
     let files_removed = sqlite
         .remove_missing_files(root.id(), &collection.active_paths)
         .map_err(|error| error.to_string())?;
+    on_progress(IndexProgress::new(
+        "sqlite",
+        collection.reports.len(),
+        collection.reports.len(),
+        format!("Removed {files_removed} stale files"),
+    ));
     Ok(PersistenceSummary {
         files_indexed: collection.reports.len(),
         chunks_indexed,
@@ -240,13 +325,26 @@ fn persist_semantic_index(
     root: &RepoRoot,
     store_config: &StoreConfig,
     collection: &IndexCollection,
+    on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
     let embed_config = EmbedConfig::from_env();
     let chunk_texts = chunk_texts(&collection.reports);
     if chunk_texts.is_empty() {
+        on_progress(IndexProgress::new(
+            "embedding",
+            1,
+            1,
+            "Embedding skipped because no chunks changed",
+        ));
         return Ok(EmbeddingSummary::SkippedNoChunks);
     }
 
+    on_progress(IndexProgress::new(
+        "embedding",
+        1,
+        5,
+        format!("Preparing {} chunks for embedding", chunk_texts.len()),
+    ));
     let embed_client =
         OllamaClient::new(embed_config.clone()).map_err(|error| error.to_string())?;
     if !embed_client
@@ -258,6 +356,12 @@ fn persist_semantic_index(
             embed_config.model
         ));
     }
+    on_progress(IndexProgress::new(
+        "embedding",
+        2,
+        5,
+        format!("Embedding {} chunks", chunk_texts.len()),
+    ));
 
     let embeddings = embed_client
         .embed_batch(
@@ -268,6 +372,12 @@ fn persist_semantic_index(
         )
         .map_err(|error| error.to_string())?;
     let dimension = embeddings.dimension().unwrap_or(0);
+    on_progress(IndexProgress::new(
+        "embedding",
+        3,
+        5,
+        format!("Embedding dimension {dimension}"),
+    ));
     sqlite
         .ensure_embedding_compatible(root.id(), &embed_config.model, dimension)
         .map_err(|error| error.to_string())?;
@@ -277,6 +387,12 @@ fn persist_semantic_index(
     qdrant
         .ensure_collection(&qdrant_collection, dimension)
         .map_err(|error| error.to_string())?;
+    on_progress(IndexProgress::new(
+        "qdrant",
+        4,
+        5,
+        format!("Upserting {} vector points", chunk_texts.len()),
+    ));
 
     let points = chunk_texts
         .iter()
@@ -286,6 +402,12 @@ fn persist_semantic_index(
     qdrant
         .upsert_points(&qdrant_collection, &points)
         .map_err(|error| error.to_string())?;
+    on_progress(IndexProgress::new(
+        "qdrant",
+        5,
+        5,
+        format!("Upserted {} vector points", points.len()),
+    ));
     sqlite
         .record_index_run(&IndexRunRecord {
             repository_id: root.id().to_owned(),

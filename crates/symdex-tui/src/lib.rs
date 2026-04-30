@@ -15,12 +15,14 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::widgets::{Cell, Row, Table, TableState};
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
-use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
+use symdex_index::{
+    EmbeddingSummary, IndexOptions, IndexProgress, IndexSummary, run_index_with_progress,
+};
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
     SymbolSearchSummary, run_call_graph, run_context_pack, run_impact, run_semantic_search,
@@ -57,13 +59,14 @@ pub struct App {
     view: View,
     screen: Screen,
     last_index_summary: Option<IndexSummary>,
+    index_progress: Option<IndexProgress>,
     diagnostics: DiagnosticsState,
     diagnostics_selection: usize,
     query: QueryWorkbenchState,
     graph: GraphBrowserState,
     evidence: EvidenceViewerState,
     last_error: Option<String>,
-    index_receiver: Option<Receiver<Result<IndexSummary, String>>>,
+    index_receiver: Option<Receiver<IndexJobMessage>>,
     diagnostics_receiver: Option<Receiver<Result<DiagnosticReport, String>>>,
     query_receiver: Option<Receiver<Result<QueryResult, String>>>,
     graph_receiver: Option<Receiver<Result<CallGraphSummary, String>>>,
@@ -94,6 +97,7 @@ impl App {
             view: View::Indexing,
             screen: Screen::Dashboard,
             last_index_summary: None,
+            index_progress: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             query: QueryWorkbenchState::default(),
@@ -127,6 +131,7 @@ impl App {
             view: View::Indexing,
             screen: Screen::Dashboard,
             last_index_summary: None,
+            index_progress: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             query: QueryWorkbenchState::default(),
@@ -724,14 +729,26 @@ impl App {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = run_index(&IndexOptions {
-                repo,
-                offline: matches!(mode, IndexMode::Offline),
-            });
-            let _ = sender.send(result);
+            let progress_sender = sender.clone();
+            let result = run_index_with_progress(
+                &IndexOptions {
+                    repo,
+                    offline: matches!(mode, IndexMode::Offline),
+                },
+                move |progress| {
+                    let _ = progress_sender.send(IndexJobMessage::Progress(progress));
+                },
+            );
+            let _ = sender.send(IndexJobMessage::Finished(result));
         });
         self.index_receiver = Some(receiver);
         self.last_index_summary = None;
+        self.index_progress = Some(IndexProgress {
+            phase: "start",
+            completed: 0,
+            total: 1,
+            message: format!("Starting {} indexing", mode.label()),
+        });
         self.last_error = None;
         self.screen = reduce_screen(self.screen, UiAction::Confirm);
         self.message = format!("{} indexing started.", mode.label());
@@ -824,7 +841,10 @@ impl App {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok(summary)) => {
+            Ok(IndexJobMessage::Progress(progress)) => {
+                self.index_progress = Some(progress);
+            }
+            Ok(IndexJobMessage::Finished(Ok(summary))) => {
                 self.index_receiver = None;
                 let mode = self.screen.index_mode().unwrap_or(IndexMode::Offline);
                 self.message = format!(
@@ -835,6 +855,7 @@ impl App {
                 );
                 let completed_message = self.message.clone();
                 self.last_index_summary = Some(summary);
+                self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
                 if let Err(error) = self.refresh_status() {
                     self.message =
@@ -843,8 +864,9 @@ impl App {
                     self.message = completed_message;
                 }
             }
-            Ok(Err(error)) => {
+            Ok(IndexJobMessage::Finished(Err(error))) => {
                 self.index_receiver = None;
+                self.index_progress = None;
                 self.last_error = Some(error);
                 self.screen = reduce_screen(self.screen, UiAction::JobFailed);
                 self.message = "Indexing failed.".to_owned();
@@ -1088,15 +1110,31 @@ fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Screen::IndexCompleted(_) => ("Indexing Complete", StatusTone::Success),
         Screen::IndexFailed(_) => ("Indexing Failed", StatusTone::Error),
     };
-    let panel = Paragraph::new(app.index_lines())
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(tone_style(tone))
-                .title(Line::from(status_span(title, tone))),
-        );
-    frame.render_widget(panel, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(tone_style(tone))
+        .title(Line::from(status_span(title, tone)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if matches!(app.screen, Screen::IndexRunning(_)) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(inner);
+        let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
+        frame.render_widget(panel, chunks[0]);
+        let progress = app.index_progress.as_ref();
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("Progress"))
+            .gauge_style(tone_style(StatusTone::Info).add_modifier(Modifier::BOLD))
+            .percent(progress_percent(progress))
+            .label(progress_label(progress));
+        frame.render_widget(gauge, chunks[1]);
+    } else {
+        let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
+        frame.render_widget(panel, inner);
+    }
 }
 
 fn render_line_panel(
@@ -1744,6 +1782,24 @@ fn context_pack_row_count(pack: &ContextPack) -> usize {
         + pack.notes.len()
 }
 
+fn progress_percent(progress: Option<&IndexProgress>) -> u16 {
+    let Some(progress) = progress else {
+        return 0;
+    };
+    let percent = progress.completed.saturating_mul(100) / progress.total.max(1);
+    percent.min(100) as u16
+}
+
+fn progress_label(progress: Option<&IndexProgress>) -> String {
+    match progress {
+        Some(progress) => format!(
+            "{} {}/{}",
+            progress.phase, progress.completed, progress.total
+        ),
+        None => "starting 0/1".to_owned(),
+    }
+}
+
 fn line_range(start: usize, end: usize) -> String {
     format!("{start}-{end}")
 }
@@ -1975,6 +2031,11 @@ enum EvidenceResult {
     ContextPack(ContextPack),
 }
 
+enum IndexJobMessage {
+    Progress(IndexProgress),
+    Finished(Result<IndexSummary, String>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexMode {
     Offline,
@@ -2063,7 +2124,7 @@ mod tests {
 
     use crate::{
         App, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus, GraphStatus,
-        IndexMode, QueryStatus, Screen, UiAction, View, reduce_screen, render,
+        IndexMode, QueryStatus, Screen, UiAction, View, progress_percent, reduce_screen, render,
     };
 
     #[test]
@@ -2162,6 +2223,44 @@ mod tests {
             cell_fg_for_text(buffer, "Confirm Indexing", None),
             Some(Color::Yellow)
         );
+    }
+
+    #[test]
+    fn renders_running_index_progress_gauge() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.screen = Screen::IndexRunning(IndexMode::Semantic);
+        app.index_progress = Some(symdex_index::IndexProgress {
+            phase: "parse",
+            completed: 2,
+            total: 4,
+            message: "Parsed src/lib.rs".to_owned(),
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Indexing Running"));
+        assert!(rendered.contains("Progress"));
+        assert!(rendered.contains("parse 2/4"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "Indexing Running", None),
+            Some(Color::Cyan)
+        );
+    }
+
+    #[test]
+    fn progress_percent_clamps_to_complete() {
+        let progress = symdex_index::IndexProgress {
+            phase: "qdrant",
+            completed: 6,
+            total: 5,
+            message: "Upserted vector points".to_owned(),
+        };
+
+        assert_eq!(progress_percent(Some(&progress)), 100);
     }
 
     #[test]
