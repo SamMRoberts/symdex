@@ -623,6 +623,41 @@ impl SqliteStore {
         })
     }
 
+    pub fn symbol_outline_summary(&self, repository_id: &str) -> Result<SymbolOutlineSummary> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.parent_symbol_id, symbols.kind,
+                        symbols.qualified_name, symbols.name, symbols.start_line,
+                        symbols.end_line, files.path
+                 FROM symbols
+                 JOIN files ON symbols.file_id = files.id
+                 WHERE files.repository_id = ?1
+                 ORDER BY files.path, symbols.start_line, symbols.qualified_name
+                 LIMIT 300",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                Ok(SymbolOutlineBaseRow {
+                    id: row.get(0)?,
+                    parent_symbol_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    qualified_name: row.get(3)?,
+                    name: row.get(4)?,
+                    start_line: row.get::<_, i64>(5)? as usize,
+                    end_line: row.get::<_, i64>(6)? as usize,
+                    path: row.get(7)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        let bases = collect_rows(rows)?;
+        Ok(SymbolOutlineSummary {
+            repository_id: repository_id.to_owned(),
+            symbols: symbol_outline_rows(bases),
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -1052,6 +1087,26 @@ pub struct FileCallDetailRow {
     pub call_line: usize,
     pub confidence: f64,
     pub resolution_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolOutlineSummary {
+    pub repository_id: String,
+    pub symbols: Vec<SymbolOutlineRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolOutlineRow {
+    pub id: String,
+    pub parent_symbol_id: Option<String>,
+    pub depth: usize,
+    pub child_count: usize,
+    pub kind: String,
+    pub qualified_name: String,
+    pub name: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1516,6 +1571,18 @@ struct FileCoverageBaseRow {
     status: FileCoverageStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolOutlineBaseRow {
+    id: String,
+    parent_symbol_id: Option<String>,
+    kind: String,
+    qualified_name: String,
+    name: String,
+    start_line: usize,
+    end_line: usize,
+    path: String,
+}
+
 fn storage_warnings(
     sqlite: &SqliteStorageSummary,
     qdrant: &QdrantStorageProjection,
@@ -1593,6 +1660,55 @@ fn chunk_vector_status(
     } else {
         ChunkVectorStatus::MissingVector
     }
+}
+
+fn symbol_outline_rows(bases: Vec<SymbolOutlineBaseRow>) -> Vec<SymbolOutlineRow> {
+    use std::collections::BTreeMap;
+
+    let parents: BTreeMap<String, Option<String>> = bases
+        .iter()
+        .map(|row| (row.id.clone(), row.parent_symbol_id.clone()))
+        .collect();
+    let mut child_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for parent_id in bases.iter().filter_map(|row| row.parent_symbol_id.as_ref()) {
+        *child_counts.entry(parent_id.clone()).or_default() += 1;
+    }
+
+    bases
+        .into_iter()
+        .map(|row| {
+            let depth = symbol_depth(&row.parent_symbol_id, &parents);
+            let child_count = child_counts.get(&row.id).copied().unwrap_or(0);
+            SymbolOutlineRow {
+                id: row.id,
+                parent_symbol_id: row.parent_symbol_id,
+                depth,
+                child_count,
+                kind: row.kind,
+                qualified_name: row.qualified_name,
+                name: row.name,
+                path: row.path,
+                start_line: row.start_line,
+                end_line: row.end_line,
+            }
+        })
+        .collect()
+}
+
+fn symbol_depth(
+    parent_symbol_id: &Option<String>,
+    parents: &std::collections::BTreeMap<String, Option<String>>,
+) -> usize {
+    let mut depth = 0;
+    let mut current = parent_symbol_id.as_ref();
+    while let Some(symbol_id) = current {
+        depth += 1;
+        if depth >= 16 {
+            break;
+        }
+        current = parents.get(symbol_id).and_then(Option::as_ref);
+    }
+    depth
 }
 
 const SCHEMA: &str = r#"
@@ -2236,6 +2352,70 @@ mod tests {
             secret.detail.chunks[0].excluded_reason.as_deref(),
             Some("secret_detected")
         );
+    }
+
+    #[test]
+    fn sqlite_builds_symbol_outline_with_parent_depths() {
+        let db = TestDb::new("symbol-outline");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let mut parent = sample_symbol("parent-symbol", "Service", "crate::Service");
+        parent.kind = "struct".to_owned();
+        let mut child = sample_symbol("child-symbol", "run", "crate::Service::run");
+        child.parent_symbol_id = Some("parent-symbol".to_owned());
+        child.start_line = 5;
+        child.end_line = 8;
+        let mut grandchild = sample_symbol("grandchild-symbol", "inner", "crate::Service::inner");
+        grandchild.parent_symbol_id = Some("child-symbol".to_owned());
+        grandchild.start_line = 6;
+        grandchild.end_line = 7;
+
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &[parent, child, grandchild],
+                &[],
+                &[],
+            )
+            .expect("symbols should persist");
+
+        let outline = store
+            .symbol_outline_summary("repo")
+            .expect("outline should load");
+
+        assert_eq!(outline.repository_id, "repo");
+        assert_eq!(outline.symbols.len(), 3);
+        let parent = outline
+            .symbols
+            .iter()
+            .find(|symbol| symbol.id == "parent-symbol")
+            .expect("parent symbol row");
+        assert_eq!(parent.depth, 0);
+        assert_eq!(parent.child_count, 1);
+        assert_eq!(parent.kind, "struct");
+
+        let child = outline
+            .symbols
+            .iter()
+            .find(|symbol| symbol.id == "child-symbol")
+            .expect("child symbol row");
+        assert_eq!(child.parent_symbol_id.as_deref(), Some("parent-symbol"));
+        assert_eq!(child.depth, 1);
+        assert_eq!(child.child_count, 1);
+
+        let grandchild = outline
+            .symbols
+            .iter()
+            .find(|symbol| symbol.id == "grandchild-symbol")
+            .expect("grandchild symbol row");
+        assert_eq!(grandchild.depth, 2);
     }
 
     #[test]

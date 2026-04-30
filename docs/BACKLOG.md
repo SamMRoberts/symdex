@@ -98,7 +98,7 @@
 - [x] storage explorer view for SQLite structural data and Qdrant semantic projection.
 - [x] index coverage view grouped by file with chunk, symbol, call, embedding, and exclusion counts.
 - [x] selected-file detail drawer for chunks, symbols, calls, vector status, and exclusion reasons.
-- [ ] symbol outline view using `symbols.parent_symbol_id`.
+- [x] symbol outline view using `symbols.parent_symbol_id`.
 - [ ] call resolution dashboard grouped by resolution status and confidence bucket.
 - [ ] embedding coverage view comparing SQLite chunks with Qdrant vector-backed chunks.
 - [ ] index runs timeline using `index_runs` metadata.

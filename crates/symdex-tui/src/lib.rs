@@ -26,13 +26,13 @@ use symdex_index::{
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
     SymbolSearchSummary, run_call_graph, run_context_pack, run_impact, run_index_coverage,
-    run_semantic_search, run_storage_explorer, run_symbol_search,
+    run_semantic_search, run_storage_explorer, run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
     ChunkVectorStatus, ContextPack, FileCoverageStatus, FileDetailSummary, IndexCoverageSummary,
     QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, SqliteStore,
     StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
-    qdrant_collection_name,
+    SymbolOutlineSummary, qdrant_collection_name,
 };
 
 pub struct TuiOptions {
@@ -48,7 +48,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle mode in storage, query, graph, and impact/context views\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -96,6 +96,9 @@ impl App {
         let coverage = sqlite
             .index_coverage_summary(root.id())
             .map_err(|error| error.to_string())?;
+        let outline = sqlite
+            .symbol_outline_summary(root.id())
+            .map_err(|error| error.to_string())?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -114,7 +117,7 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
-            storage: StorageExplorerState::completed(storage, coverage),
+            storage: StorageExplorerState::completed(storage, coverage, outline),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -136,6 +139,7 @@ impl App {
         let repository_id = repository_id.into();
         let storage = storage_summary_from_status(&repository_id, &status);
         let coverage = coverage_summary_from_status(&repository_id, &status);
+        let outline = symbol_outline_summary_from_status(&repository_id);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -153,7 +157,7 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
-            storage: StorageExplorerState::completed(storage, coverage),
+            storage: StorageExplorerState::completed(storage, coverage, outline),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -451,6 +455,10 @@ impl App {
             Ok(summary) => CoverageStatus::Completed(summary),
             Err(error) => CoverageStatus::Failed(error),
         };
+        self.storage.outline = match run_symbol_outline(&self.repo_input) {
+            Ok(summary) => OutlineStatus::Completed(summary),
+            Err(error) => OutlineStatus::Failed(error),
+        };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
         Ok(())
@@ -472,6 +480,10 @@ impl App {
             StorageMode::Coverage => match &self.storage.coverage {
                 CoverageStatus::Completed(summary) => coverage_row_count(summary),
                 CoverageStatus::Failed(_) => 1,
+            },
+            StorageMode::Outline => match &self.storage.outline {
+                OutlineStatus::Completed(summary) => outline_row_count(summary),
+                OutlineStatus::Failed(_) => 1,
             },
         }
     }
@@ -1192,6 +1204,26 @@ fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
             CoverageStatus::Failed(error) => render_storage_error(frame, area, error),
         },
+        StorageMode::Outline => match &app.storage.outline {
+            OutlineStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(7), Constraint::Length(8)])
+                    .split(area);
+                render_selectable_table(
+                    frame,
+                    chunks[0],
+                    outline_table(summary),
+                    app.storage.selection,
+                    outline_row_count(summary),
+                );
+                frame.render_widget(
+                    outline_detail_panel(summary, app.storage.selection),
+                    chunks[1],
+                );
+            }
+            OutlineStatus::Failed(error) => render_storage_error(frame, area, error),
+        },
     }
 }
 
@@ -1455,6 +1487,13 @@ fn coverage_summary_from_status(
                 calls: Vec::new(),
             },
         }],
+    }
+}
+
+fn symbol_outline_summary_from_status(repository_id: &str) -> SymbolOutlineSummary {
+    SymbolOutlineSummary {
+        repository_id: repository_id.to_owned(),
+        symbols: Vec::new(),
     }
 }
 
@@ -2215,6 +2254,97 @@ fn chunk_vector_status(status: ChunkVectorStatus) -> (&'static str, StatusTone) 
     }
 }
 
+fn outline_table(summary: &SymbolOutlineSummary) -> Table<'_> {
+    let rows = summary.symbols.iter().take(12).map(|symbol| {
+        Row::new(vec![
+            Cell::from(outline_symbol_label(symbol)),
+            Cell::from(symbol.kind.as_str()),
+            Cell::from(symbol.path.as_str()),
+            Cell::from(line_range(symbol.start_line, symbol.end_line)),
+            Cell::from(symbol.child_count.to_string()),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(36),
+            Constraint::Length(10),
+            Constraint::Percentage(28),
+            Constraint::Length(9),
+            Constraint::Length(5),
+        ],
+    )
+    .header(table_header(["Symbol", "Kind", "Path", "Lines", "Kids"]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Symbol Outline | Symbols: {} | F2 next storage mode",
+        summary.symbols.len()
+    )))
+    .column_spacing(1)
+}
+
+fn outline_detail_panel(summary: &SymbolOutlineSummary, selection: usize) -> Paragraph<'_> {
+    let Some(symbol) = selected_outline_row(summary, selection) else {
+        return Paragraph::new(vec![Line::from("No symbols indexed.")])
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Symbol Detail"),
+            );
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(symbol.qualified_name.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Kind: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(symbol.kind.as_str()),
+            Span::raw(" "),
+            Span::styled("Depth: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(symbol.depth.to_string()),
+            Span::raw(" "),
+            Span::styled("Children: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(symbol.child_count.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Parent: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(symbol.parent_symbol_id.as_deref().unwrap_or("<root>")),
+        ]),
+        Line::from(vec![
+            Span::styled("Location: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "{}:{}-{}",
+                symbol.path, symbol.start_line, symbol.end_line
+            )),
+        ]),
+    ];
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Symbol Detail"),
+    )
+}
+
+fn outline_row_count(summary: &SymbolOutlineSummary) -> usize {
+    summary.symbols.len().min(12)
+}
+
+fn selected_outline_row(
+    summary: &SymbolOutlineSummary,
+    selection: usize,
+) -> Option<&symdex_store::SymbolOutlineRow> {
+    summary
+        .symbols
+        .get(selection.min(summary.symbols.len().saturating_sub(1)))
+}
+
+fn outline_symbol_label(symbol: &symdex_store::SymbolOutlineRow) -> String {
+    let indent = "  ".repeat(symbol.depth.min(6));
+    format!("{indent}{}", symbol.qualified_name)
+}
+
 fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
     Row::new(vec![
         Cell::from(label),
@@ -2692,7 +2822,7 @@ impl View {
                 "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab next view | F2 overview/coverage | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | F2 overview/coverage/outline | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
                 "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
@@ -2745,15 +2875,21 @@ struct StorageExplorerState {
     mode: StorageMode,
     explorer: StorageStatus,
     coverage: CoverageStatus,
+    outline: OutlineStatus,
     selection: usize,
 }
 
 impl StorageExplorerState {
-    fn completed(explorer: StorageExplorerSummary, coverage: IndexCoverageSummary) -> Self {
+    fn completed(
+        explorer: StorageExplorerSummary,
+        coverage: IndexCoverageSummary,
+        outline: SymbolOutlineSummary,
+    ) -> Self {
         Self {
             mode: StorageMode::Explorer,
             explorer: StorageStatus::Completed(explorer),
             coverage: CoverageStatus::Completed(coverage),
+            outline: OutlineStatus::Completed(outline),
             selection: 0,
         }
     }
@@ -2763,6 +2899,7 @@ impl StorageExplorerState {
 enum StorageMode {
     Explorer,
     Coverage,
+    Outline,
 }
 
 impl StorageMode {
@@ -2770,13 +2907,15 @@ impl StorageMode {
         match self {
             Self::Explorer => "storage overview",
             Self::Coverage => "index coverage",
+            Self::Outline => "symbol outline",
         }
     }
 
     fn toggled(self) -> Self {
         match self {
             Self::Explorer => Self::Coverage,
-            Self::Coverage => Self::Explorer,
+            Self::Coverage => Self::Outline,
+            Self::Outline => Self::Explorer,
         }
     }
 }
@@ -2788,6 +2927,11 @@ enum StorageStatus {
 
 enum CoverageStatus {
     Completed(IndexCoverageSummary),
+    Failed(String),
+}
+
+enum OutlineStatus {
+    Completed(SymbolOutlineSummary),
     Failed(String),
 }
 
@@ -3027,7 +3171,7 @@ mod tests {
         FileChunkDetailRow, FileCoverageRow, FileCoverageStatus, FileDetailSummary,
         FileSymbolDetailRow, IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus,
         SqliteStorageSummary, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus,
-        SymbolSearchRow,
+        SymbolOutlineRow, SymbolOutlineSummary, SymbolSearchRow,
     };
 
     use crate::{
@@ -3154,6 +3298,7 @@ mod tests {
         app.storage = StorageExplorerState::completed(
             sample_storage_summary(),
             sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
         );
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3182,6 +3327,7 @@ mod tests {
         app.storage = StorageExplorerState::completed(
             sample_storage_summary(),
             sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
         );
 
         assert_eq!(app.storage.selection, 0);
@@ -3206,6 +3352,7 @@ mod tests {
         app.storage = StorageExplorerState::completed(
             sample_storage_summary(),
             sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
         );
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3227,6 +3374,7 @@ mod tests {
         app.storage = StorageExplorerState::completed(
             sample_storage_summary(),
             sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
         );
         app.storage.selection = 2;
 
@@ -3239,12 +3387,31 @@ mod tests {
     }
 
     #[test]
+    fn storage_f2_cycles_to_symbol_outline() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+        );
+
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert_eq!(app.storage.mode, StorageMode::Coverage);
+        assert!(!app.handle_key(KeyCode::F(2)));
+
+        assert_eq!(app.storage.mode, StorageMode::Outline);
+        assert_eq!(app.message, "Storage mode set to symbol outline.");
+    }
+
+    #[test]
     fn renders_index_coverage_file_rows_without_source_text() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
         app.storage = StorageExplorerState::completed(
             sample_storage_summary(),
             sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(150, 24);
@@ -3277,6 +3444,7 @@ mod tests {
         app.storage = StorageExplorerState::completed(
             sample_storage_summary(),
             sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
 
@@ -3302,6 +3470,7 @@ mod tests {
         app.storage = StorageExplorerState::completed(
             sample_storage_summary(),
             sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(80, 24);
@@ -3315,6 +3484,79 @@ mod tests {
         assert!(rendered.contains("Path"));
         assert!(rendered.contains("Status"));
         assert!(rendered.contains("File Coverage"));
+    }
+
+    #[test]
+    fn renders_symbol_outline_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+        );
+        app.storage.mode = StorageMode::Outline;
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Symbol Outline"));
+        assert!(rendered.contains("crate::Service"));
+        assert!(rendered.contains("crate::Service::run"));
+        assert!(rendered.contains("Symbol Detail"));
+        assert!(rendered.contains("Children"));
+        assert!(!rendered.contains("source_text"));
+    }
+
+    #[test]
+    fn symbol_outline_selection_drives_detail_panel() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+        );
+        app.storage.mode = StorageMode::Outline;
+
+        assert_eq!(app.storage.selection, 0);
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.storage.selection, 1);
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("crate::Service::run"));
+        assert!(rendered.contains("Depth"));
+        assert!(rendered.contains("parent-symbol"));
+        assert!(rendered.contains("src/lib.rs:5-8"));
+    }
+
+    #[test]
+    fn renders_symbol_outline_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+        );
+        app.storage.mode = StorageMode::Outline;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Storage"));
+        assert!(rendered.contains("Symbol"));
+        assert!(rendered.contains("Kind"));
+        assert!(rendered.contains("Symbol Detail"));
     }
 
     #[test]
@@ -3898,6 +4140,38 @@ mod tests {
                         symbols: Vec::new(),
                         calls: Vec::new(),
                     },
+                },
+            ],
+        }
+    }
+
+    fn sample_symbol_outline_summary() -> SymbolOutlineSummary {
+        SymbolOutlineSummary {
+            repository_id: "repo".to_owned(),
+            symbols: vec![
+                SymbolOutlineRow {
+                    id: "parent-symbol".to_owned(),
+                    parent_symbol_id: None,
+                    depth: 0,
+                    child_count: 1,
+                    kind: "struct".to_owned(),
+                    qualified_name: "crate::Service".to_owned(),
+                    name: "Service".to_owned(),
+                    path: "src/lib.rs".to_owned(),
+                    start_line: 1,
+                    end_line: 10,
+                },
+                SymbolOutlineRow {
+                    id: "child-symbol".to_owned(),
+                    parent_symbol_id: Some("parent-symbol".to_owned()),
+                    depth: 1,
+                    child_count: 0,
+                    kind: "function".to_owned(),
+                    qualified_name: "crate::Service::run".to_owned(),
+                    name: "run".to_owned(),
+                    path: "src/lib.rs".to_owned(),
+                    start_line: 5,
+                    end_line: 8,
                 },
             ],
         }

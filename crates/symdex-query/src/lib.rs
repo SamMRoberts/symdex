@@ -4,7 +4,8 @@ use symdex_core::RepoRoot;
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallSearchRow, ContextPack, IndexCoverageSummary, QdrantClient, SqliteStore,
-    StorageExplorerSummary, StoreConfig, SymbolSearchRow, qdrant_collection_name,
+    StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
+    qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +189,14 @@ pub fn run_index_coverage(repo: &str) -> Result<IndexCoverageSummary, String> {
     let sqlite = sqlite_for_read()?;
     sqlite
         .index_coverage_summary(root.id())
+        .map_err(|error| error.to_string())
+}
+
+pub fn run_symbol_outline(repo: &str) -> Result<SymbolOutlineSummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    sqlite
+        .symbol_outline_summary(root.id())
         .map_err(|error| error.to_string())
 }
 

@@ -86,8 +86,8 @@ terminal panes.
   storage, query, call graph, impact, and context-pack tables.
 - In the Storage view, row selection should drive a visible detail panel for
   the selected SQLite/Qdrant metric and nearby storage health notes.
-- In the Storage view, `F2` toggles between storage overview and index coverage
-  modes.
+- In the Storage view, `F2` toggles between storage overview, index coverage,
+  and symbol outline modes.
 - In the Doctor view, row selection must drive visible detail output for the
   selected check rather than highlight-only behavior.
 - In the Doctor view, `Enter` should toggle an expanded selected-check detail
@@ -150,8 +150,8 @@ represent the indexed repository.
   implementation details.
 - The first implementation is a Storage tab that renders a selectable
   SQLite/Qdrant metric table plus a detail/health panel.
-- The Storage tab also includes an `F2` index coverage mode for file-grouped
-  chunk, symbol, call, embedding, vector, exclusion, and status counts.
+- The Storage tab also includes `F2` modes for file-grouped index coverage and
+  symbol outlines.
 
 ### Index Coverage View
 
@@ -193,6 +193,8 @@ represent the indexed repository.
 - Show symbol kind, qualified name, and line range.
 - Selecting a symbol should allow jumping to callers/callees, impact, and
   context-pack views using the symbol query.
+- The first implementation lives in the Storage tab behind `F2` and shows
+  symbol depth, child count, path, line range, and selected-symbol detail.
 
 ### Call Resolution Dashboard
 
@@ -319,7 +321,7 @@ Current dashboard keys:
 - `p`: open the impact/context-pack viewer
 - `Tab`: switch to the next major TUI view
 - `Shift+Tab`: switch to the previous major TUI view
-- `F2`: toggle storage overview and index coverage in the storage explorer
+- `F2`: toggle storage overview, index coverage, and symbol outline in the storage explorer
 - `F2`: toggle symbol and semantic query modes in the query workbench
 - `F2`: toggle callers and callees in the symbol/call graph browser
 - `F2`: toggle impact and context-pack modes in the impact/context-pack viewer
