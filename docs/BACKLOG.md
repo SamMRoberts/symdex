@@ -79,7 +79,7 @@
 - [x] status-colored labels for confidence and resolution inside table rows.
 - [x] stateful selection/focus for result lists and tables.
 - [x] per-view footer help text.
-- confirmation panel styling for long-running jobs.
+- [x] confirmation panel styling for long-running jobs.
 - progress `Gauge` for indexing when progress reporting exists.
 - narrow-terminal render tests for 80x24 layout.
 - [x] render tests for active tabs and status colors.

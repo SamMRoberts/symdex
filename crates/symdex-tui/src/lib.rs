@@ -1076,8 +1076,27 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
             _ => render_line_panel(frame, area, "Impact/Context Pack", app.evidence_lines()),
         },
-        View::Indexing => render_line_panel(frame, area, "Indexing", app.index_lines()),
+        View::Indexing => render_index_panel(frame, area, app),
     }
+}
+
+fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let (title, tone) = match app.screen {
+        Screen::Dashboard => ("Indexing", StatusTone::Info),
+        Screen::ConfirmIndex(_) => ("Confirm Indexing", StatusTone::Warning),
+        Screen::IndexRunning(_) => ("Indexing Running", StatusTone::Info),
+        Screen::IndexCompleted(_) => ("Indexing Complete", StatusTone::Success),
+        Screen::IndexFailed(_) => ("Indexing Failed", StatusTone::Error),
+    };
+    let panel = Paragraph::new(app.index_lines())
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(tone_style(tone))
+                .title(Line::from(status_span(title, tone))),
+        );
+    frame.render_widget(panel, area);
 }
 
 fn render_line_panel(
@@ -1801,6 +1820,10 @@ enum StatusTone {
 }
 
 fn status_span(label: &str, tone: StatusTone) -> Span<'_> {
+    Span::styled(label, tone_style(tone).add_modifier(Modifier::BOLD))
+}
+
+fn tone_style(tone: StatusTone) -> Style {
     let color = match tone {
         StatusTone::Success => Color::Green,
         StatusTone::Warning => Color::Yellow,
@@ -1808,7 +1831,7 @@ fn status_span(label: &str, tone: StatusTone) -> Span<'_> {
         StatusTone::Info => Color::Cyan,
         StatusTone::Dim => Color::DarkGray,
     };
-    Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD))
+    Style::new().fg(color)
 }
 
 enum DiagnosticsState {
@@ -2118,6 +2141,26 @@ mod tests {
         assert_eq!(
             cell_fg_for_text(terminal.backend().buffer(), "failed", None),
             Some(Color::Red)
+        );
+    }
+
+    #[test]
+    fn renders_index_confirmation_panel_with_warning_style() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.screen = Screen::ConfirmIndex(IndexMode::Semantic);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Confirm Indexing"));
+        assert!(rendered.contains("Run semantic indexing"));
+        assert!(rendered.contains("Press y to start"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "Confirm Indexing", None),
+            Some(Color::Yellow)
         );
     }
 
