@@ -7,13 +7,13 @@ use symdex_core::RepoRoot;
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{QdrantClient, SqliteStore, StoreConfig, qdrant_collection_name};
 
-pub const TOOL_SEARCH: &str = "symdex.search";
-pub const TOOL_FIND_SYMBOL: &str = "symdex.find_symbol";
-pub const TOOL_CALLERS: &str = "symdex.callers";
-pub const TOOL_CALLEES: &str = "symdex.callees";
-pub const TOOL_IMPACT: &str = "symdex.impact";
-pub const TOOL_CONTEXT_PACK: &str = "symdex.context_pack";
-pub const TOOL_INDEX_STATUS: &str = "symdex.index_status";
+pub const TOOL_SEARCH: &str = "symdex_search";
+pub const TOOL_FIND_SYMBOL: &str = "symdex_find_symbol";
+pub const TOOL_CALLERS: &str = "symdex_callers";
+pub const TOOL_CALLEES: &str = "symdex_callees";
+pub const TOOL_IMPACT: &str = "symdex_impact";
+pub const TOOL_CONTEXT_PACK: &str = "symdex_context_pack";
+pub const TOOL_INDEX_STATUS: &str = "symdex_index_status";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -495,6 +495,12 @@ mod tests {
         let tools = responses[1]["result"]["tools"]
             .as_array()
             .expect("tools should be an array");
+        assert!(tools.iter().all(|tool| {
+            !tool["name"]
+                .as_str()
+                .expect("tool name should be a string")
+                .contains('.')
+        }));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_FIND_SYMBOL));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_CONTEXT_PACK));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_INDEX_STATUS));

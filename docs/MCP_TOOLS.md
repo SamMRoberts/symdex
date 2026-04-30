@@ -16,7 +16,7 @@ The MVP server runs over stdio with JSON-RPC messages and supports the standard
 responses include compact JSON in `structuredContent` and mirrored text content
 for hosts that only display text results.
 
-### `symdex.search`
+### `symdex_search`
 
 Semantic search over indexed chunks.
 
@@ -52,7 +52,7 @@ The search tool embeds the query with the configured local Ollama model and
 queries the local Qdrant collection. It returns chunk metadata only; it does not
 return source excerpts in the current MVP.
 
-### `symdex.find_symbol`
+### `symdex_find_symbol`
 
 Find symbols by exact or fuzzy name.
 
@@ -66,7 +66,7 @@ Input:
 }
 ```
 
-### `symdex.callers`
+### `symdex_callers`
 
 Find direct callers of a symbol.
 
@@ -79,7 +79,7 @@ Input:
 }
 ```
 
-### `symdex.callees`
+### `symdex_callees`
 
 Find direct callees from a symbol.
 
@@ -92,7 +92,7 @@ Input:
 }
 ```
 
-### `symdex.impact`
+### `symdex_impact`
 
 Return likely affected files and symbols.
 
@@ -117,7 +117,7 @@ Output should separate:
 The current MVP fills direct callers and direct callees. The other buckets are
 present but empty until deeper impact analysis is implemented.
 
-### `symdex.context_pack`
+### `symdex_context_pack`
 
 Return compact metadata-only evidence for editing context.
 
@@ -156,9 +156,9 @@ Output:
 
 The context pack is intentionally compact and does not return source text. It is
 currently structural only; semantic hits can be combined by calling
-`symdex.search` separately.
+`symdex_search` separately.
 
-### `symdex.index_status`
+### `symdex_index_status`
 
 Return local SQLite index counts.
 

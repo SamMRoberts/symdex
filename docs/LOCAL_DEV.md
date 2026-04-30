@@ -80,11 +80,12 @@ Implemented CLI commands currently include:
   service configuration. Use `o` to confirm offline indexing, `s` to confirm
   semantic indexing, `d` to run doctor diagnostics, `i` for indexing controls,
   `w` for the query workbench, `g` for the symbol/call graph browser, `p` for
-  the impact/context-pack viewer, `Tab` to toggle view-local modes, `r` to
-  refresh status, and `q` or `Esc` to quit.
+  the impact/context-pack viewer, `Tab` / `Shift+Tab` to switch major views,
+  `F2` to toggle view-local modes, `r` to refresh status, and `q` or `Esc` to
+  quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
-  `symdex.search`, `symdex.find_symbol`, `symdex.callers`, `symdex.callees`,
-  `symdex.impact`, and `symdex.index_status`.
+  `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
+  `symdex_impact`, `symdex_context_pack`, and `symdex_index_status`.
 
 `doctor` checks whether Qdrant is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector

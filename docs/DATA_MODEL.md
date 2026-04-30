@@ -44,7 +44,7 @@ CREATE TABLE index_runs (
 
 Successful semantic indexing runs are recorded here with the embedding model,
 vector dimension, and embedded chunk count. `index-status` and
-`symdex.index_status` expose the latest successful embedding model and
+`symdex_index_status` expose the latest successful embedding model and
 dimension when present.
 
 ### `files`
