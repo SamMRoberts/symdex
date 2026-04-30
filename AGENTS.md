@@ -35,7 +35,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Use `crates/symdex-core` for parsing, chunking, symbols, calls, hashing, and domain types.
 - Use `crates/symdex-diagnostics` for local service and configuration diagnostics shared by CLI and TUI.
 - Use `crates/symdex-index` for indexing orchestration shared by CLI and TUI.
-- Use `crates/symdex-query` for search and symbol-query orchestration shared by CLI and TUI.
+- Use `crates/symdex-query` for search, symbol-query, and call-graph orchestration shared by CLI and TUI.
 - Use `crates/symdex-store` for SQLite and Qdrant adapters.
 - Use `crates/symdex-embed` for the Ollama embedding client.
 - Use `crates/symdex-cli` for command-line orchestration.

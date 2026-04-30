@@ -65,7 +65,7 @@
 - [x] indexing controls with confirmation.
 - [x] doctor diagnostics view.
 - [x] query workbench for search and symbols.
-- symbol/call graph browser.
+- [x] symbol/call graph browser.
 - impact and context-pack viewer.
 - [x] TUI state reducer tests.
 - [x] `ratatui` render tests.

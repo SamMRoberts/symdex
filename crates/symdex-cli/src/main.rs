@@ -4,7 +4,9 @@ use std::fs;
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
-use symdex_query::{run_semantic_search, run_symbol_search};
+use symdex_query::{
+    CallDirection, CallGraphSummary, run_call_graph, run_semantic_search, run_symbol_search,
+};
 use symdex_store::{SqliteStore, StoreConfig, sqlite_parent};
 
 fn main() {
@@ -156,34 +158,26 @@ fn symbol(repo: &str, query: &str) -> Result<(), String> {
 }
 
 fn callers(repo: &str, query: &str) -> Result<(), String> {
-    if query.is_empty() {
-        return Err("callers requires a symbol query".to_owned());
-    }
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
-    let rows = sqlite
-        .callers(root.id(), query)
-        .map_err(|error| error.to_string())?;
-    println!("callers: {}", rows.len());
-    for row in rows {
-        print_call_row(&row);
-    }
+    let summary = run_call_graph(repo, query, CallDirection::Callers).map_err(|error| {
+        if error.contains("requires a symbol query") {
+            "callers requires a symbol query".to_owned()
+        } else {
+            error
+        }
+    })?;
+    print_call_graph_summary(&summary);
     Ok(())
 }
 
 fn callees(repo: &str, query: &str) -> Result<(), String> {
-    if query.is_empty() {
-        return Err("callees requires a symbol query".to_owned());
-    }
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
-    let rows = sqlite
-        .callees(root.id(), query)
-        .map_err(|error| error.to_string())?;
-    println!("callees: {}", rows.len());
-    for row in rows {
-        print_call_row(&row);
-    }
+    let summary = run_call_graph(repo, query, CallDirection::Callees).map_err(|error| {
+        if error.contains("requires a symbol query") {
+            "callees requires a symbol query".to_owned()
+        } else {
+            error
+        }
+    })?;
+    print_call_graph_summary(&summary);
     Ok(())
 }
 
@@ -232,6 +226,13 @@ fn print_call_row(row: &symdex_store::CallSearchRow) {
         row.callee_text,
         row.resolution_status
     );
+}
+
+fn print_call_graph_summary(summary: &CallGraphSummary) {
+    println!("{}: {}", summary.direction.label(), summary.rows.len());
+    for row in &summary.rows {
+        print_call_row(row);
+    }
 }
 
 fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {

@@ -59,8 +59,7 @@ binary.
 
 ### Symbol and Call Browser
 
-- Show symbol search results.
-- Show direct callers and callees.
+- Show direct callers and callees with `g`, typed symbol text, `Tab`, and `Enter`.
 - Preserve resolution status, confidence, and unresolved/ambiguous labels.
 
 ### Impact and Context Pack Viewer
@@ -85,10 +84,15 @@ Current dashboard keys:
 - `d`: run doctor diagnostics
 - `i`: return to indexing controls
 - `w`: open the query workbench
+- `g`: open the symbol/call graph browser
 - `Tab`: toggle symbol and semantic query modes in the query workbench
+- `Tab`: toggle callers and callees in the symbol/call graph browser
 - typed text: edit the query workbench input
+- typed text: edit the symbol/call graph browser input
 - `Backspace`: edit the query workbench input
+- `Backspace`: edit the symbol/call graph browser input
 - `Enter`: run the current query workbench query
+- `Enter`: run the current symbol/call graph lookup
 - `r`: refresh repository status
 - `y`: confirm a pending indexing job
 - `n` or `Esc`: cancel a pending indexing job

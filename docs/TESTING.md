@@ -72,9 +72,9 @@ cargo run -p symdex-cli -- tui --help
 ```
 
 Current TUI tests cover dashboard rendering, doctor diagnostics rendering, query
-workbench rendering and input state, and the indexing confirmation reducer.
-Future TUI views should add similar reducer and render coverage before being
-marked complete.
+workbench rendering and input state, symbol/call graph rendering and input
+state, and the indexing confirmation reducer. Future TUI views should add
+similar reducer and render coverage before being marked complete.
 
 ## Agent expectation
 

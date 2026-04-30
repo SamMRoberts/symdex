@@ -20,7 +20,10 @@ use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
-use symdex_query::{QueryMode, QueryResult, run_semantic_search, run_symbol_search};
+use symdex_query::{
+    CallDirection, CallGraphSummary, QueryMode, QueryResult, run_call_graph, run_semantic_search,
+    run_symbol_search,
+};
 use symdex_store::{RepositoryStatus, SqliteStore, StoreConfig};
 
 pub struct TuiOptions {
@@ -36,7 +39,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    Tab       Toggle query mode in the workbench\n    Enter     Run query or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    Tab       Toggle mode in query and graph views\n    Enter     Run query/graph lookup or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -54,10 +57,12 @@ pub struct App {
     last_index_summary: Option<IndexSummary>,
     diagnostics: DiagnosticsState,
     query: QueryWorkbenchState,
+    graph: GraphBrowserState,
     last_error: Option<String>,
     index_receiver: Option<Receiver<Result<IndexSummary, String>>>,
     diagnostics_receiver: Option<Receiver<Result<DiagnosticReport, String>>>,
     query_receiver: Option<Receiver<Result<QueryResult, String>>>,
+    graph_receiver: Option<Receiver<Result<CallGraphSummary, String>>>,
 }
 
 impl App {
@@ -86,10 +91,12 @@ impl App {
             last_index_summary: None,
             diagnostics: DiagnosticsState::Idle,
             query: QueryWorkbenchState::default(),
+            graph: GraphBrowserState::default(),
             last_error: None,
             index_receiver: None,
             diagnostics_receiver: None,
             query_receiver: None,
+            graph_receiver: None,
         })
     }
 
@@ -114,10 +121,12 @@ impl App {
             last_index_summary: None,
             diagnostics: DiagnosticsState::Idle,
             query: QueryWorkbenchState::default(),
+            graph: GraphBrowserState::default(),
             last_error: None,
             index_receiver: None,
             diagnostics_receiver: None,
             query_receiver: None,
+            graph_receiver: None,
         }
     }
 
@@ -338,6 +347,49 @@ impl App {
         lines
     }
 
+    fn graph_lines(&self) -> Vec<Line<'_>> {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{} (Tab toggles)", self.graph.direction.label())),
+            ]),
+            Line::from(vec![
+                Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(if self.graph.input.is_empty() {
+                    "<type symbol name>".to_owned()
+                } else {
+                    self.graph.input.clone()
+                }),
+            ]),
+            Line::from("Enter runs the lookup. Backspace edits. Esc clears input or leaves graph."),
+            Line::from(""),
+        ];
+
+        match &self.graph.status {
+            GraphStatus::Idle => {
+                lines.push(Line::from("No graph lookup has run in this TUI session."));
+            }
+            GraphStatus::Running => {
+                lines.push(Line::from(format!(
+                    "Loading {} for {}...",
+                    self.graph.direction.label(),
+                    self.graph.input
+                )));
+            }
+            GraphStatus::Completed(summary) => {
+                lines.extend(call_graph_lines(summary));
+            }
+            GraphStatus::Failed(error) => {
+                lines.push(Line::from(vec![
+                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(error.as_str()),
+                ]));
+            }
+        }
+
+        lines
+    }
+
     fn refresh_status(&mut self) -> Result<(), String> {
         let store_config = StoreConfig::from_env();
         let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
@@ -352,6 +404,9 @@ impl App {
     fn handle_key(&mut self, code: KeyCode) -> bool {
         if self.view == View::Query {
             return self.handle_query_key(code);
+        }
+        if self.view == View::Graph {
+            return self.handle_graph_key(code);
         }
 
         match code {
@@ -371,6 +426,10 @@ impl App {
             KeyCode::Char('w') => {
                 self.view = View::Query;
                 self.message = "Query workbench selected.".to_owned();
+            }
+            KeyCode::Char('g') => {
+                self.view = View::Graph;
+                self.message = "Symbol/call graph browser selected.".to_owned();
             }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
                 self.screen =
@@ -439,6 +498,40 @@ impl App {
         false
     }
 
+    fn handle_graph_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('q') if self.graph.input.is_empty() => return true,
+            KeyCode::Esc if self.graph.input.is_empty() => {
+                self.view = View::Indexing;
+                self.message = "Indexing controls selected.".to_owned();
+            }
+            KeyCode::Esc => {
+                self.graph.input.clear();
+                self.graph.status = GraphStatus::Idle;
+                self.message = "Graph input cleared.".to_owned();
+            }
+            KeyCode::Tab => {
+                self.graph.direction = self.graph.direction.toggled();
+                self.graph.status = GraphStatus::Idle;
+                self.message = format!("Graph mode set to {}.", self.graph.direction.label());
+            }
+            KeyCode::Enter => {
+                self.start_graph_lookup();
+            }
+            KeyCode::Backspace => {
+                self.graph.input.pop();
+            }
+            KeyCode::Char(character) => {
+                self.graph.input.push(character);
+                if matches!(self.graph.status, GraphStatus::Failed(_)) {
+                    self.graph.status = GraphStatus::Idle;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn start_index_job(&mut self, mode: IndexMode) {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
@@ -491,6 +584,26 @@ impl App {
         self.query.status = QueryStatus::Running;
         self.query_receiver = Some(receiver);
         self.message = format!("{} query started.", mode.label());
+    }
+
+    fn start_graph_lookup(&mut self) {
+        let query = self.graph.input.trim().to_owned();
+        if query.is_empty() {
+            self.graph.status = GraphStatus::Failed("symbol query is empty".to_owned());
+            self.message = "Graph lookup failed.".to_owned();
+            return;
+        }
+
+        let direction = self.graph.direction;
+        let repo = self.repo_input.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_call_graph(&repo, &query, direction);
+            let _ = sender.send(result);
+        });
+        self.graph.status = GraphStatus::Running;
+        self.graph_receiver = Some(receiver);
+        self.message = format!("{} graph lookup started.", direction.label());
     }
 
     fn poll_index_job(&mut self) {
@@ -581,6 +694,30 @@ impl App {
             }
         }
     }
+
+    fn poll_graph(&mut self) {
+        let Some(receiver) = &self.graph_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(summary)) => {
+                self.graph_receiver = None;
+                self.graph.status = GraphStatus::Completed(summary);
+                self.message = "Graph lookup completed.".to_owned();
+            }
+            Ok(Err(error)) => {
+                self.graph_receiver = None;
+                self.graph.status = GraphStatus::Failed(error);
+                self.message = "Graph lookup failed.".to_owned();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.graph_receiver = None;
+                self.graph.status = GraphStatus::Failed("graph worker disconnected".to_owned());
+                self.message = "Graph lookup failed.".to_owned();
+            }
+        }
+    }
 }
 
 pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), String> {
@@ -621,11 +758,13 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 View::Indexing => "Indexing",
                 View::Diagnostics => "Doctor Diagnostics",
                 View::Query => "Query Workbench",
+                View::Graph => "Symbol/Call Graph",
             };
             let right_lines = match app.view {
                 View::Indexing => app.index_lines(),
                 View::Diagnostics => app.diagnostics_lines(),
                 View::Query => app.query_lines(),
+                View::Graph => app.graph_lines(),
             };
             let right_panel = List::new(
                 right_lines
@@ -651,6 +790,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
         app.poll_index_job();
         app.poll_diagnostics();
         app.poll_query();
+        app.poll_graph();
         render(terminal, &app)?;
         if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
             continue;
@@ -832,11 +972,43 @@ fn query_result_lines(result: &QueryResult) -> Vec<Line<'_>> {
     }
 }
 
+fn call_graph_lines(summary: &CallGraphSummary) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(format!(
+            "{}: {}",
+            summary.direction.label(),
+            summary.rows.len()
+        )),
+        Line::from(format!("Symbol query: {}", summary.query)),
+    ];
+    if summary.rows.is_empty() {
+        lines.push(Line::from("No direct call relationships matched."));
+        return lines;
+    }
+
+    lines.extend(summary.rows.iter().take(12).map(|row| {
+        Line::from(format!(
+            "{} conf={:.2} {}:{}-{} callee={} status={}",
+            row.symbol_qualified_name
+                .as_deref()
+                .unwrap_or("<unresolved>"),
+            row.confidence,
+            row.path.as_deref().unwrap_or("<unknown>"),
+            row.start_line.unwrap_or(0),
+            row.end_line.unwrap_or(0),
+            row.callee_text,
+            row.resolution_status
+        ))
+    }));
+    lines
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Indexing,
     Diagnostics,
     Query,
+    Graph,
 }
 
 enum DiagnosticsState {
@@ -866,6 +1038,29 @@ enum QueryStatus {
     Idle,
     Running,
     Completed(QueryResult),
+    Failed(String),
+}
+
+struct GraphBrowserState {
+    direction: CallDirection,
+    input: String,
+    status: GraphStatus,
+}
+
+impl Default for GraphBrowserState {
+    fn default() -> Self {
+        Self {
+            direction: CallDirection::Callers,
+            input: String::new(),
+            status: GraphStatus::Idle,
+        }
+    }
+}
+
+enum GraphStatus {
+    Idle,
+    Running,
+    Completed(CallGraphSummary),
     Failed(String),
 }
 
@@ -946,12 +1141,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
-    use symdex_query::{QueryMode, QueryResult, SymbolSearchSummary};
-    use symdex_store::RepositoryStatus;
+    use symdex_query::{
+        CallDirection, CallGraphSummary, QueryMode, QueryResult, SymbolSearchSummary,
+    };
+    use symdex_store::{CallSearchRow, RepositoryStatus};
 
     use crate::{
-        App, DiagnosticsState, IndexMode, QueryStatus, Screen, UiAction, View, reduce_screen,
-        render,
+        App, DiagnosticsState, GraphStatus, IndexMode, QueryStatus, Screen, UiAction, View,
+        reduce_screen, render,
     };
 
     #[test]
@@ -1073,6 +1270,55 @@ mod tests {
     }
 
     #[test]
+    fn renders_symbol_call_graph_results() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Graph;
+        app.graph.direction = CallDirection::Callers;
+        app.graph.input = "add".to_owned();
+        app.graph.status = GraphStatus::Completed(CallGraphSummary {
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            direction: CallDirection::Callers,
+            rows: vec![sample_call_row()],
+        });
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Symbol/Call Graph"));
+        assert!(rendered.contains("callers"));
+        assert!(rendered.contains("crate::caller"));
+        assert!(rendered.contains("resolved_exact"));
+    }
+
+    #[test]
+    fn graph_browser_accepts_input_and_backspace() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Graph;
+
+        assert!(!app.handle_graph_key(KeyCode::Char('a')));
+        assert!(!app.handle_graph_key(KeyCode::Char('d')));
+        assert!(!app.handle_graph_key(KeyCode::Char('d')));
+        assert_eq!(app.graph.input, "add");
+
+        assert!(!app.handle_graph_key(KeyCode::Backspace));
+        assert_eq!(app.graph.input, "ad");
+    }
+
+    #[test]
+    fn graph_browser_toggles_call_direction() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Graph;
+        assert_eq!(app.graph.direction, CallDirection::Callers);
+
+        assert!(!app.handle_graph_key(KeyCode::Tab));
+        assert_eq!(app.graph.direction, CallDirection::Callees);
+    }
+
+    #[test]
     fn reducer_requires_confirmation_before_indexing() {
         let screen = reduce_screen(
             Screen::Dashboard,
@@ -1119,6 +1365,22 @@ mod tests {
             last_indexed_at: Some("123".to_owned()),
             embedding_model: Some("nomic-embed-text".to_owned()),
             embedding_dimension: Some(768),
+        }
+    }
+
+    fn sample_call_row() -> CallSearchRow {
+        CallSearchRow {
+            callee_text: "add".to_owned(),
+            call_line: 7,
+            confidence: 1.0,
+            resolution_status: "resolved_exact".to_owned(),
+            symbol_id: Some("symbol-1".to_owned()),
+            symbol_name: Some("caller".to_owned()),
+            symbol_qualified_name: Some("crate::caller".to_owned()),
+            symbol_kind: Some("function".to_owned()),
+            path: Some("src/lib.rs".to_owned()),
+            start_line: Some(5),
+            end_line: Some(8),
         }
     }
 }

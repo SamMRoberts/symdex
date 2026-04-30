@@ -3,7 +3,7 @@
 use symdex_core::RepoRoot;
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    QdrantClient, SqliteStore, StoreConfig, SymbolSearchRow, qdrant_collection_name,
+    CallSearchRow, QdrantClient, SqliteStore, StoreConfig, SymbolSearchRow, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,28 @@ impl QueryMode {
         match self {
             Self::Semantic => Self::Symbol,
             Self::Symbol => Self::Semantic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallDirection {
+    Callers,
+    Callees,
+}
+
+impl CallDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Callers => "callers",
+            Self::Callees => "callees",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Callers => Self::Callees,
+            Self::Callees => Self::Callers,
         }
     }
 }
@@ -59,6 +81,14 @@ pub struct SemanticSearchResult {
     pub chunk_kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallGraphSummary {
+    pub repository_id: String,
+    pub query: String,
+    pub direction: CallDirection,
+    pub rows: Vec<CallSearchRow>,
+}
+
 pub fn run_symbol_search(repo: &str, query: &str) -> Result<SymbolSearchSummary, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -73,6 +103,31 @@ pub fn run_symbol_search(repo: &str, query: &str) -> Result<SymbolSearchSummary,
         repository_id: root.id().to_owned(),
         query: query.to_owned(),
         symbols,
+    })
+}
+
+pub fn run_call_graph(
+    repo: &str,
+    query: &str,
+    direction: CallDirection,
+) -> Result<CallGraphSummary, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("call graph requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let rows = match direction {
+        CallDirection::Callers => sqlite.callers(root.id(), query),
+        CallDirection::Callees => sqlite.callees(root.id(), query),
+    }
+    .map_err(|error| error.to_string())?;
+
+    Ok(CallGraphSummary {
+        repository_id: root.id().to_owned(),
+        query: query.to_owned(),
+        direction,
+        rows,
     })
 }
 
@@ -131,12 +186,18 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{QueryMode, run_semantic_search, run_symbol_search};
+    use crate::{CallDirection, QueryMode, run_call_graph, run_semantic_search, run_symbol_search};
 
     #[test]
     fn query_mode_toggles_between_workbench_modes() {
         assert_eq!(QueryMode::Semantic.toggled(), QueryMode::Symbol);
         assert_eq!(QueryMode::Symbol.toggled(), QueryMode::Semantic);
+    }
+
+    #[test]
+    fn call_direction_toggles_between_graph_modes() {
+        assert_eq!(CallDirection::Callers.toggled(), CallDirection::Callees);
+        assert_eq!(CallDirection::Callees.toggled(), CallDirection::Callers);
     }
 
     #[test]
@@ -149,5 +210,12 @@ mod tests {
     fn semantic_search_rejects_empty_query_before_service_calls() {
         let error = run_semantic_search(".", " ", 10).expect_err("empty query should fail");
         assert!(error.contains("requires a query"));
+    }
+
+    #[test]
+    fn call_graph_rejects_empty_query() {
+        let error =
+            run_call_graph(".", " ", CallDirection::Callers).expect_err("empty query should fail");
+        assert!(error.contains("requires a symbol query"));
     }
 }

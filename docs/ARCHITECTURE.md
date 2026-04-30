@@ -75,6 +75,7 @@ Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
 Query orchestration:
 
 - SQLite symbol search
+- SQLite callers and callees
 - semantic query embedding
 - Qdrant vector search
 - compact query result summaries without source text
