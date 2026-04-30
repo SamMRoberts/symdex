@@ -7,7 +7,6 @@ use symdex_core::{
     index_rust_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_mcp::tool_names;
 use symdex_store::{
     CallRecord, ChunkRecord, FileRecord, PointPayload, QdrantClient, RepositoryRecord, SqliteStore,
     StoreConfig, SymbolRecord, VectorPoint, qdrant_collection_name, qdrant_point_id, sqlite_parent,
@@ -62,7 +61,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let query_parts = if args.len() > 2 { &args[2..] } else { &[] };
             search(repo, query_parts)
         }
-        "serve-mcp" => serve_mcp_preview(),
+        "serve-mcp" => serve_mcp(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -572,12 +571,8 @@ struct IndexArgs {
     offline: bool,
 }
 
-fn serve_mcp_preview() -> Result<(), String> {
-    println!("MCP server is not implemented yet. Planned read-only tools:");
-    for tool in tool_names() {
-        println!("- {tool}");
-    }
-    Ok(())
+fn serve_mcp() -> Result<(), String> {
+    symdex_mcp::serve_stdio()
 }
 
 fn report_writable_dir(label: &str, path: &Path) {
@@ -641,7 +636,7 @@ fn report_qdrant(config: &StoreConfig) {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Preview planned read-only MCP tools\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

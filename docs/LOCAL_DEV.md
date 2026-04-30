@@ -65,8 +65,9 @@ Implemented CLI commands currently include:
   impact view.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, and symbol names.
-- `serve-mcp`: previews the planned read-only tool names while the MCP server is
-  still pending.
+- `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
+  `symdex.search`, `symdex.find_symbol`, `symdex.callers`, `symdex.callees`,
+  `symdex.impact`, and `symdex.index_status`.
 
 `doctor` checks whether Qdrant is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector

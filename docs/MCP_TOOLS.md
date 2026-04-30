@@ -11,6 +11,11 @@
 
 ## Tool contracts
 
+The MVP server runs over stdio with JSON-RPC messages and supports the standard
+`initialize`, `ping`, `tools/list`, and `tools/call` methods. Tool call
+responses include compact JSON in `structuredContent` and mirrored text content
+for hosts that only display text results.
+
 ### `symdex.search`
 
 Semantic search over indexed chunks.
@@ -21,11 +26,7 @@ Input:
 {
   "repo": "/path/to/repo",
   "query": "where is retry logic handled?",
-  "limit": 8,
-  "filters": {
-    "language": "rust",
-    "path_prefix": "crates/"
-  }
+  "limit": 8
 }
 ```
 
@@ -41,11 +42,15 @@ Output:
       "symbol": "foo::retry::run_with_backoff",
       "score": 0.82,
       "chunk_kind": "function",
-      "snippet": "compact excerpt"
+      "text_hash": "sha256:..."
     }
   ]
 }
 ```
+
+The search tool embeds the query with the configured local Ollama model and
+queries the local Qdrant collection. It returns chunk metadata only; it does not
+return source excerpts in the current MVP.
 
 ### `symdex.find_symbol`
 
@@ -70,8 +75,7 @@ Input:
 ```json
 {
   "repo": "/path/to/repo",
-  "symbol": "foo::retry::run_with_backoff",
-  "include_unresolved_candidates": true
+  "symbol": "foo::retry::run_with_backoff"
 }
 ```
 
@@ -110,9 +114,33 @@ Output should separate:
 - tests likely to cover the symbol
 - unresolved candidates
 
+The current MVP fills direct callers and direct callees. The other buckets are
+present but empty until deeper impact analysis is implemented.
+
 ### `symdex.index_status`
 
-Return index freshness and model metadata.
+Return local SQLite index counts.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo"
+}
+```
+
+Output:
+
+```json
+{
+  "repository_id": "stable-repo-id",
+  "files_indexed": 42,
+  "chunks_indexed": 120,
+  "symbols_indexed": 80,
+  "calls_indexed": 240,
+  "last_indexed_at": "2026-04-30T12:00:00Z"
+}
+```
 
 ## Future write-capable tools
 

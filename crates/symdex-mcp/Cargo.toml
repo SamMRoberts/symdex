@@ -9,3 +9,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+serde_json = "1.0.149"
+symdex-core = { path = "../symdex-core" }
+symdex-embed = { path = "../symdex-embed" }
+symdex-store = { path = "../symdex-store" }

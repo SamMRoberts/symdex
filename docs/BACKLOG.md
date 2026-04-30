@@ -40,13 +40,14 @@
 
 ## Phase 4 — MCP server
 
-- `serve-mcp`.
-- `symdex.search`.
-- `symdex.find_symbol`.
-- `symdex.callers`.
-- `symdex.callees`.
-- `symdex.impact`.
-- contract tests.
+- [x] `serve-mcp`.
+- [x] `symdex.search`.
+- [x] `symdex.find_symbol`.
+- [x] `symdex.callers`.
+- [x] `symdex.callees`.
+- [x] `symdex.impact`.
+- [x] `symdex.index_status`.
+- [x] contract tests.
 
 ## Phase 5 — Hardening
 

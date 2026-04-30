@@ -1194,6 +1194,12 @@ dependencies = [
 [[package]]
 name = "symdex-mcp"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "symdex-core",
+ "symdex-embed",
+ "symdex-store",
+]
 
 [[package]]
 name = "symdex-store"
