@@ -102,7 +102,7 @@
 - [x] call resolution dashboard grouped by resolution status and confidence bucket.
 - [x] embedding coverage view comparing SQLite chunks with Qdrant vector-backed chunks.
 - [x] index runs timeline using `index_runs` metadata.
-- [ ] semantic neighborhood view using Qdrant metadata only.
+- [x] semantic neighborhood view using Qdrant metadata only.
 - [ ] cross-store health warnings for missing vectors, missing collections, excluded chunks, and model/dimension drift.
 - [x] TUI state/render tests for the first storage visualization, including 80x24 layout and selected-row drill-down behavior.
 

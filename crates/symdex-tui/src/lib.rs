@@ -27,14 +27,16 @@ use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
     SymbolSearchSummary, run_call_graph, run_call_resolution, run_context_pack,
     run_embedding_coverage, run_impact, run_index_coverage, run_index_runs_timeline,
-    run_semantic_search, run_storage_explorer, run_symbol_outline, run_symbol_search,
+    run_semantic_neighborhood, run_semantic_search, run_storage_explorer, run_symbol_outline,
+    run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
     EmbeddingCoverageSummary, FileCoverageStatus, FileDetailSummary, IndexCoverageSummary,
     IndexRunTimelineRow, IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus,
-    SqliteStorageSummary, SqliteStore, StorageExplorerSummary, StorageHealthRow,
-    StorageHealthStatus, StoreConfig, SymbolOutlineSummary, qdrant_collection_name,
+    SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore,
+    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    SymbolOutlineSummary, qdrant_collection_name,
 };
 
 pub struct TuiOptions {
@@ -50,7 +52,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings/runs or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings/runs/neighborhood or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -110,6 +112,9 @@ impl App {
         let index_runs = sqlite
             .index_runs_timeline_summary(root.id())
             .map_err(|error| error.to_string())?;
+        let semantic_neighborhood = sqlite
+            .semantic_neighborhood_summary(root.id(), &embed_config.model)
+            .map_err(|error| error.to_string())?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -135,6 +140,7 @@ impl App {
                 call_resolution,
                 embedding_coverage,
                 index_runs,
+                semantic_neighborhood,
             ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
@@ -161,6 +167,8 @@ impl App {
         let call_resolution = call_resolution_summary_from_status(&repository_id);
         let embedding_coverage = embedding_coverage_summary_from_status(&repository_id, &status);
         let index_runs = index_runs_timeline_summary_from_status(&repository_id, &status);
+        let semantic_neighborhood =
+            semantic_neighborhood_summary_from_status(&repository_id, &status);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -185,6 +193,7 @@ impl App {
                 call_resolution,
                 embedding_coverage,
                 index_runs,
+                semantic_neighborhood,
             ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
@@ -499,6 +508,10 @@ impl App {
             Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
             Err(error) => IndexRunsTimelineStatus::Failed(error),
         };
+        self.storage.neighborhood = match run_semantic_neighborhood(&self.repo_input) {
+            Ok(summary) => SemanticNeighborhoodStatus::Completed(summary),
+            Err(error) => SemanticNeighborhoodStatus::Failed(error),
+        };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
         Ok(())
@@ -540,6 +553,12 @@ impl App {
                     index_runs_timeline_row_count(summary)
                 }
                 IndexRunsTimelineStatus::Failed(_) => 1,
+            },
+            StorageMode::Neighborhood => match &self.storage.neighborhood {
+                SemanticNeighborhoodStatus::Completed(summary) => {
+                    semantic_neighborhood_row_count(summary)
+                }
+                SemanticNeighborhoodStatus::Failed(_) => 1,
             },
         }
     }
@@ -1340,6 +1359,26 @@ fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
             IndexRunsTimelineStatus::Failed(error) => render_storage_error(frame, area, error),
         },
+        StorageMode::Neighborhood => match &app.storage.neighborhood {
+            SemanticNeighborhoodStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(7), Constraint::Length(9)])
+                    .split(area);
+                render_selectable_table(
+                    frame,
+                    chunks[0],
+                    semantic_neighborhood_table(summary),
+                    app.storage.selection,
+                    semantic_neighborhood_row_count(summary),
+                );
+                frame.render_widget(
+                    semantic_neighborhood_detail_panel(summary, app.storage.selection),
+                    chunks[1],
+                );
+            }
+            SemanticNeighborhoodStatus::Failed(error) => render_storage_error(frame, area, error),
+        },
     }
 }
 
@@ -1699,6 +1738,55 @@ fn index_runs_timeline_summary_from_status(
     IndexRunsTimelineSummary {
         repository_id: repository_id.to_owned(),
         runs,
+    }
+}
+
+fn semantic_neighborhood_summary_from_status(
+    repository_id: &str,
+    status: &RepositoryStatus,
+) -> SemanticNeighborhoodSummary {
+    let embedding_model = status
+        .embedding_model
+        .as_deref()
+        .unwrap_or("nomic-embed-text")
+        .to_owned();
+    let rows = if status.embedding_model.is_some() && status.chunks_indexed > 0 {
+        vec![SemanticNeighborhoodRow {
+            qdrant_point_id: "sample-point".to_owned(),
+            path: "<sample>".to_owned(),
+            start_line: 1,
+            end_line: 1,
+            symbol_name: None,
+            chunk_kind: "metadata".to_owned(),
+            language: "rust".to_owned(),
+            score: None,
+            text_hash: "<sample>".to_owned(),
+        }]
+    } else {
+        Vec::new()
+    };
+    SemanticNeighborhoodSummary {
+        repository_id: repository_id.to_owned(),
+        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        embedding_model,
+        health: vec![StorageHealthRow {
+            status: if rows.is_empty() {
+                StorageHealthStatus::Warning
+            } else {
+                StorageHealthStatus::Ok
+            },
+            label: if rows.is_empty() {
+                "no_vector_payloads".to_owned()
+            } else {
+                "metadata_only".to_owned()
+            },
+            detail: if rows.is_empty() {
+                "Sample TUI state has no vector-backed payload metadata.".to_owned()
+            } else {
+                "Sample TUI state has metadata-only semantic payload rows.".to_owned()
+            },
+        }],
+        rows,
     }
 }
 
@@ -2981,6 +3069,132 @@ fn index_run_status_tone(status: &str) -> StatusTone {
     }
 }
 
+fn semantic_neighborhood_table(summary: &SemanticNeighborhoodSummary) -> Table<'_> {
+    let rows = summary.rows.iter().take(12).map(|row| {
+        Row::new(vec![
+            Cell::from(row.path.as_str()),
+            Cell::from(line_range(row.start_line, row.end_line)),
+            Cell::from(row.symbol_name.as_deref().unwrap_or("<none>")),
+            Cell::from(row.chunk_kind.as_str()),
+            Cell::from(semantic_score_label(row)),
+            Cell::from(short_hash(row.text_hash.as_str())),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Length(9),
+            Constraint::Percentage(24),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
+        ],
+    )
+    .header(table_header([
+        "Path",
+        "Lines",
+        "Symbol",
+        "Kind",
+        "Score",
+        "Text Hash",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Semantic Neighborhood | Payloads: {} | F2 next storage mode",
+        summary.rows.len()
+    )))
+    .column_spacing(1)
+}
+
+fn semantic_neighborhood_detail_panel(
+    summary: &SemanticNeighborhoodSummary,
+    selection: usize,
+) -> Paragraph<'_> {
+    let Some(row) = selected_semantic_neighborhood_row(summary, selection) else {
+        return Paragraph::new(vec![Line::from(
+            "No vector-backed Qdrant payload metadata recorded.",
+        )])
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Semantic Payload Detail"),
+        );
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Collection: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(summary.collection_name.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Location: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{}:{}-{}", row.path, row.start_line, row.end_line)),
+        ]),
+        Line::from(vec![
+            Span::styled("Payload: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "symbol={} kind={} language={} score={}",
+                row.symbol_name.as_deref().unwrap_or("<none>"),
+                row.chunk_kind,
+                row.language,
+                semantic_score_label(row)
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Point: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(row.qdrant_point_id.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Text hash: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(row.text_hash.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Health: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(semantic_neighborhood_health_summary(summary)),
+        ]),
+    ];
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(tone_style(StatusTone::Info))
+            .title("Semantic Payload Detail"),
+    )
+}
+
+fn semantic_neighborhood_row_count(summary: &SemanticNeighborhoodSummary) -> usize {
+    summary.rows.len().min(12)
+}
+
+fn selected_semantic_neighborhood_row(
+    summary: &SemanticNeighborhoodSummary,
+    selection: usize,
+) -> Option<&SemanticNeighborhoodRow> {
+    summary
+        .rows
+        .get(selection.min(summary.rows.len().saturating_sub(1)))
+}
+
+fn semantic_score_label(row: &SemanticNeighborhoodRow) -> String {
+    row.score
+        .map(|score| format!("{score:.3}"))
+        .unwrap_or_else(|| "metadata".to_owned())
+}
+
+fn semantic_neighborhood_health_summary(summary: &SemanticNeighborhoodSummary) -> String {
+    summary
+        .health
+        .iter()
+        .take(3)
+        .map(|row| format!("{}: {}", row.label, row.detail))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn short_hash(text_hash: &str) -> String {
+    text_hash.chars().take(10).collect()
+}
+
 fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
     Row::new(vec![
         Cell::from(label),
@@ -3458,7 +3672,7 @@ impl View {
                 "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab next view | F2 overview/coverage/outline/calls/embeddings/runs | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | F2 overview/coverage/outline/calls/embeddings/runs/neighborhood | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
                 "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
@@ -3515,6 +3729,7 @@ struct StorageExplorerState {
     calls: CallResolutionStatus,
     embeddings: EmbeddingCoverageStatus,
     runs: IndexRunsTimelineStatus,
+    neighborhood: SemanticNeighborhoodStatus,
     selection: usize,
 }
 
@@ -3526,6 +3741,7 @@ impl StorageExplorerState {
         calls: CallResolutionSummary,
         embeddings: EmbeddingCoverageSummary,
         runs: IndexRunsTimelineSummary,
+        neighborhood: SemanticNeighborhoodSummary,
     ) -> Self {
         Self {
             mode: StorageMode::Explorer,
@@ -3535,6 +3751,7 @@ impl StorageExplorerState {
             calls: CallResolutionStatus::Completed(calls),
             embeddings: EmbeddingCoverageStatus::Completed(embeddings),
             runs: IndexRunsTimelineStatus::Completed(runs),
+            neighborhood: SemanticNeighborhoodStatus::Completed(neighborhood),
             selection: 0,
         }
     }
@@ -3548,6 +3765,7 @@ enum StorageMode {
     Calls,
     Embeddings,
     Runs,
+    Neighborhood,
 }
 
 impl StorageMode {
@@ -3559,6 +3777,7 @@ impl StorageMode {
             Self::Calls => "call resolution",
             Self::Embeddings => "embedding coverage",
             Self::Runs => "index runs timeline",
+            Self::Neighborhood => "semantic neighborhood",
         }
     }
 
@@ -3569,7 +3788,8 @@ impl StorageMode {
             Self::Outline => Self::Calls,
             Self::Calls => Self::Embeddings,
             Self::Embeddings => Self::Runs,
-            Self::Runs => Self::Explorer,
+            Self::Runs => Self::Neighborhood,
+            Self::Neighborhood => Self::Explorer,
         }
     }
 }
@@ -3601,6 +3821,11 @@ enum EmbeddingCoverageStatus {
 
 enum IndexRunsTimelineStatus {
     Completed(IndexRunsTimelineSummary),
+    Failed(String),
+}
+
+enum SemanticNeighborhoodStatus {
+    Completed(SemanticNeighborhoodSummary),
     Failed(String),
 }
 
@@ -3841,7 +4066,8 @@ mod tests {
         EmbeddingCoverageSummary, EmbeddingExclusionRow, FileCallDetailRow, FileChunkDetailRow,
         FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
         IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
-        QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, StorageExplorerSummary,
+        QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
+        SemanticNeighborhoodSummary, SqliteStorageSummary, StorageExplorerSummary,
         StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
         SymbolSearchRow,
     };
@@ -3974,6 +4200,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -4006,6 +4233,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
 
         assert_eq!(app.storage.selection, 0);
@@ -4034,6 +4262,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -4059,6 +4288,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.selection = 2;
 
@@ -4081,6 +4311,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4102,6 +4333,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4124,6 +4356,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4147,6 +4380,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4161,6 +4395,28 @@ mod tests {
     }
 
     #[test]
+    fn storage_f2_cycles_to_semantic_neighborhood() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+        );
+
+        for _ in 0..6 {
+            assert!(!app.handle_key(KeyCode::F(2)));
+        }
+
+        assert_eq!(app.storage.mode, StorageMode::Neighborhood);
+        assert_eq!(app.message, "Storage mode set to semantic neighborhood.");
+    }
+
+    #[test]
     fn renders_index_coverage_file_rows_without_source_text() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
@@ -4171,6 +4427,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(150, 24);
@@ -4207,6 +4464,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
 
@@ -4236,6 +4494,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(80, 24);
@@ -4262,6 +4521,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(150, 24);
@@ -4289,6 +4549,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Outline;
 
@@ -4318,6 +4579,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(80, 24);
@@ -4344,6 +4606,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(150, 24);
@@ -4377,6 +4640,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Calls;
 
@@ -4406,6 +4670,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(80, 24);
@@ -4432,6 +4697,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
         let backend = TestBackend::new(150, 24);
@@ -4465,6 +4731,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
 
@@ -4495,6 +4762,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
         let backend = TestBackend::new(80, 24);
@@ -4521,6 +4789,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Runs;
         let backend = TestBackend::new(150, 24);
@@ -4550,6 +4819,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Runs;
 
@@ -4579,6 +4849,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
         );
         app.storage.mode = StorageMode::Runs;
         let backend = TestBackend::new(80, 24);
@@ -4592,6 +4863,91 @@ mod tests {
         assert!(rendered.contains("Started"));
         assert!(rendered.contains("Status"));
         assert!(rendered.contains("Index Run"));
+    }
+
+    #[test]
+    fn renders_semantic_neighborhood_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+        );
+        app.storage.mode = StorageMode::Neighborhood;
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Semantic Neighborhood"));
+        assert!(rendered.contains("src/lib.rs"));
+        assert!(rendered.contains("crate::add"));
+        assert!(rendered.contains("metadata"));
+        assert!(rendered.contains("Semantic Payload Detail"));
+        assert!(rendered.contains("hash-vector"));
+        assert!(!rendered.contains("source_text"));
+    }
+
+    #[test]
+    fn semantic_neighborhood_selection_drives_detail_panel() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+        );
+        app.storage.mode = StorageMode::Neighborhood;
+
+        assert_eq!(app.storage.selection, 0);
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.storage.selection, 1);
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("src/worker.rs:10-18"));
+        assert!(rendered.contains("crate::worker"));
+        assert!(rendered.contains("point-worker"));
+        assert!(rendered.contains("hash-worker"));
+    }
+
+    #[test]
+    fn renders_semantic_neighborhood_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+        );
+        app.storage.mode = StorageMode::Neighborhood;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Storage"));
+        assert!(rendered.contains("Semantic"));
+        assert!(rendered.contains("Payload"));
     }
 
     #[test]
@@ -5311,6 +5667,44 @@ mod tests {
                     error_summary: None,
                 },
             ],
+        }
+    }
+
+    fn sample_semantic_neighborhood_summary() -> SemanticNeighborhoodSummary {
+        SemanticNeighborhoodSummary {
+            repository_id: "repo".to_owned(),
+            collection_name: "symdex_repo_nomic_embed_text".to_owned(),
+            embedding_model: "nomic-embed-text".to_owned(),
+            rows: vec![
+                SemanticNeighborhoodRow {
+                    qdrant_point_id: "point-add".to_owned(),
+                    path: "src/lib.rs".to_owned(),
+                    start_line: 1,
+                    end_line: 3,
+                    symbol_name: Some("crate::add".to_owned()),
+                    chunk_kind: "function".to_owned(),
+                    language: "rust".to_owned(),
+                    score: None,
+                    text_hash: "hash-vector".to_owned(),
+                },
+                SemanticNeighborhoodRow {
+                    qdrant_point_id: "point-worker".to_owned(),
+                    path: "src/worker.rs".to_owned(),
+                    start_line: 10,
+                    end_line: 18,
+                    symbol_name: Some("crate::worker".to_owned()),
+                    chunk_kind: "function".to_owned(),
+                    language: "rust".to_owned(),
+                    score: None,
+                    text_hash: "hash-worker".to_owned(),
+                },
+            ],
+            health: vec![StorageHealthRow {
+                status: StorageHealthStatus::Ok,
+                label: "metadata_only".to_owned(),
+                detail: "2 Qdrant payload metadata rows are available without source text."
+                    .to_owned(),
+            }],
         }
     }
 

@@ -783,6 +783,56 @@ impl SqliteStore {
         })
     }
 
+    pub fn semantic_neighborhood_summary(
+        &self,
+        repository_id: &str,
+        configured_embedding_model: &str,
+    ) -> Result<SemanticNeighborhoodSummary> {
+        let latest_embedding = self.latest_embedding_run(repository_id)?;
+        let projected_model = latest_embedding
+            .as_ref()
+            .map(|run| run.embedding_model.as_str())
+            .unwrap_or(configured_embedding_model);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT chunks.qdrant_point_id, files.path, chunks.start_line, chunks.end_line,
+                        symbols.qualified_name, chunks.kind, files.language, chunks.text_hash
+                 FROM chunks
+                 JOIN files ON chunks.file_id = files.id
+                 LEFT JOIN symbols ON chunks.symbol_id = symbols.id
+                 WHERE files.repository_id = ?1
+                   AND chunks.qdrant_point_id IS NOT NULL
+                 ORDER BY files.path, chunks.start_line, chunks.end_line, chunks.id
+                 LIMIT 100",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                Ok(SemanticNeighborhoodRow {
+                    qdrant_point_id: row.get(0)?,
+                    path: row.get(1)?,
+                    start_line: row.get::<_, i64>(2)? as usize,
+                    end_line: row.get::<_, i64>(3)? as usize,
+                    symbol_name: row.get(4)?,
+                    chunk_kind: row.get(5)?,
+                    language: row.get(6)?,
+                    score: None,
+                    text_hash: row.get(7)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        let rows = collect_rows(rows)?;
+        let health = semantic_neighborhood_health(&rows);
+        Ok(SemanticNeighborhoodSummary {
+            repository_id: repository_id.to_owned(),
+            collection_name: qdrant_collection_name(repository_id, projected_model),
+            embedding_model: projected_model.to_owned(),
+            rows,
+            health,
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -1329,6 +1379,28 @@ pub struct IndexRunTimelineRow {
     pub files_indexed: usize,
     pub chunks_embedded: usize,
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticNeighborhoodSummary {
+    pub repository_id: String,
+    pub collection_name: String,
+    pub embedding_model: String,
+    pub rows: Vec<SemanticNeighborhoodRow>,
+    pub health: Vec<StorageHealthRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticNeighborhoodRow {
+    pub qdrant_point_id: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub symbol_name: Option<String>,
+    pub chunk_kind: String,
+    pub language: String,
+    pub score: Option<f64>,
+    pub text_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1944,6 +2016,25 @@ fn embedding_coverage_health(
         });
     }
     rows
+}
+
+fn semantic_neighborhood_health(rows: &[SemanticNeighborhoodRow]) -> Vec<StorageHealthRow> {
+    if rows.is_empty() {
+        return vec![StorageHealthRow {
+            status: StorageHealthStatus::Warning,
+            label: "no_vector_payloads".to_owned(),
+            detail: "No vector-backed chunk metadata is recorded for semantic inspection."
+                .to_owned(),
+        }];
+    }
+    vec![StorageHealthRow {
+        status: StorageHealthStatus::Ok,
+        label: "metadata_only".to_owned(),
+        detail: format!(
+            "{} Qdrant payload metadata rows are available without source text.",
+            rows.len()
+        ),
+    }]
 }
 
 fn file_coverage_status(
@@ -2721,6 +2812,57 @@ mod tests {
             Some("qdrant unavailable")
         );
         assert_eq!(summary.runs[1].id, "run-old");
+        let debug = format!("{summary:?}");
+        assert!(!debug.contains("source_text"));
+    }
+
+    #[test]
+    fn sqlite_builds_semantic_neighborhood_summary_without_source_text() {
+        let db = TestDb::new("semantic-neighborhood");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let mut vector = sample_chunk("chunk-vector");
+        vector.text_hash = "hash-vector".to_owned();
+        let mut missing = missing_vector_chunk("chunk-missing");
+        missing.text_hash = "hash-missing".to_owned();
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &[sample_symbol("symbol", "add", "crate::add")],
+                &[vector, missing],
+                &[],
+            )
+            .expect("facts should persist");
+        store
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .expect("index run should persist");
+
+        let summary = store
+            .semantic_neighborhood_summary("repo", "nomic-embed-text")
+            .expect("semantic neighborhood should load");
+
+        assert_eq!(summary.repository_id, "repo");
+        assert_eq!(summary.embedding_model, "nomic-embed-text");
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(summary.rows[0].path, "src/lib.rs");
+        assert_eq!(summary.rows[0].symbol_name.as_deref(), Some("crate::add"));
+        assert_eq!(summary.rows[0].chunk_kind, "function");
+        assert_eq!(summary.rows[0].language, "rust");
+        assert_eq!(summary.rows[0].score, None);
+        assert_eq!(summary.rows[0].text_hash, "hash-vector");
+        assert!(
+            summary
+                .health
+                .iter()
+                .any(|row| row.status == StorageHealthStatus::Ok && row.label == "metadata_only")
+        );
         let debug = format!("{summary:?}");
         assert!(!debug.contains("source_text"));
     }

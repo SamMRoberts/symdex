@@ -255,6 +255,12 @@ When visualizing nearby Qdrant points, show payload metadata only:
 
 Do not show full chunk text in semantic-neighborhood rows.
 
+The first TUI implementation uses vector-backed chunk records as the
+deterministic Qdrant payload projection and does not require a live Qdrant
+service. Rows show path, line range, symbol name, chunk kind, language, text
+hash, collection, and point ID. Score is labeled `metadata` until a future live
+nearest-neighbor interaction supplies real scores.
+
 ## ID strategy
 
 Use deterministic IDs where possible:
