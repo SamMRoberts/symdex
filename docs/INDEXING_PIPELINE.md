@@ -162,3 +162,28 @@ automated collection migration/reset remains future hardening.
 Current SQLite migrations include indexes for file cleanup, symbol lookup,
 caller/callee traversal, and index-run metadata. This keeps structural queries
 from degrading into broad table scans as repositories grow.
+
+## Continuous indexing
+
+Continuous indexing is a local watch mode layered on top of incremental
+indexing. It can be toggled on or off and is off by default.
+
+When enabled:
+
+- watch for created and modified eligible files under the repository root
+- apply built-in excludes, `.gitignore`, and future `.symdexignore` rules
+- reject symlink escapes and paths outside the repository root
+- debounce and coalesce bursts of filesystem events before indexing
+- hash candidate files and skip unchanged content
+- reindex changed or new files through the same parser, chunker, symbol, call,
+  secret-detection, SQLite, Ollama, and Qdrant paths as manual indexing
+- record compact index run summaries for watch-driven batches
+
+Continuous indexing must not execute repository code. It must not bypass model
+or dimension checks. Offline watch mode should update SQLite structural facts
+without Qdrant or Ollama; semantic watch mode requires local Ollama and Qdrant
+just like manual semantic indexing.
+
+If a manual index job is running, continuous indexing should queue or coalesce
+events and avoid concurrent writes. If a file changes repeatedly during a
+debounce window, only the latest content hash should be indexed.

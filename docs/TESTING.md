@@ -28,6 +28,10 @@ Fixtures should be tiny and purpose-built.
 - syntax chunk line ranges
 - stable IDs across repeated runs
 - changed file reindex
+- continuous indexing reindexes modified files
+- continuous indexing indexes newly created eligible files
+- continuous indexing skips ignored, out-of-root, symlink-escape, and unchanged files
+- continuous indexing toggle, debounce, queued event, and error states
 - deleted file cleanup
 - unresolved calls preserved
 - ambiguous calls labeled
@@ -49,6 +53,13 @@ do not name a directory root.
 
 Current migration tests also assert that structural-query indexes are created
 for symbols, calls, chunks, files, and index runs.
+
+Continuous indexing tests should use synthetic filesystem events where possible
+for debounce and coalescing behavior, plus tiny fixture repositories for
+end-to-end created-file and modified-file reindex behavior. Offline continuous
+indexing should be testable without Qdrant or Ollama; semantic continuous
+indexing should use mocked adapters or the existing opt-in local service test
+flags.
 
 ## Test commands
 
@@ -87,8 +98,10 @@ selected-run detail panel, semantic neighborhood payload table and selected-row
 detail panel, cross-store health warning table and selected-warning detail
 panel, selected table rows, Doctor selected-check detail behavior, two-row
 footer rendering for shortcut hints plus status messages, 80x24 narrow-terminal
-rendering, and the indexing confirmation reducer. Future TUI views should add
-similar reducer and render coverage before being marked complete.
+rendering, and the indexing confirmation reducer. Future TUI continuous
+indexing work should add reducer and render coverage for toggle confirmation,
+on/off labels, pending debounce, queued event count, latest reindexed file, and
+watch errors before being marked complete.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

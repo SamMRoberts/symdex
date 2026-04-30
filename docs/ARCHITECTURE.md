@@ -64,6 +64,8 @@ TUI.
 Indexing orchestration:
 
 - repository indexing workflow shared by CLI and TUI
+- continuous indexing watch orchestration shared by CLI and TUI
+- file-event debounce and coalescing before reindex work is scheduled
 - structural SQLite persistence
 - optional semantic embedding and Qdrant upserts
 - compact indexing summaries without source text
@@ -102,6 +104,7 @@ User-facing commands:
 - argument parsing
 - diagnostics
 - progress output
+- non-interactive continuous indexing launch path
 - command presentation
 
 Do not put core indexing logic here.
@@ -114,6 +117,7 @@ Terminal UI:
 - `ratatui` layouts and widgets
 - `crossterm` input and terminal lifecycle
 - view orchestration for dashboard, indexing controls, diagnostics, queries, impact, and context packs
+- continuous indexing toggle, confirmation state, watch status, and watch error display
 - metadata-only storage visualizations for index coverage, file details, symbol outlines, call resolution, embedding coverage, and index runs
 
 Do not shell out to the `symdex` binary. Call Rust library APIs directly.
@@ -133,6 +137,7 @@ MCP server:
 - Core emits facts; store persists facts; CLI, TUI, and MCP present facts.
 - Never let MCP invoke indexing side effects until a write-capable design is approved.
 - Require TUI confirmation before long-running jobs such as indexing.
+- Continuous indexing is an ongoing local job; TUI and CLI entry points must use shared `symdex-index` APIs and must not spawn `symdex` subprocesses.
 - Keep TUI rendering and event types out of core, store, embed, and MCP crates.
 - Keep storage visualization queries outside `symdex-tui` when they require
   nontrivial SQLite/Qdrant aggregation; expose typed summaries from shared

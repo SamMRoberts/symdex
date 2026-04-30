@@ -78,7 +78,8 @@ Implemented CLI commands currently include:
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
   opens a repository/status dashboard backed by SQLite metadata and local
   service configuration. Use `o` to confirm offline indexing, `s` to confirm
-  semantic indexing, `x` for the storage explorer, `d` to run doctor
+  semantic indexing, `c` to toggle continuous indexing, `x` for the storage
+  explorer, `d` to run doctor
   diagnostics, `i` for indexing controls, `w` for the query workbench, `g` for
   the symbol/call graph browser, and `p` for the impact/context-pack viewer,
   `Tab` / `Shift+Tab` to toggle view-local modes. The storage explorer always
@@ -94,6 +95,16 @@ Implemented CLI commands currently include:
 reachable, whether the configured embedding model is present, and whether vector
 dimension probing succeeds. These checks report diagnostic status and do not
 mutate repository data.
+
+Planned continuous indexing command:
+
+```bash
+cargo run -p symdex-cli -- index --watch .
+```
+
+The planned watch mode should watch local created and modified eligible files,
+debounce event bursts, and reindex changed content through the same manual
+indexing rules until stopped.
 
 The TUI should surface these same diagnostics. Semantic search and semantic
 indexing views require local Ollama and Qdrant; status, structural queries, and

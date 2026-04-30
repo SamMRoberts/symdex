@@ -284,8 +284,20 @@ represent the indexed repository.
 ### Indexing Controls
 
 - Offer offline indexing with `o` and semantic indexing with `s`.
+- Offer continuous indexing as a toggleable mode.
+- Continuous indexing is off by default.
+- When continuous indexing is on, modified or newly created eligible files are
+  automatically reindexed after debounce.
+- Continuous indexing must use the same ignore, path-boundary, hashing,
+  parsing, secret-detection, and embedding rules as manual indexing.
 - Require explicit `y` confirmation before starting an indexing job.
+- Require explicit confirmation before enabling continuous indexing for the
+  first time in a session because it starts an ongoing local job.
+- Toggling continuous indexing off should stop the watcher promptly without
+  deleting index data.
 - Show running, completed, failed, and cancelled states.
+- Show continuous indexing state with explicit `on` / `off` labels, pending
+  debounce state, last reindexed file, queued event count, and latest error.
 - Show final counts for files, chunks, symbols, calls, excluded chunks, and
   embedding status.
 - Use a confirmation panel styled as a warning state.
@@ -362,6 +374,7 @@ Current dashboard keys:
 
 - `o`: request offline indexing confirmation
 - `s`: request semantic indexing confirmation
+- `c`: toggle continuous indexing confirmation
 - `d`: run doctor diagnostics
 - `i`: return to indexing controls
 - `x`: open the storage explorer
@@ -389,7 +402,7 @@ Current dashboard keys:
 - `Enter`: run the current impact/context-pack lookup
 - `r`: refresh repository and storage status
 - `y`: confirm a pending indexing job
-- `n` or `Esc`: cancel a pending indexing job
+- `n` or `Esc`: cancel a pending indexing job or continuous-indexing toggle
 - `Enter`: dismiss completed or failed job state
 - `q`: quit
 

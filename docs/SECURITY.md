@@ -23,6 +23,8 @@ The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 - No path access outside the configured repository root.
 - No symlink traversal outside the root.
 - No mutation tools in MVP.
+- Continuous indexing must enforce the same local-only, path-boundary,
+  symlink, ignore, and secret-filtering rules as manual indexing.
 
 Current implementation requires repository roots to be directories. Path
 normalization canonicalizes existing paths before accepting them, rejects
@@ -79,3 +81,6 @@ Unsafe logs:
 - embeddings
 - secrets
 - absolute paths without explicit debug mode
+
+Continuous indexing logs should stay summary-only: watcher state, event counts,
+relative paths when configured, indexed file counts, and error categories.

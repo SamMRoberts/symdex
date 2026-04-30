@@ -47,6 +47,12 @@ vector dimension, and embedded chunk count. `index-status` and
 `symdex_index_status` expose the latest successful embedding model and
 dimension when present.
 
+Continuous indexing should also record compact batch summaries in `index_runs`
+or a compatible future run-history table so watch-driven updates are visible in
+storage views. At minimum, the UI should be able to distinguish manual indexing
+from continuous indexing batches, show status, timestamps, files seen/indexed,
+chunks embedded, model, dimension, and any error summary.
+
 ### `files`
 
 ```sql

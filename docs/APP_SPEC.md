@@ -28,16 +28,18 @@ It answers questions such as:
 1. User installs local dependencies.
 2. User runs `symdex init`.
 3. User runs `symdex index /path/to/repo`.
-4. User asks semantic or structural questions through CLI, TUI, or MCP.
-5. User can inspect local status, diagnostics, indexing controls, queries, and context packs in the TUI.
-6. User can visualize SQLite structural data and Qdrant semantic coverage in the TUI without exposing source text.
-7. Agent receives compact ranked evidence with file paths and line ranges.
+4. User can optionally enable continuous indexing so modified or newly created eligible files are automatically reindexed.
+5. User asks semantic or structural questions through CLI, TUI, or MCP.
+6. User can inspect local status, diagnostics, indexing controls, queries, and context packs in the TUI.
+7. User can visualize SQLite structural data and Qdrant semantic coverage in the TUI without exposing source text.
+8. Agent receives compact ranked evidence with file paths and line ranges.
 
 ## Primary commands
 
 ```bash
 symdex init
 symdex index <repo>
+symdex index --watch <repo>
 symdex search <repo> "query"
 symdex symbol <repo> <symbol>
 symdex callers <repo> <symbol>
@@ -52,6 +54,7 @@ symdex serve-mcp
 ## Success criteria
 
 - Indexing a small Rust repo completes locally without network access after setup.
+- Continuous indexing can be toggled on and off and reindexes modified or newly created eligible files without source execution.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.

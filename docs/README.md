@@ -9,6 +9,7 @@ Use this folder as the agent-facing project memory.
 | Product requirements | `APP_SPEC.md` |
 | Crate layout or module boundaries | `ARCHITECTURE.md` |
 | Parsing, chunking, embeddings, reindexing | `INDEXING_PIPELINE.md` |
+| Continuous indexing/watch mode | `CONTINUOUS_INDEXING.md` |
 | SQLite schema or Qdrant payloads | `DATA_MODEL.md` |
 | MCP tool contracts | `MCP_TOOLS.md` |
 | Terminal UI design | `TUI.md` |

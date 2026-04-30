@@ -17,6 +17,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Build a CLI, TUI, and MCP server.
 - The CLI handles indexing, querying, diagnostics, and maintenance.
 - The TUI provides an interactive local control panel over CLI-equivalent capabilities.
+- Support a local continuous indexing mode that can be toggled on or off.
+- In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
 - Qdrant stores dense vectors plus filterable payload fields.
@@ -79,6 +81,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Record embedding model name and vector dimension with every index version.
 - A model or dimension change requires collection migration or full reindex.
 - Respect `.gitignore` plus project-level ignore config.
+- Continuous indexing must use the same ignore, path-boundary, hashing, parser, secret-detection, and embedding rules as manual indexing.
+- Continuous indexing must debounce file events and coalesce bursts before reindexing.
+- Continuous indexing is off by default and must be visibly toggleable when exposed in the TUI.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 
 ## MCP Rules
@@ -107,6 +112,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Cross-store visualizations must make mismatches obvious, such as chunks with no vector point, excluded chunks, missing collections, or model/dimension drift.
 - Do not show source text by default; source previews require a future explicit design.
 - Require confirmation before starting long-running local jobs such as indexing.
+- Show continuous indexing state when available, including whether it is on or off and the latest reindexed file or error.
 - Do not add reset/delete actions until matching CLI support exists.
 - Do not execute indexed repository code from the TUI.
 
