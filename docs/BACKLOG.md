@@ -75,15 +75,16 @@
 
 - [x] ratatui `Tabs` for major views.
 - [x] status-colored labels for service health and job state.
-- `Table` widgets for diagnostics, query evidence, call graph rows, impact rows, and context-pack metadata.
-- status-colored labels for confidence and resolution inside table rows.
+- [x] `Table` widgets for diagnostics, query evidence, call graph rows, impact rows, and context-pack metadata.
+- [x] status-colored labels for confidence and resolution inside table rows.
 - stateful selection/focus for result lists and tables.
 - [x] per-view footer help text.
 - confirmation panel styling for long-running jobs.
 - progress `Gauge` for indexing when progress reporting exists.
 - narrow-terminal render tests for 80x24 layout.
 - [x] render tests for active tabs and status colors.
-- render tests for selected rows and table headers.
+- [x] render tests for table headers.
+- render tests for selected rows.
 
 ## Do not start yet
 

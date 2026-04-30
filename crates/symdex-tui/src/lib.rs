@@ -12,17 +12,19 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Cell, Row, Table};
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
 use symdex_query::{
-    CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, run_call_graph,
-    run_context_pack, run_impact, run_semantic_search, run_symbol_search,
+    CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
+    SymbolSearchSummary, run_call_graph, run_context_pack, run_impact, run_semantic_search,
+    run_symbol_search,
 };
 use symdex_store::{ContextPack, RepositoryStatus, SqliteStore, StoreConfig};
 
@@ -915,7 +917,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
 
             let body_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .split(chunks[1]);
 
             let status = List::new(
@@ -931,28 +933,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
             );
             frame.render_widget(status, body_chunks[0]);
 
-            let right_title = match app.view {
-                View::Indexing => "Indexing",
-                View::Diagnostics => "Doctor Diagnostics",
-                View::Query => "Query Workbench",
-                View::Graph => "Symbol/Call Graph",
-                View::Evidence => "Impact/Context Pack",
-            };
-            let right_lines = match app.view {
-                View::Indexing => app.index_lines(),
-                View::Diagnostics => app.diagnostics_lines(),
-                View::Query => app.query_lines(),
-                View::Graph => app.graph_lines(),
-                View::Evidence => app.evidence_lines(),
-            };
-            let right_panel = List::new(
-                right_lines
-                    .into_iter()
-                    .map(ListItem::new)
-                    .collect::<Vec<_>>(),
-            )
-            .block(Block::default().borders(Borders::ALL).title(right_title));
-            frame.render_widget(right_panel, body_chunks[1]);
+            render_right_panel(frame, body_chunks[1], app);
 
             let footer = Paragraph::new(Line::from(vec![
                 status_span(app.view.footer_label(), StatusTone::Info),
@@ -968,6 +949,50 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    match app.view {
+        View::Diagnostics => match &app.diagnostics {
+            DiagnosticsState::Completed(report) => {
+                frame.render_widget(diagnostics_table(report), area);
+            }
+            _ => render_line_panel(frame, area, "Doctor Diagnostics", app.diagnostics_lines()),
+        },
+        View::Query => match &app.query.status {
+            QueryStatus::Completed(result) => {
+                frame.render_widget(query_table(result), area);
+            }
+            _ => render_line_panel(frame, area, "Query Workbench", app.query_lines()),
+        },
+        View::Graph => match &app.graph.status {
+            GraphStatus::Completed(summary) => {
+                frame.render_widget(call_graph_table(summary), area);
+            }
+            _ => render_line_panel(frame, area, "Symbol/Call Graph", app.graph_lines()),
+        },
+        View::Evidence => match &app.evidence.status {
+            EvidenceStatus::Completed(EvidenceResult::Impact(summary)) => {
+                frame.render_widget(impact_table(summary), area);
+            }
+            EvidenceStatus::Completed(EvidenceResult::ContextPack(pack)) => {
+                frame.render_widget(context_pack_table(pack), area);
+            }
+            _ => render_line_panel(frame, area, "Impact/Context Pack", app.evidence_lines()),
+        },
+        View::Indexing => render_line_panel(frame, area, "Indexing", app.index_lines()),
+    }
+}
+
+fn render_line_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    lines: Vec<Line<'_>>,
+) {
+    let panel = List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(panel, area);
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), String> {
@@ -1091,18 +1116,7 @@ fn diagnostic_report_lines(report: &DiagnosticReport) -> Vec<Line<'_>> {
 }
 
 fn diagnostic_check_line(check: &DiagnosticCheck) -> Line<'_> {
-    let status = match check.state {
-        DiagnosticState::Ok => "ok",
-        DiagnosticState::Missing => "missing",
-        DiagnosticState::Unreachable => "unreachable",
-        DiagnosticState::Error => "error",
-        DiagnosticState::Skipped => "skipped",
-    };
-    let tone = match check.state {
-        DiagnosticState::Ok => StatusTone::Success,
-        DiagnosticState::Missing | DiagnosticState::Skipped => StatusTone::Warning,
-        DiagnosticState::Unreachable | DiagnosticState::Error => StatusTone::Error,
-    };
+    let (status, tone) = diagnostic_status(check.state);
     let detail = if check.message.is_empty() {
         String::new()
     } else {
@@ -1271,6 +1285,302 @@ fn compact_call_line(row: &symdex_store::CallSearchRow) -> Line<'_> {
     ))
 }
 
+fn diagnostics_table(report: &DiagnosticReport) -> Table<'_> {
+    let rows = report.checks.iter().map(|check| {
+        let (status, tone) = diagnostic_status(check.state);
+        Row::new(vec![
+            Cell::from(check.label.as_str()),
+            Cell::from(status_span(status, tone)),
+            Cell::from(check.message.as_str()),
+        ])
+    });
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(34),
+            Constraint::Length(13),
+            Constraint::Percentage(50),
+        ],
+    )
+    .header(table_header(["Check", "State", "Detail"]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Doctor Diagnostics | {}", report.workspace)),
+    )
+    .column_spacing(1)
+}
+
+fn query_table(result: &QueryResult) -> Table<'_> {
+    match result {
+        QueryResult::Symbol(summary) => symbol_table(summary),
+        QueryResult::Semantic(summary) => semantic_table(summary),
+    }
+}
+
+fn symbol_table(summary: &SymbolSearchSummary) -> Table<'_> {
+    let rows = summary.symbols.iter().take(12).map(|symbol| {
+        Row::new(vec![
+            Cell::from(symbol.kind.as_str()),
+            Cell::from(symbol.qualified_name.as_str()),
+            Cell::from(symbol.path.as_str()),
+            Cell::from(line_range(symbol.start_line, symbol.end_line)),
+        ])
+    });
+    Table::new(
+        rows,
+        [
+            Constraint::Length(12),
+            Constraint::Percentage(34),
+            Constraint::Percentage(34),
+            Constraint::Length(12),
+        ],
+    )
+    .header(table_header(["Kind", "Symbol", "Path", "Lines"]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Query Workbench | Symbols: {} | Query: {}",
+        summary.symbols.len(),
+        summary.query
+    )))
+    .column_spacing(1)
+}
+
+fn semantic_table(summary: &SemanticSearchSummary) -> Table<'_> {
+    let rows = summary.results.iter().take(12).map(|result| {
+        Row::new(vec![
+            Cell::from(format!("{:.4}", result.score)).style(score_style(result.score)),
+            Cell::from(result.path.as_str()),
+            Cell::from(line_range(result.start_line, result.end_line)),
+            Cell::from(result.chunk_kind.as_str()),
+            Cell::from(result.symbol_name.as_deref().unwrap_or("<none>")),
+        ])
+    });
+    Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Percentage(32),
+            Constraint::Length(12),
+            Constraint::Length(14),
+            Constraint::Percentage(24),
+        ],
+    )
+    .header(table_header(["Score", "Path", "Lines", "Kind", "Symbol"]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Query Workbench | Semantic results: {} | Collection: {}",
+        summary.results.len(),
+        summary.qdrant_collection
+    )))
+    .column_spacing(1)
+}
+
+fn call_graph_table(summary: &CallGraphSummary) -> Table<'_> {
+    let rows = summary.rows.iter().take(12).map(call_row);
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Length(8),
+            Constraint::Percentage(28),
+            Constraint::Length(12),
+            Constraint::Percentage(18),
+            Constraint::Length(16),
+        ],
+    )
+    .header(table_header([
+        "Symbol",
+        "Conf",
+        "Path",
+        "Lines",
+        "Callee",
+        "Resolution",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Symbol/Call Graph | {}: {} | Symbol query: {}",
+        summary.direction.label(),
+        summary.rows.len(),
+        summary.query
+    )))
+    .column_spacing(1)
+}
+
+fn impact_table(summary: &ImpactSummary) -> Table<'_> {
+    let caller_rows = summary
+        .direct_callers
+        .iter()
+        .take(6)
+        .map(|row| impact_row("caller", row));
+    let callee_rows = summary
+        .direct_callees
+        .iter()
+        .take(6)
+        .map(|row| impact_row("callee", row));
+    Table::new(
+        caller_rows.chain(callee_rows),
+        [
+            Constraint::Length(8),
+            Constraint::Percentage(28),
+            Constraint::Length(8),
+            Constraint::Percentage(24),
+            Constraint::Length(12),
+            Constraint::Percentage(18),
+            Constraint::Length(16),
+        ],
+    )
+    .header(table_header([
+        "Edge",
+        "Symbol",
+        "Conf",
+        "Path",
+        "Lines",
+        "Callee",
+        "Resolution",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Impact/Context Pack | Impact query: {} | Direct callers: {} | Direct callees: {}",
+        summary.query,
+        summary.direct_callers.len(),
+        summary.direct_callees.len()
+    )))
+    .column_spacing(1)
+}
+
+fn context_pack_table(pack: &ContextPack) -> Table<'_> {
+    let mut entries = vec![
+        ("Format".to_owned(), pack.format.clone()),
+        ("Query".to_owned(), pack.query.clone()),
+        (
+            "Focus symbols".to_owned(),
+            pack.focus_symbols.len().to_string(),
+        ),
+        ("Callers".to_owned(), pack.direct_callers.len().to_string()),
+        ("Callees".to_owned(), pack.direct_callees.len().to_string()),
+        ("Files".to_owned(), pack.files.len().to_string()),
+        (
+            "Limits".to_owned(),
+            format!(
+                "symbols={} callers={} callees={}",
+                pack.limits.max_symbols, pack.limits.max_callers, pack.limits.max_callees
+            ),
+        ),
+    ];
+    entries.extend(
+        pack.focus_symbols
+            .iter()
+            .take(4)
+            .map(|symbol| ("Symbol".to_owned(), symbol.qualified_name.clone())),
+    );
+    entries.extend(
+        pack.files
+            .iter()
+            .take(4)
+            .map(|file| ("File".to_owned(), file.clone())),
+    );
+    entries.extend(
+        pack.notes
+            .iter()
+            .map(|note| ("Note".to_owned(), note.clone())),
+    );
+    let rows = entries
+        .into_iter()
+        .map(|(field, value)| Row::new(vec![Cell::from(field), Cell::from(value)]));
+
+    Table::new(rows, [Constraint::Length(18), Constraint::Percentage(76)])
+        .header(table_header(["Field", "Value"]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Impact/Context Pack | Context Pack Metadata"),
+        )
+        .column_spacing(1)
+}
+
+fn call_row(row: &symdex_store::CallSearchRow) -> Row<'_> {
+    Row::new(vec![
+        Cell::from(
+            row.symbol_qualified_name
+                .as_deref()
+                .unwrap_or("<unresolved>"),
+        ),
+        confidence_cell(row.confidence),
+        Cell::from(row.path.as_deref().unwrap_or("<unknown>")),
+        Cell::from(optional_line_range(row.start_line, row.end_line)),
+        Cell::from(row.callee_text.as_str()),
+        resolution_cell(row.resolution_status.as_str()),
+    ])
+}
+
+fn impact_row<'a>(edge: &'static str, row: &'a symdex_store::CallSearchRow) -> Row<'a> {
+    Row::new(vec![
+        Cell::from(edge),
+        Cell::from(
+            row.symbol_qualified_name
+                .as_deref()
+                .unwrap_or("<unresolved>"),
+        ),
+        confidence_cell(row.confidence),
+        Cell::from(row.path.as_deref().unwrap_or("<unknown>")),
+        Cell::from(optional_line_range(row.start_line, row.end_line)),
+        Cell::from(row.callee_text.as_str()),
+        resolution_cell(row.resolution_status.as_str()),
+    ])
+}
+
+fn table_header<const N: usize>(labels: [&'static str; N]) -> Row<'static> {
+    Row::new(
+        labels
+            .into_iter()
+            .map(|label| Cell::from(label).style(Style::new().add_modifier(Modifier::BOLD))),
+    )
+    .style(Style::new().fg(Color::Cyan))
+}
+
+fn diagnostic_status(state: DiagnosticState) -> (&'static str, StatusTone) {
+    match state {
+        DiagnosticState::Ok => ("ok", StatusTone::Success),
+        DiagnosticState::Missing => ("missing", StatusTone::Warning),
+        DiagnosticState::Unreachable => ("unreachable", StatusTone::Error),
+        DiagnosticState::Error => ("error", StatusTone::Error),
+        DiagnosticState::Skipped => ("skipped", StatusTone::Warning),
+    }
+}
+
+fn confidence_cell(confidence: f64) -> Cell<'static> {
+    Cell::from(format!("{confidence:.2}")).style(score_style(confidence))
+}
+
+fn resolution_cell(status: &str) -> Cell<'_> {
+    let tone = if status.starts_with("resolved") {
+        StatusTone::Success
+    } else if status == "unresolved" {
+        StatusTone::Warning
+    } else {
+        StatusTone::Info
+    };
+    Cell::from(status_span(status, tone))
+}
+
+fn score_style(score: f64) -> Style {
+    if score >= 0.8 {
+        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else if score >= 0.5 {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    }
+}
+
+fn line_range(start: usize, end: usize) -> String {
+    format!("{start}-{end}")
+}
+
+fn optional_line_range(start: Option<usize>, end: Option<usize>) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) => line_range(start, end),
+        _ => "<unknown>".to_owned(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Indexing,
@@ -1331,7 +1641,7 @@ enum StatusTone {
     Dim,
 }
 
-fn status_span(label: &'static str, tone: StatusTone) -> Span<'static> {
+fn status_span(label: &str, tone: StatusTone) -> Span<'_> {
     let color = match tone {
         StatusTone::Success => Color::Green,
         StatusTone::Warning => Color::Yellow,
@@ -1678,8 +1988,11 @@ mod tests {
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Query Workbench"));
         assert!(rendered.contains("Symbols"));
+        assert!(rendered.contains("Kind"));
+        assert!(rendered.contains("Lines"));
         assert!(rendered.contains("crate::add"));
         assert!(rendered.contains("src/lib.rs"));
+        assert_eq!(cell_fg_for_text(buffer, "Kind", None), Some(Color::Cyan));
     }
 
     #[test]
@@ -1727,8 +2040,14 @@ mod tests {
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Symbol/Call Graph"));
         assert!(rendered.contains("callers"));
+        assert!(rendered.contains("Conf"));
+        assert!(rendered.contains("Resolution"));
         assert!(rendered.contains("crate::caller"));
         assert!(rendered.contains("resolved_exact"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "resolved_exact", None),
+            Some(Color::Green)
+        );
     }
 
     #[test]
@@ -1777,7 +2096,9 @@ mod tests {
         assert!(rendered.contains("Impact/Context Pack"));
         assert!(rendered.contains("Impact query"));
         assert!(rendered.contains("Direct callers"));
-        assert!(rendered.contains("crate::caller"));
+        assert!(rendered.contains("Edge"));
+        assert!(rendered.contains("Resolution"));
+        assert!(rendered.contains("resolved_exact"));
     }
 
     #[test]
