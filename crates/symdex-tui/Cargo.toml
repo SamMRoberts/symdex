@@ -1,21 +1,16 @@
 [package]
-name = "symdex-cli"
+name = "symdex-tui"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "symdex"
-path = "src/main.rs"
-
 [lints]
 workspace = true
 
 [dependencies]
-serde_json = "1.0.149"
+crossterm = "0.28.1"
+ratatui = "0.29.0"
 symdex-core = { path = "../symdex-core" }
 symdex-embed = { path = "../symdex-embed" }
-symdex-mcp = { path = "../symdex-mcp" }
 symdex-store = { path = "../symdex-store" }
-symdex-tui = { path = "../symdex-tui" }

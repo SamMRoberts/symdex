@@ -59,17 +59,17 @@
 
 ## Phase 6 — TUI
 
-- TUI workspace crate scaffold.
-- `symdex tui [repo]` launch command.
-- repository/status dashboard.
+- [x] TUI workspace crate scaffold.
+- [x] `symdex tui [repo]` launch command.
+- [x] repository/status dashboard.
 - indexing controls with confirmation.
 - doctor diagnostics view.
 - query workbench for search and symbols.
 - symbol/call graph browser.
 - impact and context-pack viewer.
 - TUI state reducer tests.
-- `ratatui` render tests.
-- CLI launch smoke.
+- [x] `ratatui` render tests.
+- [x] CLI launch smoke.
 
 ## Do not start yet
 

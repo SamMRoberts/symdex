@@ -67,6 +67,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let query_parts = if args.len() > 2 { &args[2..] } else { &[] };
             search(repo, query_parts)
         }
+        "tui" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            tui(repo)
+        }
         "serve-mcp" => serve_mcp(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -636,6 +640,16 @@ fn serve_mcp() -> Result<(), String> {
     symdex_mcp::serve_stdio()
 }
 
+fn tui(repo: &str) -> Result<(), String> {
+    if repo == "--help" || repo == "-h" {
+        print!("{}", symdex_tui::help_text());
+        return Ok(());
+    }
+    symdex_tui::run(symdex_tui::TuiOptions {
+        repo: repo.to_owned(),
+    })
+}
+
 fn report_writable_dir(label: &str, path: &Path) {
     if path.exists() {
         if path.is_dir() {
@@ -697,7 +711,7 @@ fn report_qdrant(config: &StoreConfig) {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

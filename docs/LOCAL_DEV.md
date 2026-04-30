@@ -75,10 +75,10 @@ Implemented CLI commands currently include:
   notes. It does not include source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, and symbol names.
-- `tui [repo]`: planned terminal UI entrypoint for a local full control panel.
-  The TUI should use existing local services and SQLite state, require
-  confirmation before indexing jobs, and avoid destructive maintenance actions
-  until matching CLI support exists.
+- `tui [repo]`: launches the local terminal UI control panel. The current TUI
+  opens a repository/status dashboard backed by SQLite metadata and local
+  service configuration. Future TUI work should add indexing controls,
+  diagnostics, query workbench, impact, and context-pack views.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex.search`, `symdex.find_symbol`, `symdex.callers`, `symdex.callees`,
   `symdex.impact`, and `symdex.index_status`.

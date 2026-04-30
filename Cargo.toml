@@ -5,6 +5,7 @@ members = [
     "crates/symdex-embed",
     "crates/symdex-mcp",
     "crates/symdex-store",
+    "crates/symdex-tui",
 ]
 resolver = "3"
 
