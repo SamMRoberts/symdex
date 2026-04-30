@@ -310,7 +310,9 @@ represent the indexed repository.
 
 ### Doctor Diagnostics
 
-- Show the same local diagnostics as `symdex doctor` with `d`.
+- Show the same local diagnostics as `symdex doctor` from the Doctor tab.
+- In the Doctor tab, `Enter` starts diagnostics when no diagnostic result rows
+  are available.
 - Surface service failures without panics.
 - Keep diagnostics local and avoid logging source text.
 - Render diagnostics as a table with check name, status, and detail columns.
@@ -324,12 +326,12 @@ represent the indexed repository.
   - full diagnostic detail text (wrapped)
   - optional remediation hint when available from diagnostics output
 - In the Doctor view, `Enter` toggles or focuses the selected-check details
-  panel instead of being a no-op.
+  panel when diagnostic result rows are available.
 
 ### Query Workbench
 
-- Support semantic search input with `w`, `Tab` / `Shift+Tab`, typed query
-  text, and `Enter`.
+- Support semantic search input from the Query tab with `Tab` / `Shift+Tab`,
+  typed query text, and `Enter`.
 - Support symbol search input with the same workbench controls.
 - Display compact ranked evidence with path, line range, symbol, score, and kind.
 - Show empty and error states.
@@ -339,7 +341,7 @@ represent the indexed repository.
 
 ### Symbol and Call Browser
 
-- Show direct callers and callees with `g`, typed symbol text,
+- Show direct callers and callees from the Calls tab with typed symbol text,
   `Tab` / `Shift+Tab`, and `Enter`.
 - Preserve resolution status, confidence, and unresolved/ambiguous labels.
 - Render callers/callees as tabs or a segmented control.
@@ -348,8 +350,8 @@ represent the indexed repository.
 
 ### Impact and Context Pack Viewer
 
-- Show the basic impact view using direct callers and callees with `p`, typed
-  symbol text, `Tab` / `Shift+Tab`, and `Enter`.
+- Show the basic impact view using direct callers and callees from the Impact
+  tab with typed symbol text, `Tab` / `Shift+Tab`, and `Enter`.
 - Show `symdex.context_pack.v1` metadata with the same viewer controls.
 - Do not include source text by default.
 - Render impact sections as separate panels or tables for direct callers and
@@ -362,9 +364,10 @@ represent the indexed repository.
 - Keyboard-first; no mouse requirement.
 - Use predictable keys for navigation, view selection, mode switching, refresh,
   confirmation, cancel, and quit.
-- Primary views are selected by their mnemonic letter keys (`i`, `x`, `d`,
-  `w`, `g`, `p`) instead of `Tab`. These view keys remain reserved while typing
-  in query, graph, impact, and context-pack inputs.
+- Primary views are selected with bracket navigation instead of letter keys:
+  `[` moves to the previous major tab and `]` moves to the next major tab.
+- Letter keys must remain available to text-entry views for query, call graph,
+  impact, and context-pack inputs.
 - Keep visible focus state.
 - Keep views compact enough for agent-facing evidence review.
 - Never hide long-running work; show loading/running/completed/failed states.
@@ -375,12 +378,8 @@ Current dashboard keys:
 - `o`: request offline indexing confirmation
 - `s`: request semantic indexing confirmation
 - `c`: toggle continuous indexing confirmation
-- `d`: run doctor diagnostics
-- `i`: return to indexing controls
-- `x`: open the storage explorer
-- `w`: open the query workbench
-- `g`: open the symbol/call graph browser
-- `p`: open the impact/context-pack viewer
+- `[`: move to the previous primary tab
+- `]`: move to the next primary tab
 - `Tab`: switch to the next mode in the active view
 - `Shift+Tab`: switch to the previous mode in the active view
 - `Tab` / `Shift+Tab`: cycle storage overview, index coverage, symbol outline,
@@ -390,6 +389,7 @@ Current dashboard keys:
 - `Tab` / `Shift+Tab`: toggle callers and callees in the symbol/call graph browser
 - `Tab` / `Shift+Tab`: toggle impact and context-pack modes in the impact/context-pack viewer
 - `Up` / `Down`: move the selected row in completed result and storage tables
+- `Enter`: start Doctor diagnostics when the Doctor tab has no result rows
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input

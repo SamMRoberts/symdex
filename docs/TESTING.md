@@ -104,10 +104,10 @@ selected-run detail panel, semantic neighborhood payload table and selected-row
 detail panel, cross-store health warning table and selected-warning detail
 panel, selected table rows, Doctor selected-check detail behavior, two-row
 footer rendering for shortcut hints plus status messages, 80x24 narrow-terminal
-rendering, the indexing confirmation reducer, and continuous-indexing reducer
-and render coverage for toggle confirmation, stopping an active watcher,
-on/off labels, pending debounce, queued event count, latest reindexed file, and
-watch errors.
+rendering, bracket-based primary tab navigation with letter-key text input,
+the indexing confirmation reducer, and continuous-indexing reducer and render
+coverage for toggle confirmation, stopping an active watcher, on/off labels,
+pending debounce, queued event count, latest reindexed file, and watch errors.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

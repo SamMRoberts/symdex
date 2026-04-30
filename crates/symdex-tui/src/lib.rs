@@ -55,7 +55,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next mode in the active view\n    Shift+Tab Switch to the previous mode in the active view\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    c         Toggle continuous indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    [         Switch to the previous primary tab\n    ]         Switch to the next primary tab\n    Tab       Switch to the next mode in the active view\n    Shift+Tab Switch to the previous mode in the active view\n    Up/Down   Move selected result row\n    Enter     Run lookup, run Doctor, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    c         Toggle continuous indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -330,14 +330,11 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Run doctor: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw("press d"),
+                Span::raw("press Enter"),
             ]),
             Line::from(vec![
-                Span::styled(
-                    "Index controls: ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("press i"),
+                Span::styled("Primary tabs: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw("press [ or ]"),
             ]),
             Line::from(""),
         ];
@@ -624,33 +621,12 @@ impl App {
                 self.toggle_active_mode(true);
                 return false;
             }
-            KeyCode::Char('i') => {
-                self.view = View::Indexing;
-                self.message = "Indexing controls selected.".to_owned();
+            KeyCode::Char('[') => {
+                self.select_primary_tab(true);
                 return false;
             }
-            KeyCode::Char('x') => {
-                self.view = View::Storage;
-                self.message = "Storage explorer selected.".to_owned();
-                return false;
-            }
-            KeyCode::Char('d') => {
-                self.start_diagnostics();
-                return false;
-            }
-            KeyCode::Char('w') => {
-                self.view = View::Query;
-                self.message = "Query workbench selected.".to_owned();
-                return false;
-            }
-            KeyCode::Char('g') => {
-                self.view = View::Graph;
-                self.message = "Symbol/call graph browser selected.".to_owned();
-                return false;
-            }
-            KeyCode::Char('p') => {
-                self.view = View::Evidence;
-                self.message = "Impact/context-pack viewer selected.".to_owned();
+            KeyCode::Char(']') => {
+                self.select_primary_tab(false);
                 return false;
             }
             _ => {}
@@ -708,6 +684,9 @@ impl App {
                     "Doctor selected-check details collapsed.".to_owned()
                 };
             }
+            KeyCode::Enter if self.view == View::Diagnostics => {
+                self.start_diagnostics();
+            }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
                 self.screen =
                     reduce_screen(self.screen, UiAction::RequestIndex(IndexMode::Offline));
@@ -757,6 +736,15 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    fn select_primary_tab(&mut self, reverse: bool) {
+        self.view = if reverse {
+            self.view.previous()
+        } else {
+            self.view.next()
+        };
+        self.message = format!("{} tab selected.", self.view.title());
     }
 
     fn toggle_active_mode(&mut self, reverse: bool) {
@@ -4051,23 +4039,56 @@ impl View {
     fn footer_help(self) -> &'static str {
         match self {
             Self::Indexing => {
-                "i index | x storage | d doctor | w query | g calls | p impact | o offline | s semantic | c continuous | r refresh | q quit"
+                "[ or ] tabs | o offline | s semantic | c continuous | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab/Shift+Tab storage tabs | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "[ or ] tabs | Tab/Shift+Tab storage tabs | Up/Down select | r refresh | q quit"
             }
             Self::Diagnostics => {
-                "Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
+                "[ or ] tabs | Enter run/details | Up/Down select | r refresh | q quit"
             }
             Self::Query => {
-                "Tab/Shift+Tab mode | type query | Up/Down select | Enter run | Esc clear/back | q quit"
+                "[ or ] tabs | Tab/Shift+Tab mode | type query | Up/Down select | Enter run | Esc clear/back | q quit"
             }
             Self::Graph => {
-                "Tab/Shift+Tab callers/callees | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
+                "[ or ] tabs | Tab/Shift+Tab callers/callees | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
             }
             Self::Evidence => {
-                "Tab/Shift+Tab impact/context | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
+                "[ or ] tabs | Tab/Shift+Tab impact/context | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
             }
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Indexing => Self::Storage,
+            Self::Storage => Self::Diagnostics,
+            Self::Diagnostics => Self::Query,
+            Self::Query => Self::Graph,
+            Self::Graph => Self::Evidence,
+            Self::Evidence => Self::Indexing,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Indexing => Self::Evidence,
+            Self::Storage => Self::Indexing,
+            Self::Diagnostics => Self::Storage,
+            Self::Query => Self::Diagnostics,
+            Self::Graph => Self::Query,
+            Self::Evidence => Self::Graph,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Indexing => "Index",
+            Self::Storage => "Storage",
+            Self::Diagnostics => "Doctor",
+            Self::Query => "Query",
+            Self::Graph => "Calls",
+            Self::Evidence => "Impact",
         }
     }
 }
@@ -4664,6 +4685,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("keys:"));
         assert!(rendered.contains("query"));
+        assert!(rendered.contains("[ or ] tabs"));
         assert!(rendered.contains("Tab/Shift+Tab mode"));
         assert!(rendered.contains("Enter run"));
         assert!(rendered.contains("status:"));
@@ -4683,16 +4705,33 @@ mod tests {
     }
 
     #[test]
-    fn primary_tab_letters_switch_views_from_text_entry_views() {
+    fn brackets_switch_primary_tabs_from_text_entry_views() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Query;
         app.query.input = "retry".to_owned();
 
-        assert!(!app.handle_key(KeyCode::Char('g')));
+        assert!(!app.handle_key(KeyCode::Char(']')));
 
         assert_eq!(app.view, View::Graph);
         assert_eq!(app.query.input, "retry");
-        assert_eq!(app.message, "Symbol/call graph browser selected.");
+        assert_eq!(app.message, "Calls tab selected.");
+
+        assert!(!app.handle_key(KeyCode::Char('[')));
+
+        assert_eq!(app.view, View::Query);
+        assert_eq!(app.query.input, "retry");
+        assert_eq!(app.message, "Query tab selected.");
+    }
+
+    #[test]
+    fn letter_keys_remain_available_in_text_entry_views() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+
+        assert!(!app.handle_key(KeyCode::Char('g')));
+
+        assert_eq!(app.view, View::Query);
+        assert_eq!(app.query.input, "g");
     }
 
     #[test]
@@ -4717,7 +4756,7 @@ mod tests {
         render(&mut terminal, &app).expect("render should succeed");
 
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("Enter details"));
+        assert!(rendered.contains("Enter run/details"));
     }
 
     #[test]
