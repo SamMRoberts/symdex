@@ -43,7 +43,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Toggle mode in query, graph, and impact/context views\n    Up/Down   Move selected result row\n    Enter     Run lookup or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle mode in query, graph, and impact/context views\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -62,6 +62,7 @@ pub struct App {
     index_progress: Option<IndexProgress>,
     diagnostics: DiagnosticsState,
     diagnostics_selection: usize,
+    diagnostics_details_expanded: bool,
     query: QueryWorkbenchState,
     graph: GraphBrowserState,
     evidence: EvidenceViewerState,
@@ -100,6 +101,7 @@ impl App {
             index_progress: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
+            diagnostics_details_expanded: false,
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -134,6 +136,7 @@ impl App {
             index_progress: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
+            diagnostics_details_expanded: false,
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -337,7 +340,7 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{} (Tab toggles)", self.query.mode.label())),
+                Span::raw(format!("{} (F2 toggles)", self.query.mode.label())),
             ]),
             Line::from(vec![
                 Span::styled("Query: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -385,7 +388,7 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{} (Tab toggles)", self.graph.direction.label())),
+                Span::raw(format!("{} (F2 toggles)", self.graph.direction.label())),
             ]),
             Line::from(vec![
                 Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -435,7 +438,7 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{} (Tab toggles)", self.evidence.mode.label())),
+                Span::raw(format!("{} (F2 toggles)", self.evidence.mode.label())),
             ]),
             Line::from(vec![
                 Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -502,6 +505,20 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Tab => {
+                self.view = self.view.next();
+                self.message = format!("{} view selected.", self.view.label());
+                return false;
+            }
+            KeyCode::BackTab => {
+                self.view = self.view.previous();
+                self.message = format!("{} view selected.", self.view.label());
+                return false;
+            }
+            _ => {}
+        }
+
         if self.view == View::Query {
             return self.handle_query_key(code);
         }
@@ -532,6 +549,16 @@ impl App {
                 self.diagnostics_selection =
                     next_selection(self.diagnostics_selection, self.diagnostics_row_count());
                 self.message = "Doctor diagnostics selection moved.".to_owned();
+            }
+            KeyCode::Enter
+                if self.view == View::Diagnostics && self.diagnostics_row_count() > 0 =>
+            {
+                self.diagnostics_details_expanded = !self.diagnostics_details_expanded;
+                self.message = if self.diagnostics_details_expanded {
+                    "Doctor selected-check details expanded.".to_owned()
+                } else {
+                    "Doctor selected-check details collapsed.".to_owned()
+                };
             }
             KeyCode::Char('d') => {
                 self.start_diagnostics();
@@ -604,7 +631,7 @@ impl App {
                 self.query.selection = 0;
                 self.message = "Query input cleared.".to_owned();
             }
-            KeyCode::Tab => {
+            KeyCode::F(2) => {
                 self.query.mode = self.query.mode.toggled();
                 self.query.status = QueryStatus::Idle;
                 self.query.selection = 0;
@@ -652,7 +679,7 @@ impl App {
                 self.graph.selection = 0;
                 self.message = "Graph input cleared.".to_owned();
             }
-            KeyCode::Tab => {
+            KeyCode::F(2) => {
                 self.graph.direction = self.graph.direction.toggled();
                 self.graph.status = GraphStatus::Idle;
                 self.graph.selection = 0;
@@ -700,7 +727,7 @@ impl App {
                 self.evidence.selection = 0;
                 self.message = "Evidence input cleared.".to_owned();
             }
-            KeyCode::Tab => {
+            KeyCode::F(2) => {
                 self.evidence.mode = self.evidence.mode.toggled();
                 self.evidence.status = EvidenceStatus::Idle;
                 self.evidence.selection = 0;
@@ -762,6 +789,7 @@ impl App {
         });
         self.view = View::Diagnostics;
         self.diagnostics = DiagnosticsState::Running;
+        self.diagnostics_details_expanded = false;
         self.diagnostics_receiver = Some(receiver);
         self.message = "Doctor diagnostics started.".to_owned();
     }
@@ -890,6 +918,7 @@ impl App {
                 self.diagnostics_receiver = None;
                 self.diagnostics = DiagnosticsState::Completed(report);
                 self.diagnostics_selection = 0;
+                self.diagnostics_details_expanded = false;
                 self.message = "Doctor diagnostics completed.".to_owned();
             }
             Ok(Err(error)) => {
@@ -1043,13 +1072,7 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     match app.view {
         View::Diagnostics => match &app.diagnostics {
             DiagnosticsState::Completed(report) => {
-                render_selectable_table(
-                    frame,
-                    area,
-                    diagnostics_table(report),
-                    app.diagnostics_selection,
-                    report.checks.len(),
-                );
+                render_diagnostics_panel(frame, area, app, report);
             }
             _ => render_line_panel(frame, area, "Doctor Diagnostics", app.diagnostics_lines()),
         },
@@ -1099,6 +1122,36 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             _ => render_line_panel(frame, area, "Impact/Context Pack", app.evidence_lines()),
         },
         View::Indexing => render_index_panel(frame, area, app),
+    }
+}
+
+fn render_diagnostics_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    report: &DiagnosticReport,
+) {
+    let detail_height = if app.diagnostics_details_expanded {
+        8
+    } else {
+        5
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(detail_height)])
+        .split(area);
+    render_selectable_table(
+        frame,
+        chunks[0],
+        diagnostics_table(report),
+        app.diagnostics_selection,
+        report.checks.len(),
+    );
+    if let Some(check) = selected_diagnostic_check(report, app.diagnostics_selection) {
+        frame.render_widget(
+            diagnostic_detail_panel(check, app.diagnostics_details_expanded),
+            chunks[1],
+        );
     }
 }
 
@@ -1484,6 +1537,72 @@ fn diagnostics_table(report: &DiagnosticReport) -> Table<'_> {
     .column_spacing(1)
 }
 
+fn diagnostic_detail_panel(check: &DiagnosticCheck, expanded: bool) -> Paragraph<'_> {
+    let (status, tone) = diagnostic_status(check.state);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Check: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(check.label.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Status: ", Style::new().add_modifier(Modifier::BOLD)),
+            status_span(status, tone),
+        ]),
+        Line::from(vec![
+            Span::styled("Detail: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(diagnostic_message(check)),
+        ]),
+    ];
+    if expanded {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Hint: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(diagnostic_hint(check)),
+        ]));
+    }
+
+    let title = if expanded {
+        "Selected Check Details | expanded"
+    } else {
+        "Selected Check Details"
+    };
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(tone_style(tone))
+            .title(Line::from(status_span(title, tone))),
+    )
+}
+
+fn selected_diagnostic_check(
+    report: &DiagnosticReport,
+    selection: usize,
+) -> Option<&DiagnosticCheck> {
+    report
+        .checks
+        .get(selection.min(report.checks.len().saturating_sub(1)))
+}
+
+fn diagnostic_message(check: &DiagnosticCheck) -> &str {
+    if check.message.is_empty() {
+        "<no detail>"
+    } else {
+        check.message.as_str()
+    }
+}
+
+fn diagnostic_hint(check: &DiagnosticCheck) -> &'static str {
+    match check.state {
+        DiagnosticState::Ok => "No action needed.",
+        DiagnosticState::Missing => "Create or configure the missing local path or dependency.",
+        DiagnosticState::Unreachable => {
+            "Start the local service or verify the configured localhost endpoint."
+        }
+        DiagnosticState::Error => "Review the diagnostic detail and local configuration.",
+        DiagnosticState::Skipped => "No action needed unless this check should apply locally.",
+    }
+}
+
 fn query_table(result: &QueryResult) -> Table<'_> {
     match result {
         QueryResult::Symbol(summary) => symbol_table(summary),
@@ -1835,6 +1954,36 @@ impl View {
         }
     }
 
+    fn label(self) -> &'static str {
+        match self {
+            Self::Indexing => "Indexing",
+            Self::Diagnostics => "Doctor Diagnostics",
+            Self::Query => "Query Workbench",
+            Self::Graph => "Symbol/Call Graph",
+            Self::Evidence => "Impact/Context Pack",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Indexing => Self::Diagnostics,
+            Self::Diagnostics => Self::Query,
+            Self::Query => Self::Graph,
+            Self::Graph => Self::Evidence,
+            Self::Evidence => Self::Indexing,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Indexing => Self::Evidence,
+            Self::Diagnostics => Self::Indexing,
+            Self::Query => Self::Diagnostics,
+            Self::Graph => Self::Query,
+            Self::Evidence => Self::Graph,
+        }
+    }
+
     fn footer_label(self) -> &'static str {
         match self {
             Self::Indexing => "index",
@@ -1848,19 +1997,19 @@ impl View {
     fn footer_help(self) -> &'static str {
         match self {
             Self::Indexing => {
-                "o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
-                "Up/Down select | d rerun | i index | w query | g calls | p impact | q quit"
+                "Tab next view | Up/Down select | Enter details | d rerun | i index | w query | g calls | p impact | q quit"
             }
             Self::Query => {
-                "type query | Up/Down select | Tab mode | Enter run | Esc clear/back | q quit"
+                "Tab next view | type query | Up/Down select | F2 mode | Enter run | Esc clear/back | q quit"
             }
             Self::Graph => {
-                "type symbol | Up/Down select | Tab callers/callees | Enter run | Esc clear/back | q quit"
+                "Tab next view | type symbol | Up/Down select | F2 callers/callees | Enter run | Esc clear/back | q quit"
             }
             Self::Evidence => {
-                "type symbol | Up/Down select | Tab impact/context | Enter run | Esc clear/back | q quit"
+                "Tab next view | type symbol | Up/Down select | F2 impact/context | Enter run | Esc clear/back | q quit"
             }
         }
     }
@@ -2185,8 +2334,46 @@ mod tests {
 
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("query"));
-        assert!(rendered.contains("Tab mode"));
+        assert!(rendered.contains("Tab next view"));
+        assert!(rendered.contains("F2 mode"));
         assert!(rendered.contains("Enter run"));
+    }
+
+    #[test]
+    fn tab_switches_major_views_from_query_without_toggling_mode() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        app.query.mode = QueryMode::Symbol;
+
+        assert!(!app.handle_key(KeyCode::Tab));
+
+        assert_eq!(app.view, View::Graph);
+        assert_eq!(app.query.mode, QueryMode::Symbol);
+        assert_eq!(app.message, "Symbol/Call Graph view selected.");
+    }
+
+    #[test]
+    fn shift_tab_switches_to_previous_major_view() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+
+        assert!(!app.handle_key(KeyCode::BackTab));
+
+        assert_eq!(app.view, View::Diagnostics);
+        assert_eq!(app.message, "Doctor Diagnostics view selected.");
+    }
+
+    #[test]
+    fn renders_doctor_footer_enter_details_help() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Enter details"));
     }
 
     #[test]
@@ -2267,25 +2454,7 @@ mod tests {
     fn renders_doctor_diagnostics() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Diagnostics;
-        app.diagnostics = DiagnosticsState::Completed(DiagnosticReport {
-            workspace: "/tmp/repo".to_owned(),
-            sqlite_path: ".symdex/symdex.sqlite".to_owned(),
-            qdrant_url: "http://localhost:6333".to_owned(),
-            ollama_url: "http://localhost:11434".to_owned(),
-            embed_model: "nomic-embed-text".to_owned(),
-            checks: vec![
-                DiagnosticCheck {
-                    label: "sqlite_parent".to_owned(),
-                    state: DiagnosticState::Ok,
-                    message: ".symdex".to_owned(),
-                },
-                DiagnosticCheck {
-                    label: "qdrant_status".to_owned(),
-                    state: DiagnosticState::Unreachable,
-                    message: "connection refused".to_owned(),
-                },
-            ],
-        });
+        app.diagnostics = DiagnosticsState::Completed(sample_diagnostic_report());
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
@@ -2297,6 +2466,44 @@ mod tests {
         assert!(rendered.contains("sqlite_parent"));
         assert!(rendered.contains("qdrant_status"));
         assert!(rendered.contains("unreachable"));
+        assert!(rendered.contains("Selected Check Details"));
+    }
+
+    #[test]
+    fn doctor_selection_updates_selected_check_details() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        app.diagnostics = DiagnosticsState::Completed(sample_diagnostic_report());
+
+        assert_eq!(app.diagnostics_selection, 0);
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.diagnostics_selection, 1);
+        assert!(!app.handle_key(KeyCode::Enter));
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Selected Check Details"));
+        assert!(rendered.contains("qdrant_status"));
+        assert!(rendered.contains("connection refused"));
+        assert!(rendered.contains("Start the local service"));
+    }
+
+    #[test]
+    fn doctor_enter_toggles_selected_check_details_expansion() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        app.diagnostics = DiagnosticsState::Completed(sample_diagnostic_report());
+
+        assert!(!app.diagnostics_details_expanded);
+        assert!(!app.handle_key(KeyCode::Enter));
+        assert!(app.diagnostics_details_expanded);
+        assert_eq!(app.message, "Doctor selected-check details expanded.");
+        assert!(!app.handle_key(KeyCode::Enter));
+        assert!(!app.diagnostics_details_expanded);
+        assert_eq!(app.message, "Doctor selected-check details collapsed.");
     }
 
     #[test]
@@ -2354,7 +2561,7 @@ mod tests {
         app.view = View::Query;
         assert_eq!(app.query.mode, QueryMode::Symbol);
 
-        assert!(!app.handle_query_key(KeyCode::Tab));
+        assert!(!app.handle_query_key(KeyCode::F(2)));
         assert_eq!(app.query.mode, QueryMode::Semantic);
     }
 
@@ -2504,7 +2711,7 @@ mod tests {
         app.view = View::Graph;
         assert_eq!(app.graph.direction, CallDirection::Callers);
 
-        assert!(!app.handle_graph_key(KeyCode::Tab));
+        assert!(!app.handle_graph_key(KeyCode::F(2)));
         assert_eq!(app.graph.direction, CallDirection::Callees);
     }
 
@@ -2587,7 +2794,7 @@ mod tests {
         assert!(!app.handle_evidence_key(KeyCode::Char('d')));
         assert_eq!(app.evidence.input, "add");
 
-        assert!(!app.handle_evidence_key(KeyCode::Tab));
+        assert!(!app.handle_evidence_key(KeyCode::F(2)));
         assert_eq!(app.evidence.mode, EvidenceMode::ContextPack);
 
         assert!(!app.handle_evidence_key(KeyCode::Backspace));
@@ -2641,6 +2848,28 @@ mod tests {
             last_indexed_at: Some("123".to_owned()),
             embedding_model: Some("nomic-embed-text".to_owned()),
             embedding_dimension: Some(768),
+        }
+    }
+
+    fn sample_diagnostic_report() -> DiagnosticReport {
+        DiagnosticReport {
+            workspace: "/tmp/repo".to_owned(),
+            sqlite_path: ".symdex/symdex.sqlite".to_owned(),
+            qdrant_url: "http://localhost:6333".to_owned(),
+            ollama_url: "http://localhost:11434".to_owned(),
+            embed_model: "nomic-embed-text".to_owned(),
+            checks: vec![
+                DiagnosticCheck {
+                    label: "sqlite_parent".to_owned(),
+                    state: DiagnosticState::Ok,
+                    message: ".symdex".to_owned(),
+                },
+                DiagnosticCheck {
+                    label: "qdrant_status".to_owned(),
+                    state: DiagnosticState::Unreachable,
+                    message: "connection refused".to_owned(),
+                },
+            ],
         }
     }
 

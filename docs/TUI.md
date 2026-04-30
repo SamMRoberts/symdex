@@ -148,7 +148,7 @@ terminal panes.
 
 ### Query Workbench
 
-- Support semantic search input with `w`, `Tab`, typed query text, and `Enter`.
+- Support semantic search input with `w`, `F2`, typed query text, and `Enter`.
 - Support symbol search input with the same workbench controls.
 - Display compact ranked evidence with path, line range, symbol, score, and kind.
 - Show empty and error states.
@@ -158,7 +158,7 @@ terminal panes.
 
 ### Symbol and Call Browser
 
-- Show direct callers and callees with `g`, typed symbol text, `Tab`, and `Enter`.
+- Show direct callers and callees with `g`, typed symbol text, `F2`, and `Enter`.
 - Preserve resolution status, confidence, and unresolved/ambiguous labels.
 - Render callers/callees as tabs or a segmented control.
 - Use a table for symbol, path, line range, confidence, callee text, and
@@ -167,7 +167,7 @@ terminal panes.
 ### Impact and Context Pack Viewer
 
 - Show the basic impact view using direct callers and callees with `p`, typed
-  symbol text, `Tab`, and `Enter`.
+  symbol text, `F2`, and `Enter`.
 - Show `symdex.context_pack.v1` metadata with the same viewer controls.
 - Do not include source text by default.
 - Render impact sections as separate panels or tables for direct callers and
@@ -193,9 +193,11 @@ Current dashboard keys:
 - `w`: open the query workbench
 - `g`: open the symbol/call graph browser
 - `p`: open the impact/context-pack viewer
-- `Tab`: toggle symbol and semantic query modes in the query workbench
-- `Tab`: toggle callers and callees in the symbol/call graph browser
-- `Tab`: toggle impact and context-pack modes in the impact/context-pack viewer
+- `Tab`: switch to the next major TUI view
+- `Shift+Tab`: switch to the previous major TUI view
+- `F2`: toggle symbol and semantic query modes in the query workbench
+- `F2`: toggle callers and callees in the symbol/call graph browser
+- `F2`: toggle impact and context-pack modes in the impact/context-pack viewer
 - `Up` / `Down`: move the selected row in completed result tables
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
 - typed text: edit the query workbench input
