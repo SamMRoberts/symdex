@@ -16,7 +16,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
-use ratatui::widgets::{Cell, Row, Table};
+use ratatui::widgets::{Cell, Row, Table, TableState};
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
@@ -41,7 +41,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Toggle mode in query, graph, and impact/context views\n    Enter     Run lookup or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Toggle mode in query, graph, and impact/context views\n    Up/Down   Move selected result row\n    Enter     Run lookup or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -58,6 +58,7 @@ pub struct App {
     screen: Screen,
     last_index_summary: Option<IndexSummary>,
     diagnostics: DiagnosticsState,
+    diagnostics_selection: usize,
     query: QueryWorkbenchState,
     graph: GraphBrowserState,
     evidence: EvidenceViewerState,
@@ -94,6 +95,7 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             diagnostics: DiagnosticsState::Idle,
+            diagnostics_selection: 0,
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -126,6 +128,7 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             diagnostics: DiagnosticsState::Idle,
+            diagnostics_selection: 0,
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -486,6 +489,13 @@ impl App {
         Ok(())
     }
 
+    fn diagnostics_row_count(&self) -> usize {
+        match &self.diagnostics {
+            DiagnosticsState::Completed(report) => report.checks.len(),
+            _ => 0,
+        }
+    }
+
     fn handle_key(&mut self, code: KeyCode) -> bool {
         if self.view == View::Query {
             return self.handle_query_key(code);
@@ -507,6 +517,16 @@ impl App {
             KeyCode::Char('i') => {
                 self.view = View::Indexing;
                 self.message = "Indexing controls selected.".to_owned();
+            }
+            KeyCode::Up if self.view == View::Diagnostics && self.diagnostics_row_count() > 0 => {
+                self.diagnostics_selection =
+                    previous_selection(self.diagnostics_selection, self.diagnostics_row_count());
+                self.message = "Doctor diagnostics selection moved.".to_owned();
+            }
+            KeyCode::Down if self.view == View::Diagnostics && self.diagnostics_row_count() > 0 => {
+                self.diagnostics_selection =
+                    next_selection(self.diagnostics_selection, self.diagnostics_row_count());
+                self.message = "Doctor diagnostics selection moved.".to_owned();
             }
             KeyCode::Char('d') => {
                 self.start_diagnostics();
@@ -559,6 +579,16 @@ impl App {
     fn handle_query_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') if self.query.input.is_empty() => return true,
+            KeyCode::Up if self.query.result_count() > 0 => {
+                self.query.selection =
+                    previous_selection(self.query.selection, self.query.result_count());
+                self.message = "Query result selection moved.".to_owned();
+            }
+            KeyCode::Down if self.query.result_count() > 0 => {
+                self.query.selection =
+                    next_selection(self.query.selection, self.query.result_count());
+                self.message = "Query result selection moved.".to_owned();
+            }
             KeyCode::Esc if self.query.input.is_empty() => {
                 self.view = View::Indexing;
                 self.message = "Indexing controls selected.".to_owned();
@@ -566,11 +596,13 @@ impl App {
             KeyCode::Esc => {
                 self.query.input.clear();
                 self.query.status = QueryStatus::Idle;
+                self.query.selection = 0;
                 self.message = "Query input cleared.".to_owned();
             }
             KeyCode::Tab => {
                 self.query.mode = self.query.mode.toggled();
                 self.query.status = QueryStatus::Idle;
+                self.query.selection = 0;
                 self.message = format!("Query mode set to {}.", self.query.mode.label());
             }
             KeyCode::Enter => {
@@ -578,12 +610,14 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.query.input.pop();
+                self.query.selection = 0;
             }
             KeyCode::Char(character) => {
                 self.query.input.push(character);
                 if matches!(self.query.status, QueryStatus::Failed(_)) {
                     self.query.status = QueryStatus::Idle;
                 }
+                self.query.selection = 0;
             }
             _ => {}
         }
@@ -593,6 +627,16 @@ impl App {
     fn handle_graph_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') if self.graph.input.is_empty() => return true,
+            KeyCode::Up if self.graph.result_count() > 0 => {
+                self.graph.selection =
+                    previous_selection(self.graph.selection, self.graph.result_count());
+                self.message = "Graph result selection moved.".to_owned();
+            }
+            KeyCode::Down if self.graph.result_count() > 0 => {
+                self.graph.selection =
+                    next_selection(self.graph.selection, self.graph.result_count());
+                self.message = "Graph result selection moved.".to_owned();
+            }
             KeyCode::Esc if self.graph.input.is_empty() => {
                 self.view = View::Indexing;
                 self.message = "Indexing controls selected.".to_owned();
@@ -600,11 +644,13 @@ impl App {
             KeyCode::Esc => {
                 self.graph.input.clear();
                 self.graph.status = GraphStatus::Idle;
+                self.graph.selection = 0;
                 self.message = "Graph input cleared.".to_owned();
             }
             KeyCode::Tab => {
                 self.graph.direction = self.graph.direction.toggled();
                 self.graph.status = GraphStatus::Idle;
+                self.graph.selection = 0;
                 self.message = format!("Graph mode set to {}.", self.graph.direction.label());
             }
             KeyCode::Enter => {
@@ -612,12 +658,14 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.graph.input.pop();
+                self.graph.selection = 0;
             }
             KeyCode::Char(character) => {
                 self.graph.input.push(character);
                 if matches!(self.graph.status, GraphStatus::Failed(_)) {
                     self.graph.status = GraphStatus::Idle;
                 }
+                self.graph.selection = 0;
             }
             _ => {}
         }
@@ -627,6 +675,16 @@ impl App {
     fn handle_evidence_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') if self.evidence.input.is_empty() => return true,
+            KeyCode::Up if self.evidence.result_count() > 0 => {
+                self.evidence.selection =
+                    previous_selection(self.evidence.selection, self.evidence.result_count());
+                self.message = "Evidence result selection moved.".to_owned();
+            }
+            KeyCode::Down if self.evidence.result_count() > 0 => {
+                self.evidence.selection =
+                    next_selection(self.evidence.selection, self.evidence.result_count());
+                self.message = "Evidence result selection moved.".to_owned();
+            }
             KeyCode::Esc if self.evidence.input.is_empty() => {
                 self.view = View::Indexing;
                 self.message = "Indexing controls selected.".to_owned();
@@ -634,11 +692,13 @@ impl App {
             KeyCode::Esc => {
                 self.evidence.input.clear();
                 self.evidence.status = EvidenceStatus::Idle;
+                self.evidence.selection = 0;
                 self.message = "Evidence input cleared.".to_owned();
             }
             KeyCode::Tab => {
                 self.evidence.mode = self.evidence.mode.toggled();
                 self.evidence.status = EvidenceStatus::Idle;
+                self.evidence.selection = 0;
                 self.message = format!("Evidence mode set to {}.", self.evidence.mode.label());
             }
             KeyCode::Enter => {
@@ -646,12 +706,14 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.evidence.input.pop();
+                self.evidence.selection = 0;
             }
             KeyCode::Char(character) => {
                 self.evidence.input.push(character);
                 if matches!(self.evidence.status, EvidenceStatus::Failed(_)) {
                     self.evidence.status = EvidenceStatus::Idle;
                 }
+                self.evidence.selection = 0;
             }
             _ => {}
         }
@@ -805,6 +867,7 @@ impl App {
             Ok(Ok(report)) => {
                 self.diagnostics_receiver = None;
                 self.diagnostics = DiagnosticsState::Completed(report);
+                self.diagnostics_selection = 0;
                 self.message = "Doctor diagnostics completed.".to_owned();
             }
             Ok(Err(error)) => {
@@ -830,6 +893,7 @@ impl App {
             Ok(Ok(result)) => {
                 self.query_receiver = None;
                 self.query.status = QueryStatus::Completed(result);
+                self.query.selection = 0;
                 self.message = "Query completed.".to_owned();
             }
             Ok(Err(error)) => {
@@ -854,6 +918,7 @@ impl App {
             Ok(Ok(summary)) => {
                 self.graph_receiver = None;
                 self.graph.status = GraphStatus::Completed(summary);
+                self.graph.selection = 0;
                 self.message = "Graph lookup completed.".to_owned();
             }
             Ok(Err(error)) => {
@@ -878,6 +943,7 @@ impl App {
             Ok(Ok(result)) => {
                 self.evidence_receiver = None;
                 self.evidence.status = EvidenceStatus::Completed(result);
+                self.evidence.selection = 0;
                 self.message = "Evidence lookup completed.".to_owned();
             }
             Ok(Err(error)) => {
@@ -955,28 +1021,58 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     match app.view {
         View::Diagnostics => match &app.diagnostics {
             DiagnosticsState::Completed(report) => {
-                frame.render_widget(diagnostics_table(report), area);
+                render_selectable_table(
+                    frame,
+                    area,
+                    diagnostics_table(report),
+                    app.diagnostics_selection,
+                    report.checks.len(),
+                );
             }
             _ => render_line_panel(frame, area, "Doctor Diagnostics", app.diagnostics_lines()),
         },
         View::Query => match &app.query.status {
             QueryStatus::Completed(result) => {
-                frame.render_widget(query_table(result), area);
+                render_selectable_table(
+                    frame,
+                    area,
+                    query_table(result),
+                    app.query.selection,
+                    query_result_count(result),
+                );
             }
             _ => render_line_panel(frame, area, "Query Workbench", app.query_lines()),
         },
         View::Graph => match &app.graph.status {
             GraphStatus::Completed(summary) => {
-                frame.render_widget(call_graph_table(summary), area);
+                render_selectable_table(
+                    frame,
+                    area,
+                    call_graph_table(summary),
+                    app.graph.selection,
+                    summary.rows.len().min(12),
+                );
             }
             _ => render_line_panel(frame, area, "Symbol/Call Graph", app.graph_lines()),
         },
         View::Evidence => match &app.evidence.status {
             EvidenceStatus::Completed(EvidenceResult::Impact(summary)) => {
-                frame.render_widget(impact_table(summary), area);
+                render_selectable_table(
+                    frame,
+                    area,
+                    impact_table(summary),
+                    app.evidence.selection,
+                    impact_result_count(summary),
+                );
             }
             EvidenceStatus::Completed(EvidenceResult::ContextPack(pack)) => {
-                frame.render_widget(context_pack_table(pack), area);
+                render_selectable_table(
+                    frame,
+                    area,
+                    context_pack_table(pack),
+                    app.evidence.selection,
+                    context_pack_row_count(pack),
+                );
             }
             _ => render_line_panel(frame, area, "Impact/Context Pack", app.evidence_lines()),
         },
@@ -993,6 +1089,26 @@ fn render_line_panel(
     let panel = List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
         .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(panel, area);
+}
+
+fn render_selectable_table(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    table: Table<'_>,
+    selection: usize,
+    row_count: usize,
+) {
+    let mut state = TableState::default();
+    if row_count > 0 {
+        state.select(Some(selection.min(row_count.saturating_sub(1))));
+    }
+    frame.render_stateful_widget(
+        table
+            .row_highlight_style(selected_row_style())
+            .highlight_symbol("> "),
+        area,
+        &mut state,
+    );
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), String> {
@@ -1570,6 +1686,45 @@ fn score_style(score: f64) -> Style {
     }
 }
 
+fn selected_row_style() -> Style {
+    Style::new().bg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+
+fn previous_selection(selection: usize, row_count: usize) -> usize {
+    if row_count == 0 {
+        0
+    } else if selection == 0 {
+        row_count - 1
+    } else {
+        selection - 1
+    }
+}
+
+fn next_selection(selection: usize, row_count: usize) -> usize {
+    if row_count == 0 {
+        0
+    } else {
+        (selection + 1) % row_count
+    }
+}
+
+fn query_result_count(result: &QueryResult) -> usize {
+    match result {
+        QueryResult::Symbol(summary) => summary.symbols.len().min(12),
+        QueryResult::Semantic(summary) => summary.results.len().min(12),
+    }
+}
+
+fn impact_result_count(summary: &ImpactSummary) -> usize {
+    summary.direct_callers.len().min(6) + summary.direct_callees.len().min(6)
+}
+
+fn context_pack_row_count(pack: &ContextPack) -> usize {
+    7 + pack.focus_symbols.iter().take(4).count()
+        + pack.files.iter().take(4).count()
+        + pack.notes.len()
+}
+
 fn line_range(start: usize, end: usize) -> String {
     format!("{start}-{end}")
 }
@@ -1620,13 +1775,17 @@ impl View {
             Self::Indexing => {
                 "o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
-            Self::Diagnostics => "d rerun | i index | w query | g calls | p impact | q quit",
-            Self::Query => "type query | Tab mode | Enter run | Esc clear/back | q quit",
+            Self::Diagnostics => {
+                "Up/Down select | d rerun | i index | w query | g calls | p impact | q quit"
+            }
+            Self::Query => {
+                "type query | Up/Down select | Tab mode | Enter run | Esc clear/back | q quit"
+            }
             Self::Graph => {
-                "type symbol | Tab callers/callees | Enter run | Esc clear/back | q quit"
+                "type symbol | Up/Down select | Tab callers/callees | Enter run | Esc clear/back | q quit"
             }
             Self::Evidence => {
-                "type symbol | Tab impact/context | Enter run | Esc clear/back | q quit"
+                "type symbol | Up/Down select | Tab impact/context | Enter run | Esc clear/back | q quit"
             }
         }
     }
@@ -1663,6 +1822,7 @@ struct QueryWorkbenchState {
     mode: QueryMode,
     input: String,
     status: QueryStatus,
+    selection: usize,
 }
 
 impl Default for QueryWorkbenchState {
@@ -1671,6 +1831,16 @@ impl Default for QueryWorkbenchState {
             mode: QueryMode::Symbol,
             input: String::new(),
             status: QueryStatus::Idle,
+            selection: 0,
+        }
+    }
+}
+
+impl QueryWorkbenchState {
+    fn result_count(&self) -> usize {
+        match &self.status {
+            QueryStatus::Completed(result) => query_result_count(result),
+            _ => 0,
         }
     }
 }
@@ -1686,6 +1856,7 @@ struct GraphBrowserState {
     direction: CallDirection,
     input: String,
     status: GraphStatus,
+    selection: usize,
 }
 
 impl Default for GraphBrowserState {
@@ -1694,6 +1865,16 @@ impl Default for GraphBrowserState {
             direction: CallDirection::Callers,
             input: String::new(),
             status: GraphStatus::Idle,
+            selection: 0,
+        }
+    }
+}
+
+impl GraphBrowserState {
+    fn result_count(&self) -> usize {
+        match &self.status {
+            GraphStatus::Completed(summary) => summary.rows.len().min(12),
+            _ => 0,
         }
     }
 }
@@ -1731,6 +1912,7 @@ struct EvidenceViewerState {
     mode: EvidenceMode,
     input: String,
     status: EvidenceStatus,
+    selection: usize,
 }
 
 impl Default for EvidenceViewerState {
@@ -1739,6 +1921,21 @@ impl Default for EvidenceViewerState {
             mode: EvidenceMode::Impact,
             input: String::new(),
             status: EvidenceStatus::Idle,
+            selection: 0,
+        }
+    }
+}
+
+impl EvidenceViewerState {
+    fn result_count(&self) -> usize {
+        match &self.status {
+            EvidenceStatus::Completed(EvidenceResult::Impact(summary)) => {
+                impact_result_count(summary)
+            }
+            EvidenceStatus::Completed(EvidenceResult::ContextPack(pack)) => {
+                context_pack_row_count(pack)
+            }
+            _ => 0,
         }
     }
 }
@@ -2020,6 +2217,52 @@ mod tests {
     }
 
     #[test]
+    fn query_workbench_moves_result_selection() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        app.query.status = QueryStatus::Completed(QueryResult::Symbol(SymbolSearchSummary {
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            symbols: vec![
+                sample_symbol("symbol-1", "crate::add", 1, 3),
+                sample_symbol("symbol-2", "crate::subtract", 5, 8),
+            ],
+        }));
+
+        assert_eq!(app.query.selection, 0);
+        assert!(!app.handle_query_key(KeyCode::Down));
+        assert_eq!(app.query.selection, 1);
+        assert!(!app.handle_query_key(KeyCode::Down));
+        assert_eq!(app.query.selection, 0);
+        assert!(!app.handle_query_key(KeyCode::Up));
+        assert_eq!(app.query.selection, 1);
+    }
+
+    #[test]
+    fn renders_selected_result_row_highlight() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        app.query.selection = 1;
+        app.query.status = QueryStatus::Completed(QueryResult::Symbol(SymbolSearchSummary {
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            symbols: vec![
+                sample_symbol("symbol-1", "crate::add", 1, 3),
+                sample_symbol("symbol-2", "crate::subtract", 5, 8),
+            ],
+        }));
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        assert_eq!(
+            cell_bg_for_text(terminal.backend().buffer(), "crate::subtract", None),
+            Some(Color::Cyan)
+        );
+    }
+
+    #[test]
     fn renders_symbol_call_graph_results() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Graph;
@@ -2206,6 +2449,28 @@ mod tests {
         }
     }
 
+    fn sample_symbol(
+        id: impl Into<String>,
+        qualified_name: impl Into<String>,
+        start_line: usize,
+        end_line: usize,
+    ) -> SymbolSearchRow {
+        let qualified_name = qualified_name.into();
+        SymbolSearchRow {
+            id: id.into(),
+            name: qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name.as_str())
+                .to_owned(),
+            qualified_name,
+            kind: "function".to_owned(),
+            path: "src/lib.rs".to_owned(),
+            start_line,
+            end_line,
+        }
+    }
+
     fn sample_context_pack() -> ContextPack {
         ContextPack {
             format: "symdex.context_pack.v1".to_owned(),
@@ -2237,6 +2502,23 @@ mod tests {
         text: &str,
         row: Option<u16>,
     ) -> Option<Color> {
+        cell_color_for_text(buffer, text, row, |cell| cell.fg)
+    }
+
+    fn cell_bg_for_text(
+        buffer: &ratatui::buffer::Buffer,
+        text: &str,
+        row: Option<u16>,
+    ) -> Option<Color> {
+        cell_color_for_text(buffer, text, row, |cell| cell.bg)
+    }
+
+    fn cell_color_for_text(
+        buffer: &ratatui::buffer::Buffer,
+        text: &str,
+        row: Option<u16>,
+        color: impl Fn(&ratatui::buffer::Cell) -> Color,
+    ) -> Option<Color> {
         let y_start = row.unwrap_or(buffer.area.y);
         let y_end = row
             .map(|value| value.saturating_add(1))
@@ -2244,7 +2526,7 @@ mod tests {
         for y in y_start..y_end {
             for x in buffer.area.x..buffer.area.x + buffer.area.width {
                 if text_starts_at(buffer, text, x, y) {
-                    return buffer.cell(Position { x, y }).map(|cell| cell.fg);
+                    return buffer.cell(Position { x, y }).map(&color);
                 }
             }
         }

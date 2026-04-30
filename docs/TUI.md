@@ -61,7 +61,8 @@ terminal panes.
   - `Paragraph` with wrapping for status messages, errors, and confirmations.
   - `Gauge` for long-running indexing progress when progress is available.
   - `Sparkline` or `BarChart` only when backed by real metrics, not decoration.
-- Use `ListState` or equivalent stateful widgets for focused/selected rows.
+- Use `TableState`, `ListState`, or equivalent stateful widgets for
+  focused/selected rows.
 - Prefer split panes for workflows that compare data:
   - repository/status summary on the left
   - active view details on the right
@@ -76,6 +77,8 @@ terminal panes.
 ### Interaction Feedback
 
 - Highlight the active tab and focused input/list row.
+- Use `Up` and `Down` to move the selected evidence row in completed diagnostic,
+  query, call graph, impact, and context-pack tables.
 - Style pending confirmation states with a warning color and explicit `y/n`
   choices.
 - Style loading/running states distinctly from idle states.
@@ -175,6 +178,7 @@ Current dashboard keys:
 - `Tab`: toggle symbol and semantic query modes in the query workbench
 - `Tab`: toggle callers and callees in the symbol/call graph browser
 - `Tab`: toggle impact and context-pack modes in the impact/context-pack viewer
+- `Up` / `Down`: move the selected row in completed result tables
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
 - typed text: edit the impact/context-pack viewer input
