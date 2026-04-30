@@ -224,6 +224,12 @@ Compare SQLite chunk metadata with Qdrant collection metadata:
 Surface missing collections, missing points, model drift, and dimension drift
 as warning or error rows.
 
+The first TUI implementation uses SQLite metadata and recorded Qdrant point IDs
+to show total, embeddable, vector-backed, missing-vector, and excluded chunk
+counts plus latest model, dimension, collection, run count, exclusion reasons,
+and health notes. It does not require a live Qdrant service for deterministic
+offline rendering.
+
 ### Index runs timeline
 
 Use `index_runs.started_at`, `finished_at`, `status`, `files_seen`,

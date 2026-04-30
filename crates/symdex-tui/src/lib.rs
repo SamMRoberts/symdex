@@ -25,15 +25,16 @@ use symdex_index::{
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
-    SymbolSearchSummary, run_call_graph, run_call_resolution, run_context_pack, run_impact,
-    run_index_coverage, run_semantic_search, run_storage_explorer, run_symbol_outline,
-    run_symbol_search,
+    SymbolSearchSummary, run_call_graph, run_call_resolution, run_context_pack,
+    run_embedding_coverage, run_impact, run_index_coverage, run_semantic_search,
+    run_storage_explorer, run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
-    CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack, FileCoverageStatus,
-    FileDetailSummary, IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus,
-    SqliteStorageSummary, SqliteStore, StorageExplorerSummary, StorageHealthRow,
-    StorageHealthStatus, StoreConfig, SymbolOutlineSummary, qdrant_collection_name,
+    CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
+    EmbeddingCoverageSummary, FileCoverageStatus, FileDetailSummary, IndexCoverageSummary,
+    QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, SqliteStore,
+    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    SymbolOutlineSummary, qdrant_collection_name,
 };
 
 pub struct TuiOptions {
@@ -49,7 +50,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -103,6 +104,9 @@ impl App {
         let call_resolution = sqlite
             .call_resolution_summary(root.id())
             .map_err(|error| error.to_string())?;
+        let embedding_coverage = sqlite
+            .embedding_coverage_summary(root.id(), &embed_config.model)
+            .map_err(|error| error.to_string())?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -121,7 +125,13 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
-            storage: StorageExplorerState::completed(storage, coverage, outline, call_resolution),
+            storage: StorageExplorerState::completed(
+                storage,
+                coverage,
+                outline,
+                call_resolution,
+                embedding_coverage,
+            ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -145,6 +155,7 @@ impl App {
         let coverage = coverage_summary_from_status(&repository_id, &status);
         let outline = symbol_outline_summary_from_status(&repository_id);
         let call_resolution = call_resolution_summary_from_status(&repository_id);
+        let embedding_coverage = embedding_coverage_summary_from_status(&repository_id, &status);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -162,7 +173,13 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
-            storage: StorageExplorerState::completed(storage, coverage, outline, call_resolution),
+            storage: StorageExplorerState::completed(
+                storage,
+                coverage,
+                outline,
+                call_resolution,
+                embedding_coverage,
+            ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -468,6 +485,10 @@ impl App {
             Ok(summary) => CallResolutionStatus::Completed(summary),
             Err(error) => CallResolutionStatus::Failed(error),
         };
+        self.storage.embeddings = match run_embedding_coverage(&self.repo_input) {
+            Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
+            Err(error) => EmbeddingCoverageStatus::Failed(error),
+        };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
         Ok(())
@@ -497,6 +518,12 @@ impl App {
             StorageMode::Calls => match &self.storage.calls {
                 CallResolutionStatus::Completed(summary) => call_resolution_row_count(summary),
                 CallResolutionStatus::Failed(_) => 1,
+            },
+            StorageMode::Embeddings => match &self.storage.embeddings {
+                EmbeddingCoverageStatus::Completed(summary) => {
+                    embedding_coverage_row_count(summary)
+                }
+                EmbeddingCoverageStatus::Failed(_) => 1,
             },
         }
     }
@@ -1257,6 +1284,26 @@ fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
             CallResolutionStatus::Failed(error) => render_storage_error(frame, area, error),
         },
+        StorageMode::Embeddings => match &app.storage.embeddings {
+            EmbeddingCoverageStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(7), Constraint::Length(9)])
+                    .split(area);
+                render_selectable_table(
+                    frame,
+                    chunks[0],
+                    embedding_coverage_table(summary),
+                    app.storage.selection,
+                    embedding_coverage_row_count(summary),
+                );
+                frame.render_widget(
+                    embedding_coverage_detail_panel(summary, app.storage.selection),
+                    chunks[1],
+                );
+            }
+            EmbeddingCoverageStatus::Failed(error) => render_storage_error(frame, area, error),
+        },
     }
 }
 
@@ -1534,6 +1581,57 @@ fn call_resolution_summary_from_status(repository_id: &str) -> CallResolutionSum
     CallResolutionSummary {
         repository_id: repository_id.to_owned(),
         buckets: Vec::new(),
+    }
+}
+
+fn embedding_coverage_summary_from_status(
+    repository_id: &str,
+    status: &RepositoryStatus,
+) -> EmbeddingCoverageSummary {
+    let embedding_model = status
+        .embedding_model
+        .as_deref()
+        .unwrap_or("nomic-embed-text")
+        .to_owned();
+    let vector_backed_chunks = if status.embedding_model.is_some() {
+        status.chunks_indexed
+    } else {
+        0
+    };
+    let missing_vector_chunks = status.chunks_indexed.saturating_sub(vector_backed_chunks);
+    EmbeddingCoverageSummary {
+        repository_id: repository_id.to_owned(),
+        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        configured_embedding_model: "nomic-embed-text".to_owned(),
+        embedding_model,
+        embedding_dimension: status.embedding_dimension,
+        total_chunks: status.chunks_indexed,
+        embeddable_chunks: status.chunks_indexed,
+        vector_backed_chunks,
+        missing_vector_chunks,
+        excluded_chunks: 0,
+        latest_chunks_embedded: status
+            .embedding_model
+            .as_ref()
+            .map(|_| vector_backed_chunks),
+        exclusion_reasons: Vec::new(),
+        health: vec![StorageHealthRow {
+            status: if missing_vector_chunks == 0 {
+                StorageHealthStatus::Ok
+            } else {
+                StorageHealthStatus::Warning
+            },
+            label: if missing_vector_chunks == 0 {
+                "embedding_coverage_ok".to_owned()
+            } else {
+                "missing_vectors".to_owned()
+            },
+            detail: if missing_vector_chunks == 0 {
+                "Sample TUI state has aligned embedding coverage.".to_owned()
+            } else {
+                format!("{missing_vector_chunks} sample chunks have no vector point metadata.")
+            },
+        }],
     }
 }
 
@@ -2502,6 +2600,200 @@ fn call_resolution_tone(status: &str, bucket: ConfidenceBucket) -> StatusTone {
     }
 }
 
+fn embedding_coverage_table(summary: &EmbeddingCoverageSummary) -> Table<'_> {
+    let rows = embedding_coverage_rows(summary).into_iter().map(|row| {
+        Row::new(vec![
+            Cell::from(row.metric),
+            Cell::from(row.value),
+            Cell::from(status_span(row.status, row.tone)),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(34),
+            Constraint::Percentage(42),
+            Constraint::Length(16),
+        ],
+    )
+    .header(table_header(["Metric", "Value", "Status"]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Embedding Coverage | {} | F2 next storage mode",
+        summary.repository_id
+    )))
+    .column_spacing(1)
+}
+
+fn embedding_coverage_detail_panel(
+    summary: &EmbeddingCoverageSummary,
+    selection: usize,
+) -> Paragraph<'_> {
+    let rows = embedding_coverage_rows(summary);
+    let row = rows.get(selection.min(rows.len().saturating_sub(1)));
+    let mut lines = Vec::new();
+    if let Some(row) = row {
+        lines.push(Line::from(vec![
+            Span::styled("Selected: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(row.metric),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Status: ", Style::new().add_modifier(Modifier::BOLD)),
+            status_span(row.status, row.tone),
+            Span::raw(" "),
+            Span::raw(row.detail),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("Collection: ", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(summary.collection_name.as_str()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Exclusions: ", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(embedding_exclusion_summary(summary)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Health: ", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(embedding_health_summary(summary)),
+    ]));
+
+    let tone = summary
+        .health
+        .iter()
+        .map(|row| storage_health_tone(row.status))
+        .find(|tone| matches!(tone, StatusTone::Error | StatusTone::Warning))
+        .unwrap_or(StatusTone::Success);
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(tone_style(tone))
+            .title("Embedding Detail"),
+    )
+}
+
+fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDisplayRow> {
+    let vector_status = if summary.embeddable_chunks == 0 {
+        ("metadata-only", StatusTone::Warning)
+    } else if summary.missing_vector_chunks == 0 {
+        ("covered", StatusTone::Success)
+    } else {
+        ("missing-vector", StatusTone::Warning)
+    };
+    let model_status = if summary.embedding_model == summary.configured_embedding_model {
+        ("aligned", StatusTone::Success)
+    } else {
+        ("model-drift", StatusTone::Error)
+    };
+
+    vec![
+        storage_row(
+            "Qdrant",
+            "total chunks",
+            summary.total_chunks.to_string(),
+            ("indexed", StatusTone::Info),
+            "SQLite chunk rows for the selected repository.",
+        ),
+        storage_row(
+            "Qdrant",
+            "embeddable",
+            summary.embeddable_chunks.to_string(),
+            ("eligible", StatusTone::Info),
+            "Chunks eligible for semantic embedding.",
+        ),
+        storage_row(
+            "Qdrant",
+            "vector-backed",
+            summary.vector_backed_chunks.to_string(),
+            vector_status,
+            "Chunks with recorded Qdrant point IDs.",
+        ),
+        storage_row(
+            "Qdrant",
+            "missing vectors",
+            summary.missing_vector_chunks.to_string(),
+            if summary.missing_vector_chunks == 0 {
+                ("ok", StatusTone::Success)
+            } else {
+                ("missing-vector", StatusTone::Warning)
+            },
+            "Embeddable chunks without vector point metadata.",
+        ),
+        storage_row(
+            "Qdrant",
+            "excluded",
+            summary.excluded_chunks.to_string(),
+            if summary.excluded_chunks == 0 {
+                ("none", StatusTone::Success)
+            } else {
+                ("metadata-only", StatusTone::Warning)
+            },
+            "Chunks intentionally withheld from embeddings.",
+        ),
+        storage_row(
+            "Qdrant",
+            "model",
+            summary.embedding_model.clone(),
+            model_status,
+            "Latest indexed embedding model compared with configured model.",
+        ),
+        storage_row(
+            "Qdrant",
+            "dimension",
+            summary
+                .embedding_dimension
+                .map(|dimension| dimension.to_string())
+                .unwrap_or_else(|| "<unknown>".to_owned()),
+            if summary.embedding_dimension.is_some() {
+                ("recorded", StatusTone::Success)
+            } else {
+                ("unknown", StatusTone::Warning)
+            },
+            "Latest recorded vector dimension.",
+        ),
+        storage_row(
+            "Qdrant",
+            "run embedded",
+            summary
+                .latest_chunks_embedded
+                .map(|chunks| chunks.to_string())
+                .unwrap_or_else(|| "<none>".to_owned()),
+            if summary.latest_chunks_embedded.is_some() {
+                ("recorded", StatusTone::Info)
+            } else {
+                ("missing", StatusTone::Warning)
+            },
+            "Chunks embedded by the latest successful semantic index run.",
+        ),
+    ]
+}
+
+fn embedding_coverage_row_count(summary: &EmbeddingCoverageSummary) -> usize {
+    embedding_coverage_rows(summary).len()
+}
+
+fn embedding_exclusion_summary(summary: &EmbeddingCoverageSummary) -> String {
+    if summary.exclusion_reasons.is_empty() {
+        return "<none>".to_owned();
+    }
+    summary
+        .exclusion_reasons
+        .iter()
+        .take(3)
+        .map(|row| format!("{}={}", row.reason, row.chunks))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn embedding_health_summary(summary: &EmbeddingCoverageSummary) -> String {
+    summary
+        .health
+        .iter()
+        .take(3)
+        .map(|row| format!("{}: {}", row.label, row.detail))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
     Row::new(vec![
         Cell::from(label),
@@ -2979,7 +3271,7 @@ impl View {
                 "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab next view | F2 overview/coverage/outline/calls | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | F2 overview/coverage/outline/calls/embeddings | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
                 "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
@@ -3034,6 +3326,7 @@ struct StorageExplorerState {
     coverage: CoverageStatus,
     outline: OutlineStatus,
     calls: CallResolutionStatus,
+    embeddings: EmbeddingCoverageStatus,
     selection: usize,
 }
 
@@ -3043,6 +3336,7 @@ impl StorageExplorerState {
         coverage: IndexCoverageSummary,
         outline: SymbolOutlineSummary,
         calls: CallResolutionSummary,
+        embeddings: EmbeddingCoverageSummary,
     ) -> Self {
         Self {
             mode: StorageMode::Explorer,
@@ -3050,6 +3344,7 @@ impl StorageExplorerState {
             coverage: CoverageStatus::Completed(coverage),
             outline: OutlineStatus::Completed(outline),
             calls: CallResolutionStatus::Completed(calls),
+            embeddings: EmbeddingCoverageStatus::Completed(embeddings),
             selection: 0,
         }
     }
@@ -3061,6 +3356,7 @@ enum StorageMode {
     Coverage,
     Outline,
     Calls,
+    Embeddings,
 }
 
 impl StorageMode {
@@ -3070,6 +3366,7 @@ impl StorageMode {
             Self::Coverage => "index coverage",
             Self::Outline => "symbol outline",
             Self::Calls => "call resolution",
+            Self::Embeddings => "embedding coverage",
         }
     }
 
@@ -3078,7 +3375,8 @@ impl StorageMode {
             Self::Explorer => Self::Coverage,
             Self::Coverage => Self::Outline,
             Self::Outline => Self::Calls,
-            Self::Calls => Self::Explorer,
+            Self::Calls => Self::Embeddings,
+            Self::Embeddings => Self::Explorer,
         }
     }
 }
@@ -3100,6 +3398,11 @@ enum OutlineStatus {
 
 enum CallResolutionStatus {
     Completed(CallResolutionSummary),
+    Failed(String),
+}
+
+enum EmbeddingCoverageStatus {
+    Completed(EmbeddingCoverageSummary),
     Failed(String),
 }
 
@@ -3336,11 +3639,12 @@ mod tests {
     };
     use symdex_store::{
         CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary, CallSearchRow,
-        ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits, FileCallDetailRow,
-        FileChunkDetailRow, FileCoverageRow, FileCoverageStatus, FileDetailSummary,
-        FileSymbolDetailRow, IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus,
-        SqliteStorageSummary, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus,
-        SymbolOutlineRow, SymbolOutlineSummary, SymbolSearchRow,
+        ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits,
+        EmbeddingCoverageSummary, EmbeddingExclusionRow, FileCallDetailRow, FileChunkDetailRow,
+        FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
+        IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary,
+        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
+        SymbolOutlineSummary, SymbolSearchRow,
     };
 
     use crate::{
@@ -3469,6 +3773,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3499,6 +3804,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
 
         assert_eq!(app.storage.selection, 0);
@@ -3525,6 +3831,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3548,6 +3855,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.selection = 2;
 
@@ -3568,6 +3876,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -3587,6 +3896,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -3599,6 +3909,28 @@ mod tests {
     }
 
     #[test]
+    fn storage_f2_cycles_to_embedding_coverage() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+        );
+
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert_eq!(app.storage.mode, StorageMode::Calls);
+        assert!(!app.handle_key(KeyCode::F(2)));
+
+        assert_eq!(app.storage.mode, StorageMode::Embeddings);
+        assert_eq!(app.message, "Storage mode set to embedding coverage.");
+    }
+
+    #[test]
     fn renders_index_coverage_file_rows_without_source_text() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
@@ -3607,6 +3939,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(150, 24);
@@ -3641,6 +3974,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
 
@@ -3668,6 +4002,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(80, 24);
@@ -3692,6 +4027,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(150, 24);
@@ -3717,6 +4053,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Outline;
 
@@ -3744,6 +4081,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(80, 24);
@@ -3768,6 +4106,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(150, 24);
@@ -3799,6 +4138,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Calls;
 
@@ -3826,6 +4166,7 @@ mod tests {
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(80, 24);
@@ -3839,6 +4180,92 @@ mod tests {
         assert!(rendered.contains("Resolution"));
         assert!(rendered.contains("Conf"));
         assert!(rendered.contains("Call Bucket"));
+    }
+
+    #[test]
+    fn renders_embedding_coverage_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+        );
+        app.storage.mode = StorageMode::Embeddings;
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Embedding Coverage"));
+        assert!(rendered.contains("vector-backed"));
+        assert!(rendered.contains("missing-vector"));
+        assert!(rendered.contains("Embedding Detail"));
+        assert!(rendered.contains("secret_detected=1"));
+        assert!(rendered.contains("missing_vectors"));
+        assert!(!rendered.contains("source_text"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "missing-vector", None),
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn embedding_coverage_selection_drives_detail_panel() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+        );
+        app.storage.mode = StorageMode::Embeddings;
+
+        assert_eq!(app.storage.selection, 0);
+        assert!(!app.handle_key(KeyCode::Down));
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.storage.selection, 2);
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Selected"));
+        assert!(rendered.contains("vector-backed"));
+        assert!(rendered.contains("Chunks with recorded Qdrant point IDs."));
+        assert!(rendered.contains("symdex_repo_nomic_embed_text"));
+    }
+
+    #[test]
+    fn renders_embedding_coverage_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+        );
+        app.storage.mode = StorageMode::Embeddings;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Storage"));
+        assert!(rendered.contains("Metric"));
+        assert!(rendered.contains("Value"));
+        assert!(rendered.contains("Embedding"));
     }
 
     #[test]
@@ -4492,6 +4919,38 @@ mod tests {
                         resolution_status: "unresolved".to_owned(),
                         confidence_bucket: ConfidenceBucket::Low,
                     }],
+                },
+            ],
+        }
+    }
+
+    fn sample_embedding_coverage_summary() -> EmbeddingCoverageSummary {
+        EmbeddingCoverageSummary {
+            repository_id: "repo".to_owned(),
+            collection_name: "symdex_repo_nomic_embed_text".to_owned(),
+            configured_embedding_model: "nomic-embed-text".to_owned(),
+            embedding_model: "nomic-embed-text".to_owned(),
+            embedding_dimension: Some(768),
+            total_chunks: 3,
+            embeddable_chunks: 2,
+            vector_backed_chunks: 1,
+            missing_vector_chunks: 1,
+            excluded_chunks: 1,
+            latest_chunks_embedded: Some(1),
+            exclusion_reasons: vec![EmbeddingExclusionRow {
+                reason: "secret_detected".to_owned(),
+                chunks: 1,
+            }],
+            health: vec![
+                StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "missing_vectors".to_owned(),
+                    detail: "1 embeddable chunk has no recorded Qdrant point ID.".to_owned(),
+                },
+                StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "excluded_chunks".to_owned(),
+                    detail: "1 chunk is intentionally excluded from embeddings.".to_owned(),
                 },
             ],
         }
