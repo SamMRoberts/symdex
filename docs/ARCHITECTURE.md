@@ -7,6 +7,7 @@ crates/
   symdex-core/
   symdex-diagnostics/
   symdex-index/
+  symdex-query/
   symdex-store/
   symdex-embed/
   symdex-cli/
@@ -66,6 +67,17 @@ Indexing orchestration:
 - structural SQLite persistence
 - optional semantic embedding and Qdrant upserts
 - compact indexing summaries without source text
+
+Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
+
+### `symdex-query`
+
+Query orchestration:
+
+- SQLite symbol search
+- semantic query embedding
+- Qdrant vector search
+- compact query result summaries without source text
 
 Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
 

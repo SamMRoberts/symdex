@@ -6,6 +6,7 @@ members = [
     "crates/symdex-embed",
     "crates/symdex-index",
     "crates/symdex-mcp",
+    "crates/symdex-query",
     "crates/symdex-store",
     "crates/symdex-tui",
 ]

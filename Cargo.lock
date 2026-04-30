@@ -1518,6 +1518,7 @@ dependencies = [
  "symdex-embed",
  "symdex-index",
  "symdex-mcp",
+ "symdex-query",
  "symdex-store",
  "symdex-tui",
 ]
@@ -1567,6 +1568,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "symdex-query"
+version = "0.1.0"
+dependencies = [
+ "symdex-core",
+ "symdex-embed",
+ "symdex-store",
+]
+
+[[package]]
 name = "symdex-store"
 version = "0.1.0"
 dependencies = [
@@ -1586,6 +1596,7 @@ dependencies = [
  "symdex-diagnostics",
  "symdex-embed",
  "symdex-index",
+ "symdex-query",
  "symdex-store",
 ]
 

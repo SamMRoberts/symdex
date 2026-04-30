@@ -52,8 +52,8 @@ binary.
 
 ### Query Workbench
 
-- Support semantic search input.
-- Support symbol search input.
+- Support semantic search input with `w`, `Tab`, typed query text, and `Enter`.
+- Support symbol search input with the same workbench controls.
 - Display compact ranked evidence with path, line range, symbol, score, and kind.
 - Show empty and error states.
 
@@ -84,6 +84,11 @@ Current dashboard keys:
 - `s`: request semantic indexing confirmation
 - `d`: run doctor diagnostics
 - `i`: return to indexing controls
+- `w`: open the query workbench
+- `Tab`: toggle symbol and semantic query modes in the query workbench
+- typed text: edit the query workbench input
+- `Backspace`: edit the query workbench input
+- `Enter`: run the current query workbench query
 - `r`: refresh repository status
 - `y`: confirm a pending indexing job
 - `n` or `Esc`: cancel a pending indexing job

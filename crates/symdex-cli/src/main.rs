@@ -3,9 +3,9 @@ use std::fs;
 
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
-use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
-use symdex_store::{QdrantClient, SqliteStore, StoreConfig, qdrant_collection_name, sqlite_parent};
+use symdex_query::{run_semantic_search, run_symbol_search};
+use symdex_store::{SqliteStore, StoreConfig, sqlite_parent};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -138,16 +138,15 @@ fn index_status(repo: &str) -> Result<(), String> {
 }
 
 fn symbol(repo: &str, query: &str) -> Result<(), String> {
-    if query.is_empty() {
-        return Err("symbol requires a symbol query".to_owned());
-    }
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
-    let symbols = sqlite
-        .find_symbols(root.id(), query)
-        .map_err(|error| error.to_string())?;
-    println!("symbols: {}", symbols.len());
-    for symbol in symbols {
+    let summary = run_symbol_search(repo, query).map_err(|error| {
+        if error.contains("requires a query") {
+            "symbol requires a symbol query".to_owned()
+        } else {
+            error
+        }
+    })?;
+    println!("symbols: {}", summary.symbols.len());
+    for symbol in summary.symbols {
         println!(
             "{} {} {}:{}-{}",
             symbol.kind, symbol.qualified_name, symbol.path, symbol.start_line, symbol.end_line
@@ -237,40 +236,25 @@ fn print_call_row(row: &symdex_store::CallSearchRow) {
 
 fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {
     let query = query_parts.join(" ");
-    if query.trim().is_empty() {
-        return Err("search requires a query".to_owned());
-    }
+    let summary = run_semantic_search(repo, &query, 10).map_err(|error| {
+        if error.contains("requires a query") {
+            "search requires a query".to_owned()
+        } else {
+            error
+        }
+    })?;
 
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let embed_config = EmbedConfig::from_env();
-    let embed_client =
-        OllamaClient::new(embed_config.clone()).map_err(|error| error.to_string())?;
-    let query_embedding = embed_client
-        .embed_batch(&[query])
-        .map_err(|error| error.to_string())?;
-    let Some(vector) = query_embedding.embeddings.into_iter().next() else {
-        return Err("embedding query returned no vector".to_owned());
-    };
-
-    let store_config = StoreConfig::from_env();
-    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
-    let collection = qdrant_collection_name(root.id(), &embed_config.model);
-    let results = qdrant
-        .query_points(&collection, vector, 10)
-        .map_err(|error| error.to_string())?;
-
-    println!("repository_id: {}", root.id());
-    println!("qdrant_collection: {collection}");
-    println!("results: {}", results.len());
-    for result in results {
-        let payload = result.payload;
+    println!("repository_id: {}", summary.repository_id);
+    println!("qdrant_collection: {}", summary.qdrant_collection);
+    println!("results: {}", summary.results.len());
+    for result in summary.results {
         println!(
             "{:.4} {}:{}-{} {}",
             result.score,
-            payload.path,
-            payload.start_line,
-            payload.end_line,
-            payload.symbol_name.as_deref().unwrap_or("<none>")
+            result.path,
+            result.start_line,
+            result.end_line,
+            result.symbol_name.as_deref().unwrap_or("<none>")
         );
     }
     Ok(())

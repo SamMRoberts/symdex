@@ -1,5 +1,5 @@
 [package]
-name = "symdex-tui"
+name = "symdex-query"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -9,11 +9,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-crossterm = "0.28.1"
-ratatui = "0.29.0"
 symdex-core = { path = "../symdex-core" }
-symdex-diagnostics = { path = "../symdex-diagnostics" }
 symdex-embed = { path = "../symdex-embed" }
-symdex-index = { path = "../symdex-index" }
-symdex-query = { path = "../symdex-query" }
 symdex-store = { path = "../symdex-store" }

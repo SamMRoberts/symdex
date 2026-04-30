@@ -20,6 +20,7 @@ use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
+use symdex_query::{QueryMode, QueryResult, run_semantic_search, run_symbol_search};
 use symdex_store::{RepositoryStatus, SqliteStore, StoreConfig};
 
 pub struct TuiOptions {
@@ -35,7 +36,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    Enter     Dismiss a completed or failed job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    Tab       Toggle query mode in the workbench\n    Enter     Run query or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -52,9 +53,11 @@ pub struct App {
     screen: Screen,
     last_index_summary: Option<IndexSummary>,
     diagnostics: DiagnosticsState,
+    query: QueryWorkbenchState,
     last_error: Option<String>,
     index_receiver: Option<Receiver<Result<IndexSummary, String>>>,
     diagnostics_receiver: Option<Receiver<Result<DiagnosticReport, String>>>,
+    query_receiver: Option<Receiver<Result<QueryResult, String>>>,
 }
 
 impl App {
@@ -82,9 +85,11 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             diagnostics: DiagnosticsState::Idle,
+            query: QueryWorkbenchState::default(),
             last_error: None,
             index_receiver: None,
             diagnostics_receiver: None,
+            query_receiver: None,
         })
     }
 
@@ -108,9 +113,11 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             diagnostics: DiagnosticsState::Idle,
+            query: QueryWorkbenchState::default(),
             last_error: None,
             index_receiver: None,
             diagnostics_receiver: None,
+            query_receiver: None,
         }
     }
 
@@ -287,6 +294,50 @@ impl App {
         lines
     }
 
+    fn query_lines(&self) -> Vec<Line<'_>> {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{} (Tab toggles)", self.query.mode.label())),
+            ]),
+            Line::from(vec![
+                Span::styled("Query: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(if self.query.input.is_empty() {
+                    "<type to search>".to_owned()
+                } else {
+                    self.query.input.clone()
+                }),
+            ]),
+            Line::from(
+                "Enter runs the query. Backspace edits. Esc clears input or leaves the workbench.",
+            ),
+            Line::from(""),
+        ];
+
+        match &self.query.status {
+            QueryStatus::Idle => {
+                lines.push(Line::from("No query has run in this TUI session."));
+            }
+            QueryStatus::Running => {
+                lines.push(Line::from(format!(
+                    "Running {} query...",
+                    self.query.mode.label()
+                )));
+            }
+            QueryStatus::Completed(result) => {
+                lines.extend(query_result_lines(result));
+            }
+            QueryStatus::Failed(error) => {
+                lines.push(Line::from(vec![
+                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(error.as_str()),
+                ]));
+            }
+        }
+
+        lines
+    }
+
     fn refresh_status(&mut self) -> Result<(), String> {
         let store_config = StoreConfig::from_env();
         let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
@@ -299,6 +350,10 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
+        if self.view == View::Query {
+            return self.handle_query_key(code);
+        }
+
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Esc if matches!(self.screen, Screen::ConfirmIndex(_)) => {
@@ -312,6 +367,10 @@ impl App {
             }
             KeyCode::Char('d') => {
                 self.start_diagnostics();
+            }
+            KeyCode::Char('w') => {
+                self.view = View::Query;
+                self.message = "Query workbench selected.".to_owned();
             }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
                 self.screen =
@@ -346,6 +405,40 @@ impl App {
         false
     }
 
+    fn handle_query_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('q') if self.query.input.is_empty() => return true,
+            KeyCode::Esc if self.query.input.is_empty() => {
+                self.view = View::Indexing;
+                self.message = "Indexing controls selected.".to_owned();
+            }
+            KeyCode::Esc => {
+                self.query.input.clear();
+                self.query.status = QueryStatus::Idle;
+                self.message = "Query input cleared.".to_owned();
+            }
+            KeyCode::Tab => {
+                self.query.mode = self.query.mode.toggled();
+                self.query.status = QueryStatus::Idle;
+                self.message = format!("Query mode set to {}.", self.query.mode.label());
+            }
+            KeyCode::Enter => {
+                self.start_query();
+            }
+            KeyCode::Backspace => {
+                self.query.input.pop();
+            }
+            KeyCode::Char(character) => {
+                self.query.input.push(character);
+                if matches!(self.query.status, QueryStatus::Failed(_)) {
+                    self.query.status = QueryStatus::Idle;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn start_index_job(&mut self, mode: IndexMode) {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
@@ -373,6 +466,31 @@ impl App {
         self.diagnostics = DiagnosticsState::Running;
         self.diagnostics_receiver = Some(receiver);
         self.message = "Doctor diagnostics started.".to_owned();
+    }
+
+    fn start_query(&mut self) {
+        let query = self.query.input.trim().to_owned();
+        if query.is_empty() {
+            self.query.status = QueryStatus::Failed("query is empty".to_owned());
+            self.message = "Query failed.".to_owned();
+            return;
+        }
+
+        let mode = self.query.mode;
+        let repo = self.repo_input.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match mode {
+                QueryMode::Semantic => {
+                    run_semantic_search(&repo, &query, 10).map(QueryResult::Semantic)
+                }
+                QueryMode::Symbol => run_symbol_search(&repo, &query).map(QueryResult::Symbol),
+            };
+            let _ = sender.send(result);
+        });
+        self.query.status = QueryStatus::Running;
+        self.query_receiver = Some(receiver);
+        self.message = format!("{} query started.", mode.label());
     }
 
     fn poll_index_job(&mut self) {
@@ -439,6 +557,30 @@ impl App {
             }
         }
     }
+
+    fn poll_query(&mut self) {
+        let Some(receiver) = &self.query_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(result)) => {
+                self.query_receiver = None;
+                self.query.status = QueryStatus::Completed(result);
+                self.message = "Query completed.".to_owned();
+            }
+            Ok(Err(error)) => {
+                self.query_receiver = None;
+                self.query.status = QueryStatus::Failed(error);
+                self.message = "Query failed.".to_owned();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.query_receiver = None;
+                self.query.status = QueryStatus::Failed("query worker disconnected".to_owned());
+                self.message = "Query failed.".to_owned();
+            }
+        }
+    }
 }
 
 pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), String> {
@@ -478,10 +620,12 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
             let right_title = match app.view {
                 View::Indexing => "Indexing",
                 View::Diagnostics => "Doctor Diagnostics",
+                View::Query => "Query Workbench",
             };
             let right_lines = match app.view {
                 View::Indexing => app.index_lines(),
                 View::Diagnostics => app.diagnostics_lines(),
+                View::Query => app.query_lines(),
             };
             let right_panel = List::new(
                 right_lines
@@ -506,6 +650,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
     loop {
         app.poll_index_job();
         app.poll_diagnostics();
+        app.poll_query();
         render(terminal, &app)?;
         if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
             continue;
@@ -640,16 +785,87 @@ fn diagnostic_check_line(check: &DiagnosticCheck) -> Line<'_> {
     ])
 }
 
+fn query_result_lines(result: &QueryResult) -> Vec<Line<'_>> {
+    match result {
+        QueryResult::Symbol(summary) => {
+            let mut lines = vec![
+                Line::from(format!("Symbols: {}", summary.symbols.len())),
+                Line::from(format!("Query: {}", summary.query)),
+            ];
+            if summary.symbols.is_empty() {
+                lines.push(Line::from("No symbols matched."));
+                return lines;
+            }
+            lines.extend(summary.symbols.iter().take(10).map(|symbol| {
+                Line::from(format!(
+                    "{} {} {}:{}-{}",
+                    symbol.kind,
+                    symbol.qualified_name,
+                    symbol.path,
+                    symbol.start_line,
+                    symbol.end_line
+                ))
+            }));
+            lines
+        }
+        QueryResult::Semantic(summary) => {
+            let mut lines = vec![
+                Line::from(format!("Semantic results: {}", summary.results.len())),
+                Line::from(format!("Collection: {}", summary.qdrant_collection)),
+            ];
+            if summary.results.is_empty() {
+                lines.push(Line::from("No semantic matches returned."));
+                return lines;
+            }
+            lines.extend(summary.results.iter().take(10).map(|result| {
+                Line::from(format!(
+                    "{:.4} {}:{}-{} {}",
+                    result.score,
+                    result.path,
+                    result.start_line,
+                    result.end_line,
+                    result.symbol_name.as_deref().unwrap_or("<none>")
+                ))
+            }));
+            lines
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Indexing,
     Diagnostics,
+    Query,
 }
 
 enum DiagnosticsState {
     Idle,
     Running,
     Completed(DiagnosticReport),
+    Failed(String),
+}
+
+struct QueryWorkbenchState {
+    mode: QueryMode,
+    input: String,
+    status: QueryStatus,
+}
+
+impl Default for QueryWorkbenchState {
+    fn default() -> Self {
+        Self {
+            mode: QueryMode::Symbol,
+            input: String::new(),
+            status: QueryStatus::Idle,
+        }
+    }
+}
+
+enum QueryStatus {
+    Idle,
+    Running,
+    Completed(QueryResult),
     Failed(String),
 }
 
@@ -726,12 +942,17 @@ fn reduce_screen(screen: Screen, action: UiAction) -> Screen {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
+    use symdex_query::{QueryMode, QueryResult, SymbolSearchSummary};
     use symdex_store::RepositoryStatus;
 
-    use crate::{App, DiagnosticsState, IndexMode, Screen, UiAction, View, reduce_screen, render};
+    use crate::{
+        App, DiagnosticsState, IndexMode, QueryStatus, Screen, UiAction, View, reduce_screen,
+        render,
+    };
 
     #[test]
     fn renders_dashboard_status() {
@@ -793,6 +1014,62 @@ mod tests {
         assert!(rendered.contains("sqlite_parent"));
         assert!(rendered.contains("qdrant_status"));
         assert!(rendered.contains("unreachable"));
+    }
+
+    #[test]
+    fn renders_query_workbench_symbol_results() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        app.query.mode = QueryMode::Symbol;
+        app.query.input = "add".to_owned();
+        app.query.status = QueryStatus::Completed(QueryResult::Symbol(SymbolSearchSummary {
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            symbols: vec![symdex_store::SymbolSearchRow {
+                id: "symbol-1".to_owned(),
+                name: "add".to_owned(),
+                qualified_name: "crate::add".to_owned(),
+                kind: "function".to_owned(),
+                path: "src/lib.rs".to_owned(),
+                start_line: 1,
+                end_line: 3,
+            }],
+        }));
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Query Workbench"));
+        assert!(rendered.contains("Symbols"));
+        assert!(rendered.contains("crate::add"));
+        assert!(rendered.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn query_workbench_accepts_input_and_backspace() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+
+        assert!(!app.handle_query_key(KeyCode::Char('a')));
+        assert!(!app.handle_query_key(KeyCode::Char('d')));
+        assert!(!app.handle_query_key(KeyCode::Char('d')));
+        assert_eq!(app.query.input, "add");
+
+        assert!(!app.handle_query_key(KeyCode::Backspace));
+        assert_eq!(app.query.input, "ad");
+    }
+
+    #[test]
+    fn query_workbench_toggles_modes() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        assert_eq!(app.query.mode, QueryMode::Symbol);
+
+        assert!(!app.handle_query_key(KeyCode::Tab));
+        assert_eq!(app.query.mode, QueryMode::Semantic);
     }
 
     #[test]
