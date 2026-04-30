@@ -87,7 +87,7 @@ terminal panes.
 - In the Storage view, row selection should drive a visible detail panel for
   the selected SQLite/Qdrant metric and nearby storage health notes.
 - In the Storage view, `F2` toggles between storage overview, index coverage,
-  and symbol outline modes.
+  symbol outline, and call resolution modes.
 - In the Doctor view, row selection must drive visible detail output for the
   selected check rather than highlight-only behavior.
 - In the Doctor view, `Enter` should toggle an expanded selected-check detail
@@ -150,8 +150,8 @@ represent the indexed repository.
   implementation details.
 - The first implementation is a Storage tab that renders a selectable
   SQLite/Qdrant metric table plus a detail/health panel.
-- The Storage tab also includes `F2` modes for file-grouped index coverage and
-  symbol outlines.
+- The Storage tab also includes `F2` modes for file-grouped index coverage,
+  symbol outlines, and call resolution.
 
 ### Index Coverage View
 
@@ -203,6 +203,8 @@ represent the indexed repository.
 - Selecting a bucket should show rows with caller symbol, callee text, call line,
   path, confidence, and resolution status.
 - Highlight unresolved or low-confidence call evidence with warning colors.
+- The first implementation lives in the Storage tab behind `F2` and shows
+  bucket counts, average confidence, and representative call rows.
 
 ### Embedding Coverage View
 
@@ -321,7 +323,7 @@ Current dashboard keys:
 - `p`: open the impact/context-pack viewer
 - `Tab`: switch to the next major TUI view
 - `Shift+Tab`: switch to the previous major TUI view
-- `F2`: toggle storage overview, index coverage, and symbol outline in the storage explorer
+- `F2`: toggle storage overview, index coverage, symbol outline, and call resolution in the storage explorer
 - `F2`: toggle symbol and semantic query modes in the query workbench
 - `F2`: toggle callers and callees in the symbol/call graph browser
 - `F2`: toggle impact and context-pack modes in the impact/context-pack viewer

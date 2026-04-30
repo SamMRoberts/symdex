@@ -658,6 +658,41 @@ impl SqliteStore {
         })
     }
 
+    pub fn call_resolution_summary(&self, repository_id: &str) -> Result<CallResolutionSummary> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT files.path, caller.qualified_name, calls.callee_text, calls.call_line,
+                        calls.confidence, calls.resolution_status
+                 FROM calls
+                 JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                 JOIN files ON caller.file_id = files.id
+                 WHERE files.repository_id = ?1
+                 ORDER BY calls.resolution_status, calls.confidence ASC, files.path,
+                          calls.call_line, calls.callee_text
+                 LIMIT 500",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                let confidence: f64 = row.get(4)?;
+                Ok(CallResolutionEdgeRow {
+                    path: row.get(0)?,
+                    caller_symbol: row.get(1)?,
+                    callee_text: row.get(2)?,
+                    call_line: row.get::<_, i64>(3)? as usize,
+                    confidence,
+                    resolution_status: row.get(5)?,
+                    confidence_bucket: confidence_bucket(confidence),
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        Ok(CallResolutionSummary {
+            repository_id: repository_id.to_owned(),
+            buckets: call_resolution_buckets(collect_rows(rows)?),
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -1107,6 +1142,49 @@ pub struct SymbolOutlineRow {
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallResolutionSummary {
+    pub repository_id: String,
+    pub buckets: Vec<CallResolutionBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallResolutionBucket {
+    pub resolution_status: String,
+    pub confidence_bucket: ConfidenceBucket,
+    pub call_count: usize,
+    pub average_confidence: f64,
+    pub rows: Vec<CallResolutionEdgeRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallResolutionEdgeRow {
+    pub path: String,
+    pub caller_symbol: String,
+    pub callee_text: String,
+    pub call_line: usize,
+    pub confidence: f64,
+    pub resolution_status: String,
+    pub confidence_bucket: ConfidenceBucket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfidenceBucket {
+    High,
+    Medium,
+    Low,
+}
+
+impl ConfidenceBucket {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1711,6 +1789,48 @@ fn symbol_depth(
     depth
 }
 
+fn confidence_bucket(confidence: f64) -> ConfidenceBucket {
+    if confidence >= 0.85 {
+        ConfidenceBucket::High
+    } else if confidence >= 0.5 {
+        ConfidenceBucket::Medium
+    } else {
+        ConfidenceBucket::Low
+    }
+}
+
+fn call_resolution_buckets(rows: Vec<CallResolutionEdgeRow>) -> Vec<CallResolutionBucket> {
+    use std::collections::BTreeMap;
+
+    let mut grouped: BTreeMap<(String, ConfidenceBucket), Vec<CallResolutionEdgeRow>> =
+        BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry((row.resolution_status.clone(), row.confidence_bucket))
+            .or_default()
+            .push(row);
+    }
+
+    grouped
+        .into_iter()
+        .map(|((resolution_status, confidence_bucket), rows)| {
+            let call_count = rows.len();
+            let average_confidence = if call_count == 0 {
+                0.0
+            } else {
+                rows.iter().map(|row| row.confidence).sum::<f64>() / call_count as f64
+            };
+            CallResolutionBucket {
+                resolution_status,
+                confidence_bucket,
+                call_count,
+                average_confidence,
+                rows,
+            }
+        })
+        .collect()
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repositories (
   id TEXT PRIMARY KEY,
@@ -1817,8 +1937,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{
-        CallRecord, ChunkRecord, ChunkVectorStatus, CreateCollectionRequest, Distance,
-        FileCoverageStatus, FileRecord, PointPayload, QdrantClient, QueryPointsRequest,
+        CallRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket, CreateCollectionRequest,
+        Distance, FileCoverageStatus, FileRecord, PointPayload, QdrantClient, QueryPointsRequest,
         RepositoryRecord, SqliteStore, StorageHealthStatus, StoreConfig, StoreError, SymbolRecord,
         UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
         validate_collection_name,
@@ -2416,6 +2536,72 @@ mod tests {
             .find(|symbol| symbol.id == "grandchild-symbol")
             .expect("grandchild symbol row");
         assert_eq!(grandchild.depth, 2);
+    }
+
+    #[test]
+    fn sqlite_builds_call_resolution_summary_by_status_and_confidence() {
+        let db = TestDb::new("call-resolution");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![
+            sample_symbol("caller-symbol", "caller", "crate::caller"),
+            sample_symbol("callee-symbol", "helper", "crate::helper"),
+        ];
+        let calls = vec![
+            CallRecord {
+                id: "call-high".to_owned(),
+                caller_symbol_id: "caller-symbol".to_owned(),
+                callee_text: "helper".to_owned(),
+                callee_symbol_id: Some("callee-symbol".to_owned()),
+                call_line: 4,
+                confidence: 1.0,
+                resolution_status: "resolved_exact".to_owned(),
+            },
+            CallRecord {
+                id: "call-low".to_owned(),
+                caller_symbol_id: "caller-symbol".to_owned(),
+                callee_text: "missing".to_owned(),
+                callee_symbol_id: None,
+                call_line: 7,
+                confidence: 0.25,
+                resolution_status: "unresolved".to_owned(),
+            },
+        ];
+        store
+            .replace_file_facts(&sample_file("hash-1"), &symbols, &[], &calls)
+            .expect("calls should persist");
+
+        let summary = store
+            .call_resolution_summary("repo")
+            .expect("call resolution summary should load");
+
+        assert_eq!(summary.repository_id, "repo");
+        assert_eq!(summary.buckets.len(), 2);
+        let resolved = summary
+            .buckets
+            .iter()
+            .find(|bucket| bucket.resolution_status == "resolved_exact")
+            .expect("resolved bucket");
+        assert_eq!(resolved.confidence_bucket, ConfidenceBucket::High);
+        assert_eq!(resolved.call_count, 1);
+        assert_eq!(resolved.rows[0].caller_symbol, "crate::caller");
+        assert_eq!(resolved.rows[0].callee_text, "helper");
+
+        let unresolved = summary
+            .buckets
+            .iter()
+            .find(|bucket| bucket.resolution_status == "unresolved")
+            .expect("unresolved bucket");
+        assert_eq!(unresolved.confidence_bucket, ConfidenceBucket::Low);
+        assert_eq!(unresolved.call_count, 1);
+        assert_eq!(unresolved.rows[0].call_line, 7);
     }
 
     #[test]

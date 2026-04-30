@@ -25,14 +25,15 @@ use symdex_index::{
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
-    SymbolSearchSummary, run_call_graph, run_context_pack, run_impact, run_index_coverage,
-    run_semantic_search, run_storage_explorer, run_symbol_outline, run_symbol_search,
+    SymbolSearchSummary, run_call_graph, run_call_resolution, run_context_pack, run_impact,
+    run_index_coverage, run_semantic_search, run_storage_explorer, run_symbol_outline,
+    run_symbol_search,
 };
 use symdex_store::{
-    ChunkVectorStatus, ContextPack, FileCoverageStatus, FileDetailSummary, IndexCoverageSummary,
-    QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, SqliteStore,
-    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
-    SymbolOutlineSummary, qdrant_collection_name,
+    CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack, FileCoverageStatus,
+    FileDetailSummary, IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus,
+    SqliteStorageSummary, SqliteStore, StorageExplorerSummary, StorageHealthRow,
+    StorageHealthStatus, StoreConfig, SymbolOutlineSummary, qdrant_collection_name,
 };
 
 pub struct TuiOptions {
@@ -48,7 +49,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -99,6 +100,9 @@ impl App {
         let outline = sqlite
             .symbol_outline_summary(root.id())
             .map_err(|error| error.to_string())?;
+        let call_resolution = sqlite
+            .call_resolution_summary(root.id())
+            .map_err(|error| error.to_string())?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -117,7 +121,7 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
-            storage: StorageExplorerState::completed(storage, coverage, outline),
+            storage: StorageExplorerState::completed(storage, coverage, outline, call_resolution),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -140,6 +144,7 @@ impl App {
         let storage = storage_summary_from_status(&repository_id, &status);
         let coverage = coverage_summary_from_status(&repository_id, &status);
         let outline = symbol_outline_summary_from_status(&repository_id);
+        let call_resolution = call_resolution_summary_from_status(&repository_id);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -157,7 +162,7 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
-            storage: StorageExplorerState::completed(storage, coverage, outline),
+            storage: StorageExplorerState::completed(storage, coverage, outline, call_resolution),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
@@ -459,6 +464,10 @@ impl App {
             Ok(summary) => OutlineStatus::Completed(summary),
             Err(error) => OutlineStatus::Failed(error),
         };
+        self.storage.calls = match run_call_resolution(&self.repo_input) {
+            Ok(summary) => CallResolutionStatus::Completed(summary),
+            Err(error) => CallResolutionStatus::Failed(error),
+        };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
         Ok(())
@@ -484,6 +493,10 @@ impl App {
             StorageMode::Outline => match &self.storage.outline {
                 OutlineStatus::Completed(summary) => outline_row_count(summary),
                 OutlineStatus::Failed(_) => 1,
+            },
+            StorageMode::Calls => match &self.storage.calls {
+                CallResolutionStatus::Completed(summary) => call_resolution_row_count(summary),
+                CallResolutionStatus::Failed(_) => 1,
             },
         }
     }
@@ -1224,6 +1237,26 @@ fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
             OutlineStatus::Failed(error) => render_storage_error(frame, area, error),
         },
+        StorageMode::Calls => match &app.storage.calls {
+            CallResolutionStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(7), Constraint::Length(9)])
+                    .split(area);
+                render_selectable_table(
+                    frame,
+                    chunks[0],
+                    call_resolution_table(summary),
+                    app.storage.selection,
+                    call_resolution_row_count(summary),
+                );
+                frame.render_widget(
+                    call_resolution_detail_panel(summary, app.storage.selection),
+                    chunks[1],
+                );
+            }
+            CallResolutionStatus::Failed(error) => render_storage_error(frame, area, error),
+        },
     }
 }
 
@@ -1494,6 +1527,13 @@ fn symbol_outline_summary_from_status(repository_id: &str) -> SymbolOutlineSumma
     SymbolOutlineSummary {
         repository_id: repository_id.to_owned(),
         symbols: Vec::new(),
+    }
+}
+
+fn call_resolution_summary_from_status(repository_id: &str) -> CallResolutionSummary {
+    CallResolutionSummary {
+        repository_id: repository_id.to_owned(),
+        buckets: Vec::new(),
     }
 }
 
@@ -2345,6 +2385,123 @@ fn outline_symbol_label(symbol: &symdex_store::SymbolOutlineRow) -> String {
     format!("{indent}{}", symbol.qualified_name)
 }
 
+fn call_resolution_table(summary: &CallResolutionSummary) -> Table<'_> {
+    let rows = summary.buckets.iter().take(12).map(|bucket| {
+        let tone =
+            call_resolution_tone(bucket.resolution_status.as_str(), bucket.confidence_bucket);
+        Row::new(vec![
+            Cell::from(status_span(bucket.resolution_status.as_str(), tone)),
+            Cell::from(status_span(bucket.confidence_bucket.label(), tone)),
+            Cell::from(bucket.call_count.to_string()),
+            Cell::from(format!("{:.2}", bucket.average_confidence))
+                .style(score_style(bucket.average_confidence)),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(42),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Length(8),
+        ],
+    )
+    .header(table_header(["Resolution", "Conf", "Calls", "Avg"]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Call Resolution | Buckets: {} | F2 next storage mode",
+        summary.buckets.len()
+    )))
+    .column_spacing(1)
+}
+
+fn call_resolution_detail_panel(
+    summary: &CallResolutionSummary,
+    selection: usize,
+) -> Paragraph<'_> {
+    let Some(bucket) = selected_call_resolution_bucket(summary, selection) else {
+        return Paragraph::new(vec![Line::from("No call edges indexed.")])
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Call Bucket Detail"),
+            );
+    };
+    let rows = bucket
+        .rows
+        .iter()
+        .take(3)
+        .map(|row| {
+            format!(
+                "{}:{} {} -> {} conf={:.2} status={}",
+                row.path,
+                row.call_line,
+                row.caller_symbol,
+                row.callee_text,
+                row.confidence,
+                row.resolution_status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let tone = call_resolution_tone(bucket.resolution_status.as_str(), bucket.confidence_bucket);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Resolution: ", Style::new().add_modifier(Modifier::BOLD)),
+            status_span(bucket.resolution_status.as_str(), tone),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Confidence bucket: ",
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            status_span(bucket.confidence_bucket.label(), tone),
+            Span::raw(format!(
+                " count={} avg={:.2}",
+                bucket.call_count, bucket.average_confidence
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Rows: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(if rows.is_empty() {
+                "<none>".to_owned()
+            } else {
+                rows
+            }),
+        ]),
+    ];
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(tone_style(tone))
+            .title("Call Bucket Detail"),
+    )
+}
+
+fn call_resolution_row_count(summary: &CallResolutionSummary) -> usize {
+    summary.buckets.len().min(12)
+}
+
+fn selected_call_resolution_bucket(
+    summary: &CallResolutionSummary,
+    selection: usize,
+) -> Option<&symdex_store::CallResolutionBucket> {
+    summary
+        .buckets
+        .get(selection.min(summary.buckets.len().saturating_sub(1)))
+}
+
+fn call_resolution_tone(status: &str, bucket: ConfidenceBucket) -> StatusTone {
+    if status == "unresolved" || matches!(bucket, ConfidenceBucket::Low) {
+        StatusTone::Warning
+    } else if status.starts_with("resolved") && matches!(bucket, ConfidenceBucket::High) {
+        StatusTone::Success
+    } else {
+        StatusTone::Info
+    }
+}
+
 fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
     Row::new(vec![
         Cell::from(label),
@@ -2822,7 +2979,7 @@ impl View {
                 "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab next view | F2 overview/coverage/outline | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | F2 overview/coverage/outline/calls | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
                 "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
@@ -2876,6 +3033,7 @@ struct StorageExplorerState {
     explorer: StorageStatus,
     coverage: CoverageStatus,
     outline: OutlineStatus,
+    calls: CallResolutionStatus,
     selection: usize,
 }
 
@@ -2884,12 +3042,14 @@ impl StorageExplorerState {
         explorer: StorageExplorerSummary,
         coverage: IndexCoverageSummary,
         outline: SymbolOutlineSummary,
+        calls: CallResolutionSummary,
     ) -> Self {
         Self {
             mode: StorageMode::Explorer,
             explorer: StorageStatus::Completed(explorer),
             coverage: CoverageStatus::Completed(coverage),
             outline: OutlineStatus::Completed(outline),
+            calls: CallResolutionStatus::Completed(calls),
             selection: 0,
         }
     }
@@ -2900,6 +3060,7 @@ enum StorageMode {
     Explorer,
     Coverage,
     Outline,
+    Calls,
 }
 
 impl StorageMode {
@@ -2908,6 +3069,7 @@ impl StorageMode {
             Self::Explorer => "storage overview",
             Self::Coverage => "index coverage",
             Self::Outline => "symbol outline",
+            Self::Calls => "call resolution",
         }
     }
 
@@ -2915,7 +3077,8 @@ impl StorageMode {
         match self {
             Self::Explorer => Self::Coverage,
             Self::Coverage => Self::Outline,
-            Self::Outline => Self::Explorer,
+            Self::Outline => Self::Calls,
+            Self::Calls => Self::Explorer,
         }
     }
 }
@@ -2932,6 +3095,11 @@ enum CoverageStatus {
 
 enum OutlineStatus {
     Completed(SymbolOutlineSummary),
+    Failed(String),
+}
+
+enum CallResolutionStatus {
+    Completed(CallResolutionSummary),
     Failed(String),
 }
 
@@ -3167,7 +3335,8 @@ mod tests {
         CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
     };
     use symdex_store::{
-        CallSearchRow, ChunkVectorStatus, ContextPack, ContextPackLimits, FileCallDetailRow,
+        CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary, CallSearchRow,
+        ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits, FileCallDetailRow,
         FileChunkDetailRow, FileCoverageRow, FileCoverageStatus, FileDetailSummary,
         FileSymbolDetailRow, IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus,
         SqliteStorageSummary, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus,
@@ -3299,6 +3468,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3328,6 +3498,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
 
         assert_eq!(app.storage.selection, 0);
@@ -3353,6 +3524,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3375,6 +3547,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         app.storage.selection = 2;
 
@@ -3394,6 +3567,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -3405,6 +3579,26 @@ mod tests {
     }
 
     #[test]
+    fn storage_f2_cycles_to_call_resolution() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+        );
+
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert_eq!(app.storage.mode, StorageMode::Outline);
+        assert!(!app.handle_key(KeyCode::F(2)));
+
+        assert_eq!(app.storage.mode, StorageMode::Calls);
+        assert_eq!(app.message, "Storage mode set to call resolution.");
+    }
+
+    #[test]
     fn renders_index_coverage_file_rows_without_source_text() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
@@ -3412,6 +3606,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(150, 24);
@@ -3445,6 +3640,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
 
@@ -3471,6 +3667,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(80, 24);
@@ -3494,6 +3691,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(150, 24);
@@ -3518,6 +3716,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         app.storage.mode = StorageMode::Outline;
 
@@ -3544,6 +3743,7 @@ mod tests {
             sample_storage_summary(),
             sample_index_coverage_summary(),
             sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(80, 24);
@@ -3557,6 +3757,88 @@ mod tests {
         assert!(rendered.contains("Symbol"));
         assert!(rendered.contains("Kind"));
         assert!(rendered.contains("Symbol Detail"));
+    }
+
+    #[test]
+    fn renders_call_resolution_dashboard_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+        );
+        app.storage.mode = StorageMode::Calls;
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Call Resolution"));
+        assert!(rendered.contains("resolved_exact"));
+        assert!(rendered.contains("unresolved"));
+        assert!(rendered.contains("Call Bucket Detail"));
+        assert!(rendered.contains("crate::caller"));
+        assert!(rendered.contains("helper"));
+        assert!(!rendered.contains("source_text"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "unresolved", None),
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn call_resolution_selection_drives_bucket_detail() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+        );
+        app.storage.mode = StorageMode::Calls;
+
+        assert_eq!(app.storage.selection, 0);
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.storage.selection, 1);
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Confidence bucket"));
+        assert!(rendered.contains("low"));
+        assert!(rendered.contains("missing"));
+        assert!(rendered.contains("src/lib.rs:7"));
+    }
+
+    #[test]
+    fn renders_call_resolution_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+        );
+        app.storage.mode = StorageMode::Calls;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Storage"));
+        assert!(rendered.contains("Resolution"));
+        assert!(rendered.contains("Conf"));
+        assert!(rendered.contains("Call Bucket"));
     }
 
     #[test]
@@ -4172,6 +4454,44 @@ mod tests {
                     path: "src/lib.rs".to_owned(),
                     start_line: 5,
                     end_line: 8,
+                },
+            ],
+        }
+    }
+
+    fn sample_call_resolution_summary() -> CallResolutionSummary {
+        CallResolutionSummary {
+            repository_id: "repo".to_owned(),
+            buckets: vec![
+                CallResolutionBucket {
+                    resolution_status: "resolved_exact".to_owned(),
+                    confidence_bucket: ConfidenceBucket::High,
+                    call_count: 1,
+                    average_confidence: 1.0,
+                    rows: vec![CallResolutionEdgeRow {
+                        path: "src/lib.rs".to_owned(),
+                        caller_symbol: "crate::caller".to_owned(),
+                        callee_text: "helper".to_owned(),
+                        call_line: 4,
+                        confidence: 1.0,
+                        resolution_status: "resolved_exact".to_owned(),
+                        confidence_bucket: ConfidenceBucket::High,
+                    }],
+                },
+                CallResolutionBucket {
+                    resolution_status: "unresolved".to_owned(),
+                    confidence_bucket: ConfidenceBucket::Low,
+                    call_count: 1,
+                    average_confidence: 0.25,
+                    rows: vec![CallResolutionEdgeRow {
+                        path: "src/lib.rs".to_owned(),
+                        caller_symbol: "crate::caller".to_owned(),
+                        callee_text: "missing".to_owned(),
+                        call_line: 7,
+                        confidence: 0.25,
+                        resolution_status: "unresolved".to_owned(),
+                        confidence_bucket: ConfidenceBucket::Low,
+                    }],
                 },
             ],
         }

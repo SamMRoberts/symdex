@@ -99,7 +99,7 @@
 - [x] index coverage view grouped by file with chunk, symbol, call, embedding, and exclusion counts.
 - [x] selected-file detail drawer for chunks, symbols, calls, vector status, and exclusion reasons.
 - [x] symbol outline view using `symbols.parent_symbol_id`.
-- [ ] call resolution dashboard grouped by resolution status and confidence bucket.
+- [x] call resolution dashboard grouped by resolution status and confidence bucket.
 - [ ] embedding coverage view comparing SQLite chunks with Qdrant vector-backed chunks.
 - [ ] index runs timeline using `index_runs` metadata.
 - [ ] semantic neighborhood view using Qdrant metadata only.
