@@ -77,10 +77,11 @@ cargo run -p symdex-cli -- tui --help
 Current TUI tests cover dashboard rendering, doctor diagnostics rendering, query
 workbench rendering and input state, symbol/call graph rendering and input
 state, impact/context-pack rendering and input state, the storage explorer
-metric table and detail panel, selected table rows, Doctor selected-check detail
-behavior, 80x24 narrow-terminal rendering, and the indexing confirmation
-reducer. Future TUI views should add similar reducer and render coverage before
-being marked complete.
+metric table and detail panel, index coverage table and selected-file detail
+panel, selected table rows, Doctor selected-check detail behavior, 80x24
+narrow-terminal rendering, and the indexing confirmation reducer. Future TUI
+views should add similar reducer and render coverage before being marked
+complete.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

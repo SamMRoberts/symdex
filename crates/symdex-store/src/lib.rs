@@ -542,6 +542,67 @@ impl SqliteStore {
         })
     }
 
+    pub fn index_coverage_summary(&self, repository_id: &str) -> Result<IndexCoverageSummary> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                   files.path,
+                   files.language,
+                   (SELECT COUNT(*) FROM chunks WHERE chunks.file_id = files.id),
+                   (SELECT COUNT(*) FROM symbols WHERE symbols.file_id = files.id),
+                   (SELECT COUNT(*)
+                    FROM calls
+                    JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                    WHERE caller.file_id = files.id),
+                   (SELECT COUNT(*)
+                    FROM chunks
+                    WHERE chunks.file_id = files.id
+                      AND chunks.excluded_reason IS NULL),
+                   (SELECT COUNT(*)
+                    FROM chunks
+                    WHERE chunks.file_id = files.id
+                      AND chunks.qdrant_point_id IS NOT NULL),
+                   (SELECT COUNT(*)
+                    FROM chunks
+                    WHERE chunks.file_id = files.id
+                      AND chunks.excluded_reason IS NOT NULL)
+                 FROM files
+                 WHERE files.repository_id = ?1
+                 ORDER BY files.path
+                 LIMIT 200",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                let chunks = row.get::<_, i64>(2)? as usize;
+                let embeddable_chunks = row.get::<_, i64>(5)? as usize;
+                let vector_backed_chunks = row.get::<_, i64>(6)? as usize;
+                let excluded_chunks = row.get::<_, i64>(7)? as usize;
+                Ok(FileCoverageRow {
+                    path: row.get(0)?,
+                    language: row.get(1)?,
+                    chunks,
+                    symbols: row.get::<_, i64>(3)? as usize,
+                    calls: row.get::<_, i64>(4)? as usize,
+                    embeddable_chunks,
+                    vector_backed_chunks,
+                    excluded_chunks,
+                    status: file_coverage_status(
+                        chunks,
+                        embeddable_chunks,
+                        vector_backed_chunks,
+                        excluded_chunks,
+                    ),
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        Ok(IndexCoverageSummary {
+            repository_id: repository_id.to_owned(),
+            files: collect_rows(rows)?,
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -811,6 +872,33 @@ pub enum StorageHealthStatus {
     Ok,
     Warning,
     Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCoverageSummary {
+    pub repository_id: String,
+    pub files: Vec<FileCoverageRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCoverageRow {
+    pub path: String,
+    pub language: String,
+    pub chunks: usize,
+    pub symbols: usize,
+    pub calls: usize,
+    pub embeddable_chunks: usize,
+    pub vector_backed_chunks: usize,
+    pub excluded_chunks: usize,
+    pub status: FileCoverageStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCoverageStatus {
+    Covered,
+    MetadataOnly,
+    Excluded,
+    MissingVector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1310,6 +1398,23 @@ fn storage_warnings(
     rows
 }
 
+fn file_coverage_status(
+    chunks: usize,
+    embeddable_chunks: usize,
+    vector_backed_chunks: usize,
+    excluded_chunks: usize,
+) -> FileCoverageStatus {
+    if chunks > 0 && excluded_chunks == chunks {
+        FileCoverageStatus::Excluded
+    } else if embeddable_chunks > vector_backed_chunks {
+        FileCoverageStatus::MissingVector
+    } else if embeddable_chunks > 0 && embeddable_chunks == vector_backed_chunks {
+        FileCoverageStatus::Covered
+    } else {
+        FileCoverageStatus::MetadataOnly
+    }
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repositories (
   id TEXT PRIMARY KEY,
@@ -1416,10 +1521,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{
-        CallRecord, ChunkRecord, CreateCollectionRequest, Distance, FileRecord, PointPayload,
-        QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore, StorageHealthStatus,
-        StoreConfig, StoreError, SymbolRecord, UpsertPointsRequest, VectorParams, VectorPoint,
-        qdrant_collection_name, qdrant_point_id, validate_collection_name,
+        CallRecord, ChunkRecord, CreateCollectionRequest, Distance, FileCoverageStatus, FileRecord,
+        PointPayload, QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore,
+        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, UpsertPointsRequest,
+        VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
+        validate_collection_name,
     };
 
     #[test]
@@ -1851,6 +1957,89 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_builds_file_index_coverage_summary() {
+        let db = TestDb::new("index-coverage");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![
+            sample_symbol("caller-symbol", "caller", "crate::caller"),
+            sample_symbol("callee-symbol", "helper", "crate::helper"),
+        ];
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &symbols,
+                &[
+                    sample_chunk("chunk-vector"),
+                    missing_vector_chunk("chunk-missing"),
+                ],
+                &[CallRecord {
+                    id: "call-1".to_owned(),
+                    caller_symbol_id: "caller-symbol".to_owned(),
+                    callee_text: "helper".to_owned(),
+                    callee_symbol_id: Some("callee-symbol".to_owned()),
+                    call_line: 4,
+                    confidence: 1.0,
+                    resolution_status: "resolved_exact".to_owned(),
+                }],
+            )
+            .expect("first file facts should persist");
+
+        let second_file = FileRecord {
+            id: "file-secret".to_owned(),
+            repository_id: "repo".to_owned(),
+            path: "src/secret.rs".to_owned(),
+            language: "rust".to_owned(),
+            content_hash: "hash-secret".to_owned(),
+        };
+        store
+            .replace_file_facts(
+                &second_file,
+                &[],
+                &[excluded_chunk("secret-chunk", "file-secret")],
+                &[],
+            )
+            .expect("second file facts should persist");
+
+        let coverage = store
+            .index_coverage_summary("repo")
+            .expect("coverage should load");
+
+        assert_eq!(coverage.repository_id, "repo");
+        assert_eq!(coverage.files.len(), 2);
+        let lib = coverage
+            .files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .expect("lib coverage row");
+        assert_eq!(lib.language, "rust");
+        assert_eq!(lib.chunks, 2);
+        assert_eq!(lib.symbols, 2);
+        assert_eq!(lib.calls, 1);
+        assert_eq!(lib.embeddable_chunks, 2);
+        assert_eq!(lib.vector_backed_chunks, 1);
+        assert_eq!(lib.excluded_chunks, 0);
+        assert_eq!(lib.status, FileCoverageStatus::MissingVector);
+
+        let secret = coverage
+            .files
+            .iter()
+            .find(|file| file.path == "src/secret.rs")
+            .expect("secret coverage row");
+        assert_eq!(secret.chunks, 1);
+        assert_eq!(secret.embeddable_chunks, 0);
+        assert_eq!(secret.excluded_chunks, 1);
+        assert_eq!(secret.status, FileCoverageStatus::Excluded);
+    }
+
+    #[test]
     fn live_qdrant_health_is_opt_in() {
         if std::env::var("SYMDEX_TEST_QDRANT").ok().as_deref() != Some("1") {
             return;
@@ -1899,6 +2088,28 @@ mod tests {
             end_byte: 32,
             qdrant_point_id: Some("01234567-89ab-cdef-fedc-ba9876543210".to_owned()),
             excluded_reason: None,
+        }
+    }
+
+    fn missing_vector_chunk(id: &str) -> ChunkRecord {
+        let mut chunk = sample_chunk(id);
+        chunk.qdrant_point_id = None;
+        chunk
+    }
+
+    fn excluded_chunk(id: &str, file_id: &str) -> ChunkRecord {
+        ChunkRecord {
+            id: id.to_owned(),
+            file_id: file_id.to_owned(),
+            symbol_id: None,
+            kind: "function".to_owned(),
+            text_hash: format!("text-{id}"),
+            start_line: 1,
+            end_line: 3,
+            start_byte: 0,
+            end_byte: 32,
+            qdrant_point_id: None,
+            excluded_reason: Some("secret_detected".to_owned()),
         }
     }
 
