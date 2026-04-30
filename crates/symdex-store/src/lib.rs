@@ -86,7 +86,13 @@ impl SqliteStore {
         Ok(stored_hash.as_deref() == Some(content_hash))
     }
 
-    pub fn replace_file_chunks(&mut self, file: &FileRecord, chunks: &[ChunkRecord]) -> Result<()> {
+    pub fn replace_file_facts(
+        &mut self,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+    ) -> Result<()> {
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         transaction
             .execute(
@@ -108,8 +114,47 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         transaction
+            .execute(
+                "DELETE FROM calls
+                 WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
             .execute("DELETE FROM chunks WHERE file_id = ?1", params![file.id])
             .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute("DELETE FROM symbols WHERE file_id = ?1", params![file.id])
+            .map_err(StoreError::Sqlite)?;
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO symbols (
+                       id, file_id, parent_symbol_id, name, qualified_name, kind, signature,
+                       start_line, end_line, start_byte, end_byte
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for symbol in symbols {
+                statement
+                    .execute(params![
+                        symbol.id,
+                        symbol.file_id,
+                        symbol.parent_symbol_id,
+                        symbol.name,
+                        symbol.qualified_name,
+                        symbol.kind,
+                        symbol.signature,
+                        symbol.start_line as i64,
+                        symbol.end_line as i64,
+                        symbol.start_byte as i64,
+                        symbol.end_byte as i64,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
 
         {
             let mut statement = transaction
@@ -136,6 +181,31 @@ impl SqliteStore {
                         chunk.end_byte as i64,
                         chunk.qdrant_point_id,
                         chunk.excluded_reason,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO calls (
+                       id, caller_symbol_id, callee_text, callee_symbol_id,
+                       call_line, confidence, resolution_status
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for call in calls {
+                statement
+                    .execute(params![
+                        call.id,
+                        call.caller_symbol_id,
+                        call.callee_text,
+                        call.callee_symbol_id,
+                        call.call_line as i64,
+                        call.confidence as f64,
+                        call.resolution_status,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -172,6 +242,13 @@ impl SqliteStore {
                 .optional()
                 .map_err(StoreError::Sqlite)?;
             if let Some(file_id) = file_id {
+                transaction
+                    .execute(
+                        "DELETE FROM calls
+                         WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                        params![file_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
                 transaction
                     .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
                     .map_err(StoreError::Sqlite)?;
@@ -223,8 +300,95 @@ impl SqliteStore {
             repository_id: repository_id.to_owned(),
             files_indexed,
             chunks_indexed,
+            symbols_indexed: self.count_joined(repository_id, "symbols")?,
+            calls_indexed: self.count_calls(repository_id)?,
             last_indexed_at,
         })
+    }
+
+    pub fn find_symbols(&self, repository_id: &str, query: &str) -> Result<Vec<SymbolSearchRow>> {
+        let like = format!("%{query}%");
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line
+                 FROM symbols
+                 JOIN files ON symbols.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND (symbols.name = ?2 OR symbols.qualified_name = ?2
+                        OR symbols.name LIKE ?3 OR symbols.qualified_name LIKE ?3)
+                 ORDER BY
+                   CASE
+                     WHEN symbols.qualified_name = ?2 THEN 0
+                     WHEN symbols.name = ?2 THEN 1
+                     ELSE 2
+                   END,
+                   files.path,
+                   symbols.start_line
+                 LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, query, like], |row| {
+                Ok(SymbolSearchRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    qualified_name: row.get(2)?,
+                    kind: row.get(3)?,
+                    path: row.get(4)?,
+                    start_line: row.get::<_, i64>(5)? as usize,
+                    end_line: row.get::<_, i64>(6)? as usize,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn callers(&self, repository_id: &str, symbol_query: &str) -> Result<Vec<CallSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
+                        caller.id, caller.name, caller.qualified_name, caller.kind,
+                        files.path, caller.start_line, caller.end_line
+                 FROM calls
+                 JOIN symbols target ON calls.callee_symbol_id = target.id
+                 JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                 JOIN files ON caller.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND (target.id = ?2 OR target.name = ?2 OR target.qualified_name = ?2)
+                 ORDER BY files.path, calls.call_line
+                 LIMIT 50",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, symbol_query], call_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn callees(&self, repository_id: &str, symbol_query: &str) -> Result<Vec<CallSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
+                        callee.id, callee.name, callee.qualified_name, callee.kind,
+                        files.path, callee.start_line, callee.end_line
+                 FROM calls
+                 JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                 LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                 JOIN files ON caller.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND (caller.id = ?2 OR caller.name = ?2 OR caller.qualified_name = ?2)
+                 ORDER BY calls.call_line, calls.callee_text
+                 LIMIT 50",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, symbol_query], call_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
     }
 
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
@@ -240,6 +404,40 @@ impl SqliteStore {
             paths.push(row.map_err(StoreError::Sqlite)?);
         }
         Ok(paths)
+    }
+
+    fn count_joined(&self, repository_id: &str, table: &str) -> Result<usize> {
+        let sql = format!(
+            "SELECT COUNT(*)
+             FROM {table}
+             JOIN files ON {table}.file_id = files.id
+             WHERE files.repository_id = ?1"
+        );
+        let count: i64 = self
+            .connection
+            .query_row(&sql, params![repository_id], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        count
+            .try_into()
+            .map_err(|_| StoreError::UnexpectedResponse(format!("negative {table} count")))
+    }
+
+    fn count_calls(&self, repository_id: &str) -> Result<usize> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM calls
+                 JOIN symbols ON calls.caller_symbol_id = symbols.id
+                 JOIN files ON symbols.file_id = files.id
+                 WHERE files.repository_id = ?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        count
+            .try_into()
+            .map_err(|_| StoreError::UnexpectedResponse("negative call count".to_owned()))
     }
 }
 
@@ -273,12 +471,66 @@ pub struct ChunkRecord {
     pub excluded_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolRecord {
+    pub id: String,
+    pub file_id: String,
+    pub parent_symbol_id: Option<String>,
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub signature: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallRecord {
+    pub id: String,
+    pub caller_symbol_id: String,
+    pub callee_text: String,
+    pub callee_symbol_id: Option<String>,
+    pub call_line: usize,
+    pub confidence: f32,
+    pub resolution_status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryStatus {
     pub repository_id: String,
     pub files_indexed: usize,
     pub chunks_indexed: usize,
+    pub symbols_indexed: usize,
+    pub calls_indexed: usize,
     pub last_indexed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSearchRow {
+    pub id: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallSearchRow {
+    pub callee_text: String,
+    pub call_line: usize,
+    pub confidence: f64,
+    pub resolution_status: String,
+    pub symbol_id: Option<String>,
+    pub symbol_name: Option<String>,
+    pub symbol_qualified_name: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub path: Option<String>,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
 }
 
 fn env_path(upper: &str, legacy: &str) -> Option<PathBuf> {
@@ -624,6 +876,32 @@ impl std::error::Error for StoreError {}
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row.map_err(StoreError::Sqlite)?);
+    }
+    Ok(values)
+}
+
+fn call_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSearchRow> {
+    Ok(CallSearchRow {
+        callee_text: row.get(0)?,
+        call_line: row.get::<_, i64>(1)? as usize,
+        confidence: row.get(2)?,
+        resolution_status: row.get(3)?,
+        symbol_id: row.get(4)?,
+        symbol_name: row.get(5)?,
+        symbol_qualified_name: row.get(6)?,
+        symbol_kind: row.get(7)?,
+        path: row.get(8)?,
+        start_line: row.get::<_, Option<i64>>(9)?.map(|line| line as usize),
+        end_line: row.get::<_, Option<i64>>(10)?.map(|line| line as usize),
+    })
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repositories (
   id TEXT PRIMARY KEY,
@@ -716,9 +994,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{
-        ChunkRecord, CreateCollectionRequest, Distance, FileRecord, PointPayload, QdrantClient,
-        QueryPointsRequest, RepositoryRecord, SqliteStore, StoreConfig, UpsertPointsRequest,
-        VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
+        CallRecord, ChunkRecord, CreateCollectionRequest, Distance, FileRecord, PointPayload,
+        QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord,
+        UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
         validate_collection_name,
     };
 
@@ -821,7 +1099,7 @@ mod tests {
             .expect("repository should persist");
 
         store
-            .replace_file_chunks(&sample_file("hash-1"), &[sample_chunk("chunk-1")])
+            .replace_file_facts(&sample_file("hash-1"), &[], &[sample_chunk("chunk-1")], &[])
             .expect("file chunks should persist");
 
         assert!(
@@ -847,12 +1125,14 @@ mod tests {
             })
             .expect("repository should persist");
         store
-            .replace_file_chunks(&sample_file("hash-1"), &[sample_chunk("chunk-1")])
+            .replace_file_facts(&sample_file("hash-1"), &[], &[sample_chunk("chunk-1")], &[])
             .expect("initial chunks should persist");
         store
-            .replace_file_chunks(
+            .replace_file_facts(
                 &sample_file("hash-2"),
+                &[],
                 &[sample_chunk("chunk-2"), sample_chunk("chunk-3")],
+                &[],
             )
             .expect("replacement chunks should persist");
 
@@ -872,6 +1152,57 @@ mod tests {
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 0);
         assert_eq!(status.chunks_indexed, 0);
+    }
+
+    #[test]
+    fn sqlite_persists_symbols_and_calls_for_queries() {
+        let db = TestDb::new("symbols-calls");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![
+            sample_symbol("caller-symbol", "caller", "caller"),
+            sample_symbol("callee-symbol", "helper", "helper"),
+        ];
+        let calls = vec![CallRecord {
+            id: "call-1".to_owned(),
+            caller_symbol_id: "caller-symbol".to_owned(),
+            callee_text: "helper".to_owned(),
+            callee_symbol_id: Some("callee-symbol".to_owned()),
+            call_line: 4,
+            confidence: 1.0,
+            resolution_status: "resolved_exact".to_owned(),
+        }];
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &symbols,
+                &[sample_chunk("chunk-1")],
+                &calls,
+            )
+            .expect("facts should persist");
+
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.symbols_indexed, 2);
+        assert_eq!(status.calls_indexed, 1);
+
+        let found = store.find_symbols("repo", "helper").expect("symbol search");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].qualified_name, "helper");
+
+        let callers = store.callers("repo", "helper").expect("callers query");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].symbol_qualified_name.as_deref(), Some("caller"));
+
+        let callees = store.callees("repo", "caller").expect("callees query");
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].symbol_qualified_name.as_deref(), Some("helper"));
     }
 
     #[test]
@@ -923,6 +1254,22 @@ mod tests {
             end_byte: 32,
             qdrant_point_id: Some("01234567-89ab-cdef-fedc-ba9876543210".to_owned()),
             excluded_reason: None,
+        }
+    }
+
+    fn sample_symbol(id: &str, name: &str, qualified_name: &str) -> SymbolRecord {
+        SymbolRecord {
+            id: id.to_owned(),
+            file_id: "file".to_owned(),
+            parent_symbol_id: None,
+            name: name.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            kind: "function".to_owned(),
+            signature: Some(format!("fn {name}()")),
+            start_line: 1,
+            end_line: 3,
+            start_byte: 0,
+            end_byte: 32,
         }
     }
 

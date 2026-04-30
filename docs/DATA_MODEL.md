@@ -6,7 +6,8 @@ Initial schema names are stable enough for early implementation but may change b
 
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
-while the current write path persists repositories, files, and chunks.
+while the current write path persists repositories, files, chunks, symbols, and
+calls.
 
 ### `repositories`
 

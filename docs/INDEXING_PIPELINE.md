@@ -117,6 +117,15 @@ Resolution states:
 
 Never drop unresolved calls. They are useful evidence.
 
+Current implementation extracts Rust function and method symbols from
+`function_item` nodes. Free functions use module-derived qualified names, while
+methods include the enclosing `impl` type when tree-sitter exposes it. Call
+extraction records `call_expression` nodes inside indexed functions. Resolution
+is local and conservative: exact qualified-name matches are
+`resolved_exact`, single suffix/name matches are `resolved_local_candidate`,
+multiple matches are `ambiguous`, and all other calls are preserved as
+`unresolved`.
+
 ## Incremental indexing
 
 A file can be skipped only when:

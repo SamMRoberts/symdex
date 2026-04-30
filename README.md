@@ -14,9 +14,12 @@ cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- index --offline tests/fixtures/rust_basic
 cargo run -p symdex-cli -- index-status tests/fixtures/rust_basic
+cargo run -p symdex-cli -- symbol tests/fixtures/rust_basic add
 ```
 
 With Ollama and Qdrant running locally, `index <repo>` embeds Rust chunks and
 upserts vectors, and `search <repo> <query>` returns ranked path and line-range
 evidence. SQLite persistence stores repository, file, and chunk facts locally.
-The MCP server remains a later slice.
+SQLite also stores basic Rust symbols and conservative direct call edges for
+`symbol`, `callers`, `callees`, and `impact`. The MCP server remains a later
+slice.

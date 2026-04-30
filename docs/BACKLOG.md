@@ -31,12 +31,12 @@
 
 ## Phase 3 — Symbols and calls
 
-- symbol extraction.
-- qualified names.
-- call extraction.
-- unresolved calls.
-- direct callers/callees CLI.
-- basic impact analysis.
+- [x] symbol extraction.
+- [x] qualified names.
+- [x] call extraction.
+- [x] unresolved calls.
+- [x] direct callers/callees CLI.
+- [x] basic impact analysis.
 
 ## Phase 4 — MCP server
 

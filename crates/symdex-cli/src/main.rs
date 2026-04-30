@@ -3,13 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use symdex_core::{
-    CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, discover_rust_files, extract_rust_chunks,
+    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, Symbol, discover_rust_files,
+    index_rust_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_mcp::tool_names;
 use symdex_store::{
-    ChunkRecord, FileRecord, PointPayload, QdrantClient, RepositoryRecord, SqliteStore,
-    StoreConfig, VectorPoint, qdrant_collection_name, qdrant_point_id, sqlite_parent,
+    CallRecord, ChunkRecord, FileRecord, PointPayload, QdrantClient, RepositoryRecord, SqliteStore,
+    StoreConfig, SymbolRecord, VectorPoint, qdrant_collection_name, qdrant_point_id, sqlite_parent,
 };
 
 fn main() {
@@ -35,6 +36,26 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "index-status" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             index_status(repo)
+        }
+        "symbol" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let query = args.get(2).map(String::as_str).unwrap_or("");
+            symbol(repo, query)
+        }
+        "callers" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let query = args.get(2).map(String::as_str).unwrap_or("");
+            callers(repo, query)
+        }
+        "callees" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let query = args.get(2).map(String::as_str).unwrap_or("");
+            callees(repo, query)
+        }
+        "impact" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let query = args.get(2).map(String::as_str).unwrap_or("");
+            impact(repo, query)
         }
         "search" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -184,11 +205,97 @@ fn index_status(repo: &str) -> Result<(), String> {
     println!("repository_id: {}", status.repository_id);
     println!("files_indexed: {}", status.files_indexed);
     println!("chunks_indexed: {}", status.chunks_indexed);
+    println!("symbols_indexed: {}", status.symbols_indexed);
+    println!("calls_indexed: {}", status.calls_indexed);
     println!(
         "last_indexed_at: {}",
         status.last_indexed_at.as_deref().unwrap_or("<never>")
     );
     Ok(())
+}
+
+fn symbol(repo: &str, query: &str) -> Result<(), String> {
+    if query.is_empty() {
+        return Err("symbol requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let symbols = sqlite
+        .find_symbols(root.id(), query)
+        .map_err(|error| error.to_string())?;
+    println!("symbols: {}", symbols.len());
+    for symbol in symbols {
+        println!(
+            "{} {} {}:{}-{}",
+            symbol.kind, symbol.qualified_name, symbol.path, symbol.start_line, symbol.end_line
+        );
+    }
+    Ok(())
+}
+
+fn callers(repo: &str, query: &str) -> Result<(), String> {
+    if query.is_empty() {
+        return Err("callers requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let rows = sqlite
+        .callers(root.id(), query)
+        .map_err(|error| error.to_string())?;
+    println!("callers: {}", rows.len());
+    for row in rows {
+        print_call_row(&row);
+    }
+    Ok(())
+}
+
+fn callees(repo: &str, query: &str) -> Result<(), String> {
+    if query.is_empty() {
+        return Err("callees requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let rows = sqlite
+        .callees(root.id(), query)
+        .map_err(|error| error.to_string())?;
+    println!("callees: {}", rows.len());
+    for row in rows {
+        print_call_row(&row);
+    }
+    Ok(())
+}
+
+fn impact(repo: &str, query: &str) -> Result<(), String> {
+    if query.is_empty() {
+        return Err("impact requires a symbol query".to_owned());
+    }
+    println!("direct_callers");
+    callers(repo, query)?;
+    println!("direct_callees");
+    callees(repo, query)?;
+    Ok(())
+}
+
+fn sqlite_for_read() -> Result<SqliteStore, String> {
+    let store_config = StoreConfig::from_env();
+    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    sqlite.migrate().map_err(|error| error.to_string())?;
+    Ok(sqlite)
+}
+
+fn print_call_row(row: &symdex_store::CallSearchRow) {
+    println!(
+        "{} {:.2} {}:{}-{} callee={} status={}",
+        row.symbol_qualified_name
+            .as_deref()
+            .unwrap_or("<unresolved>"),
+        row.confidence,
+        row.path.as_deref().unwrap_or("<unknown>"),
+        row.start_line.unwrap_or(0),
+        row.end_line.unwrap_or(0),
+        row.callee_text,
+        row.resolution_status
+    );
 }
 
 fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {
@@ -257,11 +364,12 @@ fn collect_index_reports(
 
         let source = fs::read_to_string(&file.absolute_path)
             .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
-        let chunks =
-            extract_rust_chunks(&file.facts, &source).map_err(|error| error.to_string())?;
+        let index = index_rust_file(&file.facts, &source).map_err(|error| error.to_string())?;
         reports.push(IndexReport {
             file: file.facts.clone(),
-            chunks,
+            chunks: index.chunks,
+            symbols: index.symbols,
+            calls: index.calls,
             source,
         });
     }
@@ -345,6 +453,8 @@ fn persist_structural_index(
     collection: &IndexCollection,
 ) -> Result<(), String> {
     let mut chunks_persisted = 0usize;
+    let mut symbols_persisted = 0usize;
+    let mut calls_persisted = 0usize;
     for report in &collection.reports {
         let file = FileRecord {
             id: report.file.id.clone(),
@@ -358,9 +468,13 @@ fn persist_structural_index(
             .iter()
             .map(chunk_record)
             .collect::<Result<Vec<_>, _>>()?;
+        let symbols = report.symbols.iter().map(symbol_record).collect::<Vec<_>>();
+        let calls = report.calls.iter().map(call_record).collect::<Vec<_>>();
         chunks_persisted += chunks.len();
+        symbols_persisted += symbols.len();
+        calls_persisted += calls.len();
         sqlite
-            .replace_file_chunks(&file, &chunks)
+            .replace_file_facts(&file, &symbols, &chunks, &calls)
             .map_err(|error| error.to_string())?;
     }
 
@@ -369,6 +483,8 @@ fn persist_structural_index(
         .map_err(|error| error.to_string())?;
     println!("sqlite_files_indexed: {}", collection.reports.len());
     println!("sqlite_chunks_indexed: {chunks_persisted}");
+    println!("sqlite_symbols_indexed: {symbols_persisted}");
+    println!("sqlite_calls_indexed: {calls_persisted}");
     println!("sqlite_files_removed: {files_removed}");
     Ok(())
 }
@@ -387,6 +503,34 @@ fn chunk_record(chunk: &CodeChunk) -> Result<ChunkRecord, String> {
         qdrant_point_id: Some(qdrant_point_id(&chunk.id).map_err(|error| error.to_string())?),
         excluded_reason: None,
     })
+}
+
+fn symbol_record(symbol: &Symbol) -> SymbolRecord {
+    SymbolRecord {
+        id: symbol.id.clone(),
+        file_id: symbol.file_id.clone(),
+        parent_symbol_id: symbol.parent_symbol_id.clone(),
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+        kind: symbol.kind.as_str().to_owned(),
+        signature: symbol.signature.clone(),
+        start_line: symbol.line_range.start,
+        end_line: symbol.line_range.end,
+        start_byte: symbol.byte_range.start,
+        end_byte: symbol.byte_range.end,
+    }
+}
+
+fn call_record(call: &CallEdge) -> CallRecord {
+    CallRecord {
+        id: call.id.clone(),
+        caller_symbol_id: call.caller_symbol_id.clone(),
+        callee_text: call.callee_text.clone(),
+        callee_symbol_id: call.callee_symbol_id.clone(),
+        call_line: call.call_line,
+        confidence: call.confidence,
+        resolution_status: call.resolution_status.as_str().to_owned(),
+    }
 }
 
 fn parse_index_args(args: &[String]) -> IndexArgs {
@@ -412,6 +556,8 @@ struct IndexCollection {
 struct IndexReport {
     file: FileFacts,
     chunks: Vec<CodeChunk>,
+    symbols: Vec<Symbol>,
+    calls: Vec<CallEdge>,
     source: String,
 }
 
@@ -495,7 +641,7 @@ fn report_qdrant(config: &StoreConfig) {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Preview planned read-only MCP tools\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Preview planned read-only MCP tools\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }
