@@ -44,6 +44,7 @@ cargo run -p symdex-cli -- callees . "my_symbol"
 cargo run -p symdex-cli -- impact . "my_symbol"
 cargo run -p symdex-cli -- context-pack . "my_symbol"
 cargo run -p symdex-cli -- search . "retry logic"
+cargo run -p symdex-cli -- tui .
 cargo run -p symdex-cli -- serve-mcp
 ```
 
@@ -74,6 +75,10 @@ Implemented CLI commands currently include:
   notes. It does not include source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, and symbol names.
+- `tui [repo]`: planned terminal UI entrypoint for a local full control panel.
+  The TUI should use existing local services and SQLite state, require
+  confirmation before indexing jobs, and avoid destructive maintenance actions
+  until matching CLI support exists.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex.search`, `symdex.find_symbol`, `symdex.callers`, `symdex.callees`,
   `symdex.impact`, and `symdex.index_status`.
@@ -82,6 +87,10 @@ Implemented CLI commands currently include:
 reachable, whether the configured embedding model is present, and whether vector
 dimension probing succeeds. These checks report diagnostic status and do not
 mutate repository data.
+
+The TUI should surface these same diagnostics. Semantic search and semantic
+indexing views require local Ollama and Qdrant; status, structural queries, and
+offline indexing should remain usable without those services.
 
 ## Local-only rule
 

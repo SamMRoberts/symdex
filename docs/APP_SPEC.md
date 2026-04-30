@@ -26,8 +26,9 @@ It answers questions such as:
 1. User installs local dependencies.
 2. User runs `symdex init`.
 3. User runs `symdex index /path/to/repo`.
-4. User asks semantic or structural questions through CLI or MCP.
-5. Agent receives compact ranked evidence with file paths and line ranges.
+4. User asks semantic or structural questions through CLI, TUI, or MCP.
+5. User can inspect local status, diagnostics, indexing controls, queries, and context packs in the TUI.
+6. Agent receives compact ranked evidence with file paths and line ranges.
 
 ## Primary commands
 
@@ -40,6 +41,7 @@ symdex callers <repo> <symbol>
 symdex callees <repo> <symbol>
 symdex impact <repo> <symbol>
 symdex context-pack <repo> <symbol>
+symdex tui [repo]
 symdex doctor
 symdex serve-mcp
 ```
@@ -51,4 +53,5 @@ symdex serve-mcp
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.
 - MCP tools return compact JSON evidence that a coding agent can use immediately.
+- TUI provides a local keyboard-first control panel for indexing, diagnostics, queries, impact, and context packs.
 - Unresolved or ambiguous relationships are labeled instead of fabricated.

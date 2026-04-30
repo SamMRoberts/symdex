@@ -57,6 +57,20 @@
 - [x] large repo performance pass.
 - [x] compact context pack format.
 
+## Phase 6 — TUI
+
+- TUI workspace crate scaffold.
+- `symdex tui [repo]` launch command.
+- repository/status dashboard.
+- indexing controls with confirmation.
+- doctor diagnostics view.
+- query workbench for search and symbols.
+- symbol/call graph browser.
+- impact and context-pack viewer.
+- TUI state reducer tests.
+- `ratatui` render tests.
+- CLI launch smoke.
+
 ## Do not start yet
 
 - web UI

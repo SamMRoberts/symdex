@@ -3,7 +3,7 @@
 ## Mission
 Build symdex: a local-first codebase intelligence system for AI coding agents.
 It indexes repositories semantically and structurally so agents can reason from evidence.
-Primary stack: Rust, tree-sitter, SQLite, Qdrant, Ollama, nomic-embed-text, MCP server.
+Primary stack: Rust, tree-sitter, SQLite, Qdrant, Ollama, nomic-embed-text, MCP server, TUI.
 Optimize for privacy, correctness, deterministic behavior, and compact agent context.
 
 ## First Reads
@@ -14,8 +14,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - If requirements conflict, prioritize privacy, correctness, tests, simplicity, then performance.
 
 ## Product Rules
-- Build a CLI plus MCP server.
+- Build a CLI, TUI, and MCP server.
 - The CLI handles indexing, querying, diagnostics, and maintenance.
+- The TUI provides an interactive local control panel over CLI-equivalent capabilities.
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
 - Qdrant stores dense vectors plus filterable payload fields.
@@ -35,8 +36,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Use `crates/symdex-store` for SQLite and Qdrant adapters.
 - Use `crates/symdex-embed` for the Ollama embedding client.
 - Use `crates/symdex-cli` for command-line orchestration.
+- Use `crates/symdex-tui` for terminal UI state, rendering, events, and terminal lifecycle.
 - Use `crates/symdex-mcp` for MCP server and tool handlers.
-- Do not let CLI, MCP, Qdrant, or Ollama types leak into core logic.
+- Do not let CLI, TUI, MCP, Qdrant, or Ollama types leak into core logic.
 - Keep database row types separate from domain models.
 - Put fixtures under `tests/fixtures/`.
 
@@ -86,6 +88,20 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Prefer ranked evidence over prose explanations.
 - Validate all MCP inputs.
 - Enforce repository root boundaries and fail closed on ambiguous paths or missing indexes.
+
+## TUI Rules
+- The TUI must be terminal-only, local-only, and implemented with `ratatui` plus `crossterm`.
+- Launch the TUI through `symdex tui [repo]`.
+- Keep TUI state, rendering, event handling, and terminal lifecycle in `crates/symdex-tui`.
+- Let `symdex-cli` own argument parsing and TUI launch orchestration.
+- The TUI should call Rust library APIs directly, not shell out to `symdex` subprocesses.
+- Design for keyboard-first use; mouse support is optional and must not be required.
+- Show visible loading, empty, error, and confirmation states.
+- Show compact evidence by default: paths, line ranges, scores, confidence, resolution status, symbols, and context-pack metadata.
+- Do not show source text by default; source previews require a future explicit design.
+- Require confirmation before starting long-running local jobs such as indexing.
+- Do not add reset/delete actions until matching CLI support exists.
+- Do not execute indexed repository code from the TUI.
 
 ## Security and Privacy
 - Default bind address for local services is localhost.

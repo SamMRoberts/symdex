@@ -8,6 +8,7 @@ crates/
   symdex-store/
   symdex-embed/
   symdex-cli/
+  symdex-tui/
   symdex-mcp/
 tests/
   fixtures/
@@ -64,6 +65,17 @@ User-facing commands:
 
 Do not put core indexing logic here.
 
+### `symdex-tui`
+
+Terminal UI:
+
+- app state and reducers
+- `ratatui` layouts and widgets
+- `crossterm` input and terminal lifecycle
+- view orchestration for dashboard, indexing controls, diagnostics, queries, impact, and context packs
+
+Do not shell out to the `symdex` binary. Call Rust library APIs directly.
+
 ### `symdex-mcp`
 
 MCP server:
@@ -76,8 +88,10 @@ MCP server:
 
 ## Boundary rules
 
-- Core emits facts; store persists facts; MCP presents facts.
+- Core emits facts; store persists facts; CLI, TUI, and MCP present facts.
 - Never let MCP invoke indexing side effects until a write-capable design is approved.
+- Require TUI confirmation before long-running jobs such as indexing.
+- Keep TUI rendering and event types out of core, store, embed, and MCP crates.
 - Prefer stable serialized structs for MCP outputs.
 - Keep all path normalization centralized.
 - Do not expose absolute paths unless user configuration allows it.

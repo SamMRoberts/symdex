@@ -7,6 +7,7 @@
 3. Integration tests for Qdrant adapter behind an opt-in feature or environment flag.
 4. Integration tests for Ollama adapter behind an opt-in feature or environment flag.
 5. MCP contract tests for input validation and output shape.
+6. TUI state and render tests using `ratatui` test backends.
 
 ## Fixtures
 
@@ -34,6 +35,9 @@ Fixtures should be tiny and purpose-built.
 - ignored files not indexed
 - likely secrets excluded from embeddings
 - MCP tools reject invalid paths
+- TUI navigation and confirmation flows
+- TUI loading, empty, and error states
+- TUI render snapshots or buffer assertions for key screens
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -58,6 +62,13 @@ Service-dependent checks:
 ```bash
 SYMDEX_TEST_QDRANT=1 cargo test -p symdex-store qdrant
 SYMDEX_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
+```
+
+Future TUI checks:
+
+```bash
+cargo test -p symdex-tui
+cargo run -p symdex-cli -- tui --help
 ```
 
 ## Agent expectation

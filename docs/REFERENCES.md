@@ -28,6 +28,11 @@ Verified sources for the chosen stack.
 - MCP server tools spec: https://modelcontextprotocol.io/specification/2025-06-18/server/tools
 - Rust SDK / rmcp: https://docs.rs/rmcp
 
+## Terminal UI
+
+- ratatui docs: https://docs.rs/ratatui
+- crossterm docs: https://docs.rs/crossterm
+
 ## Maintenance rule
 
-When updating crate versions, MCP behavior, embedding models, or Qdrant collection behavior, re-check the relevant upstream docs and update this file if assumptions changed.
+When updating crate versions, MCP behavior, TUI behavior, embedding models, or Qdrant collection behavior, re-check the relevant upstream docs and update this file if assumptions changed.
