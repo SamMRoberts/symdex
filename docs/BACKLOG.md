@@ -54,7 +54,7 @@
 - [x] secret detection.
 - [x] path boundary tests.
 - [x] model/dimension migration behavior.
-- large repo performance pass.
+- [x] large repo performance pass.
 - compact context pack format.
 
 ## Do not start yet

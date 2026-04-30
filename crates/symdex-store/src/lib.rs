@@ -1129,7 +1129,13 @@ CREATE TABLE IF NOT EXISTS calls (
 
 CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
 CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
+CREATE INDEX IF NOT EXISTS idx_calls_caller_symbol_id ON calls(caller_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_calls_callee_symbol_id ON calls(callee_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
 "#;
 
 fn timestamp() -> String {
@@ -1271,6 +1277,32 @@ mod tests {
         assert_eq!(status.files_indexed, 1);
         assert_eq!(status.chunks_indexed, 1);
         assert!(status.last_indexed_at.is_some());
+    }
+
+    #[test]
+    fn sqlite_migration_creates_query_indexes() {
+        let db = TestDb::new("indexes");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+
+        let indexes = sqlite_index_names(&store);
+
+        for expected in [
+            "idx_files_repository_path",
+            "idx_chunks_file_id",
+            "idx_symbols_file_id",
+            "idx_symbols_name",
+            "idx_symbols_qualified_name",
+            "idx_calls_caller_symbol_id",
+            "idx_calls_callee_symbol_id",
+            "idx_index_runs_repository_status",
+            "idx_index_runs_repository_model_status",
+        ] {
+            assert!(
+                indexes.iter().any(|index| index == expected),
+                "missing SQLite index {expected}; found {indexes:?}"
+            );
+        }
     }
 
     #[test]
@@ -1541,6 +1573,23 @@ mod tests {
             chunks_embedded: 1,
             error_summary: None,
         }
+    }
+
+    fn sqlite_index_names(store: &SqliteStore) -> Vec<String> {
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name NOT LIKE 'sqlite_autoindex%'
+                 ORDER BY name",
+            )
+            .expect("index query should prepare");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("index query should run");
+        rows.map(|row| row.expect("index row should decode"))
+            .collect()
     }
 
     struct TestDb {

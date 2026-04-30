@@ -40,6 +40,9 @@ canonical symlink escapes rejected by normalization, symlinked files and
 directories skipped during discovery, and MCP repo arguments rejected when they
 do not name a directory root.
 
+Current migration tests also assert that structural-query indexes are created
+for symbols, calls, chunks, files, and index runs.
+
 ## Test commands
 
 Default local checks:

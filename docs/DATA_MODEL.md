@@ -9,6 +9,10 @@ Current implementation runs idempotent SQLite migrations at `symdex init`,
 while the current write path persists repositories, files, chunks, symbols, and
 calls.
 
+Migrations also create indexes for large-repo query paths: repository file
+lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
+caller/callee traversal, and index-run metadata checks.
+
 ### `repositories`
 
 ```sql

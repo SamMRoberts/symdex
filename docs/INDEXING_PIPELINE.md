@@ -158,3 +158,7 @@ removes SQLite rows for deleted files. Semantic `symdex index` currently parses
 and embeds all discovered chunks so Qdrant can be rebuilt even when SQLite
 already has matching structural facts. Same-model dimension changes fail closed;
 automated collection migration/reset remains future hardening.
+
+Current SQLite migrations include indexes for file cleanup, symbol lookup,
+caller/callee traversal, and index-run metadata. This keeps structural queries
+from degrading into broad table scans as repositories grow.
