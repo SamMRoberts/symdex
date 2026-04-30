@@ -193,7 +193,14 @@ impl SqliteStore {
                        id, caller_symbol_id, callee_text, callee_symbol_id,
                        call_line, confidence, resolution_status
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(id) DO UPDATE SET
+                       caller_symbol_id = excluded.caller_symbol_id,
+                       callee_text = excluded.callee_text,
+                       callee_symbol_id = excluded.callee_symbol_id,
+                       call_line = excluded.call_line,
+                       confidence = excluded.confidence,
+                       resolution_status = excluded.resolution_status",
                 )
                 .map_err(StoreError::Sqlite)?;
             for call in calls {
@@ -1356,6 +1363,65 @@ mod tests {
         let callees = store.callees("repo", "caller").expect("callees query");
         assert_eq!(callees.len(), 1);
         assert_eq!(callees[0].symbol_qualified_name.as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn sqlite_replaces_calls_without_unique_conflict() {
+        let db = TestDb::new("replace-calls");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![
+            sample_symbol("caller-symbol", "caller", "caller"),
+            sample_symbol("callee-symbol", "helper", "helper"),
+        ];
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &symbols,
+                &[sample_chunk("chunk-1")],
+                &[CallRecord {
+                    id: "call-1".to_owned(),
+                    caller_symbol_id: "caller-symbol".to_owned(),
+                    callee_text: "helper".to_owned(),
+                    callee_symbol_id: Some("callee-symbol".to_owned()),
+                    call_line: 4,
+                    confidence: 1.0,
+                    resolution_status: "resolved_exact".to_owned(),
+                }],
+            )
+            .expect("initial calls should persist");
+
+        store
+            .replace_file_facts(
+                &sample_file("hash-2"),
+                &symbols,
+                &[sample_chunk("chunk-2")],
+                &[CallRecord {
+                    id: "call-1".to_owned(),
+                    caller_symbol_id: "caller-symbol".to_owned(),
+                    callee_text: "helper_updated".to_owned(),
+                    callee_symbol_id: Some("callee-symbol".to_owned()),
+                    call_line: 5,
+                    confidence: 0.9,
+                    resolution_status: "resolved_local_candidate".to_owned(),
+                }],
+            )
+            .expect("replacement calls should persist");
+
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.calls_indexed, 1);
+
+        let callees = store.callees("repo", "caller").expect("callees query");
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].callee_text, "helper_updated");
+        assert_eq!(callees[0].call_line, 5);
     }
 
     #[test]
