@@ -64,8 +64,9 @@ binary.
 
 ### Impact and Context Pack Viewer
 
-- Show the basic impact view using direct callers and callees.
-- Show `symdex.context_pack.v1` metadata.
+- Show the basic impact view using direct callers and callees with `p`, typed
+  symbol text, `Tab`, and `Enter`.
+- Show `symdex.context_pack.v1` metadata with the same viewer controls.
 - Do not include source text by default.
 
 ## Interaction Rules
@@ -85,14 +86,19 @@ Current dashboard keys:
 - `i`: return to indexing controls
 - `w`: open the query workbench
 - `g`: open the symbol/call graph browser
+- `p`: open the impact/context-pack viewer
 - `Tab`: toggle symbol and semantic query modes in the query workbench
 - `Tab`: toggle callers and callees in the symbol/call graph browser
+- `Tab`: toggle impact and context-pack modes in the impact/context-pack viewer
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
+- typed text: edit the impact/context-pack viewer input
 - `Backspace`: edit the query workbench input
 - `Backspace`: edit the symbol/call graph browser input
+- `Backspace`: edit the impact/context-pack viewer input
 - `Enter`: run the current query workbench query
 - `Enter`: run the current symbol/call graph lookup
+- `Enter`: run the current impact/context-pack lookup
 - `r`: refresh repository status
 - `y`: confirm a pending indexing job
 - `n` or `Esc`: cancel a pending indexing job

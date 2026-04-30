@@ -21,10 +21,10 @@ use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run
 use symdex_embed::EmbedConfig;
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
 use symdex_query::{
-    CallDirection, CallGraphSummary, QueryMode, QueryResult, run_call_graph, run_semantic_search,
-    run_symbol_search,
+    CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, run_call_graph,
+    run_context_pack, run_impact, run_semantic_search, run_symbol_search,
 };
-use symdex_store::{RepositoryStatus, SqliteStore, StoreConfig};
+use symdex_store::{ContextPack, RepositoryStatus, SqliteStore, StoreConfig};
 
 pub struct TuiOptions {
     pub repo: String,
@@ -39,7 +39,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    Tab       Toggle mode in query and graph views\n    Enter     Run query/graph lookup or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Toggle mode in query, graph, and impact/context views\n    Enter     Run lookup or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -58,11 +58,13 @@ pub struct App {
     diagnostics: DiagnosticsState,
     query: QueryWorkbenchState,
     graph: GraphBrowserState,
+    evidence: EvidenceViewerState,
     last_error: Option<String>,
     index_receiver: Option<Receiver<Result<IndexSummary, String>>>,
     diagnostics_receiver: Option<Receiver<Result<DiagnosticReport, String>>>,
     query_receiver: Option<Receiver<Result<QueryResult, String>>>,
     graph_receiver: Option<Receiver<Result<CallGraphSummary, String>>>,
+    evidence_receiver: Option<Receiver<Result<EvidenceResult, String>>>,
 }
 
 impl App {
@@ -92,11 +94,13 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
+            evidence: EvidenceViewerState::default(),
             last_error: None,
             index_receiver: None,
             diagnostics_receiver: None,
             query_receiver: None,
             graph_receiver: None,
+            evidence_receiver: None,
         })
     }
 
@@ -122,11 +126,13 @@ impl App {
             diagnostics: DiagnosticsState::Idle,
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
+            evidence: EvidenceViewerState::default(),
             last_error: None,
             index_receiver: None,
             diagnostics_receiver: None,
             query_receiver: None,
             graph_receiver: None,
+            evidence_receiver: None,
         }
     }
 
@@ -390,6 +396,51 @@ impl App {
         lines
     }
 
+    fn evidence_lines(&self) -> Vec<Line<'_>> {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Mode: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{} (Tab toggles)", self.evidence.mode.label())),
+            ]),
+            Line::from(vec![
+                Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(if self.evidence.input.is_empty() {
+                    "<type symbol name>".to_owned()
+                } else {
+                    self.evidence.input.clone()
+                }),
+            ]),
+            Line::from(
+                "Enter runs the lookup. Backspace edits. Esc clears input or leaves viewer.",
+            ),
+            Line::from(""),
+        ];
+
+        match &self.evidence.status {
+            EvidenceStatus::Idle => {
+                lines.push(Line::from("No impact or context-pack lookup has run."));
+            }
+            EvidenceStatus::Running => {
+                lines.push(Line::from(format!(
+                    "Loading {} for {}...",
+                    self.evidence.mode.label(),
+                    self.evidence.input
+                )));
+            }
+            EvidenceStatus::Completed(result) => {
+                lines.extend(evidence_result_lines(result));
+            }
+            EvidenceStatus::Failed(error) => {
+                lines.push(Line::from(vec![
+                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(error.as_str()),
+                ]));
+            }
+        }
+
+        lines
+    }
+
     fn refresh_status(&mut self) -> Result<(), String> {
         let store_config = StoreConfig::from_env();
         let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
@@ -407,6 +458,9 @@ impl App {
         }
         if self.view == View::Graph {
             return self.handle_graph_key(code);
+        }
+        if self.view == View::Evidence {
+            return self.handle_evidence_key(code);
         }
 
         match code {
@@ -430,6 +484,10 @@ impl App {
             KeyCode::Char('g') => {
                 self.view = View::Graph;
                 self.message = "Symbol/call graph browser selected.".to_owned();
+            }
+            KeyCode::Char('p') => {
+                self.view = View::Evidence;
+                self.message = "Impact/context-pack viewer selected.".to_owned();
             }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
                 self.screen =
@@ -532,6 +590,40 @@ impl App {
         false
     }
 
+    fn handle_evidence_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('q') if self.evidence.input.is_empty() => return true,
+            KeyCode::Esc if self.evidence.input.is_empty() => {
+                self.view = View::Indexing;
+                self.message = "Indexing controls selected.".to_owned();
+            }
+            KeyCode::Esc => {
+                self.evidence.input.clear();
+                self.evidence.status = EvidenceStatus::Idle;
+                self.message = "Evidence input cleared.".to_owned();
+            }
+            KeyCode::Tab => {
+                self.evidence.mode = self.evidence.mode.toggled();
+                self.evidence.status = EvidenceStatus::Idle;
+                self.message = format!("Evidence mode set to {}.", self.evidence.mode.label());
+            }
+            KeyCode::Enter => {
+                self.start_evidence_lookup();
+            }
+            KeyCode::Backspace => {
+                self.evidence.input.pop();
+            }
+            KeyCode::Char(character) => {
+                self.evidence.input.push(character);
+                if matches!(self.evidence.status, EvidenceStatus::Failed(_)) {
+                    self.evidence.status = EvidenceStatus::Idle;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn start_index_job(&mut self, mode: IndexMode) {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
@@ -604,6 +696,31 @@ impl App {
         self.graph.status = GraphStatus::Running;
         self.graph_receiver = Some(receiver);
         self.message = format!("{} graph lookup started.", direction.label());
+    }
+
+    fn start_evidence_lookup(&mut self) {
+        let query = self.evidence.input.trim().to_owned();
+        if query.is_empty() {
+            self.evidence.status = EvidenceStatus::Failed("symbol query is empty".to_owned());
+            self.message = "Evidence lookup failed.".to_owned();
+            return;
+        }
+
+        let mode = self.evidence.mode;
+        let repo = self.repo_input.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match mode {
+                EvidenceMode::Impact => run_impact(&repo, &query).map(EvidenceResult::Impact),
+                EvidenceMode::ContextPack => {
+                    run_context_pack(&repo, &query, 8).map(EvidenceResult::ContextPack)
+                }
+            };
+            let _ = sender.send(result);
+        });
+        self.evidence.status = EvidenceStatus::Running;
+        self.evidence_receiver = Some(receiver);
+        self.message = format!("{} lookup started.", mode.label());
     }
 
     fn poll_index_job(&mut self) {
@@ -718,6 +835,31 @@ impl App {
             }
         }
     }
+
+    fn poll_evidence(&mut self) {
+        let Some(receiver) = &self.evidence_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(result)) => {
+                self.evidence_receiver = None;
+                self.evidence.status = EvidenceStatus::Completed(result);
+                self.message = "Evidence lookup completed.".to_owned();
+            }
+            Ok(Err(error)) => {
+                self.evidence_receiver = None;
+                self.evidence.status = EvidenceStatus::Failed(error);
+                self.message = "Evidence lookup failed.".to_owned();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.evidence_receiver = None;
+                self.evidence.status =
+                    EvidenceStatus::Failed("evidence worker disconnected".to_owned());
+                self.message = "Evidence lookup failed.".to_owned();
+            }
+        }
+    }
 }
 
 pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), String> {
@@ -759,12 +901,14 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 View::Diagnostics => "Doctor Diagnostics",
                 View::Query => "Query Workbench",
                 View::Graph => "Symbol/Call Graph",
+                View::Evidence => "Impact/Context Pack",
             };
             let right_lines = match app.view {
                 View::Indexing => app.index_lines(),
                 View::Diagnostics => app.diagnostics_lines(),
                 View::Query => app.query_lines(),
                 View::Graph => app.graph_lines(),
+                View::Evidence => app.evidence_lines(),
             };
             let right_panel = List::new(
                 right_lines
@@ -791,6 +935,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
         app.poll_diagnostics();
         app.poll_query();
         app.poll_graph();
+        app.poll_evidence();
         render(terminal, &app)?;
         if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
             continue;
@@ -1003,12 +1148,88 @@ fn call_graph_lines(summary: &CallGraphSummary) -> Vec<Line<'_>> {
     lines
 }
 
+fn evidence_result_lines(result: &EvidenceResult) -> Vec<Line<'_>> {
+    match result {
+        EvidenceResult::Impact(summary) => impact_lines(summary),
+        EvidenceResult::ContextPack(pack) => context_pack_lines(pack),
+    }
+}
+
+fn impact_lines(summary: &ImpactSummary) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(format!("Impact query: {}", summary.query)),
+        Line::from(format!("Direct callers: {}", summary.direct_callers.len())),
+    ];
+    lines.extend(summary.direct_callers.iter().take(5).map(compact_call_line));
+    lines.push(Line::from(format!(
+        "Direct callees: {}",
+        summary.direct_callees.len()
+    )));
+    lines.extend(summary.direct_callees.iter().take(5).map(compact_call_line));
+    if summary.direct_callers.is_empty() && summary.direct_callees.is_empty() {
+        lines.push(Line::from("No direct impact relationships matched."));
+    }
+    lines
+}
+
+fn context_pack_lines(pack: &ContextPack) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(format!("Format: {}", pack.format)),
+        Line::from(format!("Query: {}", pack.query)),
+        Line::from(format!("Focus symbols: {}", pack.focus_symbols.len())),
+    ];
+    lines.extend(pack.focus_symbols.iter().take(5).map(|symbol| {
+        Line::from(format!(
+            "{} {} {}:{}-{}",
+            symbol.kind, symbol.qualified_name, symbol.path, symbol.start_line, symbol.end_line
+        ))
+    }));
+    lines.push(Line::from(format!(
+        "Callers: {} Callees: {}",
+        pack.direct_callers.len(),
+        pack.direct_callees.len()
+    )));
+    lines.push(Line::from(format!("Files: {}", pack.files.len())));
+    lines.extend(
+        pack.files
+            .iter()
+            .take(6)
+            .map(|file| Line::from(file.clone())),
+    );
+    lines.push(Line::from(format!(
+        "Limits: symbols={} callers={} callees={}",
+        pack.limits.max_symbols, pack.limits.max_callers, pack.limits.max_callees
+    )));
+    lines.extend(
+        pack.notes
+            .iter()
+            .map(|note| Line::from(format!("Note: {note}"))),
+    );
+    lines
+}
+
+fn compact_call_line(row: &symdex_store::CallSearchRow) -> Line<'_> {
+    Line::from(format!(
+        "{} conf={:.2} {}:{}-{} callee={} status={}",
+        row.symbol_qualified_name
+            .as_deref()
+            .unwrap_or("<unresolved>"),
+        row.confidence,
+        row.path.as_deref().unwrap_or("<unknown>"),
+        row.start_line.unwrap_or(0),
+        row.end_line.unwrap_or(0),
+        row.callee_text,
+        row.resolution_status
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Indexing,
     Diagnostics,
     Query,
     Graph,
+    Evidence,
 }
 
 enum DiagnosticsState {
@@ -1062,6 +1283,56 @@ enum GraphStatus {
     Running,
     Completed(CallGraphSummary),
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceMode {
+    Impact,
+    ContextPack,
+}
+
+impl EvidenceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Impact => "impact",
+            Self::ContextPack => "context pack",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Impact => Self::ContextPack,
+            Self::ContextPack => Self::Impact,
+        }
+    }
+}
+
+struct EvidenceViewerState {
+    mode: EvidenceMode,
+    input: String,
+    status: EvidenceStatus,
+}
+
+impl Default for EvidenceViewerState {
+    fn default() -> Self {
+        Self {
+            mode: EvidenceMode::Impact,
+            input: String::new(),
+            status: EvidenceStatus::Idle,
+        }
+    }
+}
+
+enum EvidenceStatus {
+    Idle,
+    Running,
+    Completed(EvidenceResult),
+    Failed(String),
+}
+
+enum EvidenceResult {
+    Impact(ImpactSummary),
+    ContextPack(ContextPack),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1142,13 +1413,15 @@ mod tests {
     use ratatui::backend::TestBackend;
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
-        CallDirection, CallGraphSummary, QueryMode, QueryResult, SymbolSearchSummary,
+        CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
     };
-    use symdex_store::{CallSearchRow, RepositoryStatus};
+    use symdex_store::{
+        CallSearchRow, ContextPack, ContextPackLimits, RepositoryStatus, SymbolSearchRow,
+    };
 
     use crate::{
-        App, DiagnosticsState, GraphStatus, IndexMode, QueryStatus, Screen, UiAction, View,
-        reduce_screen, render,
+        App, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus, GraphStatus,
+        IndexMode, QueryStatus, Screen, UiAction, View, reduce_screen, render,
     };
 
     #[test]
@@ -1319,6 +1592,70 @@ mod tests {
     }
 
     #[test]
+    fn renders_impact_results() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Evidence;
+        app.evidence.mode = EvidenceMode::Impact;
+        app.evidence.input = "add".to_owned();
+        app.evidence.status = EvidenceStatus::Completed(EvidenceResult::Impact(ImpactSummary {
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            direct_callers: vec![sample_call_row()],
+            direct_callees: Vec::new(),
+        }));
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Impact/Context Pack"));
+        assert!(rendered.contains("Impact query"));
+        assert!(rendered.contains("Direct callers"));
+        assert!(rendered.contains("crate::caller"));
+    }
+
+    #[test]
+    fn renders_context_pack_metadata() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Evidence;
+        app.evidence.mode = EvidenceMode::ContextPack;
+        app.evidence.input = "add".to_owned();
+        app.evidence.status =
+            EvidenceStatus::Completed(EvidenceResult::ContextPack(sample_context_pack()));
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("symdex.context_pack.v1"));
+        assert!(rendered.contains("Focus symbols"));
+        assert!(rendered.contains("metadata_only_no_source_text"));
+        assert!(rendered.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn evidence_viewer_accepts_input_and_toggles_modes() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Evidence;
+        assert_eq!(app.evidence.mode, EvidenceMode::Impact);
+
+        assert!(!app.handle_evidence_key(KeyCode::Char('a')));
+        assert!(!app.handle_evidence_key(KeyCode::Char('d')));
+        assert!(!app.handle_evidence_key(KeyCode::Char('d')));
+        assert_eq!(app.evidence.input, "add");
+
+        assert!(!app.handle_evidence_key(KeyCode::Tab));
+        assert_eq!(app.evidence.mode, EvidenceMode::ContextPack);
+
+        assert!(!app.handle_evidence_key(KeyCode::Backspace));
+        assert_eq!(app.evidence.input, "ad");
+    }
+
+    #[test]
     fn reducer_requires_confirmation_before_indexing() {
         let screen = reduce_screen(
             Screen::Dashboard,
@@ -1381,6 +1718,32 @@ mod tests {
             path: Some("src/lib.rs".to_owned()),
             start_line: Some(5),
             end_line: Some(8),
+        }
+    }
+
+    fn sample_context_pack() -> ContextPack {
+        ContextPack {
+            format: "symdex.context_pack.v1".to_owned(),
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            focus_symbols: vec![SymbolSearchRow {
+                id: "symbol-1".to_owned(),
+                name: "add".to_owned(),
+                qualified_name: "crate::add".to_owned(),
+                kind: "function".to_owned(),
+                path: "src/lib.rs".to_owned(),
+                start_line: 1,
+                end_line: 3,
+            }],
+            direct_callers: vec![sample_call_row()],
+            direct_callees: Vec::new(),
+            files: vec!["src/lib.rs".to_owned()],
+            limits: ContextPackLimits {
+                max_symbols: 8,
+                max_callers: 8,
+                max_callees: 8,
+            },
+            notes: vec!["metadata_only_no_source_text".to_owned()],
         }
     }
 }

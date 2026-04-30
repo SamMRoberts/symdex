@@ -5,7 +5,8 @@ use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
 use symdex_query::{
-    CallDirection, CallGraphSummary, run_call_graph, run_semantic_search, run_symbol_search,
+    CallDirection, CallGraphSummary, ImpactSummary, run_call_graph, run_context_pack, run_impact,
+    run_semantic_search, run_symbol_search,
 };
 use symdex_store::{SqliteStore, StoreConfig, sqlite_parent};
 
@@ -182,35 +183,41 @@ fn callees(repo: &str, query: &str) -> Result<(), String> {
 }
 
 fn impact(repo: &str, query: &str) -> Result<(), String> {
-    if query.is_empty() {
-        return Err("impact requires a symbol query".to_owned());
-    }
-    println!("direct_callers");
-    callers(repo, query)?;
-    println!("direct_callees");
-    callees(repo, query)?;
+    let summary = run_impact(repo, query).map_err(|error| {
+        if error.contains("requires a symbol query") {
+            "impact requires a symbol query".to_owned()
+        } else {
+            error
+        }
+    })?;
+    print_impact_summary(&summary);
     Ok(())
+}
+
+fn print_impact_summary(summary: &ImpactSummary) {
+    println!("direct_callers");
+    println!("callers: {}", summary.direct_callers.len());
+    for row in &summary.direct_callers {
+        print_call_row(row);
+    }
+    println!("direct_callees");
+    println!("callees: {}", summary.direct_callees.len());
+    for row in &summary.direct_callees {
+        print_call_row(row);
+    }
 }
 
 fn context_pack(repo: &str, query: &str) -> Result<(), String> {
-    if query.is_empty() {
-        return Err("context-pack requires a symbol query".to_owned());
-    }
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
-    let pack = sqlite
-        .context_pack(root.id(), query, 8)
-        .map_err(|error| error.to_string())?;
+    let pack = run_context_pack(repo, query, 8).map_err(|error| {
+        if error.contains("requires a symbol query") {
+            "context-pack requires a symbol query".to_owned()
+        } else {
+            error
+        }
+    })?;
     let json = serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())?;
     println!("{json}");
     Ok(())
-}
-
-fn sqlite_for_read() -> Result<SqliteStore, String> {
-    let store_config = StoreConfig::from_env();
-    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
-    Ok(sqlite)
 }
 
 fn print_call_row(row: &symdex_store::CallSearchRow) {

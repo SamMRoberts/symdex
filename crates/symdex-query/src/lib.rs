@@ -3,7 +3,8 @@
 use symdex_core::RepoRoot;
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    CallSearchRow, QdrantClient, SqliteStore, StoreConfig, SymbolSearchRow, qdrant_collection_name,
+    CallSearchRow, ContextPack, QdrantClient, SqliteStore, StoreConfig, SymbolSearchRow,
+    qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,14 @@ pub struct CallGraphSummary {
     pub rows: Vec<CallSearchRow>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpactSummary {
+    pub repository_id: String,
+    pub query: String,
+    pub direct_callers: Vec<CallSearchRow>,
+    pub direct_callees: Vec<CallSearchRow>,
+}
+
 pub fn run_symbol_search(repo: &str, query: &str) -> Result<SymbolSearchSummary, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -129,6 +138,40 @@ pub fn run_call_graph(
         direction,
         rows,
     })
+}
+
+pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("impact requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let direct_callers = sqlite
+        .callers(root.id(), query)
+        .map_err(|error| error.to_string())?;
+    let direct_callees = sqlite
+        .callees(root.id(), query)
+        .map_err(|error| error.to_string())?;
+
+    Ok(ImpactSummary {
+        repository_id: root.id().to_owned(),
+        query: query.to_owned(),
+        direct_callers,
+        direct_callees,
+    })
+}
+
+pub fn run_context_pack(repo: &str, query: &str, limit: usize) -> Result<ContextPack, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("context-pack requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    sqlite
+        .context_pack(root.id(), query, limit)
+        .map_err(|error| error.to_string())
 }
 
 pub fn run_semantic_search(
@@ -186,7 +229,10 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{CallDirection, QueryMode, run_call_graph, run_semantic_search, run_symbol_search};
+    use crate::{
+        CallDirection, QueryMode, run_call_graph, run_context_pack, run_impact,
+        run_semantic_search, run_symbol_search,
+    };
 
     #[test]
     fn query_mode_toggles_between_workbench_modes() {
@@ -216,6 +262,18 @@ mod tests {
     fn call_graph_rejects_empty_query() {
         let error =
             run_call_graph(".", " ", CallDirection::Callers).expect_err("empty query should fail");
+        assert!(error.contains("requires a symbol query"));
+    }
+
+    #[test]
+    fn impact_rejects_empty_query() {
+        let error = run_impact(".", " ").expect_err("empty query should fail");
+        assert!(error.contains("requires a symbol query"));
+    }
+
+    #[test]
+    fn context_pack_rejects_empty_query() {
+        let error = run_context_pack(".", " ", 8).expect_err("empty query should fail");
         assert!(error.contains("requires a symbol query"));
     }
 }

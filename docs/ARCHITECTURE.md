@@ -76,6 +76,7 @@ Query orchestration:
 
 - SQLite symbol search
 - SQLite callers and callees
+- impact summaries and context-pack retrieval
 - semantic query embedding
 - Qdrant vector search
 - compact query result summaries without source text

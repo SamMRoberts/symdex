@@ -79,9 +79,9 @@ Implemented CLI commands currently include:
   opens a repository/status dashboard backed by SQLite metadata and local
   service configuration. Use `o` to confirm offline indexing, `s` to confirm
   semantic indexing, `d` to run doctor diagnostics, `i` for indexing controls,
-  `w` for the query workbench, `g` for the symbol/call graph browser, `Tab` to
-  toggle query or graph modes, `r` to refresh status, and `q` or `Esc` to quit.
-  Future TUI work should add impact and context-pack views.
+  `w` for the query workbench, `g` for the symbol/call graph browser, `p` for
+  the impact/context-pack viewer, `Tab` to toggle view-local modes, `r` to
+  refresh status, and `q` or `Esc` to quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex.search`, `symdex.find_symbol`, `symdex.callers`, `symdex.callees`,
   `symdex.impact`, and `symdex.index_status`.
