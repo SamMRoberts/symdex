@@ -79,6 +79,11 @@ terminal panes.
 - Highlight the active tab and focused input/list row.
 - Use `Up` and `Down` to move the selected evidence row in completed diagnostic,
   query, call graph, impact, and context-pack tables.
+- In the Doctor view, row selection must drive visible detail output for the
+  selected check rather than highlight-only behavior.
+- In the Doctor view, `Enter` should toggle an expanded selected-check detail
+  panel (or focus it if already visible) showing the full check label, status,
+  and diagnostic message.
 - Style pending confirmation states with a warning color and explicit `y/n`
   choices.
 - Style loading/running states distinctly from idle states.
@@ -130,6 +135,16 @@ terminal panes.
 - Keep diagnostics local and avoid logging source text.
 - Render diagnostics as a table with check name, status, and detail columns.
 - Color status labels by severity.
+- Keep `Up` / `Down` row navigation stateful and visible.
+- Display selected-check details in a dedicated panel below or beside the table
+  when diagnostics are completed.
+- The selected-check details panel should include:
+  - check label
+  - status label
+  - full diagnostic detail text (wrapped)
+  - optional remediation hint when available from diagnostics output
+- In the Doctor view, `Enter` toggles or focuses the selected-check details
+  panel instead of being a no-op.
 
 ### Query Workbench
 
@@ -182,6 +197,7 @@ Current dashboard keys:
 - `Tab`: toggle callers and callees in the symbol/call graph browser
 - `Tab`: toggle impact and context-pack modes in the impact/context-pack viewer
 - `Up` / `Down`: move the selected row in completed result tables
+- `Enter`: toggle/focus selected-check details in Doctor diagnostics view
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
 - typed text: edit the impact/context-pack viewer input
