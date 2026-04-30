@@ -1132,7 +1132,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(10),
-                    Constraint::Length(3),
+                    Constraint::Length(4),
                 ])
                 .split(frame.area());
 
@@ -1152,14 +1152,18 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
 
             render_right_panel(frame, body_chunks[1], app);
 
-            let footer = Paragraph::new(Line::from(vec![
-                status_span(app.view.footer_label(), StatusTone::Info),
-                Span::raw(" "),
-                Span::raw(app.view.footer_help()),
-                Span::raw(" | "),
-                Span::styled("status: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(app.message.as_str()),
-            ]))
+            let footer = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("keys: ", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(app.view.footer_help()),
+                ]),
+                Line::from(vec![
+                    status_span(app.view.footer_label(), StatusTone::Info),
+                    Span::raw(" "),
+                    Span::styled("status: ", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(app.message.as_str()),
+                ]),
+            ])
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("Status"));
             frame.render_widget(footer, chunks[2]);
@@ -4352,9 +4356,11 @@ mod tests {
         render(&mut terminal, &app).expect("render should succeed");
 
         let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("keys:"));
         assert!(rendered.contains("query"));
         assert!(rendered.contains("Tab/Shift+Tab mode"));
         assert!(rendered.contains("Enter run"));
+        assert!(rendered.contains("status:"));
     }
 
     #[test]
