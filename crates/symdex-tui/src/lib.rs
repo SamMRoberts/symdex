@@ -26,16 +26,16 @@ use symdex_index::{
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
     SymbolSearchSummary, run_call_graph, run_call_resolution, run_context_pack,
-    run_embedding_coverage, run_impact, run_index_coverage, run_index_runs_timeline,
-    run_semantic_neighborhood, run_semantic_search, run_storage_explorer, run_symbol_outline,
-    run_symbol_search,
+    run_cross_store_health, run_embedding_coverage, run_impact, run_index_coverage,
+    run_index_runs_timeline, run_semantic_neighborhood, run_semantic_search, run_storage_explorer,
+    run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
-    EmbeddingCoverageSummary, FileCoverageStatus, FileDetailSummary, IndexCoverageSummary,
-    IndexRunTimelineRow, IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus,
-    SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore,
-    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    CrossStoreHealthSummary, EmbeddingCoverageSummary, FileCoverageStatus, FileDetailSummary,
+    IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary, QdrantStorageProjection,
+    RepositoryStatus, SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
+    SqliteStore, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
     SymbolOutlineSummary, qdrant_collection_name,
 };
 
@@ -52,7 +52,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings/runs/neighborhood or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings/runs/neighborhood/health or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -115,6 +115,9 @@ impl App {
         let semantic_neighborhood = sqlite
             .semantic_neighborhood_summary(root.id(), &embed_config.model)
             .map_err(|error| error.to_string())?;
+        let cross_store_health = sqlite
+            .cross_store_health_summary(root.id(), &embed_config.model)
+            .map_err(|error| error.to_string())?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -141,6 +144,7 @@ impl App {
                 embedding_coverage,
                 index_runs,
                 semantic_neighborhood,
+                cross_store_health,
             ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
@@ -169,6 +173,7 @@ impl App {
         let index_runs = index_runs_timeline_summary_from_status(&repository_id, &status);
         let semantic_neighborhood =
             semantic_neighborhood_summary_from_status(&repository_id, &status);
+        let cross_store_health = cross_store_health_summary_from_status(&repository_id, &status);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -194,6 +199,7 @@ impl App {
                 embedding_coverage,
                 index_runs,
                 semantic_neighborhood,
+                cross_store_health,
             ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
@@ -512,6 +518,10 @@ impl App {
             Ok(summary) => SemanticNeighborhoodStatus::Completed(summary),
             Err(error) => SemanticNeighborhoodStatus::Failed(error),
         };
+        self.storage.health = match run_cross_store_health(&self.repo_input) {
+            Ok(summary) => CrossStoreHealthStatus::Completed(summary),
+            Err(error) => CrossStoreHealthStatus::Failed(error),
+        };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
         Ok(())
@@ -559,6 +569,10 @@ impl App {
                     semantic_neighborhood_row_count(summary)
                 }
                 SemanticNeighborhoodStatus::Failed(_) => 1,
+            },
+            StorageMode::Health => match &self.storage.health {
+                CrossStoreHealthStatus::Completed(summary) => cross_store_health_row_count(summary),
+                CrossStoreHealthStatus::Failed(_) => 1,
             },
         }
     }
@@ -1379,6 +1393,26 @@ fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
             SemanticNeighborhoodStatus::Failed(error) => render_storage_error(frame, area, error),
         },
+        StorageMode::Health => match &app.storage.health {
+            CrossStoreHealthStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(7), Constraint::Length(9)])
+                    .split(area);
+                render_selectable_table(
+                    frame,
+                    chunks[0],
+                    cross_store_health_table(summary),
+                    app.storage.selection,
+                    cross_store_health_row_count(summary),
+                );
+                frame.render_widget(
+                    cross_store_health_detail_panel(summary, app.storage.selection),
+                    chunks[1],
+                );
+            }
+            CrossStoreHealthStatus::Failed(error) => render_storage_error(frame, area, error),
+        },
     }
 }
 
@@ -1786,6 +1820,37 @@ fn semantic_neighborhood_summary_from_status(
                 "Sample TUI state has metadata-only semantic payload rows.".to_owned()
             },
         }],
+        rows,
+    }
+}
+
+fn cross_store_health_summary_from_status(
+    repository_id: &str,
+    status: &RepositoryStatus,
+) -> CrossStoreHealthSummary {
+    let embedding_model = status
+        .embedding_model
+        .as_deref()
+        .unwrap_or("nomic-embed-text")
+        .to_owned();
+    let mut rows = Vec::new();
+    if status.embedding_model.is_none() && status.chunks_indexed > 0 {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Error,
+            label: "missing_collection".to_owned(),
+            detail: "Sample state has chunks but no semantic collection metadata.".to_owned(),
+        });
+    }
+    if rows.is_empty() {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Ok,
+            label: "cross_store_ok".to_owned(),
+            detail: "Sample SQLite and Qdrant projection metadata are aligned.".to_owned(),
+        });
+    }
+    CrossStoreHealthSummary {
+        repository_id: repository_id.to_owned(),
+        collection_name: qdrant_collection_name(repository_id, &embedding_model),
         rows,
     }
 }
@@ -3195,6 +3260,97 @@ fn short_hash(text_hash: &str) -> String {
     text_hash.chars().take(10).collect()
 }
 
+fn cross_store_health_table(summary: &CrossStoreHealthSummary) -> Table<'_> {
+    let rows = summary.rows.iter().take(12).map(|row| {
+        let tone = storage_health_tone(row.status);
+        Row::new(vec![
+            Cell::from(status_span(row.label.as_str(), tone)),
+            Cell::from(storage_health_label(row.status)),
+            Cell::from(row.detail.as_str()),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(28),
+            Constraint::Length(9),
+            Constraint::Percentage(58),
+        ],
+    )
+    .header(table_header(["Check", "Status", "Detail"]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Cross-Store Health | Checks: {} | F2 next storage mode",
+        summary.rows.len()
+    )))
+    .column_spacing(1)
+}
+
+fn cross_store_health_detail_panel(
+    summary: &CrossStoreHealthSummary,
+    selection: usize,
+) -> Paragraph<'_> {
+    let Some(row) = selected_cross_store_health_row(summary, selection) else {
+        return Paragraph::new(vec![Line::from("No cross-store health checks available.")])
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Cross-Store Detail"),
+            );
+    };
+    let tone = storage_health_tone(row.status);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Collection: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(summary.collection_name.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Check: ", Style::new().add_modifier(Modifier::BOLD)),
+            status_span(row.label.as_str(), tone),
+            Span::raw(" "),
+            status_span(storage_health_label(row.status), tone),
+        ]),
+        Line::from(vec![
+            Span::styled("Detail: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(row.detail.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Scope: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(
+                "missing collections, missing vectors, excluded chunks, model drift, dimension drift",
+            ),
+        ]),
+    ];
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(tone_style(tone))
+            .title("Cross-Store Detail"),
+    )
+}
+
+fn cross_store_health_row_count(summary: &CrossStoreHealthSummary) -> usize {
+    summary.rows.len().min(12)
+}
+
+fn selected_cross_store_health_row(
+    summary: &CrossStoreHealthSummary,
+    selection: usize,
+) -> Option<&StorageHealthRow> {
+    summary
+        .rows
+        .get(selection.min(summary.rows.len().saturating_sub(1)))
+}
+
+fn storage_health_label(status: StorageHealthStatus) -> &'static str {
+    match status {
+        StorageHealthStatus::Ok => "ok",
+        StorageHealthStatus::Warning => "warning",
+        StorageHealthStatus::Error => "error",
+    }
+}
+
 fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
     Row::new(vec![
         Cell::from(label),
@@ -3672,7 +3828,7 @@ impl View {
                 "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab next view | F2 overview/coverage/outline/calls/embeddings/runs/neighborhood | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | F2 overview/coverage/outline/calls/embeddings/runs/neighborhood/health | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
                 "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
@@ -3730,10 +3886,12 @@ struct StorageExplorerState {
     embeddings: EmbeddingCoverageStatus,
     runs: IndexRunsTimelineStatus,
     neighborhood: SemanticNeighborhoodStatus,
+    health: CrossStoreHealthStatus,
     selection: usize,
 }
 
 impl StorageExplorerState {
+    #[allow(clippy::too_many_arguments)]
     fn completed(
         explorer: StorageExplorerSummary,
         coverage: IndexCoverageSummary,
@@ -3742,6 +3900,7 @@ impl StorageExplorerState {
         embeddings: EmbeddingCoverageSummary,
         runs: IndexRunsTimelineSummary,
         neighborhood: SemanticNeighborhoodSummary,
+        health: CrossStoreHealthSummary,
     ) -> Self {
         Self {
             mode: StorageMode::Explorer,
@@ -3752,6 +3911,7 @@ impl StorageExplorerState {
             embeddings: EmbeddingCoverageStatus::Completed(embeddings),
             runs: IndexRunsTimelineStatus::Completed(runs),
             neighborhood: SemanticNeighborhoodStatus::Completed(neighborhood),
+            health: CrossStoreHealthStatus::Completed(health),
             selection: 0,
         }
     }
@@ -3766,6 +3926,7 @@ enum StorageMode {
     Embeddings,
     Runs,
     Neighborhood,
+    Health,
 }
 
 impl StorageMode {
@@ -3778,6 +3939,7 @@ impl StorageMode {
             Self::Embeddings => "embedding coverage",
             Self::Runs => "index runs timeline",
             Self::Neighborhood => "semantic neighborhood",
+            Self::Health => "cross-store health",
         }
     }
 
@@ -3789,7 +3951,8 @@ impl StorageMode {
             Self::Calls => Self::Embeddings,
             Self::Embeddings => Self::Runs,
             Self::Runs => Self::Neighborhood,
-            Self::Neighborhood => Self::Explorer,
+            Self::Neighborhood => Self::Health,
+            Self::Health => Self::Explorer,
         }
     }
 }
@@ -3826,6 +3989,11 @@ enum IndexRunsTimelineStatus {
 
 enum SemanticNeighborhoodStatus {
     Completed(SemanticNeighborhoodSummary),
+    Failed(String),
+}
+
+enum CrossStoreHealthStatus {
+    Completed(CrossStoreHealthSummary),
     Failed(String),
 }
 
@@ -4063,13 +4231,13 @@ mod tests {
     use symdex_store::{
         CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary, CallSearchRow,
         ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits,
-        EmbeddingCoverageSummary, EmbeddingExclusionRow, FileCallDetailRow, FileChunkDetailRow,
-        FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
-        IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
-        QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
-        SemanticNeighborhoodSummary, SqliteStorageSummary, StorageExplorerSummary,
-        StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
-        SymbolSearchRow,
+        CrossStoreHealthSummary, EmbeddingCoverageSummary, EmbeddingExclusionRow,
+        FileCallDetailRow, FileChunkDetailRow, FileCoverageRow, FileCoverageStatus,
+        FileDetailSummary, FileSymbolDetailRow, IndexCoverageSummary, IndexRunTimelineRow,
+        IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus,
+        SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
+        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
+        SymbolOutlineSummary, SymbolSearchRow,
     };
 
     use crate::{
@@ -4201,6 +4369,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -4234,6 +4403,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
 
         assert_eq!(app.storage.selection, 0);
@@ -4263,6 +4433,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -4289,6 +4460,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.selection = 2;
 
@@ -4312,6 +4484,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4334,6 +4507,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4357,6 +4531,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4381,6 +4556,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -4406,6 +4582,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
 
         for _ in 0..6 {
@@ -4414,6 +4591,29 @@ mod tests {
 
         assert_eq!(app.storage.mode, StorageMode::Neighborhood);
         assert_eq!(app.message, "Storage mode set to semantic neighborhood.");
+    }
+
+    #[test]
+    fn storage_f2_cycles_to_cross_store_health() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+
+        for _ in 0..7 {
+            assert!(!app.handle_key(KeyCode::F(2)));
+        }
+
+        assert_eq!(app.storage.mode, StorageMode::Health);
+        assert_eq!(app.message, "Storage mode set to cross-store health.");
     }
 
     #[test]
@@ -4428,6 +4628,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(150, 24);
@@ -4465,6 +4666,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
 
@@ -4495,6 +4697,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(80, 24);
@@ -4522,6 +4725,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(150, 24);
@@ -4550,6 +4754,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Outline;
 
@@ -4580,6 +4785,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(80, 24);
@@ -4607,6 +4813,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(150, 24);
@@ -4641,6 +4848,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Calls;
 
@@ -4671,6 +4879,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(80, 24);
@@ -4698,6 +4907,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
         let backend = TestBackend::new(150, 24);
@@ -4732,6 +4942,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
 
@@ -4763,6 +4974,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
         let backend = TestBackend::new(80, 24);
@@ -4790,6 +5002,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Runs;
         let backend = TestBackend::new(150, 24);
@@ -4820,6 +5033,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Runs;
 
@@ -4850,6 +5064,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Runs;
         let backend = TestBackend::new(80, 24);
@@ -4877,6 +5092,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Neighborhood;
         let backend = TestBackend::new(150, 24);
@@ -4906,6 +5122,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Neighborhood;
 
@@ -4936,6 +5153,7 @@ mod tests {
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
             sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Neighborhood;
         let backend = TestBackend::new(80, 24);
@@ -4948,6 +5166,98 @@ mod tests {
         assert!(rendered.contains("Storage"));
         assert!(rendered.contains("Semantic"));
         assert!(rendered.contains("Payload"));
+    }
+
+    #[test]
+    fn renders_cross_store_health_warnings_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+        app.storage.mode = StorageMode::Health;
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Cross-Store Health"));
+        assert!(rendered.contains("missing_vectors"));
+        assert!(rendered.contains("excluded_chunks"));
+        assert!(rendered.contains("model_drift"));
+        assert!(rendered.contains("dimension_drift"));
+        assert!(rendered.contains("Cross-Store Detail"));
+        assert!(!rendered.contains("source_text"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "model_drift", None),
+            Some(Color::Red)
+        );
+    }
+
+    #[test]
+    fn cross_store_health_selection_drives_detail_panel() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+        app.storage.mode = StorageMode::Health;
+
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.storage.selection, 1);
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("excluded_chunks"));
+        assert!(rendered.contains("intentionally excluded"));
+        assert!(rendered.contains("missing collections"));
+    }
+
+    #[test]
+    fn renders_cross_store_health_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+        app.storage.mode = StorageMode::Health;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Storage"));
+        assert!(rendered.contains("Health"));
+        assert!(rendered.contains("Check"));
+        assert!(rendered.contains("Detail"));
     }
 
     #[test]
@@ -5705,6 +6015,36 @@ mod tests {
                 detail: "2 Qdrant payload metadata rows are available without source text."
                     .to_owned(),
             }],
+        }
+    }
+
+    fn sample_cross_store_health_summary() -> CrossStoreHealthSummary {
+        CrossStoreHealthSummary {
+            repository_id: "repo".to_owned(),
+            collection_name: "symdex_repo_nomic_embed_text".to_owned(),
+            rows: vec![
+                StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "missing_vectors".to_owned(),
+                    detail: "1 embeddable chunk is missing a recorded Qdrant point ID.".to_owned(),
+                },
+                StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "excluded_chunks".to_owned(),
+                    detail: "1 chunk is intentionally excluded from semantic embedding."
+                        .to_owned(),
+                },
+                StorageHealthRow {
+                    status: StorageHealthStatus::Error,
+                    label: "model_drift".to_owned(),
+                    detail: "Configured model nomic-embed-text differs from latest indexed model different-model.".to_owned(),
+                },
+                StorageHealthRow {
+                    status: StorageHealthStatus::Error,
+                    label: "dimension_drift".to_owned(),
+                    detail: "Successful runs recorded multiple dimensions: 768, 1024.".to_owned(),
+                },
+            ],
         }
     }
 

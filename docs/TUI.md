@@ -88,7 +88,7 @@ terminal panes.
   the selected SQLite/Qdrant metric and nearby storage health notes.
 - In the Storage view, `F2` toggles between storage overview, index coverage,
   symbol outline, call resolution, embedding coverage, and index runs timeline
-  modes, plus the semantic neighborhood payload view.
+  modes, plus semantic neighborhood payload and cross-store health views.
 - In the Doctor view, row selection must drive visible detail output for the
   selected check rather than highlight-only behavior.
 - In the Doctor view, `Enter` should toggle an expanded selected-check detail
@@ -153,7 +153,8 @@ represent the indexed repository.
   SQLite/Qdrant metric table plus a detail/health panel.
 - The Storage tab also includes `F2` modes for file-grouped index coverage,
   symbol outlines, call resolution, embedding coverage, and index runs
-  timeline, plus semantic neighborhood payload metadata.
+  timeline, plus semantic neighborhood payload metadata and cross-store health
+  warnings.
 
 ### Index Coverage View
 
@@ -252,6 +253,20 @@ represent the indexed repository.
   `metadata` score label when no live nearest-neighbor score is available.
 - Do not fetch or display full source text as part of this view.
 
+### Cross-Store Health View
+
+- Surface cross-store health warnings for:
+  - missing expected collection metadata
+  - embeddable chunks missing vector point IDs
+  - intentionally excluded chunks
+  - configured model drift from the latest indexed model
+  - inconsistent recorded vector dimensions across successful runs
+- Selecting a health row should show the expected collection name, status, and
+  detailed warning text.
+- The first implementation lives in the Storage tab behind `F2` and uses
+  SQLite metadata plus recorded Qdrant point IDs. It does not require live
+  Qdrant service checks.
+
 ### Indexing Controls
 
 - Offer offline indexing with `o` and semantic indexing with `s`.
@@ -335,7 +350,7 @@ Current dashboard keys:
 - `p`: open the impact/context-pack viewer
 - `Tab`: switch to the next major TUI view
 - `Shift+Tab`: switch to the previous major TUI view
-- `F2`: toggle storage overview, index coverage, symbol outline, call resolution, embedding coverage, index runs timeline, and semantic neighborhood in the storage explorer
+- `F2`: toggle storage overview, index coverage, symbol outline, call resolution, embedding coverage, index runs timeline, semantic neighborhood, and cross-store health in the storage explorer
 - `F2`: toggle symbol and semantic query modes in the query workbench
 - `F2`: toggle callers and callees in the symbol/call graph browser
 - `F2`: toggle impact and context-pack modes in the impact/context-pack viewer

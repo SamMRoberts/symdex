@@ -230,6 +230,14 @@ counts plus latest model, dimension, collection, run count, exclusion reasons,
 and health notes. It does not require a live Qdrant service for deterministic
 offline rendering.
 
+The cross-store health view consolidates these checks into selectable warning
+rows. It flags missing collection metadata when embeddable chunks have no
+successful semantic run or no vector-backed chunks, missing vectors when
+eligible chunks lack `qdrant_point_id`, excluded chunks when `excluded_reason`
+is present, model drift when the configured model differs from the latest
+indexed model, and dimension drift when successful runs for the same model have
+recorded multiple vector dimensions.
+
 ### Index runs timeline
 
 Use `index_runs.started_at`, `finished_at`, `status`, `files_seen`,

@@ -3,10 +3,10 @@
 use symdex_core::RepoRoot;
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    CallResolutionSummary, CallSearchRow, ContextPack, EmbeddingCoverageSummary,
-    IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, SemanticNeighborhoodSummary,
-    SqliteStore, StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
-    qdrant_collection_name,
+    CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
+    EmbeddingCoverageSummary, IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient,
+    SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary, StoreConfig,
+    SymbolOutlineSummary, SymbolSearchRow, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +232,15 @@ pub fn run_semantic_neighborhood(repo: &str) -> Result<SemanticNeighborhoodSumma
     let embed_config = EmbedConfig::from_env();
     sqlite
         .semantic_neighborhood_summary(root.id(), &embed_config.model)
+        .map_err(|error| error.to_string())
+}
+
+pub fn run_cross_store_health(repo: &str) -> Result<CrossStoreHealthSummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let embed_config = EmbedConfig::from_env();
+    sqlite
+        .cross_store_health_summary(root.id(), &embed_config.model)
         .map_err(|error| error.to_string())
 }
 

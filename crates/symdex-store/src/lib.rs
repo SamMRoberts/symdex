@@ -833,6 +833,97 @@ impl SqliteStore {
         })
     }
 
+    pub fn cross_store_health_summary(
+        &self,
+        repository_id: &str,
+        configured_embedding_model: &str,
+    ) -> Result<CrossStoreHealthSummary> {
+        let projection = self.chunk_projection(repository_id)?;
+        let latest_embedding = self.latest_embedding_run(repository_id)?;
+        let projected_model = latest_embedding
+            .as_ref()
+            .map(|run| run.embedding_model.as_str())
+            .unwrap_or(configured_embedding_model);
+        let mut rows = Vec::new();
+
+        if projection.embeddable_chunks > 0 && latest_embedding.is_none() {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Error,
+                label: "missing_collection".to_owned(),
+                detail: "Embeddable chunks exist, but no successful semantic index run has recorded collection metadata.".to_owned(),
+            });
+        } else if projection.embeddable_chunks > 0 && projection.vector_backed_chunks == 0 {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Error,
+                label: "missing_collection".to_owned(),
+                detail: "Embeddable chunks exist, but no chunks have recorded Qdrant point IDs."
+                    .to_owned(),
+            });
+        }
+        if projection.missing_vector_chunks > 0 {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Warning,
+                label: "missing_vectors".to_owned(),
+                detail: format!(
+                    "{} embeddable chunks are missing recorded Qdrant point IDs.",
+                    projection.missing_vector_chunks
+                ),
+            });
+        }
+        if projection.excluded_chunks > 0 {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Warning,
+                label: "excluded_chunks".to_owned(),
+                detail: format!(
+                    "{} chunks are intentionally excluded from semantic embedding.",
+                    projection.excluded_chunks
+                ),
+            });
+        }
+        if let Some(latest) = &latest_embedding
+            && latest.embedding_model != configured_embedding_model
+        {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Error,
+                label: "model_drift".to_owned(),
+                detail: format!(
+                    "Configured model {configured_embedding_model} differs from latest indexed model {}.",
+                    latest.embedding_model
+                ),
+            });
+        }
+        let dimensions = self.successful_embedding_dimensions(repository_id, projected_model)?;
+        if dimensions.len() > 1 {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Error,
+                label: "dimension_drift".to_owned(),
+                detail: format!(
+                    "Successful runs for model {projected_model} recorded multiple dimensions: {}.",
+                    dimensions
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        if rows.is_empty() {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Ok,
+                label: "cross_store_ok".to_owned(),
+                detail:
+                    "SQLite chunk metadata and recorded Qdrant projection metadata are aligned."
+                        .to_owned(),
+            });
+        }
+
+        Ok(CrossStoreHealthSummary {
+            repository_id: repository_id.to_owned(),
+            collection_name: qdrant_collection_name(repository_id, projected_model),
+            rows,
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -1047,6 +1138,31 @@ impl SqliteStore {
                     reason: row.get(0)?,
                     chunks: row.get::<_, i64>(1)? as usize,
                 })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn successful_embedding_dimensions(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+    ) -> Result<Vec<usize>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT embedding_dimension
+                 FROM index_runs
+                 WHERE repository_id = ?1
+                   AND embedding_model = ?2
+                   AND status = 'success'
+                   AND embedding_dimension IS NOT NULL
+                 ORDER BY embedding_dimension",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, embedding_model], |row| {
+                Ok(row.get::<_, i64>(0)? as usize)
             })
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
@@ -1401,6 +1517,13 @@ pub struct SemanticNeighborhoodRow {
     pub language: String,
     pub score: Option<f64>,
     pub text_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossStoreHealthSummary {
+    pub repository_id: String,
+    pub collection_name: String,
+    pub rows: Vec<StorageHealthRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2865,6 +2988,118 @@ mod tests {
         );
         let debug = format!("{summary:?}");
         assert!(!debug.contains("source_text"));
+    }
+
+    #[test]
+    fn sqlite_builds_cross_store_health_warnings() {
+        let db = TestDb::new("cross-store-health");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &[sample_symbol("symbol", "add", "crate::add")],
+                &[
+                    sample_chunk("chunk-vector"),
+                    missing_vector_chunk("chunk-missing"),
+                    excluded_chunk("chunk-secret", "file"),
+                ],
+                &[],
+            )
+            .expect("facts should persist");
+        insert_index_run_fixture(
+            &store,
+            IndexRunFixture {
+                id: "run-drift-768",
+                started_at: "2026-01-01T00:00:00Z",
+                finished_at: Some("2026-01-01T00:00:10Z"),
+                status: "success",
+                model: "different-model",
+                dimension: Some(768),
+                files_seen: 1,
+                files_indexed: 1,
+                chunks_embedded: 1,
+                error_summary: None,
+            },
+        );
+        insert_index_run_fixture(
+            &store,
+            IndexRunFixture {
+                id: "run-drift-1024",
+                started_at: "2026-01-02T00:00:00Z",
+                finished_at: Some("2026-01-02T00:00:10Z"),
+                status: "success",
+                model: "different-model",
+                dimension: Some(1024),
+                files_seen: 1,
+                files_indexed: 1,
+                chunks_embedded: 1,
+                error_summary: None,
+            },
+        );
+
+        let summary = store
+            .cross_store_health_summary("repo", "nomic-embed-text")
+            .expect("health summary should load");
+
+        assert_eq!(summary.repository_id, "repo");
+        assert!(summary.rows.iter().any(
+            |row| row.status == StorageHealthStatus::Warning && row.label == "missing_vectors"
+        ));
+        assert!(summary.rows.iter().any(
+            |row| row.status == StorageHealthStatus::Warning && row.label == "excluded_chunks"
+        ));
+        assert!(
+            summary
+                .rows
+                .iter()
+                .any(|row| row.status == StorageHealthStatus::Error && row.label == "model_drift")
+        );
+        assert!(
+            summary
+                .rows
+                .iter()
+                .any(|row| row.status == StorageHealthStatus::Error
+                    && row.label == "dimension_drift")
+        );
+        let debug = format!("{summary:?}");
+        assert!(!debug.contains("source_text"));
+    }
+
+    #[test]
+    fn sqlite_flags_missing_collection_health() {
+        let db = TestDb::new("missing-collection-health");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &[],
+                &[missing_vector_chunk("chunk-missing")],
+                &[],
+            )
+            .expect("facts should persist");
+
+        let summary = store
+            .cross_store_health_summary("repo", "nomic-embed-text")
+            .expect("health summary should load");
+
+        assert!(summary.rows.iter().any(
+            |row| row.status == StorageHealthStatus::Error && row.label == "missing_collection"
+        ));
     }
 
     #[test]
