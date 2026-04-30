@@ -547,6 +547,7 @@ impl SqliteStore {
             .connection
             .prepare(
                 "SELECT
+                   files.id,
                    files.path,
                    files.language,
                    (SELECT COUNT(*) FROM chunks WHERE chunks.file_id = files.id),
@@ -575,16 +576,17 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id], |row| {
-                let chunks = row.get::<_, i64>(2)? as usize;
-                let embeddable_chunks = row.get::<_, i64>(5)? as usize;
-                let vector_backed_chunks = row.get::<_, i64>(6)? as usize;
-                let excluded_chunks = row.get::<_, i64>(7)? as usize;
-                Ok(FileCoverageRow {
-                    path: row.get(0)?,
-                    language: row.get(1)?,
+                let chunks = row.get::<_, i64>(3)? as usize;
+                let embeddable_chunks = row.get::<_, i64>(6)? as usize;
+                let vector_backed_chunks = row.get::<_, i64>(7)? as usize;
+                let excluded_chunks = row.get::<_, i64>(8)? as usize;
+                Ok(FileCoverageBaseRow {
+                    file_id: row.get(0)?,
+                    path: row.get(1)?,
+                    language: row.get(2)?,
                     chunks,
-                    symbols: row.get::<_, i64>(3)? as usize,
-                    calls: row.get::<_, i64>(4)? as usize,
+                    symbols: row.get::<_, i64>(4)? as usize,
+                    calls: row.get::<_, i64>(5)? as usize,
                     embeddable_chunks,
                     vector_backed_chunks,
                     excluded_chunks,
@@ -597,9 +599,27 @@ impl SqliteStore {
                 })
             })
             .map_err(StoreError::Sqlite)?;
+        let files = collect_rows(rows)?
+            .into_iter()
+            .map(|row| {
+                let detail = self.file_detail_summary(&row.file_id)?;
+                Ok(FileCoverageRow {
+                    path: row.path,
+                    language: row.language,
+                    chunks: row.chunks,
+                    symbols: row.symbols,
+                    calls: row.calls,
+                    embeddable_chunks: row.embeddable_chunks,
+                    vector_backed_chunks: row.vector_backed_chunks,
+                    excluded_chunks: row.excluded_chunks,
+                    status: row.status,
+                    detail,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(IndexCoverageSummary {
             repository_id: repository_id.to_owned(),
-            files: collect_rows(rows)?,
+            files,
         })
     }
 
@@ -702,6 +722,96 @@ impl SqliteStore {
                 },
             )
             .map_err(StoreError::Sqlite)
+    }
+
+    fn file_detail_summary(&self, file_id: &str) -> Result<FileDetailSummary> {
+        Ok(FileDetailSummary {
+            chunks: self.file_chunk_details(file_id)?,
+            symbols: self.file_symbol_details(file_id)?,
+            calls: self.file_call_details(file_id)?,
+        })
+    }
+
+    fn file_chunk_details(&self, file_id: &str) -> Result<Vec<FileChunkDetailRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT chunks.kind, symbols.qualified_name, chunks.start_line,
+                        chunks.end_line, chunks.qdrant_point_id, chunks.excluded_reason
+                 FROM chunks
+                 LEFT JOIN symbols ON chunks.symbol_id = symbols.id
+                 WHERE chunks.file_id = ?1
+                 ORDER BY chunks.start_line, chunks.kind
+                 LIMIT 6",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![file_id], |row| {
+                let qdrant_point_id: Option<String> = row.get(4)?;
+                let excluded_reason: Option<String> = row.get(5)?;
+                Ok(FileChunkDetailRow {
+                    kind: row.get(0)?,
+                    symbol: row.get(1)?,
+                    start_line: row.get::<_, i64>(2)? as usize,
+                    end_line: row.get::<_, i64>(3)? as usize,
+                    vector_status: chunk_vector_status(&qdrant_point_id, &excluded_reason),
+                    excluded_reason,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn file_symbol_details(&self, file_id: &str) -> Result<Vec<FileSymbolDetailRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT kind, qualified_name, parent_symbol_id, start_line, end_line
+                 FROM symbols
+                 WHERE file_id = ?1
+                 ORDER BY start_line, qualified_name
+                 LIMIT 6",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![file_id], |row| {
+                Ok(FileSymbolDetailRow {
+                    kind: row.get(0)?,
+                    qualified_name: row.get(1)?,
+                    parent_symbol_id: row.get(2)?,
+                    start_line: row.get::<_, i64>(3)? as usize,
+                    end_line: row.get::<_, i64>(4)? as usize,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn file_call_details(&self, file_id: &str) -> Result<Vec<FileCallDetailRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT caller.qualified_name, calls.callee_text, calls.call_line,
+                        calls.confidence, calls.resolution_status
+                 FROM calls
+                 JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                 WHERE caller.file_id = ?1
+                 ORDER BY calls.call_line, calls.callee_text
+                 LIMIT 6",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![file_id], |row| {
+                Ok(FileCallDetailRow {
+                    caller_symbol: row.get(0)?,
+                    callee_text: row.get(1)?,
+                    call_line: row.get::<_, i64>(2)? as usize,
+                    confidence: row.get(3)?,
+                    resolution_status: row.get(4)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
     }
 
     fn latest_embedding_run(&self, repository_id: &str) -> Result<Option<EmbeddingIndexMetadata>> {
@@ -874,13 +984,13 @@ pub enum StorageHealthStatus {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexCoverageSummary {
     pub repository_id: String,
     pub files: Vec<FileCoverageRow>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileCoverageRow {
     pub path: String,
     pub language: String,
@@ -891,6 +1001,7 @@ pub struct FileCoverageRow {
     pub vector_backed_chunks: usize,
     pub excluded_chunks: usize,
     pub status: FileCoverageStatus,
+    pub detail: FileDetailSummary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -899,6 +1010,48 @@ pub enum FileCoverageStatus {
     MetadataOnly,
     Excluded,
     MissingVector,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileDetailSummary {
+    pub chunks: Vec<FileChunkDetailRow>,
+    pub symbols: Vec<FileSymbolDetailRow>,
+    pub calls: Vec<FileCallDetailRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChunkDetailRow {
+    pub kind: String,
+    pub symbol: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub vector_status: ChunkVectorStatus,
+    pub excluded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkVectorStatus {
+    VectorBacked,
+    MissingVector,
+    Excluded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSymbolDetailRow {
+    pub kind: String,
+    pub qualified_name: String,
+    pub parent_symbol_id: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileCallDetailRow {
+    pub caller_symbol: String,
+    pub callee_text: String,
+    pub call_line: usize,
+    pub confidence: f64,
+    pub resolution_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1349,6 +1502,20 @@ struct ChunkProjectionCounts {
     missing_vector_chunks: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileCoverageBaseRow {
+    file_id: String,
+    path: String,
+    language: String,
+    chunks: usize,
+    symbols: usize,
+    calls: usize,
+    embeddable_chunks: usize,
+    vector_backed_chunks: usize,
+    excluded_chunks: usize,
+    status: FileCoverageStatus,
+}
+
 fn storage_warnings(
     sqlite: &SqliteStorageSummary,
     qdrant: &QdrantStorageProjection,
@@ -1412,6 +1579,19 @@ fn file_coverage_status(
         FileCoverageStatus::Covered
     } else {
         FileCoverageStatus::MetadataOnly
+    }
+}
+
+fn chunk_vector_status(
+    qdrant_point_id: &Option<String>,
+    excluded_reason: &Option<String>,
+) -> ChunkVectorStatus {
+    if excluded_reason.is_some() {
+        ChunkVectorStatus::Excluded
+    } else if qdrant_point_id.is_some() {
+        ChunkVectorStatus::VectorBacked
+    } else {
+        ChunkVectorStatus::MissingVector
     }
 }
 
@@ -1521,10 +1701,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{
-        CallRecord, ChunkRecord, CreateCollectionRequest, Distance, FileCoverageStatus, FileRecord,
-        PointPayload, QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore,
-        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, UpsertPointsRequest,
-        VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
+        CallRecord, ChunkRecord, ChunkVectorStatus, CreateCollectionRequest, Distance,
+        FileCoverageStatus, FileRecord, PointPayload, QdrantClient, QueryPointsRequest,
+        RepositoryRecord, SqliteStore, StorageHealthStatus, StoreConfig, StoreError, SymbolRecord,
+        UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
         validate_collection_name,
     };
 
@@ -2027,6 +2207,17 @@ mod tests {
         assert_eq!(lib.vector_backed_chunks, 1);
         assert_eq!(lib.excluded_chunks, 0);
         assert_eq!(lib.status, FileCoverageStatus::MissingVector);
+        assert_eq!(lib.detail.chunks.len(), 2);
+        assert!(
+            lib.detail
+                .chunks
+                .iter()
+                .any(|chunk| chunk.vector_status == ChunkVectorStatus::MissingVector)
+        );
+        assert_eq!(lib.detail.symbols.len(), 2);
+        assert_eq!(lib.detail.calls.len(), 1);
+        assert_eq!(lib.detail.calls[0].callee_text, "helper");
+        assert_eq!(lib.detail.calls[0].resolution_status, "resolved_exact");
 
         let secret = coverage
             .files
@@ -2037,6 +2228,14 @@ mod tests {
         assert_eq!(secret.embeddable_chunks, 0);
         assert_eq!(secret.excluded_chunks, 1);
         assert_eq!(secret.status, FileCoverageStatus::Excluded);
+        assert_eq!(
+            secret.detail.chunks[0].vector_status,
+            ChunkVectorStatus::Excluded
+        );
+        assert_eq!(
+            secret.detail.chunks[0].excluded_reason.as_deref(),
+            Some("secret_detected")
+        );
     }
 
     #[test]

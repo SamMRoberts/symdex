@@ -183,6 +183,8 @@ represent the indexed repository.
     status
 - Preserve metadata-only behavior. Do not show source previews unless a future
   source-preview design explicitly adds them.
+- The first implementation is part of the Storage tab index coverage mode and
+  shows bounded chunk, symbol, and call summaries for the selected file.
 
 ### Symbol Outline View
 

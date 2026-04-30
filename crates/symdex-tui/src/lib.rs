@@ -29,9 +29,10 @@ use symdex_query::{
     run_semantic_search, run_storage_explorer, run_symbol_search,
 };
 use symdex_store::{
-    ContextPack, FileCoverageStatus, IndexCoverageSummary, QdrantStorageProjection,
-    RepositoryStatus, SqliteStorageSummary, SqliteStore, StorageExplorerSummary, StorageHealthRow,
-    StorageHealthStatus, StoreConfig, qdrant_collection_name,
+    ChunkVectorStatus, ContextPack, FileCoverageStatus, FileDetailSummary, IndexCoverageSummary,
+    QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, SqliteStore,
+    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    qdrant_collection_name,
 };
 
 pub struct TuiOptions {
@@ -1175,7 +1176,7 @@ fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             CoverageStatus::Completed(summary) => {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(9), Constraint::Length(8)])
+                    .constraints([Constraint::Min(5), Constraint::Length(13)])
                     .split(area);
                 render_selectable_table(
                     frame,
@@ -1447,6 +1448,11 @@ fn coverage_summary_from_status(
                 FileCoverageStatus::Covered
             } else {
                 FileCoverageStatus::MissingVector
+            },
+            detail: FileDetailSummary {
+                chunks: Vec::new(),
+                symbols: Vec::new(),
+                calls: Vec::new(),
             },
         }],
     }
@@ -2046,7 +2052,7 @@ fn coverage_detail_panel(summary: &IndexCoverageSummary, selection: usize) -> Pa
             );
     };
     let (label, tone) = file_coverage_status(file.status);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("File: ", Style::new().add_modifier(Modifier::BOLD)),
             Span::raw(file.path.as_str()),
@@ -2075,6 +2081,18 @@ fn coverage_detail_panel(summary: &IndexCoverageSummary, selection: usize) -> Pa
             )),
         ]),
     ];
+    lines.push(Line::from(vec![
+        Span::styled("Chunks: ", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(file_chunk_detail_summary(file)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Symbols: ", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(file_symbol_detail_summary(file)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Calls: ", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(file_call_detail_summary(file)),
+    ]));
     Paragraph::new(lines).wrap(Wrap { trim: true }).block(
         Block::default()
             .borders(Borders::ALL)
@@ -2113,6 +2131,87 @@ fn file_coverage_detail(file: &symdex_store::FileCoverageRow) -> &'static str {
         FileCoverageStatus::MissingVector => {
             "some embeddable chunks are missing recorded vector metadata."
         }
+    }
+}
+
+fn file_chunk_detail_summary(file: &symdex_store::FileCoverageRow) -> String {
+    if file.detail.chunks.is_empty() {
+        return "<none>".to_owned();
+    }
+    file.detail
+        .chunks
+        .iter()
+        .take(2)
+        .map(|chunk| {
+            let (label, _) = chunk_vector_status(chunk.vector_status);
+            let exclusion = chunk
+                .excluded_reason
+                .as_deref()
+                .map(|reason| format!(" reason={reason}"))
+                .unwrap_or_default();
+            format!(
+                "{} {} {}-{} symbol={}{}",
+                chunk.kind,
+                label,
+                chunk.start_line,
+                chunk.end_line,
+                chunk.symbol.as_deref().unwrap_or("<none>"),
+                exclusion
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn file_symbol_detail_summary(file: &symdex_store::FileCoverageRow) -> String {
+    if file.detail.symbols.is_empty() {
+        return "<none>".to_owned();
+    }
+    file.detail
+        .symbols
+        .iter()
+        .take(2)
+        .map(|symbol| {
+            format!(
+                "{} {} {}-{} parent={}",
+                symbol.kind,
+                symbol.qualified_name,
+                symbol.start_line,
+                symbol.end_line,
+                symbol.parent_symbol_id.as_deref().unwrap_or("<root>")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn file_call_detail_summary(file: &symdex_store::FileCoverageRow) -> String {
+    if file.detail.calls.is_empty() {
+        return "<none>".to_owned();
+    }
+    file.detail
+        .calls
+        .iter()
+        .take(2)
+        .map(|call| {
+            format!(
+                "status={} conf={:.2} line={} {} -> {}",
+                call.resolution_status,
+                call.confidence,
+                call.call_line,
+                call.caller_symbol,
+                call.callee_text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn chunk_vector_status(status: ChunkVectorStatus) -> (&'static str, StatusTone) {
+    match status {
+        ChunkVectorStatus::VectorBacked => ("vector-backed", StatusTone::Success),
+        ChunkVectorStatus::MissingVector => ("missing-vector", StatusTone::Warning),
+        ChunkVectorStatus::Excluded => ("excluded", StatusTone::Warning),
     }
 }
 
@@ -2924,9 +3023,11 @@ mod tests {
         CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
     };
     use symdex_store::{
-        CallSearchRow, ContextPack, ContextPackLimits, FileCoverageRow, FileCoverageStatus,
-        IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary,
-        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolSearchRow,
+        CallSearchRow, ChunkVectorStatus, ContextPack, ContextPackLimits, FileCallDetailRow,
+        FileChunkDetailRow, FileCoverageRow, FileCoverageStatus, FileDetailSummary,
+        FileSymbolDetailRow, IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus,
+        SqliteStorageSummary, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus,
+        SymbolSearchRow,
     };
 
     use crate::{
@@ -3159,6 +3260,9 @@ mod tests {
         assert!(rendered.contains("missing-vector"));
         assert!(rendered.contains("File Coverage"));
         assert!(rendered.contains("chunks=2"));
+        assert!(rendered.contains("vector-backed"));
+        assert!(rendered.contains("crate::add"));
+        assert!(rendered.contains("resolved_exact"));
         assert!(!rendered.contains("source_text"));
         assert_eq!(
             cell_fg_for_text(buffer, "missing-vector", None),
@@ -3187,6 +3291,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("src/secret.rs"));
         assert!(rendered.contains("excluded"));
+        assert!(rendered.contains("reason=secret_detected"));
         assert!(rendered.contains("all chunks are intentionally excluded"));
     }
 
@@ -3736,6 +3841,40 @@ mod tests {
                     vector_backed_chunks: 1,
                     excluded_chunks: 0,
                     status: FileCoverageStatus::MissingVector,
+                    detail: FileDetailSummary {
+                        chunks: vec![
+                            FileChunkDetailRow {
+                                kind: "function".to_owned(),
+                                symbol: Some("crate::add".to_owned()),
+                                start_line: 1,
+                                end_line: 3,
+                                vector_status: ChunkVectorStatus::VectorBacked,
+                                excluded_reason: None,
+                            },
+                            FileChunkDetailRow {
+                                kind: "function".to_owned(),
+                                symbol: Some("crate::helper".to_owned()),
+                                start_line: 5,
+                                end_line: 8,
+                                vector_status: ChunkVectorStatus::MissingVector,
+                                excluded_reason: None,
+                            },
+                        ],
+                        symbols: vec![FileSymbolDetailRow {
+                            kind: "function".to_owned(),
+                            qualified_name: "crate::add".to_owned(),
+                            parent_symbol_id: None,
+                            start_line: 1,
+                            end_line: 3,
+                        }],
+                        calls: vec![FileCallDetailRow {
+                            caller_symbol: "crate::add".to_owned(),
+                            callee_text: "helper".to_owned(),
+                            call_line: 2,
+                            confidence: 1.0,
+                            resolution_status: "resolved_exact".to_owned(),
+                        }],
+                    },
                 },
                 FileCoverageRow {
                     path: "src/secret.rs".to_owned(),
@@ -3747,6 +3886,18 @@ mod tests {
                     vector_backed_chunks: 0,
                     excluded_chunks: 1,
                     status: FileCoverageStatus::Excluded,
+                    detail: FileDetailSummary {
+                        chunks: vec![FileChunkDetailRow {
+                            kind: "function".to_owned(),
+                            symbol: None,
+                            start_line: 1,
+                            end_line: 4,
+                            vector_status: ChunkVectorStatus::Excluded,
+                            excluded_reason: Some("secret_detected".to_owned()),
+                        }],
+                        symbols: Vec::new(),
+                        calls: Vec::new(),
+                    },
                 },
             ],
         }
