@@ -2681,6 +2681,37 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_migration_creates_provenance_columns() {
+        let db = TestDb::new("provenance-columns");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+
+        for (table, column) in [
+            ("index_runs", "parser_version"),
+            ("index_runs", "indexer_version"),
+            ("index_runs", "run_kind"),
+            ("files", "index_run_id"),
+            ("files", "parser_version"),
+            ("symbols", "index_run_id"),
+            ("symbols", "parser_version"),
+            ("chunks", "index_run_id"),
+            ("chunks", "parser_version"),
+            ("chunks", "embedding_model"),
+            ("chunks", "embedding_dimension"),
+            ("chunks", "embedded_at"),
+            ("calls", "index_run_id"),
+            ("calls", "parser_version"),
+        ] {
+            assert!(
+                store
+                    .column_exists(table, column)
+                    .expect("column check should run"),
+                "missing {table}.{column}"
+            );
+        }
+    }
+
+    #[test]
     fn sqlite_replaces_chunks_and_removes_deleted_files() {
         let db = TestDb::new("cleanup");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -2719,6 +2750,118 @@ mod tests {
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 0);
         assert_eq!(status.chunks_indexed, 0);
+    }
+
+    #[test]
+    fn sqlite_persists_index_provenance_metadata() {
+        let db = TestDb::new("provenance-values");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![sample_symbol("symbol", "caller", "caller")];
+        let calls = vec![CallRecord {
+            id: "call-1".to_owned(),
+            caller_symbol_id: "symbol".to_owned(),
+            callee_text: "helper".to_owned(),
+            callee_symbol_id: None,
+            call_line: 4,
+            confidence: 0.25,
+            resolution_status: "unresolved".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        }];
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &symbols,
+                &[sample_chunk("chunk-1")],
+                &calls,
+            )
+            .expect("facts should persist");
+        store
+            .record_chunk_embedding_provenance(&["chunk-1".to_owned()], "nomic-embed-text", 768)
+            .expect("chunk provenance should update");
+        store
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .expect("index run should persist");
+
+        let file_provenance: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT index_run_id, parser_version FROM files WHERE id = 'file'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("file provenance should load");
+        assert_eq!(file_provenance, ("run".to_owned(), "parser".to_owned()));
+
+        let chunk_provenance: (String, String, String, i64, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT index_run_id, parser_version, embedding_model,
+                        embedding_dimension, embedded_at
+                 FROM chunks
+                 WHERE id = 'chunk-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("chunk provenance should load");
+        assert_eq!(chunk_provenance.0, "run");
+        assert_eq!(chunk_provenance.1, "parser");
+        assert_eq!(chunk_provenance.2, "nomic-embed-text");
+        assert_eq!(chunk_provenance.3, 768);
+        assert!(chunk_provenance.4.is_some());
+
+        let symbol_provenance: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT index_run_id, parser_version FROM symbols WHERE id = 'symbol'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("symbol provenance should load");
+        assert_eq!(symbol_provenance, ("run".to_owned(), "parser".to_owned()));
+
+        let call_provenance: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT index_run_id, parser_version FROM calls WHERE id = 'call-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("call provenance should load");
+        assert_eq!(call_provenance, ("run".to_owned(), "parser".to_owned()));
+
+        let run_provenance: (String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT parser_version, indexer_version, run_kind FROM index_runs LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("run provenance should load");
+        assert_eq!(
+            run_provenance,
+            (
+                "parser".to_owned(),
+                "indexer".to_owned(),
+                "semantic".to_owned()
+            )
+        );
     }
 
     #[test]

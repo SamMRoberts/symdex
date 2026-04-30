@@ -122,7 +122,7 @@
 
 ## Phase 11 — Evidence freshness and provenance
 
-- [ ] Index provenance schema for files, chunks, symbols, calls, vectors, and index runs.
+- [x] Index provenance schema for files, chunks, symbols, calls, vectors, and index runs.
 - [ ] Store parser version, embedding model, vector dimension, content hash, index run ID, and indexed timestamp with returned evidence.
 - [ ] Staleness detection by comparing indexed content hashes against current eligible files.
 - [ ] CLI staleness report for repositories, files, symbols, and context packs.
