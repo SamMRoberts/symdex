@@ -2306,6 +2306,31 @@ mod tests {
     }
 
     #[test]
+    fn renders_query_results_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        app.query.status = QueryStatus::Completed(QueryResult::Symbol(SymbolSearchSummary {
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            symbols: vec![
+                sample_symbol("symbol-1", "crate::add", 1, 3),
+                sample_symbol("symbol-2", "crate::subtract", 5, 8),
+            ],
+        }));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Query"));
+        assert!(rendered.contains("Kind"));
+        assert!(rendered.contains("Lines"));
+        assert!(rendered.contains("Status"));
+    }
+
+    #[test]
     fn renders_symbol_call_graph_results() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Graph;
@@ -2334,6 +2359,30 @@ mod tests {
             cell_fg_for_text(buffer, "resolved_exact", None),
             Some(Color::Green)
         );
+    }
+
+    #[test]
+    fn renders_call_graph_results_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Graph;
+        app.graph.direction = CallDirection::Callers;
+        app.graph.status = GraphStatus::Completed(CallGraphSummary {
+            repository_id: "repo".to_owned(),
+            query: "add".to_owned(),
+            direction: CallDirection::Callers,
+            rows: vec![sample_call_row()],
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Calls"));
+        assert!(rendered.contains("Conf"));
+        assert!(rendered.contains("Lines"));
+        assert!(rendered.contains("Status"));
     }
 
     #[test]
@@ -2406,6 +2455,26 @@ mod tests {
         assert!(rendered.contains("Focus symbols"));
         assert!(rendered.contains("metadata_only_no_source_text"));
         assert!(rendered.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn renders_context_pack_metadata_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Evidence;
+        app.evidence.mode = EvidenceMode::ContextPack;
+        app.evidence.status =
+            EvidenceStatus::Completed(EvidenceResult::ContextPack(sample_context_pack()));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Impact"));
+        assert!(rendered.contains("Field"));
+        assert!(rendered.contains("Value"));
+        assert!(rendered.contains("Status"));
     }
 
     #[test]

@@ -81,7 +81,7 @@
 - [x] per-view footer help text.
 - [x] confirmation panel styling for long-running jobs.
 - progress `Gauge` for indexing when progress reporting exists.
-- narrow-terminal render tests for 80x24 layout.
+- [x] narrow-terminal render tests for 80x24 layout.
 - [x] render tests for active tabs and status colors.
 - [x] render tests for table headers.
 - [x] render tests for selected rows.
