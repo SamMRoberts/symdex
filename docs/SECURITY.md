@@ -24,6 +24,11 @@ The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 - No symlink traversal outside the root.
 - No mutation tools in MVP.
 
+Current implementation requires repository roots to be directories. Path
+normalization canonicalizes existing paths before accepting them, rejects
+canonical paths outside the root, and discovery skips symlinked files and
+directories instead of following them.
+
 ## Secret handling
 
 Before embedding a chunk, scan for likely secrets.

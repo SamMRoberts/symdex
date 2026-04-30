@@ -33,6 +33,9 @@ Current implementation applies built-in directory excludes and simple scoped
 `.gitignore` rules from the repository root and nested directories. Literal
 file paths, directory suffix rules, and basename rules are supported. Glob
 patterns and negation rules are intentionally not implemented yet.
+Repository roots must be directories, discovered symlinked files and directories
+are skipped, and canonicalized symlink escapes are rejected by path
+normalization.
 
 ## Chunking strategy
 

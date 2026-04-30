@@ -35,6 +35,11 @@ Fixtures should be tiny and purpose-built.
 - likely secrets excluded from embeddings
 - MCP tools reject invalid paths
 
+Current path-boundary tests cover file paths rejected as repository roots,
+canonical symlink escapes rejected by normalization, symlinked files and
+directories skipped during discovery, and MCP repo arguments rejected when they
+do not name a directory root.
+
 ## Test commands
 
 Default local checks:

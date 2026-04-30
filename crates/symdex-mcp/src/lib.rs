@@ -497,4 +497,36 @@ mod tests {
                 .contains("missing required string argument")
         );
     }
+
+    #[test]
+    fn repo_argument_must_be_directory_root() {
+        let input = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": TOOL_INDEX_STATUS,
+                    "arguments": {
+                        "repo": "Cargo.toml"
+                    }
+                }
+            })
+        );
+        let mut output = Vec::new();
+
+        serve(input.as_bytes(), &mut output).expect("server should respond");
+        let output = String::from_utf8(output).expect("output should be utf8");
+        let response: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("json response");
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("error text")
+                .contains("repository root is not a directory")
+        );
+    }
 }

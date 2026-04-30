@@ -271,6 +271,33 @@ mod tests {
         assert_eq!(paths, vec!["nested/visible.rs", "src/lib.rs"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinked_files_and_directories() {
+        let repo = TestRepo::new("symlink-skip");
+        let outside = TestRepo::new("symlink-outside");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        outside.write("outside.rs", "pub fn outside_file() {}\n");
+        outside.write("dir/mod.rs", "pub fn outside_dir() {}\n");
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.rs"),
+            repo.path().join("link.rs"),
+        )
+        .expect("file symlink should be created");
+        std::os::unix::fs::symlink(outside.path().join("dir"), repo.path().join("linked_dir"))
+            .expect("directory symlink should be created");
+
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let files = discover_rust_files(&root, &DiscoveryOptions::default())
+            .expect("discovery should succeed");
+
+        let paths: Vec<_> = files
+            .iter()
+            .map(|file| file.facts.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["src/lib.rs"]);
+    }
+
     struct TestRepo {
         path: PathBuf,
     }

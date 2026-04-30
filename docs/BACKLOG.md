@@ -52,7 +52,7 @@
 ## Phase 5 — Hardening
 
 - [x] secret detection.
-- path boundary tests.
+- [x] path boundary tests.
 - model/dimension migration behavior.
 - large repo performance pass.
 - compact context pack format.

@@ -11,6 +11,9 @@ pub enum CoreError {
         source: std::io::Error,
     },
     EmptyPath,
+    RepositoryRootNotDirectory {
+        path: PathBuf,
+    },
     PathOutsideRepo {
         root: PathBuf,
         path: PathBuf,
@@ -49,6 +52,9 @@ impl Display for CoreError {
                 source,
             } => write!(f, "failed to {action} {}: {source}", path.display()),
             Self::EmptyPath => write!(f, "path must not be empty"),
+            Self::RepositoryRootNotDirectory { path } => {
+                write!(f, "repository root is not a directory: {}", path.display())
+            }
             Self::PathOutsideRepo { root, path } => write!(
                 f,
                 "path {} is outside repository root {}",
@@ -69,6 +75,7 @@ impl std::error::Error for CoreError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::EmptyPath
+            | Self::RepositoryRootNotDirectory { .. }
             | Self::PathOutsideRepo { .. }
             | Self::NonUtf8Path { .. }
             | Self::ParserLanguage { .. }
