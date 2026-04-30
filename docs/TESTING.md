@@ -48,8 +48,8 @@ cargo test --workspace
 Service-dependent checks:
 
 ```bash
-symdex_TEST_QDRANT=1 cargo test -p symdex-store qdrant
-symdex_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
+SYMDEX_TEST_QDRANT=1 cargo test -p symdex-store qdrant
+SYMDEX_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
 ```
 
 ## Agent expectation

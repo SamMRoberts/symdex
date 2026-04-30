@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use symdex_core::{
     CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, discover_rust_files, extract_rust_chunks,
 };
-use symdex_embed::EmbedConfig;
+use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_mcp::tool_names;
-use symdex_store::{StoreConfig, sqlite_parent};
+use symdex_store::{QdrantClient, StoreConfig, sqlite_parent};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -59,7 +59,8 @@ fn doctor() -> Result<(), String> {
         None => println!("sqlite_parent: skipped (database path has no parent)"),
     }
 
-    println!("network_checks: skipped (local service adapters not implemented yet)");
+    report_ollama(&embed);
+    report_qdrant(&store);
     Ok(())
 }
 
@@ -151,6 +152,48 @@ fn report_writable_dir(label: &str, path: &Path) {
         "{label}: missing ({}) - run `symdex init` to create it",
         display_path.display()
     );
+}
+
+fn report_ollama(config: &EmbedConfig) {
+    let client = match OllamaClient::new(config.clone()) {
+        Ok(client) => client,
+        Err(error) => {
+            println!("ollama_status: error ({error})");
+            return;
+        }
+    };
+
+    match client.model_available() {
+        Ok(true) => println!("ollama_model: ok ({})", config.model),
+        Ok(false) => {
+            println!("ollama_model: missing ({})", config.model);
+            return;
+        }
+        Err(error) => {
+            println!("ollama_status: unreachable ({error})");
+            return;
+        }
+    }
+
+    match client.probe_dimension() {
+        Ok(dimension) => println!("embedding_dimension: {dimension}"),
+        Err(error) => println!("embedding_dimension: unavailable ({error})"),
+    }
+}
+
+fn report_qdrant(config: &StoreConfig) {
+    let client = match QdrantClient::with_timeout(config, std::time::Duration::from_secs(3)) {
+        Ok(client) => client,
+        Err(error) => {
+            println!("qdrant_status: error ({error})");
+            return;
+        }
+    };
+
+    match client.health_check() {
+        Ok(()) => println!("qdrant_status: ok"),
+        Err(error) => println!("qdrant_status: unreachable ({error})"),
+    }
 }
 
 fn print_help() {

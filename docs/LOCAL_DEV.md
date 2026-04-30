@@ -21,10 +21,10 @@ docker run -p 6333:6333 -p 6334:6334 \
 ## Environment variables
 
 ```bash
-symdex_DB_PATH=.symdex/symdex.sqlite
-symdex_QDRANT_URL=http://localhost:6334
-symdex_OLLAMA_URL=http://localhost:11434
-symdex_EMBED_MODEL=nomic-embed-text
+SYMDEX_DB_PATH=.symdex/symdex.sqlite
+SYMDEX_QDRANT_URL=http://localhost:6333
+SYMDEX_OLLAMA_URL=http://localhost:11434
+SYMDEX_EMBED_MODEL=nomic-embed-text
 ```
 
 ## Expected commands
@@ -50,8 +50,10 @@ Implemented CLI commands currently include:
 - `serve-mcp`: previews the planned read-only tool names while the MCP server is
   still pending.
 
-The service-dependent `doctor` checks for Qdrant, Ollama, model availability,
-and vector dimensions are not wired yet.
+`doctor` checks whether Qdrant is reachable over REST, whether Ollama is
+reachable, whether the configured embedding model is present, and whether vector
+dimension probing succeeds. These checks report diagnostic status and do not
+mutate repository data.
 
 ## Local-only rule
 

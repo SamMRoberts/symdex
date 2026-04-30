@@ -105,6 +105,9 @@ Collection name pattern:
 symdex_<repository_id>_<embedding_model_slug>
 ```
 
+The current slugger lowercases ASCII alphanumerics and converts other
+characters to underscores so generated collection names are safe for REST paths.
+
 Payload fields:
 
 - `repository_id`

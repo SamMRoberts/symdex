@@ -16,8 +16,8 @@
 - [x] content hashing.
 - [x] tree-sitter Rust parsing.
 - [x] function-level chunk extraction.
-- Ollama embedding client.
-- Qdrant collection creation.
+- [x] Ollama embedding client.
+- [x] Qdrant collection creation.
 - semantic search CLI.
 
 ## Phase 2 — SQLite structural index

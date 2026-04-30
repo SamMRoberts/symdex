@@ -11,10 +11,12 @@ Verified sources for the chosen stack.
 
 - Qdrant docs: https://qdrant.tech/documentation/
 - Qdrant local quickstart: https://qdrant.tech/documentation/quickstart/
+- Qdrant create collection API: https://api.qdrant.tech/api-reference/collections/create-collection
 - Qdrant Rust client: https://docs.rs/qdrant-client
 
 ## Local embeddings
 
+- Ollama API docs: https://docs.ollama.com/api
 - Ollama embeddings docs: https://docs.ollama.com/capabilities/embeddings
 - nomic-embed-text model: https://ollama.com/library/nomic-embed-text
 

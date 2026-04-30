@@ -65,6 +65,10 @@ chunks.
 
 Use Ollama with `nomic-embed-text`.
 
+Current implementation uses Ollama `POST /api/embed` with `truncate: false` for
+batch embeddings and `GET /api/tags` for local model availability. Vector
+dimension probing embeds a tiny diagnostic string through the same local model.
+
 Store:
 
 - embedding model
@@ -75,6 +79,13 @@ Store:
 - Qdrant point ID
 
 If model name or vector dimension changes, require full reindex or collection migration.
+
+## Qdrant Collections
+
+Current implementation creates Qdrant collections through the REST API on the
+configured `SYMDEX_QDRANT_URL`, defaulting to `http://localhost:6333`. Collection
+creation uses dense vectors with cosine distance and validates generated
+collection names before sending requests.
 
 ## Call extraction
 
