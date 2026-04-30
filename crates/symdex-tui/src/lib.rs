@@ -13,9 +13,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
@@ -228,11 +228,15 @@ impl App {
 
         match self.screen {
             Screen::Dashboard => {
-                lines.push(Line::from("No indexing job is pending."));
+                lines.push(Line::from(vec![
+                    status_span("idle", StatusTone::Dim),
+                    Span::raw(" No indexing job is pending."),
+                ]));
             }
             Screen::ConfirmIndex(mode) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Confirm: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("confirm", StatusTone::Warning),
+                    Span::raw(" "),
                     Span::raw(format!(
                         "Run {} indexing for this repository?",
                         mode.label()
@@ -242,14 +246,16 @@ impl App {
             }
             Screen::IndexRunning(mode) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Running: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("running", StatusTone::Info),
+                    Span::raw(" "),
                     Span::raw(format!("{} indexing", mode.label())),
                 ]));
                 lines.push(Line::from("The TUI will update when the job finishes."));
             }
             Screen::IndexCompleted(mode) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Completed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("complete", StatusTone::Success),
+                    Span::raw(" "),
                     Span::raw(format!("{} indexing", mode.label())),
                 ]));
                 if let Some(summary) = &self.last_index_summary {
@@ -258,7 +264,8 @@ impl App {
             }
             Screen::IndexFailed(mode) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("failed", StatusTone::Error),
+                    Span::raw(" "),
                     Span::raw(format!("{} indexing", mode.label())),
                 ]));
                 lines.push(Line::from(
@@ -290,17 +297,24 @@ impl App {
 
         match &self.diagnostics {
             DiagnosticsState::Idle => {
-                lines.push(Line::from("Diagnostics have not run in this TUI session."));
+                lines.push(Line::from(vec![
+                    status_span("idle", StatusTone::Dim),
+                    Span::raw(" Diagnostics have not run in this TUI session."),
+                ]));
             }
             DiagnosticsState::Running => {
-                lines.push(Line::from("Running local diagnostics..."));
+                lines.push(Line::from(vec![
+                    status_span("running", StatusTone::Info),
+                    Span::raw(" local diagnostics..."),
+                ]));
             }
             DiagnosticsState::Completed(report) => {
                 lines.extend(diagnostic_report_lines(report));
             }
             DiagnosticsState::Failed(error) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("failed", StatusTone::Error),
+                    Span::raw(" "),
                     Span::raw(error.as_str()),
                 ]));
             }
@@ -331,20 +345,24 @@ impl App {
 
         match &self.query.status {
             QueryStatus::Idle => {
-                lines.push(Line::from("No query has run in this TUI session."));
+                lines.push(Line::from(vec![
+                    status_span("idle", StatusTone::Dim),
+                    Span::raw(" No query has run in this TUI session."),
+                ]));
             }
             QueryStatus::Running => {
-                lines.push(Line::from(format!(
-                    "Running {} query...",
-                    self.query.mode.label()
-                )));
+                lines.push(Line::from(vec![
+                    status_span("running", StatusTone::Info),
+                    Span::raw(format!(" {} query...", self.query.mode.label())),
+                ]));
             }
             QueryStatus::Completed(result) => {
                 lines.extend(query_result_lines(result));
             }
             QueryStatus::Failed(error) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("failed", StatusTone::Error),
+                    Span::raw(" "),
                     Span::raw(error.as_str()),
                 ]));
             }
@@ -373,21 +391,28 @@ impl App {
 
         match &self.graph.status {
             GraphStatus::Idle => {
-                lines.push(Line::from("No graph lookup has run in this TUI session."));
+                lines.push(Line::from(vec![
+                    status_span("idle", StatusTone::Dim),
+                    Span::raw(" No graph lookup has run in this TUI session."),
+                ]));
             }
             GraphStatus::Running => {
-                lines.push(Line::from(format!(
-                    "Loading {} for {}...",
-                    self.graph.direction.label(),
-                    self.graph.input
-                )));
+                lines.push(Line::from(vec![
+                    status_span("running", StatusTone::Info),
+                    Span::raw(format!(
+                        " loading {} for {}...",
+                        self.graph.direction.label(),
+                        self.graph.input
+                    )),
+                ]));
             }
             GraphStatus::Completed(summary) => {
                 lines.extend(call_graph_lines(summary));
             }
             GraphStatus::Failed(error) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("failed", StatusTone::Error),
+                    Span::raw(" "),
                     Span::raw(error.as_str()),
                 ]));
             }
@@ -418,21 +443,28 @@ impl App {
 
         match &self.evidence.status {
             EvidenceStatus::Idle => {
-                lines.push(Line::from("No impact or context-pack lookup has run."));
+                lines.push(Line::from(vec![
+                    status_span("idle", StatusTone::Dim),
+                    Span::raw(" No impact or context-pack lookup has run."),
+                ]));
             }
             EvidenceStatus::Running => {
-                lines.push(Line::from(format!(
-                    "Loading {} for {}...",
-                    self.evidence.mode.label(),
-                    self.evidence.input
-                )));
+                lines.push(Line::from(vec![
+                    status_span("running", StatusTone::Info),
+                    Span::raw(format!(
+                        " loading {} for {}...",
+                        self.evidence.mode.label(),
+                        self.evidence.input
+                    )),
+                ]));
             }
             EvidenceStatus::Completed(result) => {
                 lines.extend(evidence_result_lines(result));
             }
             EvidenceStatus::Failed(error) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    status_span("failed", StatusTone::Error),
+                    Span::raw(" "),
                     Span::raw(error.as_str()),
                 ]));
             }
@@ -874,9 +906,12 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 ])
                 .split(frame.area());
 
-            let title = Paragraph::new("symdex TUI")
-                .block(Block::default().borders(Borders::ALL).title("Dashboard"));
-            frame.render_widget(title, chunks[0]);
+            let tabs = Tabs::new(View::tabs())
+                .block(Block::default().borders(Borders::ALL).title("symdex TUI"))
+                .select(app.view.tab_index())
+                .style(Style::new().fg(Color::DarkGray))
+                .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+            frame.render_widget(tabs, chunks[0]);
 
             let body_chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -919,9 +954,16 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
             .block(Block::default().borders(Borders::ALL).title(right_title));
             frame.render_widget(right_panel, body_chunks[1]);
 
-            let footer = Paragraph::new(app.message.as_str())
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).title("Status"));
+            let footer = Paragraph::new(Line::from(vec![
+                status_span(app.view.footer_label(), StatusTone::Info),
+                Span::raw(" "),
+                Span::raw(app.view.footer_help()),
+                Span::raw(" | "),
+                Span::styled("status: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(app.message.as_str()),
+            ]))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("Status"));
             frame.render_widget(footer, chunks[2]);
         })
         .map(|_| ())
@@ -1056,16 +1098,22 @@ fn diagnostic_check_line(check: &DiagnosticCheck) -> Line<'_> {
         DiagnosticState::Error => "error",
         DiagnosticState::Skipped => "skipped",
     };
+    let tone = match check.state {
+        DiagnosticState::Ok => StatusTone::Success,
+        DiagnosticState::Missing | DiagnosticState::Skipped => StatusTone::Warning,
+        DiagnosticState::Unreachable | DiagnosticState::Error => StatusTone::Error,
+    };
     let detail = if check.message.is_empty() {
-        status.to_owned()
+        String::new()
     } else {
-        format!("{status}: {}", check.message)
+        format!(" {}", check.message)
     };
     Line::from(vec![
         Span::styled(
             format!("{}: ", check.label),
             Style::new().add_modifier(Modifier::BOLD),
         ),
+        status_span(status, tone),
         Span::raw(detail),
     ])
 }
@@ -1230,6 +1278,68 @@ enum View {
     Query,
     Graph,
     Evidence,
+}
+
+impl View {
+    fn tabs() -> [&'static str; 5] {
+        ["Index", "Doctor", "Query", "Calls", "Impact"]
+    }
+
+    fn tab_index(self) -> usize {
+        match self {
+            Self::Indexing => 0,
+            Self::Diagnostics => 1,
+            Self::Query => 2,
+            Self::Graph => 3,
+            Self::Evidence => 4,
+        }
+    }
+
+    fn footer_label(self) -> &'static str {
+        match self {
+            Self::Indexing => "index",
+            Self::Diagnostics => "doctor",
+            Self::Query => "query",
+            Self::Graph => "calls",
+            Self::Evidence => "impact",
+        }
+    }
+
+    fn footer_help(self) -> &'static str {
+        match self {
+            Self::Indexing => {
+                "o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
+            }
+            Self::Diagnostics => "d rerun | i index | w query | g calls | p impact | q quit",
+            Self::Query => "type query | Tab mode | Enter run | Esc clear/back | q quit",
+            Self::Graph => {
+                "type symbol | Tab callers/callees | Enter run | Esc clear/back | q quit"
+            }
+            Self::Evidence => {
+                "type symbol | Tab impact/context | Enter run | Esc clear/back | q quit"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTone {
+    Success,
+    Warning,
+    Error,
+    Info,
+    Dim,
+}
+
+fn status_span(label: &'static str, tone: StatusTone) -> Span<'static> {
+    let color = match tone {
+        StatusTone::Success => Color::Green,
+        StatusTone::Warning => Color::Yellow,
+        StatusTone::Error => Color::Red,
+        StatusTone::Info => Color::Cyan,
+        StatusTone::Dim => Color::DarkGray,
+    };
+    Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD))
 }
 
 enum DiagnosticsState {
@@ -1411,6 +1521,8 @@ mod tests {
     use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Position;
+    use ratatui::style::Color;
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
         CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
@@ -1448,6 +1560,58 @@ mod tests {
         assert!(rendered.contains("Files indexed"));
         assert!(rendered.contains("Indexing"));
         assert!(rendered.contains("nomic-embed-text"));
+    }
+
+    #[test]
+    fn renders_major_view_tabs_with_active_style() {
+        let app = App::from_status("/tmp/repo", "repo", sample_status());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Index"));
+        assert!(rendered.contains("Doctor"));
+        assert!(rendered.contains("Query"));
+        assert!(rendered.contains("Calls"));
+        assert!(rendered.contains("Impact"));
+        assert_eq!(
+            cell_fg_for_text(buffer, "Index", Some(1)),
+            Some(Color::Cyan)
+        );
+    }
+
+    #[test]
+    fn renders_view_specific_footer_help() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("query"));
+        assert!(rendered.contains("Tab mode"));
+        assert!(rendered.contains("Enter run"));
+    }
+
+    #[test]
+    fn renders_status_labels_with_semantic_color() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        app.query.status = QueryStatus::Failed("bad query".to_owned());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        assert_eq!(
+            cell_fg_for_text(terminal.backend().buffer(), "failed", None),
+            Some(Color::Red)
+        );
     }
 
     #[test]
@@ -1745,5 +1909,39 @@ mod tests {
             },
             notes: vec!["metadata_only_no_source_text".to_owned()],
         }
+    }
+
+    fn cell_fg_for_text(
+        buffer: &ratatui::buffer::Buffer,
+        text: &str,
+        row: Option<u16>,
+    ) -> Option<Color> {
+        let y_start = row.unwrap_or(buffer.area.y);
+        let y_end = row
+            .map(|value| value.saturating_add(1))
+            .unwrap_or(buffer.area.y + buffer.area.height);
+        for y in y_start..y_end {
+            for x in buffer.area.x..buffer.area.x + buffer.area.width {
+                if text_starts_at(buffer, text, x, y) {
+                    return buffer.cell(Position { x, y }).map(|cell| cell.fg);
+                }
+            }
+        }
+        None
+    }
+
+    fn text_starts_at(buffer: &ratatui::buffer::Buffer, text: &str, x: u16, y: u16) -> bool {
+        for (offset, expected) in text.chars().enumerate() {
+            let Some(cell) = buffer.cell(Position {
+                x: x + offset as u16,
+                y,
+            }) else {
+                return false;
+            };
+            if cell.symbol() != expected.to_string() {
+                return false;
+            }
+        }
+        true
     }
 }
