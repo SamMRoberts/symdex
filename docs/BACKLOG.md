@@ -120,6 +120,46 @@
 - [x] TUI toggle state tests.
 - [x] Tests for event coalescing, ignored paths, created-file indexing, modified-file reindexing, and unchanged-content skips.
 
+## Phase 11 — Evidence freshness and provenance
+
+- [ ] Index provenance schema for files, chunks, symbols, calls, vectors, and index runs.
+- [ ] Store parser version, embedding model, vector dimension, content hash, index run ID, and indexed timestamp with returned evidence.
+- [ ] Staleness detection by comparing indexed content hashes against current eligible files.
+- [ ] CLI staleness report for repositories, files, symbols, and context packs.
+- [ ] TUI freshness/provenance panels for repository status, storage views, and evidence rows.
+- [ ] MCP response fields for freshness state and provenance metadata.
+- [ ] Tests for fresh, stale, deleted, missing, and unknown evidence states.
+
+## Phase 12 — Explicit graph traversal and repeatable impact
+
+- [ ] Call path tracing API over persisted call edges with bounded traversal depth.
+- [ ] CLI command for call path tracing between source and target symbols.
+- [ ] TUI call path view with paths, hops, confidence, resolution status, and file/line evidence.
+- [ ] MCP tool for compact call path tracing.
+- [ ] Expand impact analysis to include bounded transitive paths and related files.
+- [ ] Add test discovery and mapping design before claiming likely affected tests.
+- [ ] Impact output includes provenance and staleness labels for every evidence row.
+- [ ] Tests for deterministic traversal order, unresolved edges, ambiguous edges, cycles, and depth limits.
+
+## Phase 13 — Debug context and runtime mapping
+
+- [ ] Runtime-to-source input parser for stack traces, panic locations, failing test names, frame symbols, and file paths.
+- [ ] Source mapping API that joins runtime frames to indexed files, symbols, calls, and likely tests when available.
+- [ ] Debug context pack format for reusable debugging evidence bundles.
+- [ ] CLI command for building debug context packs from runtime failure input.
+- [ ] TUI debug context-pack viewer with matched frames, call paths, likely tests, provenance, and staleness.
+- [ ] MCP tool for debug context packs with compact context-window-safe output.
+- [ ] Tests for mapped frames, unmapped frames, stale frames, deleted files, and malformed stack traces.
+
+## Phase 14 — Cross-agent local reuse
+
+- [ ] Version stable evidence contracts across CLI, TUI, and MCP.
+- [ ] Document local/private indexing guarantees for multi-agent reuse.
+- [ ] Read-only cross-agent access patterns for shared SQLite and Qdrant state.
+- [ ] Repository root boundary checks for multi-agent requests.
+- [ ] Diagnostics for model, vector DB, SQLite path, index freshness, and provenance consistency.
+- [ ] Tests for multiple agents reading the same index without write-capable tools.
+
 ## Do not start yet
 
 - web UI

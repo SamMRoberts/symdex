@@ -13,6 +13,9 @@ It answers questions such as:
 - What compact context should an AI agent receive before editing?
 - How complete and healthy is the local structural and semantic index?
 - Which files, chunks, symbols, calls, and embeddings explain the evidence?
+- Which explicit call paths connect two symbols?
+- Is the evidence fresh relative to the current working tree?
+- Which indexed facts explain a stack trace, panic, or failing test?
 
 ## Non-goals for MVP
 
@@ -63,3 +66,23 @@ symdex serve-mcp
 - TUI makes index health inspectable with local visualizations for coverage, file details, symbol outlines, call resolution, embedding coverage, and index runs.
 - TUI storage visualizations are grouped under an always-visible nested storage tab header so users can see the available storage panes while inspecting any one pane.
 - Unresolved or ambiguous relationships are labeled instead of fabricated.
+
+## Future product directions
+
+These are planned but not yet implemented. See `FUTURE_FEATURES.md` for the
+feature contracts.
+
+- Call path tracing through persisted call graph edges.
+- Repeatable impact analysis with callers, callees, bounded paths, related
+  files, and likely tests when test mapping exists.
+- Debug context packs for stack traces, failing tests, panic locations, symbols,
+  and file paths.
+- Index provenance for what was indexed, when, with which parser/model/vector
+  dimension, and from which content hash.
+- Local/private indexing with user-controlled model, vector database, and
+  storage.
+- Cross-agent reuse of the same local index through stable CLI, TUI, and MCP
+  evidence contracts.
+- Runtime-to-source mapping from stack traces and test failures into indexed
+  files, symbols, call graph edges, and tests.
+- Staleness detection for evidence that no longer matches current file hashes.

@@ -16,6 +16,7 @@ Use this folder as the agent-facing project memory.
 | Local setup and commands | `LOCAL_DEV.md` |
 | Test expectations | `TESTING.md` |
 | Privacy, secret handling, path safety | `SECURITY.md` |
+| Future feature planning | `FUTURE_FEATURES.md` |
 | Planning implementation work | `BACKLOG.md` |
 | External references | `REFERENCES.md` |
 
