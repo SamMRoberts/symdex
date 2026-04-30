@@ -1,8 +1,8 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use symdex_core::RepoRoot;
+use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
 use symdex_store::{QdrantClient, SqliteStore, StoreConfig, qdrant_collection_name, sqlite_parent};
@@ -79,24 +79,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn doctor() -> Result<(), String> {
-    let store = StoreConfig::from_env();
-    let embed = EmbedConfig::from_env();
-    let cwd = env::current_dir().map_err(|error| format!("read current directory: {error}"))?;
-
-    println!("symdex doctor");
-    println!("workspace: {}", cwd.display());
-    println!("sqlite: {}", store.sqlite_path.display());
-    println!("qdrant: {}", store.qdrant_url);
-    println!("ollama: {}", embed.ollama_url);
-    println!("embed_model: {}", embed.model);
-
-    match sqlite_parent(&store) {
-        Some(parent) => report_writable_dir("sqlite_parent", &parent),
-        None => println!("sqlite_parent: skipped (database path has no parent)"),
-    }
-
-    report_ollama(&embed);
-    report_qdrant(&store);
+    print_diagnostic_report(&run_diagnostics()?);
     Ok(())
 }
 
@@ -356,6 +339,35 @@ fn print_index_summary(summary: &IndexSummary) {
     }
 }
 
+fn print_diagnostic_report(report: &DiagnosticReport) {
+    println!("symdex doctor");
+    println!("workspace: {}", report.workspace);
+    println!("sqlite: {}", report.sqlite_path);
+    println!("qdrant: {}", report.qdrant_url);
+    println!("ollama: {}", report.ollama_url);
+    println!("embed_model: {}", report.embed_model);
+    for check in &report.checks {
+        print_diagnostic_check(check);
+    }
+}
+
+fn print_diagnostic_check(check: &DiagnosticCheck) {
+    match check.state {
+        DiagnosticState::Ok if check.message.is_empty() => {
+            println!("{}: ok", check.label);
+        }
+        DiagnosticState::Ok => {
+            println!("{}: ok ({})", check.label, check.message);
+        }
+        DiagnosticState::Skipped => {
+            println!("{}: skipped ({})", check.label, check.message);
+        }
+        state => {
+            println!("{}: {} ({})", check.label, state.as_str(), check.message);
+        }
+    }
+}
+
 fn parse_index_args(args: &[String]) -> IndexArgs {
     let mut repo = ".".to_owned();
     let mut offline = false;
@@ -386,65 +398,6 @@ fn tui(repo: &str) -> Result<(), String> {
     symdex_tui::run(symdex_tui::TuiOptions {
         repo: repo.to_owned(),
     })
-}
-
-fn report_writable_dir(label: &str, path: &Path) {
-    if path.exists() {
-        if path.is_dir() {
-            println!("{label}: ok ({})", path.display());
-        } else {
-            println!("{label}: not a directory ({})", path.display());
-        }
-        return;
-    }
-
-    let display_path: PathBuf = path.to_path_buf();
-    println!(
-        "{label}: missing ({}) - run `symdex init` to create it",
-        display_path.display()
-    );
-}
-
-fn report_ollama(config: &EmbedConfig) {
-    let client = match OllamaClient::new(config.clone()) {
-        Ok(client) => client,
-        Err(error) => {
-            println!("ollama_status: error ({error})");
-            return;
-        }
-    };
-
-    match client.model_available() {
-        Ok(true) => println!("ollama_model: ok ({})", config.model),
-        Ok(false) => {
-            println!("ollama_model: missing ({})", config.model);
-            return;
-        }
-        Err(error) => {
-            println!("ollama_status: unreachable ({error})");
-            return;
-        }
-    }
-
-    match client.probe_dimension() {
-        Ok(dimension) => println!("embedding_dimension: {dimension}"),
-        Err(error) => println!("embedding_dimension: unavailable ({error})"),
-    }
-}
-
-fn report_qdrant(config: &StoreConfig) {
-    let client = match QdrantClient::with_timeout(config, std::time::Duration::from_secs(3)) {
-        Ok(client) => client,
-        Err(error) => {
-            println!("qdrant_status: error ({error})");
-            return;
-        }
-    };
-
-    match client.health_check() {
-        Ok(()) => println!("qdrant_status: ok"),
-        Err(error) => println!("qdrant_status: unreachable ({error})"),
-    }
 }
 
 fn print_help() {

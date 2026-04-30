@@ -63,7 +63,7 @@
 - [x] `symdex tui [repo]` launch command.
 - [x] repository/status dashboard.
 - [x] indexing controls with confirmation.
-- doctor diagnostics view.
+- [x] doctor diagnostics view.
 - query workbench for search and symbols.
 - symbol/call graph browser.
 - impact and context-pack viewer.

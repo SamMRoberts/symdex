@@ -46,7 +46,7 @@ binary.
 
 ### Doctor Diagnostics
 
-- Show the same local diagnostics as `symdex doctor`.
+- Show the same local diagnostics as `symdex doctor` with `d`.
 - Surface service failures without panics.
 - Keep diagnostics local and avoid logging source text.
 
@@ -82,6 +82,8 @@ Current dashboard keys:
 
 - `o`: request offline indexing confirmation
 - `s`: request semantic indexing confirmation
+- `d`: run doctor diagnostics
+- `i`: return to indexing controls
 - `r`: refresh repository status
 - `y`: confirm a pending indexing job
 - `n` or `Esc`: cancel a pending indexing job

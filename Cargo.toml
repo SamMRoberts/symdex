@@ -2,6 +2,7 @@
 members = [
     "crates/symdex-cli",
     "crates/symdex-core",
+    "crates/symdex-diagnostics",
     "crates/symdex-embed",
     "crates/symdex-index",
     "crates/symdex-mcp",

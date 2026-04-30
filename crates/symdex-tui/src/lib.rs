@@ -17,6 +17,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use symdex_core::RepoRoot;
+use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
 use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
 use symdex_store::{RepositoryStatus, SqliteStore, StoreConfig};
@@ -34,7 +35,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    Enter     Dismiss a completed or failed job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    d         Run doctor diagnostics\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository status\n    y / n     Confirm or cancel a pending job\n    Enter     Dismiss a completed or failed job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -47,10 +48,13 @@ pub struct App {
     embed_model: String,
     status: RepositoryStatus,
     message: String,
+    view: View,
     screen: Screen,
     last_index_summary: Option<IndexSummary>,
+    diagnostics: DiagnosticsState,
     last_error: Option<String>,
     index_receiver: Option<Receiver<Result<IndexSummary, String>>>,
+    diagnostics_receiver: Option<Receiver<Result<DiagnosticReport, String>>>,
 }
 
 impl App {
@@ -74,10 +78,13 @@ impl App {
             embed_model: embed_config.model,
             status,
             message: "Dashboard loaded. Press q or Esc to quit.".to_owned(),
+            view: View::Indexing,
             screen: Screen::Dashboard,
             last_index_summary: None,
+            diagnostics: DiagnosticsState::Idle,
             last_error: None,
             index_receiver: None,
+            diagnostics_receiver: None,
         })
     }
 
@@ -97,10 +104,13 @@ impl App {
             embed_model: "nomic-embed-text".to_owned(),
             status,
             message: "Dashboard loaded. Press q or Esc to quit.".to_owned(),
+            view: View::Indexing,
             screen: Screen::Dashboard,
             last_index_summary: None,
+            diagnostics: DiagnosticsState::Idle,
             last_error: None,
             index_receiver: None,
+            diagnostics_receiver: None,
         }
     }
 
@@ -240,6 +250,43 @@ impl App {
         lines
     }
 
+    fn diagnostics_lines(&self) -> Vec<Line<'_>> {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Run doctor: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw("press d"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Index controls: ",
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("press i"),
+            ]),
+            Line::from(""),
+        ];
+
+        match &self.diagnostics {
+            DiagnosticsState::Idle => {
+                lines.push(Line::from("Diagnostics have not run in this TUI session."));
+            }
+            DiagnosticsState::Running => {
+                lines.push(Line::from("Running local diagnostics..."));
+            }
+            DiagnosticsState::Completed(report) => {
+                lines.extend(diagnostic_report_lines(report));
+            }
+            DiagnosticsState::Failed(error) => {
+                lines.push(Line::from(vec![
+                    Span::styled("Failed: ", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(error.as_str()),
+                ]));
+            }
+        }
+
+        lines
+    }
+
     fn refresh_status(&mut self) -> Result<(), String> {
         let store_config = StoreConfig::from_env();
         let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
@@ -259,6 +306,13 @@ impl App {
                 self.message = "Indexing cancelled before start.".to_owned();
             }
             KeyCode::Esc => return true,
+            KeyCode::Char('i') => {
+                self.view = View::Indexing;
+                self.message = "Indexing controls selected.".to_owned();
+            }
+            KeyCode::Char('d') => {
+                self.start_diagnostics();
+            }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
                 self.screen =
                     reduce_screen(self.screen, UiAction::RequestIndex(IndexMode::Offline));
@@ -309,6 +363,18 @@ impl App {
         self.message = format!("{} indexing started.", mode.label());
     }
 
+    fn start_diagnostics(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_diagnostics();
+            let _ = sender.send(result);
+        });
+        self.view = View::Diagnostics;
+        self.diagnostics = DiagnosticsState::Running;
+        self.diagnostics_receiver = Some(receiver);
+        self.message = "Doctor diagnostics started.".to_owned();
+    }
+
     fn poll_index_job(&mut self) {
         let Some(receiver) = &self.index_receiver else {
             return;
@@ -348,6 +414,31 @@ impl App {
             }
         }
     }
+
+    fn poll_diagnostics(&mut self) {
+        let Some(receiver) = &self.diagnostics_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(report)) => {
+                self.diagnostics_receiver = None;
+                self.diagnostics = DiagnosticsState::Completed(report);
+                self.message = "Doctor diagnostics completed.".to_owned();
+            }
+            Ok(Err(error)) => {
+                self.diagnostics_receiver = None;
+                self.diagnostics = DiagnosticsState::Failed(error);
+                self.message = "Doctor diagnostics failed.".to_owned();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.diagnostics_receiver = None;
+                self.diagnostics =
+                    DiagnosticsState::Failed("diagnostics worker disconnected".to_owned());
+                self.message = "Doctor diagnostics failed.".to_owned();
+            }
+        }
+    }
 }
 
 pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), String> {
@@ -384,14 +475,22 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
             );
             frame.render_widget(status, body_chunks[0]);
 
-            let indexing = List::new(
-                app.index_lines()
+            let right_title = match app.view {
+                View::Indexing => "Indexing",
+                View::Diagnostics => "Doctor Diagnostics",
+            };
+            let right_lines = match app.view {
+                View::Indexing => app.index_lines(),
+                View::Diagnostics => app.diagnostics_lines(),
+            };
+            let right_panel = List::new(
+                right_lines
                     .into_iter()
                     .map(ListItem::new)
                     .collect::<Vec<_>>(),
             )
-            .block(Block::default().borders(Borders::ALL).title("Indexing"));
-            frame.render_widget(indexing, body_chunks[1]);
+            .block(Block::default().borders(Borders::ALL).title(right_title));
+            frame.render_widget(right_panel, body_chunks[1]);
 
             let footer = Paragraph::new(app.message.as_str())
                 .wrap(Wrap { trim: true })
@@ -406,6 +505,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
     let mut app = app;
     loop {
         app.poll_index_job();
+        app.poll_diagnostics();
         render(terminal, &app)?;
         if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
             continue;
@@ -487,6 +587,72 @@ fn summary_lines(summary: &IndexSummary) -> Vec<Line<'static>> {
     lines
 }
 
+fn diagnostic_report_lines(report: &DiagnosticReport) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Workspace: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(report.workspace.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("SQLite: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(report.sqlite_path.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Qdrant: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(report.qdrant_url.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Ollama: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(report.ollama_url.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Embedding model: ",
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(report.embed_model.as_str()),
+        ]),
+        Line::from(""),
+    ];
+    lines.extend(report.checks.iter().map(diagnostic_check_line));
+    lines
+}
+
+fn diagnostic_check_line(check: &DiagnosticCheck) -> Line<'_> {
+    let status = match check.state {
+        DiagnosticState::Ok => "ok",
+        DiagnosticState::Missing => "missing",
+        DiagnosticState::Unreachable => "unreachable",
+        DiagnosticState::Error => "error",
+        DiagnosticState::Skipped => "skipped",
+    };
+    let detail = if check.message.is_empty() {
+        status.to_owned()
+    } else {
+        format!("{status}: {}", check.message)
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{}: ", check.label),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(detail),
+    ])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Indexing,
+    Diagnostics,
+}
+
+enum DiagnosticsState {
+    Idle,
+    Running,
+    Completed(DiagnosticReport),
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexMode {
     Offline,
@@ -562,9 +728,10 @@ fn reduce_screen(screen: Screen, action: UiAction) -> Screen {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_store::RepositoryStatus;
 
-    use crate::{App, IndexMode, Screen, UiAction, reduce_screen, render};
+    use crate::{App, DiagnosticsState, IndexMode, Screen, UiAction, View, reduce_screen, render};
 
     #[test]
     fn renders_dashboard_status() {
@@ -590,6 +757,42 @@ mod tests {
         assert!(rendered.contains("Files indexed"));
         assert!(rendered.contains("Indexing"));
         assert!(rendered.contains("nomic-embed-text"));
+    }
+
+    #[test]
+    fn renders_doctor_diagnostics() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        app.diagnostics = DiagnosticsState::Completed(DiagnosticReport {
+            workspace: "/tmp/repo".to_owned(),
+            sqlite_path: ".symdex/symdex.sqlite".to_owned(),
+            qdrant_url: "http://localhost:6333".to_owned(),
+            ollama_url: "http://localhost:11434".to_owned(),
+            embed_model: "nomic-embed-text".to_owned(),
+            checks: vec![
+                DiagnosticCheck {
+                    label: "sqlite_parent".to_owned(),
+                    state: DiagnosticState::Ok,
+                    message: ".symdex".to_owned(),
+                },
+                DiagnosticCheck {
+                    label: "qdrant_status".to_owned(),
+                    state: DiagnosticState::Unreachable,
+                    message: "connection refused".to_owned(),
+                },
+            ],
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Doctor Diagnostics"));
+        assert!(rendered.contains("sqlite_parent"));
+        assert!(rendered.contains("qdrant_status"));
+        assert!(rendered.contains("unreachable"));
     }
 
     #[test]
@@ -627,5 +830,18 @@ mod tests {
 
         let screen = reduce_screen(screen, UiAction::Dismiss);
         assert_eq!(screen, Screen::Dashboard);
+    }
+
+    fn sample_status() -> RepositoryStatus {
+        RepositoryStatus {
+            repository_id: "repo".to_owned(),
+            files_indexed: 2,
+            chunks_indexed: 3,
+            symbols_indexed: 4,
+            calls_indexed: 5,
+            last_indexed_at: Some("123".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_dimension: Some(768),
+        }
     }
 }

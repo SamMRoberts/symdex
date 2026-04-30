@@ -5,6 +5,7 @@
 ```text
 crates/
   symdex-core/
+  symdex-diagnostics/
   symdex-index/
   symdex-store/
   symdex-embed/
@@ -44,6 +45,18 @@ Persistence adapters:
 - repository index metadata
 
 Keep database DTOs separate from domain types.
+
+### `symdex-diagnostics`
+
+Local diagnostics:
+
+- current workspace and configured local service endpoints
+- SQLite parent path checks
+- Ollama model and embedding dimension checks
+- Qdrant health checks
+
+Do not mutate repository data. Keep diagnostics local and reusable by CLI and
+TUI.
 
 ### `symdex-index`
 

@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 serde_json = "1.0.149"
 symdex-core = { path = "../symdex-core" }
+symdex-diagnostics = { path = "../symdex-diagnostics" }
 symdex-embed = { path = "../symdex-embed" }
 symdex-index = { path = "../symdex-index" }
 symdex-mcp = { path = "../symdex-mcp" }
