@@ -2,7 +2,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use symdex_core::{DiscoveryOptions, RepoRoot, discover_rust_files};
+use symdex_core::{
+    CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, discover_rust_files, extract_rust_chunks,
+};
 use symdex_embed::EmbedConfig;
 use symdex_mcp::tool_names;
 use symdex_store::{StoreConfig, sqlite_parent};
@@ -80,20 +82,50 @@ fn index(repo: &str) -> Result<(), String> {
     println!("repository_id: {}", root.id());
     println!("repository_root: {}", root.path().display());
     println!("rust_files_seen: {}", files.len());
-    for file in files.iter().take(20) {
+
+    let mut reports = Vec::new();
+    for file in &files {
+        let source = fs::read_to_string(&file.absolute_path)
+            .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
+        let chunks =
+            extract_rust_chunks(&file.facts, &source).map_err(|error| error.to_string())?;
+        reports.push(IndexReport {
+            file: file.facts.clone(),
+            chunks,
+        });
+    }
+
+    let chunks_seen: usize = reports.iter().map(|report| report.chunks.len()).sum();
+    for report in reports.iter().take(20) {
         println!(
-            "{} {} {}",
-            file.facts.relative_path,
-            file.facts.language.as_str(),
-            file.facts.content_hash
+            "{} {} {} chunks={}",
+            report.file.relative_path,
+            report.file.language.as_str(),
+            report.file.content_hash,
+            report.chunks.len()
         );
+        for chunk in report.chunks.iter().take(5) {
+            println!(
+                "  chunk {} lines={}-{} symbol={}",
+                chunk.kind.as_str(),
+                chunk.line_range.start,
+                chunk.line_range.end,
+                chunk.symbol_name.as_deref().unwrap_or("<none>")
+            );
+        }
     }
     if files.len() > 20 {
         println!("... {} more files", files.len() - 20);
     }
+    println!("chunks_seen: {chunks_seen}");
     println!("embedding: skipped (offline discovery slice)");
     println!("persistence: skipped (SQLite adapter pending)");
     Ok(())
+}
+
+struct IndexReport {
+    file: FileFacts,
+    chunks: Vec<CodeChunk>,
 }
 
 fn serve_mcp_preview() -> Result<(), String> {

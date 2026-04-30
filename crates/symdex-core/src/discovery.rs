@@ -56,6 +56,7 @@ fn visit_dir(
     ignore_rules: &IgnoreRules,
     files: &mut Vec<DiscoveredFile>,
 ) -> Result<()> {
+    let ignore_rules = ignore_rules.extend_from_gitignore(root, dir)?;
     let entries =
         fs::read_dir(dir).map_err(|source| CoreError::io("read directory", dir, source))?;
     for entry in entries {
@@ -80,7 +81,7 @@ fn visit_dir(
             if ignore_rules.matches_dir(relative.as_str()) {
                 continue;
             }
-            visit_dir(root, &path, ignore_rules, files)?;
+            visit_dir(root, &path, &ignore_rules, files)?;
             continue;
         }
 
@@ -110,25 +111,31 @@ fn visit_dir(
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct IgnoreRules {
     exact_paths: BTreeSet<String>,
     dir_prefixes: BTreeSet<String>,
-    names: BTreeSet<String>,
+    names: BTreeSet<ScopedNameRule>,
 }
 
 impl IgnoreRules {
     fn load(root: &Path) -> Result<Self> {
-        let path = root.join(".gitignore");
+        let root = RepoRoot::open(root)?;
+        Self::default().extend_from_gitignore(&root, root.path())
+    }
+
+    fn extend_from_gitignore(&self, root: &RepoRoot, dir: &Path) -> Result<Self> {
+        let path = dir.join(".gitignore");
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+                return Ok(self.clone());
             }
             Err(source) => return Err(CoreError::io("read .gitignore", path, source)),
         };
 
-        let mut rules = Self::default();
+        let mut rules = self.clone();
+        let base_prefix = scoped_base_prefix(root, dir)?;
         for raw_line in contents.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
@@ -141,11 +148,16 @@ impl IgnoreRules {
             }
 
             if let Some(dir) = normalized.strip_suffix('/') {
-                rules.dir_prefixes.insert(format!("{dir}/"));
+                rules.dir_prefixes.insert(format!("{base_prefix}{dir}/"));
             } else if normalized.contains('/') {
-                rules.exact_paths.insert(normalized);
+                rules
+                    .exact_paths
+                    .insert(format!("{base_prefix}{normalized}"));
             } else {
-                rules.names.insert(normalized);
+                rules.names.insert(ScopedNameRule {
+                    base_prefix: base_prefix.clone(),
+                    name: normalized,
+                });
             }
         }
         Ok(rules)
@@ -153,8 +165,7 @@ impl IgnoreRules {
 
     fn matches_dir(&self, relative_path: &str) -> bool {
         let path = format!("{relative_path}/");
-        self.names
-            .contains(relative_path.rsplit('/').next().unwrap_or(relative_path))
+        self.names.iter().any(|rule| rule.matches(relative_path))
             || self
                 .dir_prefixes
                 .iter()
@@ -168,10 +179,29 @@ impl IgnoreRules {
                 .dir_prefixes
                 .iter()
                 .any(|prefix| relative_path.starts_with(prefix))
-            || self
-                .names
-                .contains(relative_path.rsplit('/').next().unwrap_or(relative_path))
+            || self.names.iter().any(|rule| rule.matches(relative_path))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ScopedNameRule {
+    base_prefix: String,
+    name: String,
+}
+
+impl ScopedNameRule {
+    fn matches(&self, relative_path: &str) -> bool {
+        relative_path.starts_with(&self.base_prefix)
+            && relative_path.rsplit('/').next() == Some(self.name.as_str())
+    }
+}
+
+fn scoped_base_prefix(root: &RepoRoot, dir: &Path) -> Result<String> {
+    if dir == root.path() {
+        return Ok(String::new());
+    }
+    let relative = root.normalize_existing_path(dir)?;
+    Ok(format!("{}/", relative.as_str()))
 }
 
 #[cfg(test)]
@@ -219,6 +249,26 @@ mod tests {
             .map(|file| file.facts.relative_path.as_str())
             .collect();
         assert_eq!(paths, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn applies_nested_gitignore_excludes_from_parent_index() {
+        let repo = TestRepo::new("nested-ignore");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        repo.write("nested/.gitignore", "ignored.rs\nignored_dir/\n");
+        repo.write("nested/visible.rs", "pub fn visible() {}\n");
+        repo.write("nested/ignored.rs", "pub fn ignored() {}\n");
+        repo.write("nested/ignored_dir/mod.rs", "pub fn ignored() {}\n");
+
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let files = discover_rust_files(&root, &DiscoveryOptions::default())
+            .expect("discovery should succeed");
+
+        let paths: Vec<_> = files
+            .iter()
+            .map(|file| file.facts.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["nested/visible.rs", "src/lib.rs"]);
     }
 
     struct TestRepo {

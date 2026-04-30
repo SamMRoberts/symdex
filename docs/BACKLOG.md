@@ -12,10 +12,10 @@
 - [x] Rust workspace scaffold.
 - [x] `doctor` command.
 - [x] repo file discovery.
-- [x] basic `.gitignore` support.
+- [x] scoped `.gitignore` support for simple rules.
 - [x] content hashing.
-- tree-sitter Rust parsing.
-- function-level chunk extraction.
+- [x] tree-sitter Rust parsing.
+- [x] function-level chunk extraction.
 - Ollama embedding client.
 - Qdrant collection creation.
 - semantic search CLI.

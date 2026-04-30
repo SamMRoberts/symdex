@@ -44,8 +44,9 @@ Implemented CLI commands currently include:
 
 - `init`: creates the local state directory for the configured SQLite path.
 - `doctor`: prints local configuration and basic filesystem diagnostics.
-- `index <repo>`: discovers Rust files, applies built-in excludes and simple
-  `.gitignore` rules, hashes file contents, and prints deterministic file facts.
+- `index <repo>`: discovers Rust files, applies built-in excludes and scoped
+  simple `.gitignore` rules, hashes file contents, extracts tree-sitter
+  function and method chunks, and prints deterministic file and chunk facts.
 - `serve-mcp`: previews the planned read-only tool names while the MCP server is
   still pending.
 

@@ -29,6 +29,11 @@ Respect:
 
 Never follow symlinks outside the repository root.
 
+Current implementation applies built-in directory excludes and simple scoped
+`.gitignore` rules from the repository root and nested directories. Literal
+file paths, directory suffix rules, and basename rules are supported. Glob
+patterns and negation rules are intentionally not implemented yet.
+
 ## Chunking strategy
 
 Preferred chunk units:
@@ -49,6 +54,12 @@ Every chunk must include:
 - symbol ID when available
 - content hash
 - chunk kind
+
+Current implementation extracts Rust `function_item` syntax nodes as function
+chunks, classifies functions under `impl_item` nodes as method chunks, and emits
+a file fallback chunk only when no function-like chunks exist. Files with
+tree-sitter syntax errors currently fail closed instead of producing partial
+chunks.
 
 ## Embeddings
 

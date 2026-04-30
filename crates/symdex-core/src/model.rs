@@ -65,3 +65,16 @@ pub struct FileFacts {
     pub language: Language,
     pub content_hash: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeChunk {
+    pub id: String,
+    pub file_id: String,
+    pub relative_path: String,
+    pub symbol_id: Option<String>,
+    pub symbol_name: Option<String>,
+    pub kind: ChunkKind,
+    pub byte_range: ByteRange,
+    pub line_range: LineRange,
+    pub text_hash: String,
+}

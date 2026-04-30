@@ -18,6 +18,12 @@ pub enum CoreError {
     NonUtf8Path {
         path: PathBuf,
     },
+    ParserLanguage {
+        message: String,
+    },
+    ParseFailed {
+        path: String,
+    },
 }
 
 impl CoreError {
@@ -50,6 +56,10 @@ impl Display for CoreError {
                 root.display()
             ),
             Self::NonUtf8Path { path } => write!(f, "path is not valid UTF-8: {}", path.display()),
+            Self::ParserLanguage { message } => {
+                write!(f, "failed to configure tree-sitter Rust parser: {message}")
+            }
+            Self::ParseFailed { path } => write!(f, "failed to parse Rust file {path}"),
         }
     }
 }
@@ -58,7 +68,11 @@ impl std::error::Error for CoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::EmptyPath | Self::PathOutsideRepo { .. } | Self::NonUtf8Path { .. } => None,
+            Self::EmptyPath
+            | Self::PathOutsideRepo { .. }
+            | Self::NonUtf8Path { .. }
+            | Self::ParserLanguage { .. }
+            | Self::ParseFailed { .. } => None,
         }
     }
 }
