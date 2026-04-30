@@ -37,9 +37,11 @@ binary.
 
 ### Indexing Controls
 
-- Offer offline indexing and semantic indexing actions.
-- Require explicit confirmation before starting an indexing job.
-- Show progress summaries and final counts.
+- Offer offline indexing with `o` and semantic indexing with `s`.
+- Require explicit `y` confirmation before starting an indexing job.
+- Show running, completed, failed, and cancelled states.
+- Show final counts for files, chunks, symbols, calls, excluded chunks, and
+  embedding status.
 - Do not add reset/delete actions until matching CLI support exists.
 
 ### Doctor Diagnostics
@@ -75,6 +77,16 @@ binary.
 - Keep views compact enough for agent-facing evidence review.
 - Never hide long-running work; show loading/running/completed/failed states.
 - Fail closed on invalid repository roots or missing indexes.
+
+Current dashboard keys:
+
+- `o`: request offline indexing confirmation
+- `s`: request semantic indexing confirmation
+- `r`: refresh repository status
+- `y`: confirm a pending indexing job
+- `n` or `Esc`: cancel a pending indexing job
+- `Enter`: dismiss completed or failed job state
+- `q`: quit
 
 ## Boundaries
 

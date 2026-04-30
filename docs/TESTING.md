@@ -71,6 +71,10 @@ cargo test -p symdex-tui
 cargo run -p symdex-cli -- tui --help
 ```
 
+Current TUI tests cover dashboard rendering and the indexing confirmation
+reducer. Future TUI views should add similar reducer and render coverage before
+being marked complete.
+
 ## Agent expectation
 
 When changing behavior, add tests. When unable to run service-dependent tests, run unit tests and state which integration checks remain unverified.

@@ -77,8 +77,9 @@ Implemented CLI commands currently include:
   matches with scores, paths, line ranges, and symbol names.
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
   opens a repository/status dashboard backed by SQLite metadata and local
-  service configuration. Future TUI work should add indexing controls,
-  diagnostics, query workbench, impact, and context-pack views.
+  service configuration. Use `o` to confirm offline indexing, `s` to confirm
+  semantic indexing, `r` to refresh status, and `q` or `Esc` to quit. Future TUI
+  work should add diagnostics, query workbench, impact, and context-pack views.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex.search`, `symdex.find_symbol`, `symdex.callers`, `symdex.callees`,
   `symdex.impact`, and `symdex.index_status`.

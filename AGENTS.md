@@ -33,6 +33,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Keep root-level files minimal.
 - Keep durable specs under `docs/`.
 - Use `crates/symdex-core` for parsing, chunking, symbols, calls, hashing, and domain types.
+- Use `crates/symdex-index` for indexing orchestration shared by CLI and TUI.
 - Use `crates/symdex-store` for SQLite and Qdrant adapters.
 - Use `crates/symdex-embed` for the Ollama embedding client.
 - Use `crates/symdex-cli` for command-line orchestration.

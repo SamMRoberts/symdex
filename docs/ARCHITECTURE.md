@@ -5,6 +5,7 @@
 ```text
 crates/
   symdex-core/
+  symdex-index/
   symdex-store/
   symdex-embed/
   symdex-cli/
@@ -44,6 +45,17 @@ Persistence adapters:
 
 Keep database DTOs separate from domain types.
 
+### `symdex-index`
+
+Indexing orchestration:
+
+- repository indexing workflow shared by CLI and TUI
+- structural SQLite persistence
+- optional semantic embedding and Qdrant upserts
+- compact indexing summaries without source text
+
+Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
+
 ### `symdex-embed`
 
 Local embedding adapter:
@@ -61,7 +73,7 @@ User-facing commands:
 - argument parsing
 - diagnostics
 - progress output
-- command orchestration
+- command presentation
 
 Do not put core indexing logic here.
 

@@ -62,12 +62,12 @@
 - [x] TUI workspace crate scaffold.
 - [x] `symdex tui [repo]` launch command.
 - [x] repository/status dashboard.
-- indexing controls with confirmation.
+- [x] indexing controls with confirmation.
 - doctor diagnostics view.
 - query workbench for search and symbols.
 - symbol/call graph browser.
 - impact and context-pack viewer.
-- TUI state reducer tests.
+- [x] TUI state reducer tests.
 - [x] `ratatui` render tests.
 - [x] CLI launch smoke.
 

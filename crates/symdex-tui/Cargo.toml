@@ -13,4 +13,5 @@ crossterm = "0.28.1"
 ratatui = "0.29.0"
 symdex-core = { path = "../symdex-core" }
 symdex-embed = { path = "../symdex-embed" }
+symdex-index = { path = "../symdex-index" }
 symdex-store = { path = "../symdex-store" }

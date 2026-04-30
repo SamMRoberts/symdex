@@ -1515,6 +1515,7 @@ dependencies = [
  "serde_json",
  "symdex-core",
  "symdex-embed",
+ "symdex-index",
  "symdex-mcp",
  "symdex-store",
  "symdex-tui",
@@ -1535,6 +1536,15 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "symdex-index"
+version = "0.1.0"
+dependencies = [
+ "symdex-core",
+ "symdex-embed",
+ "symdex-store",
 ]
 
 [[package]]
@@ -1565,6 +1575,7 @@ dependencies = [
  "ratatui",
  "symdex-core",
  "symdex-embed",
+ "symdex-index",
  "symdex-store",
 ]
 
