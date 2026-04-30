@@ -149,73 +149,6 @@ impl App {
         }
     }
 
-    fn lines(&self) -> Vec<Line<'_>> {
-        vec![
-            Line::from(vec![
-                Span::styled("Repository: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.repo_root.as_str()),
-            ]),
-            Line::from(vec![
-                Span::styled("Repository ID: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.repository_id.as_str()),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("SQLite: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.sqlite_path.as_str()),
-            ]),
-            Line::from(vec![
-                Span::styled("Qdrant: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.qdrant_url.as_str()),
-            ]),
-            Line::from(vec![
-                Span::styled("Ollama: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.ollama_url.as_str()),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Embedding model: ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(self.embed_model.as_str()),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Files indexed: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.status.files_indexed.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Chunks indexed: ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(self.status.chunks_indexed.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Symbols indexed: ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(self.status.symbols_indexed.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled("Calls indexed: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.status.calls_indexed.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Index embedding: ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(index_embedding(&self.status)),
-            ]),
-            Line::from(vec![
-                Span::styled("Last indexed: ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.status.last_indexed_at.as_deref().unwrap_or("<never>")),
-            ]),
-        ]
-    }
-
     fn index_lines(&self) -> Vec<Line<'_>> {
         let mut lines = vec![
             Line::from(vec![
@@ -1037,18 +970,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .split(chunks[1]);
 
-            let status = List::new(
-                app.lines()
-                    .into_iter()
-                    .map(ListItem::new)
-                    .collect::<Vec<_>>(),
-            )
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Repository Status"),
-            );
-            frame.render_widget(status, body_chunks[0]);
+            render_repository_status_panel(frame, body_chunks[0], app);
 
             render_right_panel(frame, body_chunks[1], app);
 
@@ -1123,6 +1045,50 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         },
         View::Indexing => render_index_panel(frame, area, app),
     }
+}
+
+fn render_repository_status_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(tone_style(StatusTone::Info))
+        .title(Line::from(status_span(
+            "Repository Status",
+            StatusTone::Info,
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Min(5),
+        ])
+        .split(inner);
+
+    let identity = Paragraph::new(vec![
+        Line::from(vec![
+            status_span("repo", StatusTone::Info),
+            Span::raw(" "),
+            Span::raw(app.repo_root.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("id ", Style::new().fg(Color::DarkGray)),
+            Span::raw(app.repository_id.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("last indexed ", Style::new().fg(Color::DarkGray)),
+            index_freshness_span(app.status.last_indexed_at.as_deref()),
+            Span::raw(" "),
+            Span::raw(app.status.last_indexed_at.as_deref().unwrap_or("<never>")),
+        ]),
+    ])
+    .wrap(Wrap { trim: true });
+    frame.render_widget(identity, chunks[0]);
+
+    frame.render_widget(index_counts_table(app), chunks[1]);
+    frame.render_widget(local_services_table(app), chunks[2]);
 }
 
 fn render_diagnostics_panel(
@@ -1266,6 +1232,22 @@ fn index_embedding(status: &RepositoryStatus) -> String {
         (Some(model), Some(dimension)) => format!("{model} ({dimension})"),
         (Some(model), None) => model.clone(),
         _ => "<none>".to_owned(),
+    }
+}
+
+fn index_freshness_span(last_indexed_at: Option<&str>) -> Span<'static> {
+    if last_indexed_at.is_some() {
+        status_span("indexed", StatusTone::Success)
+    } else {
+        status_span("never", StatusTone::Warning)
+    }
+}
+
+fn index_embedding_status_span(status: &RepositoryStatus) -> Span<'static> {
+    if status.embedding_model.is_some() {
+        status_span("ready", StatusTone::Success)
+    } else {
+        status_span("none", StatusTone::Warning)
     }
 }
 
@@ -1535,6 +1517,66 @@ fn diagnostics_table(report: &DiagnosticReport) -> Table<'_> {
             .title(format!("Doctor Diagnostics | {}", report.workspace)),
     )
     .column_spacing(1)
+}
+
+fn index_counts_table(app: &App) -> Table<'_> {
+    let rows = [
+        ("Files indexed", app.status.files_indexed),
+        ("Chunks indexed", app.status.chunks_indexed),
+        ("Symbols indexed", app.status.symbols_indexed),
+        ("Calls indexed", app.status.calls_indexed),
+    ]
+    .into_iter()
+    .map(|(label, value)| {
+        Row::new(vec![
+            Cell::from(label),
+            Cell::from(value.to_string()).style(Style::new().fg(Color::Green)),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [Constraint::Percentage(62), Constraint::Percentage(30)],
+    )
+    .header(table_header(["Index", "Count"]))
+    .column_spacing(1)
+}
+
+fn local_services_table(app: &App) -> Table<'_> {
+    let rows = vec![
+        service_row("SQLite", "local", app.sqlite_path.as_str()),
+        service_row("Qdrant", "local", app.qdrant_url.as_str()),
+        service_row("Ollama", "local", app.ollama_url.as_str()),
+        Row::new(vec![
+            Cell::from("Embedding"),
+            Cell::from(index_embedding_status_span(&app.status)),
+            Cell::from(index_embedding(&app.status)),
+        ]),
+        Row::new(vec![
+            Cell::from("Model"),
+            Cell::from(status_span("cfg", StatusTone::Info)),
+            Cell::from(app.embed_model.as_str()),
+        ]),
+    ];
+
+    Table::new(
+        rows,
+        [
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Percentage(64),
+        ],
+    )
+    .header(table_header(["Service", "State", "Target"]))
+    .column_spacing(1)
+}
+
+fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
+    Row::new(vec![
+        Cell::from(label),
+        Cell::from(status_span(state, StatusTone::Info)),
+        Cell::from(target),
+    ])
 }
 
 fn diagnostic_detail_panel(check: &DiagnosticCheck, expanded: bool) -> Paragraph<'_> {
@@ -2297,9 +2339,19 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Repository Status"));
+        assert!(rendered.contains("repo"));
+        assert!(rendered.contains("indexed"));
+        assert!(rendered.contains("Index"));
+        assert!(rendered.contains("Count"));
         assert!(rendered.contains("Files indexed"));
+        assert!(rendered.contains("Service"));
+        assert!(rendered.contains("State"));
+        assert!(rendered.contains("SQLite"));
+        assert!(rendered.contains("ready"));
         assert!(rendered.contains("Indexing"));
         assert!(rendered.contains("nomic-embed-text"));
+        assert_eq!(cell_fg_for_text(buffer, "ready", None), Some(Color::Green));
     }
 
     #[test]

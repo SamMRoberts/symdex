@@ -111,7 +111,10 @@ terminal panes.
 - Show latest embedding model and vector dimension when available.
 - Show local service status for SQLite path, Ollama, and Qdrant.
 - Use status-colored labels for local service health and index freshness.
-- Use compact stat widgets or table rows for counts instead of plain paragraphs.
+- Use compact table rows for index counts and local service targets instead of
+  plain paragraphs.
+- Keep repository identity, index freshness, counts, service targets, and
+  embedding readiness visually grouped inside the status pane.
 
 ### Indexing Controls
 
