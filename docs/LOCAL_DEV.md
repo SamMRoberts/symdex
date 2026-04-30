@@ -33,11 +33,24 @@ symdex_EMBED_MODEL=nomic-embed-text
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- index .
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- serve-mcp
 ```
+
+Implemented CLI commands currently include:
+
+- `init`: creates the local state directory for the configured SQLite path.
+- `doctor`: prints local configuration and basic filesystem diagnostics.
+- `index <repo>`: discovers Rust files, applies built-in excludes and simple
+  `.gitignore` rules, hashes file contents, and prints deterministic file facts.
+- `serve-mcp`: previews the planned read-only tool names while the MCP server is
+  still pending.
+
+The service-dependent `doctor` checks for Qdrant, Ollama, model availability,
+and vector dimensions are not wired yet.
 
 ## Local-only rule
 

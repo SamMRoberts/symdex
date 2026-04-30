@@ -2,18 +2,18 @@
 
 ## Phase 0 — Harness and docs
 
-- Create repo-level `AGENTS.md`.
-- Create docs index and project specs.
-- Decide workspace crate layout.
-- Add initial CLI command list.
+- [x] Create repo-level `AGENTS.md`.
+- [x] Create docs index and project specs.
+- [x] Decide workspace crate layout.
+- [x] Add initial CLI command list.
 
 ## Phase 1 — Semantic MVP
 
-- Rust workspace scaffold.
-- `doctor` command.
-- repo file discovery.
-- `.gitignore` support.
-- content hashing.
+- [x] Rust workspace scaffold.
+- [x] `doctor` command.
+- [x] repo file discovery.
+- [x] basic `.gitignore` support.
+- [x] content hashing.
 - tree-sitter Rust parsing.
 - function-level chunk extraction.
 - Ollama embedding client.
