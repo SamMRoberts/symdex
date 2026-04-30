@@ -87,7 +87,8 @@ terminal panes.
 - In the Storage view, row selection should drive a visible detail panel for
   the selected SQLite/Qdrant metric and nearby storage health notes.
 - In the Storage view, `F2` toggles between storage overview, index coverage,
-  symbol outline, call resolution, and embedding coverage modes.
+  symbol outline, call resolution, embedding coverage, and index runs timeline
+  modes.
 - In the Doctor view, row selection must drive visible detail output for the
   selected check rather than highlight-only behavior.
 - In the Doctor view, `Enter` should toggle an expanded selected-check detail
@@ -151,7 +152,8 @@ represent the indexed repository.
 - The first implementation is a Storage tab that renders a selectable
   SQLite/Qdrant metric table plus a detail/health panel.
 - The Storage tab also includes `F2` modes for file-grouped index coverage,
-  symbol outlines, call resolution, and embedding coverage.
+  symbol outlines, call resolution, embedding coverage, and index runs
+  timeline.
 
 ### Index Coverage View
 
@@ -234,6 +236,9 @@ represent the indexed repository.
   - error summary
 - Selecting a run should show detailed counts and any error summary.
 - Failed or partial runs should be visually distinct from successful runs.
+- The first implementation lives in the Storage tab behind `F2` and shows a
+  compact timeline table plus a selected-run detail panel with status, counts,
+  model, dimension, timestamps, and error summary.
 
 ### Semantic Neighborhood View
 
@@ -326,7 +331,7 @@ Current dashboard keys:
 - `p`: open the impact/context-pack viewer
 - `Tab`: switch to the next major TUI view
 - `Shift+Tab`: switch to the previous major TUI view
-- `F2`: toggle storage overview, index coverage, symbol outline, call resolution, and embedding coverage in the storage explorer
+- `F2`: toggle storage overview, index coverage, symbol outline, call resolution, embedding coverage, and index runs timeline in the storage explorer
 - `F2`: toggle symbol and semantic query modes in the query workbench
 - `F2`: toggle callers and callees in the symbol/call graph browser
 - `F2`: toggle impact and context-pack modes in the impact/context-pack viewer

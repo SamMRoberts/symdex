@@ -743,6 +743,46 @@ impl SqliteStore {
         })
     }
 
+    pub fn index_runs_timeline_summary(
+        &self,
+        repository_id: &str,
+    ) -> Result<IndexRunsTimelineSummary> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, started_at, finished_at, status, embedding_model,
+                        embedding_dimension, files_seen, files_indexed,
+                        chunks_embedded, error_summary
+                 FROM index_runs
+                 WHERE repository_id = ?1
+                 ORDER BY started_at DESC, finished_at DESC, id DESC
+                 LIMIT 50",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                Ok(IndexRunTimelineRow {
+                    id: row.get(0)?,
+                    started_at: row.get(1)?,
+                    finished_at: row.get(2)?,
+                    status: row.get(3)?,
+                    embedding_model: row.get(4)?,
+                    embedding_dimension: row
+                        .get::<_, Option<i64>>(5)?
+                        .map(|dimension| dimension as usize),
+                    files_seen: row.get::<_, i64>(6)? as usize,
+                    files_indexed: row.get::<_, i64>(7)? as usize,
+                    chunks_embedded: row.get::<_, i64>(8)? as usize,
+                    error_summary: row.get(9)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        Ok(IndexRunsTimelineSummary {
+            repository_id: repository_id.to_owned(),
+            runs: collect_rows(rows)?,
+        })
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -1269,6 +1309,26 @@ pub struct EmbeddingCoverageSummary {
 pub struct EmbeddingExclusionRow {
     pub reason: String,
     pub chunks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRunsTimelineSummary {
+    pub repository_id: String,
+    pub runs: Vec<IndexRunTimelineRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRunTimelineRow {
+    pub id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub embedding_model: String,
+    pub embedding_dimension: Option<usize>,
+    pub files_seen: usize,
+    pub files_indexed: usize,
+    pub chunks_embedded: usize,
+    pub error_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2112,6 +2172,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rusqlite::params;
+
     use crate::{
         CallRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket, CreateCollectionRequest,
         Distance, FileCoverageStatus, FileRecord, PointPayload, QdrantClient, QueryPointsRequest,
@@ -2602,6 +2664,68 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_builds_index_runs_timeline_summary() {
+        let db = TestDb::new("index-runs-timeline");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        insert_index_run_fixture(
+            &store,
+            IndexRunFixture {
+                id: "run-old",
+                started_at: "2026-01-01T00:00:00Z",
+                finished_at: Some("2026-01-01T00:00:10Z"),
+                status: "success",
+                model: "nomic-embed-text",
+                dimension: Some(768),
+                files_seen: 4,
+                files_indexed: 3,
+                chunks_embedded: 7,
+                error_summary: None,
+            },
+        );
+        insert_index_run_fixture(
+            &store,
+            IndexRunFixture {
+                id: "run-new",
+                started_at: "2026-01-02T00:00:00Z",
+                finished_at: Some("2026-01-02T00:00:04Z"),
+                status: "failed",
+                model: "nomic-embed-text",
+                dimension: Some(768),
+                files_seen: 5,
+                files_indexed: 2,
+                chunks_embedded: 1,
+                error_summary: Some("qdrant unavailable"),
+            },
+        );
+
+        let summary = store
+            .index_runs_timeline_summary("repo")
+            .expect("timeline summary should load");
+
+        assert_eq!(summary.repository_id, "repo");
+        assert_eq!(summary.runs.len(), 2);
+        assert_eq!(summary.runs[0].id, "run-new");
+        assert_eq!(summary.runs[0].status, "failed");
+        assert_eq!(summary.runs[0].files_seen, 5);
+        assert_eq!(summary.runs[0].files_indexed, 2);
+        assert_eq!(summary.runs[0].chunks_embedded, 1);
+        assert_eq!(
+            summary.runs[0].error_summary.as_deref(),
+            Some("qdrant unavailable")
+        );
+        assert_eq!(summary.runs[1].id, "run-old");
+        let debug = format!("{summary:?}");
+        assert!(!debug.contains("source_text"));
+    }
+
+    #[test]
     fn sqlite_builds_file_index_coverage_summary() {
         let db = TestDb::new("index-coverage");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -2934,6 +3058,45 @@ mod tests {
             chunks_embedded: 1,
             error_summary: None,
         }
+    }
+
+    struct IndexRunFixture {
+        id: &'static str,
+        started_at: &'static str,
+        finished_at: Option<&'static str>,
+        status: &'static str,
+        model: &'static str,
+        dimension: Option<usize>,
+        files_seen: usize,
+        files_indexed: usize,
+        chunks_embedded: usize,
+        error_summary: Option<&'static str>,
+    }
+
+    fn insert_index_run_fixture(store: &SqliteStore, fixture: IndexRunFixture) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO index_runs (
+                   id, repository_id, started_at, finished_at, status, embedding_model,
+                   embedding_dimension, files_seen, files_indexed, chunks_embedded,
+                   error_summary
+                 )
+                 VALUES (?1, 'repo', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    fixture.id,
+                    fixture.started_at,
+                    fixture.finished_at,
+                    fixture.status,
+                    fixture.model,
+                    fixture.dimension.map(|dimension| dimension as i64),
+                    fixture.files_seen as i64,
+                    fixture.files_indexed as i64,
+                    fixture.chunks_embedded as i64,
+                    fixture.error_summary,
+                ],
+            )
+            .expect("index run fixture should insert");
     }
 
     fn sqlite_index_names(store: &SqliteStore) -> Vec<String> {

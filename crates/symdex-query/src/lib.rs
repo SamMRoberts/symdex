@@ -4,8 +4,9 @@ use symdex_core::RepoRoot;
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallResolutionSummary, CallSearchRow, ContextPack, EmbeddingCoverageSummary,
-    IndexCoverageSummary, QdrantClient, SqliteStore, StorageExplorerSummary, StoreConfig,
-    SymbolOutlineSummary, SymbolSearchRow, qdrant_collection_name,
+    IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, SqliteStore,
+    StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
+    qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +215,14 @@ pub fn run_embedding_coverage(repo: &str) -> Result<EmbeddingCoverageSummary, St
     let embed_config = EmbedConfig::from_env();
     sqlite
         .embedding_coverage_summary(root.id(), &embed_config.model)
+        .map_err(|error| error.to_string())
+}
+
+pub fn run_index_runs_timeline(repo: &str) -> Result<IndexRunsTimelineSummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    sqlite
+        .index_runs_timeline_summary(root.id())
         .map_err(|error| error.to_string())
 }
 

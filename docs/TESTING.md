@@ -81,9 +81,10 @@ metric table and detail panel, index coverage table and selected-file detail
 panel with chunk, symbol, and call metadata, symbol outline table and
 selected-symbol detail panel, call resolution bucket table and selected-bucket
 detail panel, embedding coverage table and selected-metric detail panel with
-exclusion-reason and health summaries, selected table rows, Doctor
-selected-check detail behavior, 80x24 narrow-terminal rendering, and the
-indexing confirmation reducer. Future TUI
+exclusion-reason and health summaries, index runs timeline table and
+selected-run detail panel, selected table rows, Doctor selected-check detail
+behavior, 80x24 narrow-terminal rendering, and the indexing confirmation
+reducer. Future TUI
 views should add similar reducer and render coverage before being marked
 complete.
 

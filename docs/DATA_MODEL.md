@@ -236,6 +236,11 @@ Use `index_runs.started_at`, `finished_at`, `status`, `files_seen`,
 `files_indexed`, `chunks_embedded`, `embedding_model`, `embedding_dimension`,
 and `error_summary` for a compact run timeline.
 
+The first TUI implementation reads `index_runs` directly from SQLite and shows
+the latest 50 runs as metadata-only rows ordered by start time. Selecting a row
+shows timestamps, status, file/chunk counts, embedding model and dimension, and
+the stored error summary when present.
+
 ### Semantic neighborhood view
 
 When visualizing nearby Qdrant points, show payload metadata only:

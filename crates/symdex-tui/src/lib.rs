@@ -26,15 +26,15 @@ use symdex_index::{
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
     SymbolSearchSummary, run_call_graph, run_call_resolution, run_context_pack,
-    run_embedding_coverage, run_impact, run_index_coverage, run_semantic_search,
-    run_storage_explorer, run_symbol_outline, run_symbol_search,
+    run_embedding_coverage, run_impact, run_index_coverage, run_index_runs_timeline,
+    run_semantic_search, run_storage_explorer, run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
     EmbeddingCoverageSummary, FileCoverageStatus, FileDetailSummary, IndexCoverageSummary,
-    QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, SqliteStore,
-    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
-    SymbolOutlineSummary, qdrant_collection_name,
+    IndexRunTimelineRow, IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus,
+    SqliteStorageSummary, SqliteStore, StorageExplorerSummary, StorageHealthRow,
+    StorageHealthStatus, StoreConfig, SymbolOutlineSummary, qdrant_collection_name,
 };
 
 pub struct TuiOptions {
@@ -50,7 +50,7 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
 }
 
 pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
+    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    i         Show indexing controls\n    x         Show storage explorer\n    d         Run doctor diagnostics\n    w         Show query workbench\n    g         Show symbol/call graph browser\n    p         Show impact/context-pack viewer\n    Tab       Switch to the next tab view\n    Shift+Tab Switch to the previous tab view\n    F2        Toggle storage overview/coverage/outline/calls/embeddings/runs or view-local modes\n    Up/Down   Move selected result row\n    Enter     Run lookup, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -107,6 +107,9 @@ impl App {
         let embedding_coverage = sqlite
             .embedding_coverage_summary(root.id(), &embed_config.model)
             .map_err(|error| error.to_string())?;
+        let index_runs = sqlite
+            .index_runs_timeline_summary(root.id())
+            .map_err(|error| error.to_string())?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -131,6 +134,7 @@ impl App {
                 outline,
                 call_resolution,
                 embedding_coverage,
+                index_runs,
             ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
@@ -156,6 +160,7 @@ impl App {
         let outline = symbol_outline_summary_from_status(&repository_id);
         let call_resolution = call_resolution_summary_from_status(&repository_id);
         let embedding_coverage = embedding_coverage_summary_from_status(&repository_id, &status);
+        let index_runs = index_runs_timeline_summary_from_status(&repository_id, &status);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -179,6 +184,7 @@ impl App {
                 outline,
                 call_resolution,
                 embedding_coverage,
+                index_runs,
             ),
             query: QueryWorkbenchState::default(),
             graph: GraphBrowserState::default(),
@@ -489,6 +495,10 @@ impl App {
             Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
             Err(error) => EmbeddingCoverageStatus::Failed(error),
         };
+        self.storage.runs = match run_index_runs_timeline(&self.repo_input) {
+            Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
+            Err(error) => IndexRunsTimelineStatus::Failed(error),
+        };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
         Ok(())
@@ -524,6 +534,12 @@ impl App {
                     embedding_coverage_row_count(summary)
                 }
                 EmbeddingCoverageStatus::Failed(_) => 1,
+            },
+            StorageMode::Runs => match &self.storage.runs {
+                IndexRunsTimelineStatus::Completed(summary) => {
+                    index_runs_timeline_row_count(summary)
+                }
+                IndexRunsTimelineStatus::Failed(_) => 1,
             },
         }
     }
@@ -1304,6 +1320,26 @@ fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
             EmbeddingCoverageStatus::Failed(error) => render_storage_error(frame, area, error),
         },
+        StorageMode::Runs => match &app.storage.runs {
+            IndexRunsTimelineStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(7), Constraint::Length(9)])
+                    .split(area);
+                render_selectable_table(
+                    frame,
+                    chunks[0],
+                    index_runs_timeline_table(summary),
+                    app.storage.selection,
+                    index_runs_timeline_row_count(summary),
+                );
+                frame.render_widget(
+                    index_runs_timeline_detail_panel(summary, app.storage.selection),
+                    chunks[1],
+                );
+            }
+            IndexRunsTimelineStatus::Failed(error) => render_storage_error(frame, area, error),
+        },
     }
 }
 
@@ -1632,6 +1668,37 @@ fn embedding_coverage_summary_from_status(
                 format!("{missing_vector_chunks} sample chunks have no vector point metadata.")
             },
         }],
+    }
+}
+
+fn index_runs_timeline_summary_from_status(
+    repository_id: &str,
+    status: &RepositoryStatus,
+) -> IndexRunsTimelineSummary {
+    let runs = status
+        .embedding_model
+        .as_ref()
+        .map(|model| {
+            vec![IndexRunTimelineRow {
+                id: "sample-run".to_owned(),
+                started_at: status
+                    .last_indexed_at
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_owned()),
+                finished_at: status.last_indexed_at.clone(),
+                status: "success".to_owned(),
+                embedding_model: model.clone(),
+                embedding_dimension: status.embedding_dimension,
+                files_seen: status.files_indexed,
+                files_indexed: status.files_indexed,
+                chunks_embedded: status.chunks_indexed,
+                error_summary: None,
+            }]
+        })
+        .unwrap_or_default();
+    IndexRunsTimelineSummary {
+        repository_id: repository_id.to_owned(),
+        runs,
     }
 }
 
@@ -2794,6 +2861,126 @@ fn embedding_health_summary(summary: &EmbeddingCoverageSummary) -> String {
         .join(" | ")
 }
 
+fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
+    let rows = summary.runs.iter().take(12).map(|run| {
+        let tone = index_run_status_tone(run.status.as_str());
+        Row::new(vec![
+            Cell::from(run.started_at.as_str()),
+            Cell::from(status_span(run.status.as_str(), tone)),
+            Cell::from(run.files_seen.to_string()),
+            Cell::from(run.files_indexed.to_string()),
+            Cell::from(run.chunks_embedded.to_string()),
+            Cell::from(run.embedding_model.as_str()),
+            Cell::from(
+                run.embedding_dimension
+                    .map(|dimension| dimension.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_owned()),
+            ),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(24),
+            Constraint::Length(10),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Percentage(26),
+            Constraint::Length(8),
+        ],
+    )
+    .header(table_header([
+        "Started", "Status", "Seen", "Idx", "Emb", "Model", "Dim",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Index Runs Timeline | Runs: {} | F2 next storage mode",
+        summary.runs.len()
+    )))
+    .column_spacing(1)
+}
+
+fn index_runs_timeline_detail_panel(
+    summary: &IndexRunsTimelineSummary,
+    selection: usize,
+) -> Paragraph<'_> {
+    let Some(run) = selected_index_run(summary, selection) else {
+        return Paragraph::new(vec![Line::from("No index runs recorded.")])
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Index Run Detail"),
+            );
+    };
+    let tone = index_run_status_tone(run.status.as_str());
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Run: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(run.id.as_str()),
+            Span::raw(" "),
+            status_span(run.status.as_str(), tone),
+        ]),
+        Line::from(vec![
+            Span::styled("Started: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(run.started_at.as_str()),
+            Span::raw(" "),
+            Span::styled("Finished: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(run.finished_at.as_deref().unwrap_or("<running>")),
+        ]),
+        Line::from(vec![
+            Span::styled("Counts: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "files_seen={} files_indexed={} chunks_embedded={}",
+                run.files_seen, run.files_indexed, run.chunks_embedded
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Embedding: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "{} dim={}",
+                run.embedding_model,
+                run.embedding_dimension
+                    .map(|dimension| dimension.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_owned())
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Error: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(run.error_summary.as_deref().unwrap_or("<none>")),
+        ]),
+    ];
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(tone_style(tone))
+            .title("Index Run Detail"),
+    )
+}
+
+fn index_runs_timeline_row_count(summary: &IndexRunsTimelineSummary) -> usize {
+    summary.runs.len().min(12)
+}
+
+fn selected_index_run(
+    summary: &IndexRunsTimelineSummary,
+    selection: usize,
+) -> Option<&IndexRunTimelineRow> {
+    summary
+        .runs
+        .get(selection.min(summary.runs.len().saturating_sub(1)))
+}
+
+fn index_run_status_tone(status: &str) -> StatusTone {
+    match status {
+        "success" | "complete" | "completed" => StatusTone::Success,
+        "failed" | "error" => StatusTone::Error,
+        "running" | "started" | "pending" => StatusTone::Info,
+        _ => StatusTone::Warning,
+    }
+}
+
 fn service_row<'a>(label: &'static str, state: &'static str, target: &'a str) -> Row<'a> {
     Row::new(vec![
         Cell::from(label),
@@ -3271,7 +3458,7 @@ impl View {
                 "Tab next view | x storage | o offline | s semantic | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab next view | F2 overview/coverage/outline/calls/embeddings | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab next view | F2 overview/coverage/outline/calls/embeddings/runs | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
                 "Tab next view | Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
@@ -3327,6 +3514,7 @@ struct StorageExplorerState {
     outline: OutlineStatus,
     calls: CallResolutionStatus,
     embeddings: EmbeddingCoverageStatus,
+    runs: IndexRunsTimelineStatus,
     selection: usize,
 }
 
@@ -3337,6 +3525,7 @@ impl StorageExplorerState {
         outline: SymbolOutlineSummary,
         calls: CallResolutionSummary,
         embeddings: EmbeddingCoverageSummary,
+        runs: IndexRunsTimelineSummary,
     ) -> Self {
         Self {
             mode: StorageMode::Explorer,
@@ -3345,6 +3534,7 @@ impl StorageExplorerState {
             outline: OutlineStatus::Completed(outline),
             calls: CallResolutionStatus::Completed(calls),
             embeddings: EmbeddingCoverageStatus::Completed(embeddings),
+            runs: IndexRunsTimelineStatus::Completed(runs),
             selection: 0,
         }
     }
@@ -3357,6 +3547,7 @@ enum StorageMode {
     Outline,
     Calls,
     Embeddings,
+    Runs,
 }
 
 impl StorageMode {
@@ -3367,6 +3558,7 @@ impl StorageMode {
             Self::Outline => "symbol outline",
             Self::Calls => "call resolution",
             Self::Embeddings => "embedding coverage",
+            Self::Runs => "index runs timeline",
         }
     }
 
@@ -3376,7 +3568,8 @@ impl StorageMode {
             Self::Coverage => Self::Outline,
             Self::Outline => Self::Calls,
             Self::Calls => Self::Embeddings,
-            Self::Embeddings => Self::Explorer,
+            Self::Embeddings => Self::Runs,
+            Self::Runs => Self::Explorer,
         }
     }
 }
@@ -3403,6 +3596,11 @@ enum CallResolutionStatus {
 
 enum EmbeddingCoverageStatus {
     Completed(EmbeddingCoverageSummary),
+    Failed(String),
+}
+
+enum IndexRunsTimelineStatus {
+    Completed(IndexRunsTimelineSummary),
     Failed(String),
 }
 
@@ -3642,9 +3840,10 @@ mod tests {
         ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits,
         EmbeddingCoverageSummary, EmbeddingExclusionRow, FileCallDetailRow, FileChunkDetailRow,
         FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
-        IndexCoverageSummary, QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary,
-        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
-        SymbolOutlineSummary, SymbolSearchRow,
+        IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
+        QdrantStorageProjection, RepositoryStatus, SqliteStorageSummary, StorageExplorerSummary,
+        StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
+        SymbolSearchRow,
     };
 
     use crate::{
@@ -3774,6 +3973,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3805,6 +4005,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
 
         assert_eq!(app.storage.selection, 0);
@@ -3832,6 +4033,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -3856,6 +4058,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.selection = 2;
 
@@ -3877,6 +4080,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -3897,6 +4101,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -3918,6 +4123,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
 
         assert!(!app.handle_key(KeyCode::F(2)));
@@ -3931,6 +4137,30 @@ mod tests {
     }
 
     #[test]
+    fn storage_f2_cycles_to_index_runs_timeline() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+        );
+
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert!(!app.handle_key(KeyCode::F(2)));
+        assert_eq!(app.storage.mode, StorageMode::Embeddings);
+        assert!(!app.handle_key(KeyCode::F(2)));
+
+        assert_eq!(app.storage.mode, StorageMode::Runs);
+        assert_eq!(app.message, "Storage mode set to index runs timeline.");
+    }
+
+    #[test]
     fn renders_index_coverage_file_rows_without_source_text() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
@@ -3940,6 +4170,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(150, 24);
@@ -3975,6 +4206,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
 
@@ -4003,6 +4235,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
         let backend = TestBackend::new(80, 24);
@@ -4028,6 +4261,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(150, 24);
@@ -4054,6 +4288,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Outline;
 
@@ -4082,6 +4317,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Outline;
         let backend = TestBackend::new(80, 24);
@@ -4107,6 +4343,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(150, 24);
@@ -4139,6 +4376,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Calls;
 
@@ -4167,6 +4405,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Calls;
         let backend = TestBackend::new(80, 24);
@@ -4192,6 +4431,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
         let backend = TestBackend::new(150, 24);
@@ -4224,6 +4464,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
 
@@ -4253,6 +4494,7 @@ mod tests {
             sample_symbol_outline_summary(),
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
         );
         app.storage.mode = StorageMode::Embeddings;
         let backend = TestBackend::new(80, 24);
@@ -4266,6 +4508,90 @@ mod tests {
         assert!(rendered.contains("Metric"));
         assert!(rendered.contains("Value"));
         assert!(rendered.contains("Embedding"));
+    }
+
+    #[test]
+    fn renders_index_runs_timeline_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+        );
+        app.storage.mode = StorageMode::Runs;
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Index Runs Timeline"));
+        assert!(rendered.contains("2026-01-02T00:00:00Z"));
+        assert!(rendered.contains("failed"));
+        assert!(rendered.contains("Index Run Detail"));
+        assert!(rendered.contains("qdrant unavailable"));
+        assert!(!rendered.contains("source_text"));
+        assert_eq!(cell_fg_for_text(buffer, "failed", None), Some(Color::Red));
+    }
+
+    #[test]
+    fn index_runs_timeline_selection_drives_detail_panel() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+        );
+        app.storage.mode = StorageMode::Runs;
+
+        assert_eq!(app.storage.selection, 0);
+        assert!(!app.handle_key(KeyCode::Down));
+        assert_eq!(app.storage.selection, 1);
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("run-success"));
+        assert!(rendered.contains("files_seen=4"));
+        assert!(rendered.contains("chunks_embedded=7"));
+        assert!(rendered.contains("Error"));
+    }
+
+    #[test]
+    fn renders_index_runs_timeline_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+        );
+        app.storage.mode = StorageMode::Runs;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Storage"));
+        assert!(rendered.contains("Started"));
+        assert!(rendered.contains("Status"));
+        assert!(rendered.contains("Index Run"));
     }
 
     #[test]
@@ -4951,6 +5277,38 @@ mod tests {
                     status: StorageHealthStatus::Warning,
                     label: "excluded_chunks".to_owned(),
                     detail: "1 chunk is intentionally excluded from embeddings.".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn sample_index_runs_timeline_summary() -> IndexRunsTimelineSummary {
+        IndexRunsTimelineSummary {
+            repository_id: "repo".to_owned(),
+            runs: vec![
+                IndexRunTimelineRow {
+                    id: "run-failed".to_owned(),
+                    started_at: "2026-01-02T00:00:00Z".to_owned(),
+                    finished_at: Some("2026-01-02T00:00:04Z".to_owned()),
+                    status: "failed".to_owned(),
+                    embedding_model: "nomic-embed-text".to_owned(),
+                    embedding_dimension: Some(768),
+                    files_seen: 5,
+                    files_indexed: 2,
+                    chunks_embedded: 1,
+                    error_summary: Some("qdrant unavailable".to_owned()),
+                },
+                IndexRunTimelineRow {
+                    id: "run-success".to_owned(),
+                    started_at: "2026-01-01T00:00:00Z".to_owned(),
+                    finished_at: Some("2026-01-01T00:00:10Z".to_owned()),
+                    status: "success".to_owned(),
+                    embedding_model: "nomic-embed-text".to_owned(),
+                    embedding_dimension: Some(768),
+                    files_seen: 4,
+                    files_indexed: 3,
+                    chunks_embedded: 7,
+                    error_summary: None,
                 },
             ],
         }
