@@ -38,6 +38,11 @@ CREATE TABLE index_runs (
 );
 ```
 
+Successful semantic indexing runs are recorded here with the embedding model,
+vector dimension, and embedded chunk count. `index-status` and
+`symdex.index_status` expose the latest successful embedding model and
+dimension when present.
+
 ### `files`
 
 ```sql
@@ -134,6 +139,11 @@ Payload fields:
 Do not store source text in Qdrant payloads.
 
 Use cosine distance unless a selected embedding model requires otherwise.
+
+Before writing vectors, symdex checks the latest successful run for the same
+repository and embedding model. If the vector dimension changed, indexing fails
+closed with a reset/reindex message instead of mixing incompatible points in the
+same Qdrant collection. Different model names use different collection names.
 
 ## ID strategy
 

@@ -247,6 +247,8 @@ fn tool_index_status(arguments: &Value) -> Result<Value, String> {
         "chunks_indexed": status.chunks_indexed,
         "symbols_indexed": status.symbols_indexed,
         "calls_indexed": status.calls_indexed,
+        "embedding_model": status.embedding_model,
+        "embedding_dimension": status.embedding_dimension,
         "last_indexed_at": status.last_indexed_at
     }))
 }

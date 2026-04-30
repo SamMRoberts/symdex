@@ -59,6 +59,8 @@ Implemented CLI commands currently include:
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/Qdrant embedding.
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
+  When a semantic index has completed, it also reports the latest embedding
+  model and vector dimension recorded for that repository.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
   name and returns path and line ranges.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct

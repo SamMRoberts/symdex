@@ -296,6 +296,7 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .map_err(StoreError::Sqlite)?;
+        let embedding = self.latest_embedding_run(repository_id)?;
         Ok(RepositoryStatus {
             repository_id: repository_id.to_owned(),
             files_indexed,
@@ -303,7 +304,66 @@ impl SqliteStore {
             symbols_indexed: self.count_joined(repository_id, "symbols")?,
             calls_indexed: self.count_calls(repository_id)?,
             last_indexed_at,
+            embedding_model: embedding.as_ref().map(|run| run.embedding_model.clone()),
+            embedding_dimension: embedding.and_then(|run| run.embedding_dimension),
         })
+    }
+
+    pub fn ensure_embedding_compatible(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+        embedding_dimension: usize,
+    ) -> Result<()> {
+        let Some(previous) = self.latest_embedding_run_for_model(repository_id, embedding_model)?
+        else {
+            return Ok(());
+        };
+        if let Some(previous_dimension) = previous.embedding_dimension
+            && previous_dimension != embedding_dimension
+        {
+            return Err(StoreError::EmbeddingDimensionChanged {
+                repository_id: repository_id.to_owned(),
+                embedding_model: embedding_model.to_owned(),
+                previous_dimension,
+                current_dimension: embedding_dimension,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn record_index_run(&self, run: &IndexRunRecord) -> Result<()> {
+        let now = timestamp();
+        let id = format!(
+            "{}-{}-{}-{}",
+            run.repository_id,
+            run.embedding_model,
+            run.status,
+            timestamp_nanos()
+        );
+        self.connection
+            .execute(
+                "INSERT INTO index_runs (
+                   id, repository_id, started_at, finished_at, status, embedding_model,
+                   embedding_dimension, files_seen, files_indexed, chunks_embedded,
+                   error_summary
+                 )
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    id,
+                    run.repository_id,
+                    now,
+                    run.status,
+                    run.embedding_model,
+                    run.embedding_dimension.map(|dimension| dimension as i64),
+                    run.files_seen as i64,
+                    run.files_indexed as i64,
+                    run.chunks_embedded as i64,
+                    run.error_summary,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
     }
 
     pub fn find_symbols(&self, repository_id: &str, query: &str) -> Result<Vec<SymbolSearchRow>> {
@@ -439,6 +499,45 @@ impl SqliteStore {
             .try_into()
             .map_err(|_| StoreError::UnexpectedResponse("negative call count".to_owned()))
     }
+
+    fn latest_embedding_run(&self, repository_id: &str) -> Result<Option<EmbeddingIndexMetadata>> {
+        self.connection
+            .query_row(
+                "SELECT embedding_model, embedding_dimension, chunks_embedded
+                 FROM index_runs
+                 WHERE repository_id = ?1
+                   AND status = 'success'
+                   AND embedding_dimension IS NOT NULL
+                 ORDER BY finished_at DESC, started_at DESC
+                 LIMIT 1",
+                params![repository_id],
+                embedding_index_metadata,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    fn latest_embedding_run_for_model(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+    ) -> Result<Option<EmbeddingIndexMetadata>> {
+        self.connection
+            .query_row(
+                "SELECT embedding_model, embedding_dimension, chunks_embedded
+                 FROM index_runs
+                 WHERE repository_id = ?1
+                   AND embedding_model = ?2
+                   AND status = 'success'
+                   AND embedding_dimension IS NOT NULL
+                 ORDER BY finished_at DESC, started_at DESC
+                 LIMIT 1",
+                params![repository_id, embedding_model],
+                embedding_index_metadata,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,6 +604,27 @@ pub struct RepositoryStatus {
     pub symbols_indexed: usize,
     pub calls_indexed: usize,
     pub last_indexed_at: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_dimension: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRunRecord {
+    pub repository_id: String,
+    pub status: String,
+    pub embedding_model: String,
+    pub embedding_dimension: Option<usize>,
+    pub files_seen: usize,
+    pub files_indexed: usize,
+    pub chunks_embedded: usize,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingIndexMetadata {
+    pub embedding_model: String,
+    pub embedding_dimension: Option<usize>,
+    pub chunks_embedded: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,6 +966,12 @@ pub enum StoreError {
     InvalidVectorSize(usize),
     InvalidLimit(usize),
     InconsistentVectorDimensions,
+    EmbeddingDimensionChanged {
+        repository_id: String,
+        embedding_model: String,
+        previous_dimension: usize,
+        current_dimension: usize,
+    },
     UnexpectedResponse(String),
 }
 
@@ -867,6 +993,15 @@ impl Display for StoreError {
             Self::InconsistentVectorDimensions => {
                 write!(f, "Qdrant points have inconsistent vector dimensions")
             }
+            Self::EmbeddingDimensionChanged {
+                repository_id,
+                embedding_model,
+                previous_dimension,
+                current_dimension,
+            } => write!(
+                f,
+                "embedding dimension changed for repository `{repository_id}` and model `{embedding_model}`: previous={previous_dimension} current={current_dimension}; reset the collection or use a new model name before reindexing"
+            ),
             Self::UnexpectedResponse(message) => write!(f, "unexpected Qdrant response: {message}"),
         }
     }
@@ -899,6 +1034,16 @@ fn call_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSearchRow> {
         path: row.get(8)?,
         start_line: row.get::<_, Option<i64>>(9)?.map(|line| line as usize),
         end_line: row.get::<_, Option<i64>>(10)?.map(|line| line as usize),
+    })
+}
+
+fn embedding_index_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingIndexMetadata> {
+    Ok(EmbeddingIndexMetadata {
+        embedding_model: row.get(0)?,
+        embedding_dimension: row
+            .get::<_, Option<i64>>(1)?
+            .map(|dimension| dimension as usize),
+        chunks_embedded: row.get::<_, i64>(2)? as usize,
     })
 }
 
@@ -977,6 +1122,7 @@ CREATE TABLE IF NOT EXISTS calls (
 
 CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
 CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 "#;
 
 fn timestamp() -> String {
@@ -987,6 +1133,13 @@ fn timestamp() -> String {
     seconds.to_string()
 }
 
+fn timestamp_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -995,9 +1148,9 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkRecord, CreateCollectionRequest, Distance, FileRecord, PointPayload,
-        QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord,
-        UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
-        validate_collection_name,
+        QdrantClient, QueryPointsRequest, RepositoryRecord, SqliteStore, StoreConfig, StoreError,
+        SymbolRecord, UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name,
+        qdrant_point_id, validate_collection_name,
     };
 
     #[test]
@@ -1206,6 +1359,44 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_records_embedding_runs_and_rejects_dimension_changes() {
+        let db = TestDb::new("embedding-runs");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        store
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .expect("index run should persist");
+
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.embedding_model.as_deref(), Some("nomic-embed-text"));
+        assert_eq!(status.embedding_dimension, Some(768));
+        store
+            .ensure_embedding_compatible("repo", "nomic-embed-text", 768)
+            .expect("same dimension should be compatible");
+        let error = store
+            .ensure_embedding_compatible("repo", "nomic-embed-text", 1024)
+            .expect_err("changed dimension should be rejected");
+        assert!(matches!(
+            error,
+            StoreError::EmbeddingDimensionChanged {
+                previous_dimension: 768,
+                current_dimension: 1024,
+                ..
+            }
+        ));
+        store
+            .ensure_embedding_compatible("repo", "different-model", 1024)
+            .expect("different model writes to a different collection");
+    }
+
+    #[test]
     fn live_qdrant_health_is_opt_in() {
         if std::env::var("SYMDEX_TEST_QDRANT").ok().as_deref() != Some("1") {
             return;
@@ -1270,6 +1461,19 @@ mod tests {
             end_line: 3,
             start_byte: 0,
             end_byte: 32,
+        }
+    }
+
+    fn sample_index_run(model: &str, dimension: usize) -> crate::IndexRunRecord {
+        crate::IndexRunRecord {
+            repository_id: "repo".to_owned(),
+            status: "success".to_owned(),
+            embedding_model: model.to_owned(),
+            embedding_dimension: Some(dimension),
+            files_seen: 1,
+            files_indexed: 1,
+            chunks_embedded: 1,
+            error_summary: None,
         }
     }
 

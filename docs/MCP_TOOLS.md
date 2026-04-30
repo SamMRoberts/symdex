@@ -138,6 +138,8 @@ Output:
   "chunks_indexed": 120,
   "symbols_indexed": 80,
   "calls_indexed": 240,
+  "embedding_model": "nomic-embed-text",
+  "embedding_dimension": 768,
   "last_indexed_at": "2026-04-30T12:00:00Z"
 }
 ```

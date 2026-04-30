@@ -8,8 +8,9 @@ use symdex_core::{
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    CallRecord, ChunkRecord, FileRecord, PointPayload, QdrantClient, RepositoryRecord, SqliteStore,
-    StoreConfig, SymbolRecord, VectorPoint, qdrant_collection_name, qdrant_point_id, sqlite_parent,
+    CallRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
+    RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, VectorPoint, qdrant_collection_name,
+    qdrant_point_id, sqlite_parent,
 };
 
 fn main() {
@@ -169,11 +170,14 @@ fn index(args: &IndexArgs) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     let dimension = embeddings.dimension().unwrap_or(0);
+    sqlite
+        .ensure_embedding_compatible(root.id(), &embed_config.model, dimension)
+        .map_err(|error| error.to_string())?;
 
     let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
-    let collection = qdrant_collection_name(root.id(), &embed_config.model);
+    let qdrant_collection = qdrant_collection_name(root.id(), &embed_config.model);
     qdrant
-        .ensure_collection(&collection, dimension)
+        .ensure_collection(&qdrant_collection, dimension)
         .map_err(|error| error.to_string())?;
 
     let points = chunk_texts
@@ -182,12 +186,24 @@ fn index(args: &IndexArgs) -> Result<(), String> {
         .map(|(chunk, vector)| vector_point(root.id(), chunk, vector))
         .collect::<Result<Vec<_>, _>>()?;
     qdrant
-        .upsert_points(&collection, &points)
+        .upsert_points(&qdrant_collection, &points)
+        .map_err(|error| error.to_string())?;
+    sqlite
+        .record_index_run(&IndexRunRecord {
+            repository_id: root.id().to_owned(),
+            status: "success".to_owned(),
+            embedding_model: embed_config.model.clone(),
+            embedding_dimension: Some(dimension),
+            files_seen: collection.files_seen,
+            files_indexed: collection.reports.len(),
+            chunks_embedded: points.len(),
+            error_summary: None,
+        })
         .map_err(|error| error.to_string())?;
 
-    println!("embedding_model: {}", embeddings.model);
+    println!("embedding_model: {}", embed_config.model);
     println!("embedding_dimension: {dimension}");
-    println!("qdrant_collection: {collection}");
+    println!("qdrant_collection: {qdrant_collection}");
     println!("chunks_embedded: {}", points.len());
     Ok(())
 }
@@ -206,6 +222,17 @@ fn index_status(repo: &str) -> Result<(), String> {
     println!("chunks_indexed: {}", status.chunks_indexed);
     println!("symbols_indexed: {}", status.symbols_indexed);
     println!("calls_indexed: {}", status.calls_indexed);
+    println!(
+        "embedding_model: {}",
+        status.embedding_model.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "embedding_dimension: {}",
+        status
+            .embedding_dimension
+            .map(|dimension| dimension.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
     println!(
         "last_indexed_at: {}",
         status.last_indexed_at.as_deref().unwrap_or("<never>")

@@ -89,6 +89,11 @@ Store:
 
 If model name or vector dimension changes, require full reindex or collection migration.
 
+Current implementation records successful semantic index runs in SQLite. Before
+upserting vectors, it rejects a same-repository, same-model dimension change so
+an existing Qdrant collection is not reused with incompatible vector sizes.
+Different model names map to different Qdrant collection names.
+
 ## Qdrant Collections
 
 Current implementation creates Qdrant collections through the REST API on the
@@ -151,5 +156,5 @@ Current implementation skips unchanged files by path plus content hash for
 `symdex index --offline`, persists changed file/chunk facts to SQLite, and
 removes SQLite rows for deleted files. Semantic `symdex index` currently parses
 and embeds all discovered chunks so Qdrant can be rebuilt even when SQLite
-already has matching structural facts. Model/dimension-aware incremental
-semantic indexing remains future hardening.
+already has matching structural facts. Same-model dimension changes fail closed;
+automated collection migration/reset remains future hardening.
