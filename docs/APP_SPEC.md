@@ -11,6 +11,11 @@ It answers questions such as:
 - Which functions call or are called by this symbol?
 - What files and tests are likely affected?
 - What compact context should an AI agent receive before editing?
+- How complete and healthy is the local structural and semantic index?
+- Which files, chunks, symbols, calls, and embeddings explain the evidence?
+- Which explicit call paths connect two symbols?
+- Is the evidence fresh relative to the current working tree?
+- Which indexed facts explain a stack trace, panic, or failing test?
 
 ## Non-goals for MVP
 
@@ -26,19 +31,25 @@ It answers questions such as:
 1. User installs local dependencies.
 2. User runs `symdex init`.
 3. User runs `symdex index /path/to/repo`.
-4. User asks semantic or structural questions through CLI or MCP.
-5. Agent receives compact ranked evidence with file paths and line ranges.
+4. User can optionally enable continuous indexing so modified or newly created eligible files are automatically reindexed.
+5. User asks semantic or structural questions through CLI, TUI, or MCP.
+6. User can inspect local status, diagnostics, indexing controls, queries, and context packs in the TUI.
+7. User can visualize SQLite structural data and Qdrant semantic coverage in the TUI without exposing source text.
+8. Agent receives compact ranked evidence with file paths and line ranges.
 
 ## Primary commands
 
 ```bash
 symdex init
 symdex index <repo>
+symdex index --watch <repo>
 symdex search <repo> "query"
 symdex symbol <repo> <symbol>
 symdex callers <repo> <symbol>
 symdex callees <repo> <symbol>
 symdex impact <repo> <symbol>
+symdex context-pack <repo> <symbol>
+symdex tui [repo]
 symdex doctor
 symdex serve-mcp
 ```
@@ -46,8 +57,32 @@ symdex serve-mcp
 ## Success criteria
 
 - Indexing a small Rust repo completes locally without network access after setup.
+- Continuous indexing can be toggled on and off and reindexes modified or newly created eligible files without source execution.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.
 - MCP tools return compact JSON evidence that a coding agent can use immediately.
+- TUI provides a local keyboard-first control panel for indexing, storage health, diagnostics, queries, impact, and context packs.
+- TUI makes index health inspectable with local visualizations for coverage, file details, symbol outlines, call resolution, embedding coverage, and index runs.
+- TUI storage visualizations are grouped under an always-visible nested storage tab header so users can see the available storage panes while inspecting any one pane.
 - Unresolved or ambiguous relationships are labeled instead of fabricated.
+
+## Future product directions
+
+These are planned but not yet implemented. See `FUTURE_FEATURES.md` for the
+feature contracts.
+
+- Call path tracing through persisted call graph edges.
+- Repeatable impact analysis with callers, callees, bounded paths, related
+  files, and likely tests when test mapping exists.
+- Debug context packs for stack traces, failing tests, panic locations, symbols,
+  and file paths.
+- Index provenance for what was indexed, when, with which parser/model/vector
+  dimension, and from which content hash.
+- Local/private indexing with user-controlled model, vector database, and
+  storage.
+- Cross-agent reuse of the same local index through stable CLI, TUI, and MCP
+  evidence contracts.
+- Runtime-to-source mapping from stack traces and test failures into indexed
+  files, symbols, call graph edges, and tests.
+- Staleness detection for evidence that no longer matches current file hashes.

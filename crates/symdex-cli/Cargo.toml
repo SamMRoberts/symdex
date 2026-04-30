@@ -1,0 +1,24 @@
+[package]
+name = "symdex-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "symdex"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1.0.149"
+symdex-core = { path = "../symdex-core" }
+symdex-diagnostics = { path = "../symdex-diagnostics" }
+symdex-embed = { path = "../symdex-embed" }
+symdex-index = { path = "../symdex-index" }
+symdex-mcp = { path = "../symdex-mcp" }
+symdex-query = { path = "../symdex-query" }
+symdex-store = { path = "../symdex-store" }
+symdex-tui = { path = "../symdex-tui" }

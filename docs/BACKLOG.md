@@ -2,59 +2,163 @@
 
 ## Phase 0 — Harness and docs
 
-- Create repo-level `AGENTS.md`.
-- Create docs index and project specs.
-- Decide workspace crate layout.
-- Add initial CLI command list.
+- [x] Create repo-level `AGENTS.md`.
+- [x] Create docs index and project specs.
+- [x] Decide workspace crate layout.
+- [x] Add initial CLI command list.
 
 ## Phase 1 — Semantic MVP
 
-- Rust workspace scaffold.
-- `doctor` command.
-- repo file discovery.
-- `.gitignore` support.
-- content hashing.
-- tree-sitter Rust parsing.
-- function-level chunk extraction.
-- Ollama embedding client.
-- Qdrant collection creation.
-- semantic search CLI.
+- [x] Rust workspace scaffold.
+- [x] `doctor` command.
+- [x] repo file discovery.
+- [x] scoped `.gitignore` support for simple rules.
+- [x] content hashing.
+- [x] tree-sitter Rust parsing.
+- [x] function-level chunk extraction.
+- [x] Ollama embedding client.
+- [x] Qdrant collection creation.
+- [x] semantic search CLI.
 
 ## Phase 2 — SQLite structural index
 
-- migrations.
-- repositories/files/chunks tables.
-- stable IDs.
-- incremental indexing.
-- deleted file cleanup.
-- index status command.
+- [x] migrations.
+- [x] repositories/files/chunks tables.
+- [x] stable IDs.
+- [x] incremental structural indexing by content hash.
+- [x] deleted file cleanup.
+- [x] index status command.
 
 ## Phase 3 — Symbols and calls
 
-- symbol extraction.
-- qualified names.
-- call extraction.
-- unresolved calls.
-- direct callers/callees CLI.
-- basic impact analysis.
+- [x] symbol extraction.
+- [x] qualified names.
+- [x] call extraction.
+- [x] unresolved calls.
+- [x] direct callers/callees CLI.
+- [x] basic impact analysis.
 
 ## Phase 4 — MCP server
 
-- `serve-mcp`.
-- `symdex.search`.
-- `symdex.find_symbol`.
-- `symdex.callers`.
-- `symdex.callees`.
-- `symdex.impact`.
-- contract tests.
+- [x] `serve-mcp`.
+- [x] `symdex_search`.
+- [x] `symdex_find_symbol`.
+- [x] `symdex_callers`.
+- [x] `symdex_callees`.
+- [x] `symdex_impact`.
+- [x] `symdex_index_status`.
+- [x] contract tests.
 
 ## Phase 5 — Hardening
 
-- secret detection.
-- path boundary tests.
-- model/dimension migration behavior.
-- large repo performance pass.
-- compact context pack format.
+- [x] secret detection.
+- [x] path boundary tests.
+- [x] model/dimension migration behavior.
+- [x] large repo performance pass.
+- [x] compact context pack format.
+
+## Phase 6 — TUI
+
+- [x] TUI workspace crate scaffold.
+- [x] `symdex tui [repo]` launch command.
+- [x] repository/status dashboard.
+- [x] indexing controls with confirmation.
+- [x] doctor diagnostics view.
+- [x] query workbench for search and symbols.
+- [x] symbol/call graph browser.
+- [x] impact and context-pack viewer.
+- [x] TUI state reducer tests.
+- [x] `ratatui` render tests.
+- [x] CLI launch smoke.
+
+## Phase 7 — TUI visual polish
+
+- [x] ratatui `Tabs` for major views.
+- [x] status-colored labels for service health and job state.
+- [x] `Table` widgets for diagnostics, query evidence, call graph rows, impact rows, and context-pack metadata.
+- [x] status-colored labels for confidence and resolution inside table rows.
+- [x] stateful selection/focus for result lists and tables.
+- [x] per-view footer help text.
+- [x] confirmation panel styling for long-running jobs.
+- [x] progress `Gauge` for indexing when progress reporting exists.
+- [x] narrow-terminal render tests for 80x24 layout.
+- [x] render tests for active tabs and status colors.
+- [x] render tests for table headers.
+- [x] render tests for selected rows.
+
+## Phase 8 — Doctor diagnostics interaction
+
+- [x] actionable Doctor row selection with selected-check details panel.
+- [x] `Enter` toggle/focus behavior for selected-check details in Doctor view.
+- [x] footer help update for Doctor `Enter` action.
+- [x] TUI reducer/render tests for Doctor selected-check detail behavior.
+
+## Phase 9 — TUI storage visualizations
+
+- [x] storage explorer view for SQLite structural data and Qdrant semantic projection.
+- [x] index coverage view grouped by file with chunk, symbol, call, embedding, and exclusion counts.
+- [x] selected-file detail drawer for chunks, symbols, calls, vector status, and exclusion reasons.
+- [x] symbol outline view using `symbols.parent_symbol_id`.
+- [x] call resolution dashboard grouped by resolution status and confidence bucket.
+- [x] embedding coverage view comparing SQLite chunks with Qdrant vector-backed chunks.
+- [x] index runs timeline using `index_runs` metadata.
+- [x] semantic neighborhood view using Qdrant metadata only.
+- [x] cross-store health warnings for missing vectors, missing collections, excluded chunks, and model/dimension drift.
+- [x] TUI state/render tests for the first storage visualization, including 80x24 layout and selected-row drill-down behavior.
+
+## Phase 10 — Continuous indexing
+
+- [x] Shared continuous indexing API in `symdex-index`.
+- [x] Polling filesystem watcher for created and modified eligible files.
+- [x] Debounce and coalesce event bursts before reindexing.
+- [x] Reuse manual indexing ignore, path-boundary, hashing, parser, secret-filtering, SQLite, Ollama, and Qdrant rules.
+- [x] Offline continuous indexing path that updates SQLite without Ollama or Qdrant.
+- [x] Semantic continuous indexing path that updates Qdrant when local services are available.
+- [x] CLI launch path such as `symdex index --watch <repo>`.
+- [x] TUI continuous indexing toggle with explicit on/off labels and first-enable confirmation.
+- [x] TUI watch status showing pending debounce state, queued event count, last reindexed file, and latest error.
+- [x] TUI toggle state tests.
+- [x] Tests for event coalescing, ignored paths, created-file indexing, modified-file reindexing, and unchanged-content skips.
+
+## Phase 11 — Evidence freshness and provenance
+
+- [ ] Index provenance schema for files, chunks, symbols, calls, vectors, and index runs.
+- [ ] Store parser version, embedding model, vector dimension, content hash, index run ID, and indexed timestamp with returned evidence.
+- [ ] Staleness detection by comparing indexed content hashes against current eligible files.
+- [ ] CLI staleness report for repositories, files, symbols, and context packs.
+- [ ] TUI freshness/provenance panels for repository status, storage views, and evidence rows.
+- [ ] MCP response fields for freshness state and provenance metadata.
+- [ ] Tests for fresh, stale, deleted, missing, and unknown evidence states.
+
+## Phase 12 — Explicit graph traversal and repeatable impact
+
+- [ ] Call path tracing API over persisted call edges with bounded traversal depth.
+- [ ] CLI command for call path tracing between source and target symbols.
+- [ ] TUI call path view with paths, hops, confidence, resolution status, and file/line evidence.
+- [ ] MCP tool for compact call path tracing.
+- [ ] Expand impact analysis to include bounded transitive paths and related files.
+- [ ] Add test discovery and mapping design before claiming likely affected tests.
+- [ ] Impact output includes provenance and staleness labels for every evidence row.
+- [ ] Tests for deterministic traversal order, unresolved edges, ambiguous edges, cycles, and depth limits.
+
+## Phase 13 — Debug context and runtime mapping
+
+- [ ] Runtime-to-source input parser for stack traces, panic locations, failing test names, frame symbols, and file paths.
+- [ ] Source mapping API that joins runtime frames to indexed files, symbols, calls, and likely tests when available.
+- [ ] Debug context pack format for reusable debugging evidence bundles.
+- [ ] CLI command for building debug context packs from runtime failure input.
+- [ ] TUI debug context-pack viewer with matched frames, call paths, likely tests, provenance, and staleness.
+- [ ] MCP tool for debug context packs with compact context-window-safe output.
+- [ ] Tests for mapped frames, unmapped frames, stale frames, deleted files, and malformed stack traces.
+
+## Phase 14 — Cross-agent local reuse
+
+- [ ] Version stable evidence contracts across CLI, TUI, and MCP.
+- [ ] Document local/private indexing guarantees for multi-agent reuse.
+- [ ] Read-only cross-agent access patterns for shared SQLite and Qdrant state.
+- [ ] Repository root boundary checks for multi-agent requests.
+- [ ] Diagnostics for model, vector DB, SQLite path, index freshness, and provenance consistency.
+- [ ] Tests for multiple agents reading the same index without write-capable tools.
 
 ## Do not start yet
 

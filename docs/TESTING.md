@@ -7,6 +7,7 @@
 3. Integration tests for Qdrant adapter behind an opt-in feature or environment flag.
 4. Integration tests for Ollama adapter behind an opt-in feature or environment flag.
 5. MCP contract tests for input validation and output shape.
+6. TUI state and render tests using `ratatui` test backends.
 
 ## Fixtures
 
@@ -27,6 +28,10 @@ Fixtures should be tiny and purpose-built.
 - syntax chunk line ranges
 - stable IDs across repeated runs
 - changed file reindex
+- continuous indexing reindexes modified files
+- continuous indexing indexes newly created eligible files
+- continuous indexing skips ignored, out-of-root, symlink-escape, and unchanged files
+- continuous indexing toggle, debounce, queued event, and error states
 - deleted file cleanup
 - unresolved calls preserved
 - ambiguous calls labeled
@@ -34,6 +39,33 @@ Fixtures should be tiny and purpose-built.
 - ignored files not indexed
 - likely secrets excluded from embeddings
 - MCP tools reject invalid paths
+- TUI navigation and confirmation flows
+- TUI loading, empty, and error states
+- TUI render snapshots or buffer assertions for key screens
+- TUI storage visualization state and render coverage for SQLite/Qdrant
+  metadata, selected-row drill-down, empty stores, missing vectors, excluded
+  chunks, and model/dimension drift
+
+Current path-boundary tests cover file paths rejected as repository roots,
+canonical symlink escapes rejected by normalization, symlinked files and
+directories skipped during discovery, and MCP repo arguments rejected when they
+do not name a directory root.
+
+Current migration tests also assert that structural-query indexes are created
+for symbols, calls, chunks, files, and index runs.
+
+Continuous indexing tests should use synthetic filesystem events where possible
+for debounce and coalescing behavior, plus tiny fixture repositories for
+end-to-end created-file and modified-file reindex behavior. Offline continuous
+indexing should be testable without Qdrant or Ollama; semantic continuous
+indexing should use mocked adapters or the existing opt-in local service test
+flags.
+
+Current continuous indexing tests cover snapshot diff coalescing, created-file
+and modified-file detection, ignored path skips, non-Rust path skips, and
+unchanged-content skips. TUI state/render tests cover continuous-indexing
+toggle confirmation, stopping an active watcher, pending debounce display,
+queued event count, and latest error rendering.
 
 ## Test commands
 
@@ -48,9 +80,39 @@ cargo test --workspace
 Service-dependent checks:
 
 ```bash
-symdex_TEST_QDRANT=1 cargo test -p symdex-store qdrant
-symdex_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
+SYMDEX_TEST_QDRANT=1 cargo test -p symdex-store qdrant
+SYMDEX_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
 ```
+
+Future TUI checks:
+
+```bash
+cargo test -p symdex-tui
+cargo run -p symdex-cli -- tui --help
+```
+
+Current TUI tests cover dashboard rendering, doctor diagnostics rendering, query
+workbench rendering and input state, symbol/call graph rendering and input
+state, impact/context-pack rendering and input state, the storage explorer
+metric table, always-visible nested storage tab header, and detail panel,
+index coverage table and selected-file detail panel with chunk, symbol, and
+call metadata, symbol outline table and
+selected-symbol detail panel, call resolution bucket table and selected-bucket
+detail panel, embedding coverage table and selected-metric detail panel with
+exclusion-reason and health summaries, index runs timeline table and
+selected-run detail panel, semantic neighborhood payload table and selected-row
+detail panel, cross-store health warning table and selected-warning detail
+panel, selected table rows, Doctor selected-check detail behavior, separate
+footer containers for shortcut hints and status messages, 80x24 narrow-terminal
+rendering, bracket-based primary tab navigation with letter-key text input,
+the indexing confirmation reducer, and continuous-indexing reducer and render
+coverage for toggle confirmation, stopping an active watcher, on/off labels,
+pending debounce, queued event count, latest reindexed file, watch errors, and
+the animated continuous-indexing activity indicator.
+
+TUI storage visualizations should use SQLite fixtures for deterministic
+structural data and mocked or adapter-level Qdrant metadata for semantic
+coverage checks. Tests should assert labels and counts instead of source text.
 
 ## Agent expectation
 

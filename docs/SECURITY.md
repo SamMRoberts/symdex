@@ -23,6 +23,13 @@ The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 - No path access outside the configured repository root.
 - No symlink traversal outside the root.
 - No mutation tools in MVP.
+- Continuous indexing must enforce the same local-only, path-boundary,
+  symlink, ignore, and secret-filtering rules as manual indexing.
+
+Current implementation requires repository roots to be directories. Path
+normalization canonicalizes existing paths before accepting them, rejects
+canonical paths outside the root, and discovery skips symlinked files and
+directories instead of following them.
 
 ## Secret handling
 
@@ -43,6 +50,12 @@ If a chunk is sensitive:
 - do not embed it
 - set `excluded_reason`
 - avoid returning snippets
+
+Current implementation uses conservative local heuristics for private key
+markers, credential-looking assignments, token prefixes, and credentialed
+database connection strings. These rules are intentionally broad enough to
+avoid embedding likely secrets, but they are not a substitute for a complete
+secret scanner.
 
 ## MCP-specific risks
 
@@ -68,3 +81,6 @@ Unsafe logs:
 - embeddings
 - secrets
 - absolute paths without explicit debug mode
+
+Continuous indexing logs should stay summary-only: watcher state, event counts,
+relative paths when configured, indexed file counts, and error categories.

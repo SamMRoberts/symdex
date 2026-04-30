@@ -3,7 +3,7 @@
 ## Mission
 Build symdex: a local-first codebase intelligence system for AI coding agents.
 It indexes repositories semantically and structurally so agents can reason from evidence.
-Primary stack: Rust, tree-sitter, SQLite, Qdrant, Ollama, nomic-embed-text, MCP server.
+Primary stack: Rust, tree-sitter, SQLite, Qdrant, Ollama, nomic-embed-text, MCP server, TUI.
 Optimize for privacy, correctness, deterministic behavior, and compact agent context.
 
 ## First Reads
@@ -14,8 +14,11 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - If requirements conflict, prioritize privacy, correctness, tests, simplicity, then performance.
 
 ## Product Rules
-- Build a CLI plus MCP server.
+- Build a CLI, TUI, and MCP server.
 - The CLI handles indexing, querying, diagnostics, and maintenance.
+- The TUI provides an interactive local control panel over CLI-equivalent capabilities.
+- Support a local continuous indexing mode that can be toggled on or off.
+- In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
 - Qdrant stores dense vectors plus filterable payload fields.
@@ -32,11 +35,15 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Keep root-level files minimal.
 - Keep durable specs under `docs/`.
 - Use `crates/symdex-core` for parsing, chunking, symbols, calls, hashing, and domain types.
+- Use `crates/symdex-diagnostics` for local service and configuration diagnostics shared by CLI and TUI.
+- Use `crates/symdex-index` for indexing orchestration shared by CLI and TUI.
+- Use `crates/symdex-query` for search, symbol-query, call-graph, impact, and context-pack orchestration shared by CLI and TUI.
 - Use `crates/symdex-store` for SQLite and Qdrant adapters.
 - Use `crates/symdex-embed` for the Ollama embedding client.
 - Use `crates/symdex-cli` for command-line orchestration.
+- Use `crates/symdex-tui` for terminal UI state, rendering, events, and terminal lifecycle.
 - Use `crates/symdex-mcp` for MCP server and tool handlers.
-- Do not let CLI, MCP, Qdrant, or Ollama types leak into core logic.
+- Do not let CLI, TUI, MCP, Qdrant, or Ollama types leak into core logic.
 - Keep database row types separate from domain models.
 - Put fixtures under `tests/fixtures/`.
 
@@ -74,6 +81,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Record embedding model name and vector dimension with every index version.
 - A model or dimension change requires collection migration or full reindex.
 - Respect `.gitignore` plus project-level ignore config.
+- Continuous indexing must use the same ignore, path-boundary, hashing, parser, secret-detection, and embedding rules as manual indexing.
+- Continuous indexing must debounce file events and coalesce bursts before reindexing.
+- Continuous indexing is off by default and must be visibly toggleable when exposed in the TUI.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 
 ## MCP Rules
@@ -86,6 +96,25 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Prefer ranked evidence over prose explanations.
 - Validate all MCP inputs.
 - Enforce repository root boundaries and fail closed on ambiguous paths or missing indexes.
+
+## TUI Rules
+- The TUI must be terminal-only, local-only, and implemented with `ratatui` plus `crossterm`.
+- Launch the TUI through `symdex tui [repo]`.
+- Keep TUI state, rendering, event handling, and terminal lifecycle in `crates/symdex-tui`.
+- Let `symdex-cli` own argument parsing and TUI launch orchestration.
+- The TUI should call Rust library APIs directly, not shell out to `symdex` subprocesses.
+- Design for keyboard-first use; mouse support is optional and must not be required.
+- Show visible loading, empty, error, and confirmation states.
+- Show compact evidence by default: paths, line ranges, scores, confidence, resolution status, symbols, and context-pack metadata.
+- Visualize SQLite as the structural source of truth: repositories, files, chunks, symbols, calls, and index runs.
+- Visualize Qdrant as the semantic projection of embeddable chunks: collection, vector model/dimension, point payload metadata, and semantic coverage.
+- Prefer tables, split panes, gauges, and compact relationship views over prose-only summaries.
+- Cross-store visualizations must make mismatches obvious, such as chunks with no vector point, excluded chunks, missing collections, or model/dimension drift.
+- Do not show source text by default; source previews require a future explicit design.
+- Require confirmation before starting long-running local jobs such as indexing.
+- Show continuous indexing state when available, including whether it is on or off and the latest reindexed file or error.
+- Do not add reset/delete actions until matching CLI support exists.
+- Do not execute indexed repository code from the TUI.
 
 ## Security and Privacy
 - Default bind address for local services is localhost.
