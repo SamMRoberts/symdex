@@ -50,7 +50,64 @@ impl SqliteStore {
         self.connection
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;
+        self.ensure_provenance_columns()?;
         Ok(())
+    }
+
+    fn ensure_provenance_columns(&self) -> Result<()> {
+        for (table, column, definition) in [
+            ("index_runs", "parser_version", "parser_version TEXT"),
+            ("index_runs", "indexer_version", "indexer_version TEXT"),
+            (
+                "index_runs",
+                "run_kind",
+                "run_kind TEXT NOT NULL DEFAULT 'manual'",
+            ),
+            ("files", "index_run_id", "index_run_id TEXT"),
+            ("files", "parser_version", "parser_version TEXT"),
+            ("symbols", "index_run_id", "index_run_id TEXT"),
+            ("symbols", "parser_version", "parser_version TEXT"),
+            ("chunks", "index_run_id", "index_run_id TEXT"),
+            ("chunks", "parser_version", "parser_version TEXT"),
+            ("chunks", "embedding_model", "embedding_model TEXT"),
+            (
+                "chunks",
+                "embedding_dimension",
+                "embedding_dimension INTEGER",
+            ),
+            ("chunks", "embedded_at", "embedded_at TEXT"),
+            ("calls", "index_run_id", "index_run_id TEXT"),
+            ("calls", "parser_version", "parser_version TEXT"),
+        ] {
+            self.ensure_column(table, column, definition)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        if self.column_exists(table, column)? {
+            return Ok(());
+        }
+        self.connection
+            .execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(StoreError::Sqlite)?;
+        for row in rows {
+            if row.map_err(StoreError::Sqlite)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn upsert_repository(&self, repository: &RepositoryRecord) -> Result<()> {
@@ -96,20 +153,27 @@ impl SqliteStore {
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         transaction
             .execute(
-                "INSERT INTO files (id, repository_id, path, language, content_hash, indexed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(repository_id, path) DO UPDATE SET
-                   id = excluded.id,
-                   language = excluded.language,
-                   content_hash = excluded.content_hash,
-                   indexed_at = excluded.indexed_at",
+                "INSERT INTO files (
+                   id, repository_id, path, language, content_hash, indexed_at,
+                   index_run_id, parser_version
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                  ON CONFLICT(repository_id, path) DO UPDATE SET
+                    id = excluded.id,
+                    language = excluded.language,
+                    content_hash = excluded.content_hash,
+                    indexed_at = excluded.indexed_at,
+                    index_run_id = excluded.index_run_id,
+                    parser_version = excluded.parser_version",
                 params![
                     file.id,
                     file.repository_id,
                     file.path,
                     file.language,
                     file.content_hash,
-                    timestamp()
+                    timestamp(),
+                    file.index_run_id,
+                    file.parser_version
                 ],
             )
             .map_err(StoreError::Sqlite)?;
@@ -131,10 +195,10 @@ impl SqliteStore {
             let mut statement = transaction
                 .prepare(
                     "INSERT INTO symbols (
-                       id, file_id, parent_symbol_id, name, qualified_name, kind, signature,
-                       start_line, end_line, start_byte, end_byte
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        id, file_id, parent_symbol_id, name, qualified_name, kind, signature,
+                        start_line, end_line, start_byte, end_byte, index_run_id, parser_version
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )
                 .map_err(StoreError::Sqlite)?;
             for symbol in symbols {
@@ -151,6 +215,8 @@ impl SqliteStore {
                         symbol.end_line as i64,
                         symbol.start_byte as i64,
                         symbol.end_byte as i64,
+                        symbol.index_run_id,
+                        symbol.parser_version,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -159,12 +225,13 @@ impl SqliteStore {
         {
             let mut statement = transaction
                 .prepare(
-                    "INSERT INTO chunks (
-                       id, file_id, symbol_id, kind, text_hash,
-                       start_line, end_line, start_byte, end_byte,
-                       qdrant_point_id, excluded_reason
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     "INSERT INTO chunks (
+                        id, file_id, symbol_id, kind, text_hash,
+                        start_line, end_line, start_byte, end_byte,
+                        qdrant_point_id, excluded_reason, index_run_id, parser_version,
+                        embedding_model, embedding_dimension, embedded_at
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 )
                 .map_err(StoreError::Sqlite)?;
             for chunk in chunks {
@@ -181,6 +248,11 @@ impl SqliteStore {
                         chunk.end_byte as i64,
                         chunk.qdrant_point_id,
                         chunk.excluded_reason,
+                        chunk.index_run_id,
+                        chunk.parser_version,
+                        chunk.embedding_model,
+                        chunk.embedding_dimension.map(|dimension| dimension as i64),
+                        chunk.embedded_at,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -190,17 +262,19 @@ impl SqliteStore {
             let mut statement = transaction
                 .prepare(
                     "INSERT INTO calls (
-                       id, caller_symbol_id, callee_text, callee_symbol_id,
-                       call_line, confidence, resolution_status
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(id) DO UPDATE SET
-                       caller_symbol_id = excluded.caller_symbol_id,
-                       callee_text = excluded.callee_text,
-                       callee_symbol_id = excluded.callee_symbol_id,
-                       call_line = excluded.call_line,
-                       confidence = excluded.confidence,
-                       resolution_status = excluded.resolution_status",
+                        id, caller_symbol_id, callee_text, callee_symbol_id,
+                        call_line, confidence, resolution_status, index_run_id, parser_version
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                      ON CONFLICT(id) DO UPDATE SET
+                        caller_symbol_id = excluded.caller_symbol_id,
+                        callee_text = excluded.callee_text,
+                        callee_symbol_id = excluded.callee_symbol_id,
+                        call_line = excluded.call_line,
+                        confidence = excluded.confidence,
+                        resolution_status = excluded.resolution_status,
+                        index_run_id = excluded.index_run_id,
+                        parser_version = excluded.parser_version",
                 )
                 .map_err(StoreError::Sqlite)?;
             for call in calls {
@@ -213,6 +287,8 @@ impl SqliteStore {
                         call.call_line as i64,
                         call.confidence as f64,
                         call.resolution_status,
+                        call.index_run_id,
+                        call.parser_version,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -341,23 +417,16 @@ impl SqliteStore {
 
     pub fn record_index_run(&self, run: &IndexRunRecord) -> Result<()> {
         let now = timestamp();
-        let id = format!(
-            "{}-{}-{}-{}",
-            run.repository_id,
-            run.embedding_model,
-            run.status,
-            timestamp_nanos()
-        );
         self.connection
             .execute(
                 "INSERT INTO index_runs (
                    id, repository_id, started_at, finished_at, status, embedding_model,
                    embedding_dimension, files_seen, files_indexed, chunks_embedded,
-                   error_summary
-                 )
-                 VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                   error_summary, parser_version, indexer_version, run_kind
+                  )
+                  VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
-                    id,
+                    run.id,
                     run.repository_id,
                     now,
                     run.status,
@@ -367,10 +436,47 @@ impl SqliteStore {
                     run.files_indexed as i64,
                     run.chunks_embedded as i64,
                     run.error_summary,
+                    run.parser_version,
+                    run.indexer_version,
+                    run.run_kind,
                 ],
             )
             .map_err(StoreError::Sqlite)?;
         Ok(())
+    }
+
+    pub fn record_chunk_embedding_provenance(
+        &self,
+        chunk_ids: &[String],
+        embedding_model: &str,
+        embedding_dimension: usize,
+    ) -> Result<()> {
+        let embedded_at = timestamp();
+        let mut statement = self
+            .connection
+            .prepare(
+                "UPDATE chunks
+                 SET embedding_model = ?2,
+                     embedding_dimension = ?3,
+                     embedded_at = ?4
+                 WHERE id = ?1",
+            )
+            .map_err(StoreError::Sqlite)?;
+        for chunk_id in chunk_ids {
+            statement
+                .execute(params![
+                    chunk_id,
+                    embedding_model,
+                    embedding_dimension as i64,
+                    embedded_at
+                ])
+                .map_err(StoreError::Sqlite)?;
+        }
+        Ok(())
+    }
+
+    pub fn new_index_run_id(repository_id: &str, run_kind: &str) -> String {
+        format!("{repository_id}-{run_kind}-{}", timestamp_nanos())
     }
 
     pub fn find_symbols(&self, repository_id: &str, query: &str) -> Result<Vec<SymbolSearchRow>> {
@@ -1221,6 +1327,8 @@ pub struct FileRecord {
     pub path: String,
     pub language: String,
     pub content_hash: String,
+    pub index_run_id: String,
+    pub parser_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1236,6 +1344,11 @@ pub struct ChunkRecord {
     pub end_byte: usize,
     pub qdrant_point_id: Option<String>,
     pub excluded_reason: Option<String>,
+    pub index_run_id: String,
+    pub parser_version: String,
+    pub embedding_model: Option<String>,
+    pub embedding_dimension: Option<usize>,
+    pub embedded_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1251,6 +1364,8 @@ pub struct SymbolRecord {
     pub end_line: usize,
     pub start_byte: usize,
     pub end_byte: usize,
+    pub index_run_id: String,
+    pub parser_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1262,6 +1377,8 @@ pub struct CallRecord {
     pub call_line: usize,
     pub confidence: f32,
     pub resolution_status: String,
+    pub index_run_id: String,
+    pub parser_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1278,6 +1395,7 @@ pub struct RepositoryStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRunRecord {
+    pub id: String,
     pub repository_id: String,
     pub status: String,
     pub embedding_model: String,
@@ -1286,6 +1404,9 @@ pub struct IndexRunRecord {
     pub files_indexed: usize,
     pub chunks_embedded: usize,
     pub error_summary: Option<String>,
+    pub parser_version: String,
+    pub indexer_version: String,
+    pub run_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1857,6 +1978,16 @@ pub struct PointPayload {
     pub start_line: usize,
     pub end_line: usize,
     pub text_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimension: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2300,7 +2431,10 @@ CREATE TABLE IF NOT EXISTS index_runs (
   files_seen INTEGER DEFAULT 0,
   files_indexed INTEGER DEFAULT 0,
   chunks_embedded INTEGER DEFAULT 0,
-  error_summary TEXT
+  error_summary TEXT,
+  parser_version TEXT,
+  indexer_version TEXT,
+  run_kind TEXT NOT NULL DEFAULT 'manual'
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -2310,6 +2444,8 @@ CREATE TABLE IF NOT EXISTS files (
   language TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   indexed_at TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
   UNIQUE(repository_id, path),
   FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
@@ -2326,6 +2462,8 @@ CREATE TABLE IF NOT EXISTS symbols (
   end_line INTEGER NOT NULL,
   start_byte INTEGER NOT NULL,
   end_byte INTEGER NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
   FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 
@@ -2341,6 +2479,11 @@ CREATE TABLE IF NOT EXISTS chunks (
   end_byte INTEGER NOT NULL,
   qdrant_point_id TEXT,
   excluded_reason TEXT,
+  index_run_id TEXT,
+  parser_version TEXT,
+  embedding_model TEXT,
+  embedding_dimension INTEGER,
+  embedded_at TEXT,
   FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 
@@ -2351,7 +2494,9 @@ CREATE TABLE IF NOT EXISTS calls (
   callee_symbol_id TEXT,
   call_line INTEGER NOT NULL,
   confidence REAL NOT NULL,
-  resolution_status TEXT NOT NULL
+  resolution_status TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
@@ -2600,6 +2745,8 @@ mod tests {
             call_line: 4,
             confidence: 1.0,
             resolution_status: "resolved_exact".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
         }];
         store
             .replace_file_facts(
@@ -2651,6 +2798,8 @@ mod tests {
             call_line: 4,
             confidence: 1.0,
             resolution_status: "resolved_exact".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
         }];
         store
             .replace_file_facts(
@@ -2704,6 +2853,8 @@ mod tests {
                     call_line: 4,
                     confidence: 1.0,
                     resolution_status: "resolved_exact".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
                 }],
             )
             .expect("initial calls should persist");
@@ -2721,6 +2872,8 @@ mod tests {
                     call_line: 5,
                     confidence: 0.9,
                     resolution_status: "resolved_local_candidate".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
                 }],
             )
             .expect("replacement calls should persist");
@@ -3134,6 +3287,8 @@ mod tests {
                     call_line: 4,
                     confidence: 1.0,
                     resolution_status: "resolved_exact".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
                 }],
             )
             .expect("first file facts should persist");
@@ -3144,6 +3299,8 @@ mod tests {
             path: "src/secret.rs".to_owned(),
             language: "rust".to_owned(),
             content_hash: "hash-secret".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
         };
         store
             .replace_file_facts(
@@ -3293,6 +3450,8 @@ mod tests {
                 call_line: 4,
                 confidence: 1.0,
                 resolution_status: "resolved_exact".to_owned(),
+                index_run_id: "run".to_owned(),
+                parser_version: "parser".to_owned(),
             },
             CallRecord {
                 id: "call-low".to_owned(),
@@ -3302,6 +3461,8 @@ mod tests {
                 call_line: 7,
                 confidence: 0.25,
                 resolution_status: "unresolved".to_owned(),
+                index_run_id: "run".to_owned(),
+                parser_version: "parser".to_owned(),
             },
         ];
         store
@@ -3357,6 +3518,11 @@ mod tests {
             start_line: 1,
             end_line: 3,
             text_hash: "hash".to_owned(),
+            content_hash: Some("content-hash".to_owned()),
+            index_run_id: Some("run".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_dimension: Some(768),
+            indexed_at: Some("123".to_owned()),
         }
     }
 
@@ -3367,6 +3533,8 @@ mod tests {
             path: "src/lib.rs".to_owned(),
             language: "rust".to_owned(),
             content_hash: content_hash.to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
         }
     }
 
@@ -3383,6 +3551,11 @@ mod tests {
             end_byte: 32,
             qdrant_point_id: Some("01234567-89ab-cdef-fedc-ba9876543210".to_owned()),
             excluded_reason: None,
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
         }
     }
 
@@ -3405,6 +3578,11 @@ mod tests {
             end_byte: 32,
             qdrant_point_id: None,
             excluded_reason: Some("secret_detected".to_owned()),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
         }
     }
 
@@ -3421,11 +3599,14 @@ mod tests {
             end_line: 3,
             start_byte: 0,
             end_byte: 32,
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
         }
     }
 
     fn sample_index_run(model: &str, dimension: usize) -> crate::IndexRunRecord {
         crate::IndexRunRecord {
+            id: format!("run-{model}-{dimension}"),
             repository_id: "repo".to_owned(),
             status: "success".to_owned(),
             embedding_model: model.to_owned(),
@@ -3434,6 +3615,9 @@ mod tests {
             files_indexed: 1,
             chunks_embedded: 1,
             error_summary: None,
+            parser_version: "parser".to_owned(),
+            indexer_version: "indexer".to_owned(),
+            run_kind: "semantic".to_owned(),
         }
     }
 

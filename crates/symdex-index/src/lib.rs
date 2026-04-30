@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use symdex_core::{
-    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, Symbol, discover_rust_files,
-    index_rust_file,
+    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, RUST_PARSER_VERSION, RepoRoot, Symbol,
+    discover_rust_files, index_rust_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
@@ -330,6 +330,12 @@ fn run_index_internal(
         "Repository and SQLite store ready",
     ));
 
+    let run_kind = if options.offline {
+        "offline"
+    } else {
+        "semantic"
+    };
+    let index_run_id = SqliteStore::new_index_run_id(root.id(), run_kind);
     let collection = collect_index_reports(
         &root,
         if skip_unchanged { Some(&sqlite) } else { None },
@@ -347,7 +353,13 @@ fn run_index_internal(
         .flat_map(|report| report.chunks.iter())
         .filter(|chunk| chunk.excluded_reason.is_some())
         .count();
-    let persistence = persist_structural_index(&mut sqlite, &root, &collection, &mut on_progress)?;
+    let persistence = persist_structural_index(
+        &mut sqlite,
+        &root,
+        &collection,
+        &index_run_id,
+        &mut on_progress,
+    )?;
 
     let embedding = if options.offline {
         on_progress(IndexProgress::new(
@@ -356,9 +368,33 @@ fn run_index_internal(
             1,
             "Embedding skipped for offline indexing",
         ));
+        sqlite
+            .record_index_run(&IndexRunRecord {
+                id: index_run_id.clone(),
+                repository_id: root.id().to_owned(),
+                status: "success".to_owned(),
+                embedding_model: "offline".to_owned(),
+                embedding_dimension: None,
+                files_seen: collection.files_seen,
+                files_indexed: collection.reports.len(),
+                chunks_embedded: 0,
+                error_summary: None,
+                parser_version: RUST_PARSER_VERSION.to_owned(),
+                indexer_version: env!("CARGO_PKG_VERSION").to_owned(),
+                run_kind: run_kind.to_owned(),
+            })
+            .map_err(|error| error.to_string())?;
         EmbeddingSummary::SkippedOffline
     } else {
-        persist_semantic_index(&sqlite, &root, &store_config, &collection, &mut on_progress)?
+        persist_semantic_index(
+            &sqlite,
+            &root,
+            &store_config,
+            &collection,
+            &index_run_id,
+            run_kind,
+            &mut on_progress,
+        )?
     };
 
     Ok(IndexSummary {
@@ -469,6 +505,7 @@ fn persist_structural_index(
     sqlite: &mut SqliteStore,
     root: &RepoRoot,
     collection: &IndexCollection,
+    index_run_id: &str,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<PersistenceSummary, String> {
     let mut chunks_indexed = 0usize;
@@ -481,14 +518,24 @@ fn persist_structural_index(
             path: report.file.relative_path.clone(),
             language: report.file.language.as_str().to_owned(),
             content_hash: report.file.content_hash.clone(),
+            index_run_id: index_run_id.to_owned(),
+            parser_version: RUST_PARSER_VERSION.to_owned(),
         };
         let chunks = report
             .chunks
             .iter()
-            .map(chunk_record)
+            .map(|chunk| chunk_record(chunk, index_run_id))
             .collect::<Result<Vec<_>, _>>()?;
-        let symbols = report.symbols.iter().map(symbol_record).collect::<Vec<_>>();
-        let calls = report.calls.iter().map(call_record).collect::<Vec<_>>();
+        let symbols = report
+            .symbols
+            .iter()
+            .map(|symbol| symbol_record(symbol, index_run_id))
+            .collect::<Vec<_>>();
+        let calls = report
+            .calls
+            .iter()
+            .map(|call| call_record(call, index_run_id))
+            .collect::<Vec<_>>();
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
         calls_indexed += calls.len();
@@ -526,6 +573,8 @@ fn persist_semantic_index(
     root: &RepoRoot,
     store_config: &StoreConfig,
     collection: &IndexCollection,
+    index_run_id: &str,
+    run_kind: &str,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
     let embed_config = EmbedConfig::from_env();
@@ -598,10 +647,29 @@ fn persist_semantic_index(
     let points = chunk_texts
         .iter()
         .zip(embeddings.embeddings)
-        .map(|(chunk, vector)| vector_point(root.id(), chunk, vector))
+        .map(|(chunk, vector)| {
+            vector_point(
+                root.id(),
+                chunk,
+                vector,
+                index_run_id,
+                &embed_config.model,
+                dimension,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     qdrant
         .upsert_points(&qdrant_collection, &points)
+        .map_err(|error| error.to_string())?;
+    sqlite
+        .record_chunk_embedding_provenance(
+            &chunk_texts
+                .iter()
+                .map(|chunk| chunk.chunk.id.clone())
+                .collect::<Vec<_>>(),
+            &embed_config.model,
+            dimension,
+        )
         .map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
         "qdrant",
@@ -611,6 +679,7 @@ fn persist_semantic_index(
     ));
     sqlite
         .record_index_run(&IndexRunRecord {
+            id: index_run_id.to_owned(),
             repository_id: root.id().to_owned(),
             status: "success".to_owned(),
             embedding_model: embed_config.model.clone(),
@@ -619,6 +688,9 @@ fn persist_semantic_index(
             files_indexed: collection.reports.len(),
             chunks_embedded: points.len(),
             error_summary: None,
+            parser_version: RUST_PARSER_VERSION.to_owned(),
+            indexer_version: env!("CARGO_PKG_VERSION").to_owned(),
+            run_kind: run_kind.to_owned(),
         })
         .map_err(|error| error.to_string())?;
 
@@ -651,6 +723,9 @@ fn vector_point(
     repository_id: &str,
     chunk: &ChunkText<'_>,
     vector: Vec<f32>,
+    index_run_id: &str,
+    embedding_model: &str,
+    embedding_dimension: usize,
 ) -> Result<VectorPoint, String> {
     Ok(VectorPoint {
         id: qdrant_point_id(&chunk.chunk.id).map_err(|error| error.to_string())?,
@@ -667,11 +742,16 @@ fn vector_point(
             start_line: chunk.chunk.line_range.start,
             end_line: chunk.chunk.line_range.end,
             text_hash: chunk.chunk.text_hash.clone(),
+            content_hash: Some(chunk.file.content_hash.clone()),
+            index_run_id: Some(index_run_id.to_owned()),
+            embedding_model: Some(embedding_model.to_owned()),
+            embedding_dimension: Some(embedding_dimension),
+            indexed_at: Some(timestamp()),
         },
     })
 }
 
-fn chunk_record(chunk: &CodeChunk) -> Result<ChunkRecord, String> {
+fn chunk_record(chunk: &CodeChunk, index_run_id: &str) -> Result<ChunkRecord, String> {
     Ok(ChunkRecord {
         id: chunk.id.clone(),
         file_id: chunk.file_id.clone(),
@@ -688,10 +768,15 @@ fn chunk_record(chunk: &CodeChunk) -> Result<ChunkRecord, String> {
             None
         },
         excluded_reason: chunk.excluded_reason.clone(),
+        index_run_id: index_run_id.to_owned(),
+        parser_version: RUST_PARSER_VERSION.to_owned(),
+        embedding_model: None,
+        embedding_dimension: None,
+        embedded_at: None,
     })
 }
 
-fn symbol_record(symbol: &Symbol) -> SymbolRecord {
+fn symbol_record(symbol: &Symbol, index_run_id: &str) -> SymbolRecord {
     SymbolRecord {
         id: symbol.id.clone(),
         file_id: symbol.file_id.clone(),
@@ -704,10 +789,12 @@ fn symbol_record(symbol: &Symbol) -> SymbolRecord {
         end_line: symbol.line_range.end,
         start_byte: symbol.byte_range.start,
         end_byte: symbol.byte_range.end,
+        index_run_id: index_run_id.to_owned(),
+        parser_version: RUST_PARSER_VERSION.to_owned(),
     }
 }
 
-fn call_record(call: &CallEdge) -> CallRecord {
+fn call_record(call: &CallEdge, index_run_id: &str) -> CallRecord {
     CallRecord {
         id: call.id.clone(),
         caller_symbol_id: call.caller_symbol_id.clone(),
@@ -716,7 +803,17 @@ fn call_record(call: &CallEdge) -> CallRecord {
         call_line: call.call_line,
         confidence: call.confidence,
         resolution_status: call.resolution_status.as_str().to_owned(),
+        index_run_id: index_run_id.to_owned(),
+        parser_version: RUST_PARSER_VERSION.to_owned(),
     }
+}
+
+fn timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    seconds.to_string()
 }
 
 struct IndexCollection {
@@ -776,8 +873,8 @@ mod tests {
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk.id, public.id);
-        let public_record = chunk_record(&public).expect("public record");
-        let secret_record = chunk_record(&secret).expect("secret record");
+        let public_record = chunk_record(&public, "run").expect("public record");
+        let secret_record = chunk_record(&secret, "run").expect("secret record");
         assert!(public_record.qdrant_point_id.is_some());
         assert!(secret_record.qdrant_point_id.is_none());
         assert_eq!(
