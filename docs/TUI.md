@@ -74,13 +74,15 @@ terminal panes.
 - Prefer split panes for workflows that compare data:
   - repository/status summary on the left
   - active view details on the right
-  - two-row footer at the bottom
+  - two-container footer at the bottom
 - Keep footer help persistent and concise. It should show current-view keys,
   not the entire global key list.
-- The footer must be two rows:
-  - top row: keyboard shortcut hints for the active view
-  - second row: status bar content, including current view/status labels,
+- The footer must be two separate stacked containers:
+  - top container: stylized keyboard shortcut hints for the active view
+  - bottom container: status bar content, including current view/status labels,
     running job state, warnings, errors, and the latest user-facing message
+- Do not combine shortcut hints and status messages into the same bordered
+  panel.
 - Use full-width panels rather than nested card-like boxes. Avoid deeply nested
   borders that waste terminal space.
 - Preserve compact evidence density. Styling should improve scanning, not turn

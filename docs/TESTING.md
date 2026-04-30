@@ -102,8 +102,8 @@ detail panel, embedding coverage table and selected-metric detail panel with
 exclusion-reason and health summaries, index runs timeline table and
 selected-run detail panel, semantic neighborhood payload table and selected-row
 detail panel, cross-store health warning table and selected-warning detail
-panel, selected table rows, Doctor selected-check detail behavior, two-row
-footer rendering for shortcut hints plus status messages, 80x24 narrow-terminal
+panel, selected table rows, Doctor selected-check detail behavior, separate
+footer containers for shortcut hints and status messages, 80x24 narrow-terminal
 rendering, bracket-based primary tab navigation with letter-key text input,
 the indexing confirmation reducer, and continuous-indexing reducer and render
 coverage for toggle confirmation, stopping an active watcher, on/off labels,

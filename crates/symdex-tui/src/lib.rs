@@ -1396,16 +1396,36 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 Span::raw(app.message.as_str()),
             ]);
 
-            let footer = Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled("keys: ", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(app.view.footer_help()),
-                ]),
-                Line::from(status_line),
-            ])
+            let footer_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Length(2)])
+                .split(chunks[2]);
+
+            let keys = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "keys ",
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(app.view.footer_help(), Style::new().fg(Color::White)),
+            ]))
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("Status"));
-            frame.render_widget(footer, chunks[2]);
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(tone_style(StatusTone::Info))
+                    .title(Line::from(status_span("Keys", StatusTone::Info))),
+            );
+            frame.render_widget(keys, footer_chunks[0]);
+
+            let status = Paragraph::new(Line::from(status_line))
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(tone_style(StatusTone::Dim))
+                        .title(Line::from(status_span("Status", StatusTone::Dim))),
+                );
+            frame.render_widget(status, footer_chunks[1]);
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -4729,13 +4749,17 @@ mod tests {
 
         render(&mut terminal, &app).expect("render should succeed");
 
-        let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("keys:"));
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Keys"));
+        assert!(rendered.contains("keys"));
         assert!(rendered.contains("query"));
         assert!(rendered.contains("[ or ] tabs"));
         assert!(rendered.contains("Tab/Shift+Tab mode"));
         assert!(rendered.contains("Enter run"));
+        assert!(rendered.contains("Status"));
         assert!(rendered.contains("status:"));
+        assert_eq!(cell_fg_for_text(buffer, "Keys", None), Some(Color::Cyan));
     }
 
     #[test]
