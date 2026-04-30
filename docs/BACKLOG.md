@@ -108,16 +108,17 @@
 
 ## Phase 10 — Continuous indexing
 
-- [ ] Shared continuous indexing API in `symdex-index`.
-- [ ] Filesystem watcher for created and modified eligible files.
-- [ ] Debounce and coalesce event bursts before reindexing.
-- [ ] Reuse manual indexing ignore, path-boundary, hashing, parser, secret-filtering, SQLite, Ollama, and Qdrant rules.
-- [ ] Offline continuous indexing path that updates SQLite without Ollama or Qdrant.
-- [ ] Semantic continuous indexing path that updates Qdrant when local services are available.
-- [ ] CLI launch path such as `symdex index --watch <repo>`.
+- [x] Shared continuous indexing API in `symdex-index`.
+- [x] Polling filesystem watcher for created and modified eligible files.
+- [x] Debounce and coalesce event bursts before reindexing.
+- [x] Reuse manual indexing ignore, path-boundary, hashing, parser, secret-filtering, SQLite, Ollama, and Qdrant rules.
+- [x] Offline continuous indexing path that updates SQLite without Ollama or Qdrant.
+- [x] Semantic continuous indexing path that updates Qdrant when local services are available.
+- [x] CLI launch path such as `symdex index --watch <repo>`.
 - [ ] TUI continuous indexing toggle with explicit on/off labels and first-enable confirmation.
 - [ ] TUI watch status showing pending debounce state, queued event count, last reindexed file, and latest error.
-- [ ] Tests for event coalescing, ignored paths, created-file indexing, modified-file reindexing, unchanged-content skips, and TUI toggle states.
+- [ ] TUI toggle state tests.
+- [x] Tests for event coalescing, ignored paths, created-file indexing, modified-file reindexing, and unchanged-content skips.
 
 ## Do not start yet
 

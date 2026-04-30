@@ -3,7 +3,10 @@ use std::fs;
 
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
-use symdex_index::{EmbeddingSummary, IndexOptions, IndexSummary, run_index};
+use symdex_index::{
+    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexSummary,
+    WatchChangeSet, run_continuous_index, run_index,
+};
 use symdex_query::{
     CallDirection, CallGraphSummary, ImpactSummary, run_call_graph, run_context_pack, run_impact,
     run_semantic_search, run_symbol_search,
@@ -100,12 +103,27 @@ fn init() -> Result<(), String> {
 }
 
 fn index(args: &IndexArgs) -> Result<(), String> {
+    if args.watch {
+        return continuous_index(args);
+    }
     let summary = run_index(&IndexOptions {
         repo: args.repo.clone(),
         offline: args.offline,
     })?;
     print_index_summary(&summary);
     Ok(())
+}
+
+fn continuous_index(args: &IndexArgs) -> Result<(), String> {
+    println!(
+        "continuous_indexing: on mode={}",
+        if args.offline { "offline" } else { "semantic" }
+    );
+    println!("press Ctrl+C to stop");
+    run_continuous_index(
+        &ContinuousIndexOptions::new(args.repo.clone(), args.offline),
+        print_continuous_index_event,
+    )
 }
 
 fn index_status(repo: &str) -> Result<(), String> {
@@ -363,19 +381,79 @@ fn print_diagnostic_check(check: &DiagnosticCheck) {
 fn parse_index_args(args: &[String]) -> IndexArgs {
     let mut repo = ".".to_owned();
     let mut offline = false;
+    let mut watch = false;
     for arg in args {
         if arg == "--offline" {
             offline = true;
+        } else if arg == "--watch" {
+            watch = true;
         } else {
             repo = arg.clone();
         }
     }
-    IndexArgs { repo, offline }
+    IndexArgs {
+        repo,
+        offline,
+        watch,
+    }
 }
 
 struct IndexArgs {
     repo: String,
     offline: bool,
+    watch: bool,
+}
+
+fn print_continuous_index_event(event: ContinuousIndexEvent) {
+    match event {
+        ContinuousIndexEvent::Started {
+            repository_id,
+            files_seen,
+        } => {
+            println!("watch_started repository_id={repository_id} files_seen={files_seen}");
+        }
+        ContinuousIndexEvent::Idle { .. } => {}
+        ContinuousIndexEvent::ChangesDetected { changes } => {
+            println!("watch_changes {}", continuous_change_summary(&changes));
+        }
+        ContinuousIndexEvent::BatchCompleted { changes, summary } => {
+            println!(
+                "watch_indexed {} files_indexed={} chunks_indexed={} chunks_embedded={}",
+                continuous_change_summary(&changes),
+                summary.sqlite_files_indexed,
+                summary.sqlite_chunks_indexed,
+                chunks_embedded(&summary.embedding)
+            );
+        }
+        ContinuousIndexEvent::BatchFailed { changes, error } => {
+            println!(
+                "watch_failed {} error={}",
+                continuous_change_summary(&changes),
+                error
+            );
+        }
+    }
+}
+
+fn continuous_change_summary(changes: &WatchChangeSet) -> String {
+    let paths = changes.paths().join(",");
+    format!(
+        "events={} created={} modified={} deleted={} paths={}",
+        changes.event_count(),
+        changes.created.len(),
+        changes.modified.len(),
+        changes.deleted.len(),
+        if paths.is_empty() { "<none>" } else { &paths }
+    )
+}
+
+fn chunks_embedded(embedding: &EmbeddingSummary) -> usize {
+    match embedding {
+        EmbeddingSummary::Completed {
+            chunks_embedded, ..
+        } => *chunks_embedded,
+        EmbeddingSummary::SkippedOffline | EmbeddingSummary::SkippedNoChunks => 0,
+    }
 }
 
 fn serve_mcp() -> Result<(), String> {
@@ -394,7 +472,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

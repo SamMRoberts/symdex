@@ -37,6 +37,7 @@ cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- index .
 cargo run -p symdex-cli -- index --offline .
+cargo run -p symdex-cli -- index --watch .
 cargo run -p symdex-cli -- index-status .
 cargo run -p symdex-cli -- symbol . "my_symbol"
 cargo run -p symdex-cli -- callers . "my_symbol"
@@ -60,6 +61,10 @@ Implemented CLI commands currently include:
   service calls; unchanged files are skipped by content hash. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/Qdrant embedding.
+- `index --watch <repo>`: starts continuous indexing. It polls local eligible
+  Rust files, debounces event bursts, detects created/modified/deleted paths by
+  content-hash snapshots, and reindexes changed content through the incremental
+  indexing path until stopped with `Ctrl+C`.
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
   When a semantic index has completed, it also reports the latest embedding
   model and vector dimension recorded for that repository.
@@ -95,16 +100,6 @@ Implemented CLI commands currently include:
 reachable, whether the configured embedding model is present, and whether vector
 dimension probing succeeds. These checks report diagnostic status and do not
 mutate repository data.
-
-Planned continuous indexing command:
-
-```bash
-cargo run -p symdex-cli -- index --watch .
-```
-
-The planned watch mode should watch local created and modified eligible files,
-debounce event bursts, and reindex changed content through the same manual
-indexing rules until stopped.
 
 The TUI should surface these same diagnostics. Semantic search and semantic
 indexing views require local Ollama and Qdrant; status, structural queries, and

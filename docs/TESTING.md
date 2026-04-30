@@ -61,6 +61,10 @@ indexing should be testable without Qdrant or Ollama; semantic continuous
 indexing should use mocked adapters or the existing opt-in local service test
 flags.
 
+Current continuous indexing tests cover snapshot diff coalescing, created-file
+and modified-file detection, ignored path skips, non-Rust path skips, and
+unchanged-content skips.
+
 ## Test commands
 
 Default local checks:

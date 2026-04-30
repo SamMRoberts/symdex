@@ -1,6 +1,9 @@
 //! Indexing orchestration shared by the CLI and TUI.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use symdex_core::{
     CallEdge, CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, Symbol, discover_rust_files,
@@ -17,6 +20,25 @@ use symdex_store::{
 pub struct IndexOptions {
     pub repo: String,
     pub offline: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuousIndexOptions {
+    pub repo: String,
+    pub offline: bool,
+    pub poll_interval: Duration,
+    pub debounce: Duration,
+}
+
+impl ContinuousIndexOptions {
+    pub fn new(repo: impl Into<String>, offline: bool) -> Self {
+        Self {
+            repo: repo.into(),
+            offline,
+            poll_interval: Duration::from_millis(1_000),
+            debounce: Duration::from_millis(250),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +111,69 @@ pub enum EmbeddingSummary {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchSnapshot {
+    files: BTreeMap<String, String>,
+}
+
+impl WatchSnapshot {
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchChangeSet {
+    pub created: Vec<String>,
+    pub modified: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
+impl WatchChangeSet {
+    pub fn is_empty(&self) -> bool {
+        self.created.is_empty() && self.modified.is_empty() && self.deleted.is_empty()
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.created.len() + self.modified.len() + self.deleted.len()
+    }
+
+    pub fn paths(&self) -> Vec<&str> {
+        self.created
+            .iter()
+            .chain(self.modified.iter())
+            .chain(self.deleted.iter())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContinuousIndexEvent {
+    Started {
+        repository_id: String,
+        files_seen: usize,
+    },
+    Idle {
+        files_seen: usize,
+    },
+    ChangesDetected {
+        changes: WatchChangeSet,
+    },
+    BatchCompleted {
+        changes: WatchChangeSet,
+        summary: IndexSummary,
+    },
+    BatchFailed {
+        changes: WatchChangeSet,
+        error: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PersistenceSummary {
     files_indexed: usize,
@@ -102,8 +187,103 @@ pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
     run_index_with_progress(options, |_| {})
 }
 
+pub fn run_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
+    run_index_internal(options, true, |_| {})
+}
+
+pub fn run_continuous_index(
+    options: &ContinuousIndexOptions,
+    mut on_event: impl FnMut(ContinuousIndexEvent),
+) -> Result<(), String> {
+    let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
+    let mut snapshot = watch_snapshot(&root)?;
+    on_event(ContinuousIndexEvent::Started {
+        repository_id: root.id().to_owned(),
+        files_seen: snapshot.len(),
+    });
+
+    loop {
+        thread::sleep(options.poll_interval);
+        let (next_snapshot, first_changes) = detect_watch_changes(&root, &snapshot)?;
+        if first_changes.is_empty() {
+            snapshot = next_snapshot;
+            on_event(ContinuousIndexEvent::Idle {
+                files_seen: snapshot.len(),
+            });
+            continue;
+        }
+
+        thread::sleep(options.debounce);
+        let (debounced_snapshot, changes) = detect_watch_changes(&root, &snapshot)?;
+        let changes = if changes.is_empty() {
+            first_changes
+        } else {
+            changes
+        };
+        on_event(ContinuousIndexEvent::ChangesDetected {
+            changes: changes.clone(),
+        });
+
+        match run_incremental_index(&IndexOptions {
+            repo: options.repo.clone(),
+            offline: options.offline,
+        }) {
+            Ok(summary) => {
+                snapshot = watch_snapshot(&root).unwrap_or(debounced_snapshot);
+                on_event(ContinuousIndexEvent::BatchCompleted { changes, summary });
+            }
+            Err(error) => {
+                snapshot = debounced_snapshot;
+                on_event(ContinuousIndexEvent::BatchFailed { changes, error });
+            }
+        }
+    }
+}
+
+pub fn watch_snapshot(root: &RepoRoot) -> Result<WatchSnapshot, String> {
+    let files = discover_rust_files(root, &DiscoveryOptions::default())
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|file| (file.facts.relative_path, file.facts.content_hash))
+        .collect();
+    Ok(WatchSnapshot { files })
+}
+
+pub fn detect_watch_changes(
+    root: &RepoRoot,
+    previous: &WatchSnapshot,
+) -> Result<(WatchSnapshot, WatchChangeSet), String> {
+    let next = watch_snapshot(root)?;
+    Ok((next.clone(), diff_watch_snapshots(previous, &next)))
+}
+
+pub fn diff_watch_snapshots(previous: &WatchSnapshot, next: &WatchSnapshot) -> WatchChangeSet {
+    let mut changes = WatchChangeSet::default();
+    for (path, hash) in &next.files {
+        match previous.files.get(path) {
+            None => changes.created.push(path.clone()),
+            Some(previous_hash) if previous_hash != hash => changes.modified.push(path.clone()),
+            Some(_) => {}
+        }
+    }
+    for path in previous.files.keys() {
+        if !next.files.contains_key(path) {
+            changes.deleted.push(path.clone());
+        }
+    }
+    changes
+}
+
 pub fn run_index_with_progress(
     options: &IndexOptions,
+    mut on_progress: impl FnMut(IndexProgress),
+) -> Result<IndexSummary, String> {
+    run_index_internal(options, options.offline, &mut on_progress)
+}
+
+fn run_index_internal(
+    options: &IndexOptions,
+    skip_unchanged: bool,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<IndexSummary, String> {
     on_progress(IndexProgress::new(
@@ -131,7 +311,7 @@ pub fn run_index_with_progress(
 
     let collection = collect_index_reports(
         &root,
-        if options.offline { Some(&sqlite) } else { None },
+        if skip_unchanged { Some(&sqlite) } else { None },
         &mut on_progress,
     )?;
     let files = file_summaries(&collection.reports);
@@ -541,11 +721,20 @@ struct ChunkText<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use symdex_core::{
-        ByteRange, ChunkKind, CodeChunk, FileFacts, Language, LineRange, content_hash, stable_id,
+        ByteRange, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot, content_hash,
+        stable_id,
     };
 
-    use crate::{IndexReport, chunk_record, chunk_texts};
+    use crate::{
+        IndexReport, WatchSnapshot, chunk_record, chunk_texts, detect_watch_changes,
+        diff_watch_snapshots, watch_snapshot,
+    };
 
     #[test]
     fn chunk_texts_skip_secret_excluded_chunks() {
@@ -576,6 +765,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn watch_snapshot_diff_coalesces_created_modified_and_deleted_paths() {
+        let previous = WatchSnapshot {
+            files: BTreeMap::from([
+                ("src/deleted.rs".to_owned(), "old-delete".to_owned()),
+                ("src/lib.rs".to_owned(), "old-lib".to_owned()),
+                ("src/unchanged.rs".to_owned(), "same".to_owned()),
+            ]),
+        };
+        let next = WatchSnapshot {
+            files: BTreeMap::from([
+                ("src/created.rs".to_owned(), "new-create".to_owned()),
+                ("src/lib.rs".to_owned(), "new-lib".to_owned()),
+                ("src/unchanged.rs".to_owned(), "same".to_owned()),
+            ]),
+        };
+
+        let changes = diff_watch_snapshots(&previous, &next);
+
+        assert_eq!(changes.created, vec!["src/created.rs"]);
+        assert_eq!(changes.modified, vec!["src/lib.rs"]);
+        assert_eq!(changes.deleted, vec!["src/deleted.rs"]);
+        assert_eq!(changes.event_count(), 3);
+        assert_eq!(
+            changes.paths(),
+            vec!["src/created.rs", "src/lib.rs", "src/deleted.rs"]
+        );
+    }
+
+    #[test]
+    fn detect_watch_changes_reports_created_and_modified_rust_files() {
+        let repo = TestRepo::new("watch-created-modified");
+        repo.write("src/lib.rs", "pub fn old() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let snapshot = watch_snapshot(&root).expect("snapshot should load");
+
+        repo.write("src/lib.rs", "pub fn new_name() {}\n");
+        repo.write("src/created.rs", "pub fn created() {}\n");
+        let (_next, changes) =
+            detect_watch_changes(&root, &snapshot).expect("changes should detect");
+
+        assert_eq!(changes.created, vec!["src/created.rs"]);
+        assert_eq!(changes.modified, vec!["src/lib.rs"]);
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn detect_watch_changes_skips_ignored_non_rust_and_unchanged_files() {
+        let repo = TestRepo::new("watch-ignored-unchanged");
+        repo.write(".gitignore", "ignored.rs\nignored_dir/\n");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let snapshot = watch_snapshot(&root).expect("snapshot should load");
+
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        repo.write("README.md", "# not indexed\n");
+        repo.write("ignored.rs", "pub fn ignored() {}\n");
+        repo.write("ignored_dir/new.rs", "pub fn ignored() {}\n");
+        let (_next, changes) =
+            detect_watch_changes(&root, &snapshot).expect("changes should detect");
+
+        assert!(changes.is_empty());
+    }
+
     fn sample_file() -> FileFacts {
         FileFacts {
             id: "file-1".to_owned(),
@@ -603,5 +856,46 @@ mod tests {
             text_hash: content_hash(name.as_bytes()),
             excluded_reason: excluded_reason.map(str::to_owned),
         }
+    }
+
+    struct TestRepo {
+        path: PathBuf,
+    }
+
+    impl TestRepo {
+        fn new(name: &str) -> Self {
+            let path = temp_path(name);
+            fs::create_dir_all(&path).expect("repo should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.path.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("parent directory should be created");
+            }
+            fs::write(path, contents).expect("test file should be written");
+        }
+    }
+
+    impl Drop for TestRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "symdex-index-{name}-{}-{nonce}",
+            std::process::id()
+        ))
     }
 }

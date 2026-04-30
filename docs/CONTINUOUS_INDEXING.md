@@ -23,7 +23,8 @@ enabled, modified or newly created eligible files are automatically reindexed.
 ## Event Handling
 
 - Watch for eligible file create and modify events under the configured
-  repository root.
+  repository root. The current implementation uses a polling watcher that
+  compares discovered file content hashes across intervals.
 - Ignore files and directories excluded by built-in excludes, `.gitignore`, and
   future `.symdexignore` rules.
 - Reject symlink escapes and paths outside the configured repository root.
@@ -66,6 +67,16 @@ enabled, modified or newly created eligible files are automatically reindexed.
   to `symdex` subprocesses.
 - The MCP server remains read-only for the MVP and must not start or stop
   continuous indexing.
+
+Current implementation status:
+
+- `symdex-index` exposes shared watch snapshot, diff, and continuous polling
+  APIs.
+- `symdex index --watch <repo>` starts the non-interactive watch loop and uses
+  the shared indexing APIs directly.
+- Continuous batches call the incremental index path so unchanged files are
+  skipped by content hash.
+- TUI toggle controls remain planned work.
 
 ## Observability
 

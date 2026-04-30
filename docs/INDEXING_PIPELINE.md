@@ -168,6 +168,11 @@ from degrading into broad table scans as repositories grow.
 Continuous indexing is a local watch mode layered on top of incremental
 indexing. It can be toggled on or off and is off by default.
 
+Current implementation uses a polling watcher: it discovers eligible Rust files
+at a fixed interval, compares path-to-content-hash snapshots, debounces detected
+changes, and runs an incremental index batch when created, modified, or deleted
+paths are found.
+
 When enabled:
 
 - watch for created and modified eligible files under the repository root
@@ -177,7 +182,8 @@ When enabled:
 - hash candidate files and skip unchanged content
 - reindex changed or new files through the same parser, chunker, symbol, call,
   secret-detection, SQLite, Ollama, and Qdrant paths as manual indexing
-- record compact index run summaries for watch-driven batches
+- record compact index run summaries for watch-driven batches when semantic
+  indexing runs
 
 Continuous indexing must not execute repository code. It must not bypass model
 or dimension checks. Offline watch mode should update SQLite structural facts
