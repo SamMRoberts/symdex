@@ -81,10 +81,11 @@ Implemented CLI commands currently include:
   semantic indexing, `x` for the storage explorer, `d` to run doctor
   diagnostics, `i` for indexing controls, `w` for the query workbench, `g` for
   the symbol/call graph browser, and `p` for the impact/context-pack viewer,
-  `Tab` / `Shift+Tab` to toggle view-local modes including storage
-  overview/index coverage/symbol outline/call resolution/embedding
-  coverage/index runs timeline/semantic neighborhood/cross-store health, `r` to
-  refresh repository/storage status, and `q` or `Esc` to quit.
+  `Tab` / `Shift+Tab` to toggle view-local modes. The storage explorer always
+  shows its own nested tab header for storage overview/index coverage/symbol
+  outline/call resolution/embedding coverage/index runs timeline/semantic
+  neighborhood/cross-store health. Use `r` to refresh repository/storage status,
+  and `q` or `Esc` to quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_impact`, `symdex_context_pack`, and `symdex_index_status`.

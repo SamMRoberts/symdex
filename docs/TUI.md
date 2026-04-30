@@ -55,6 +55,9 @@ terminal panes.
   clearer structure:
   - `Tabs` for major views: Dashboard, Index, Storage, Doctor, Query, Calls,
     Impact.
+  - Nested `Tabs` inside the Storage view for storage overview, index coverage,
+    symbol outline, call resolution, embedding coverage, index runs, semantic
+    neighborhood, and cross-store health.
   - `Block` with styled borders and titles for each focused panel.
   - `Table` for evidence lists with columns for path, line range, score,
     confidence, kind, status, and symbol.
@@ -86,6 +89,9 @@ terminal panes.
   storage, query, call graph, impact, and context-pack tables.
 - In the Storage view, row selection should drive a visible detail panel for
   the selected SQLite/Qdrant metric and nearby storage health notes.
+- In the Storage view, always show a self-contained storage tab header above
+  the active storage visualization so users can see every storage subview
+  without relying on footer help.
 - In the Storage view, `Tab` and `Shift+Tab` cycle between storage overview,
   index coverage, symbol outline, call resolution, embedding coverage, and
   index runs timeline modes, plus semantic neighborhood payload and cross-store
@@ -152,6 +158,9 @@ represent the indexed repository.
   implementation details.
 - The first implementation is a Storage tab that renders a selectable
   SQLite/Qdrant metric table plus a detail/health panel.
+- The Storage tab must always render a nested tab header for its storage
+  visualizations. The first labels may be compact for narrow terminals, such as
+  `Store`, `Files`, `Syms`, `Calls`, `Vecs`, `Runs`, `Near`, and `Health`.
 - The Storage tab also includes `Tab` / `Shift+Tab` modes for file-grouped
   index coverage, symbol outlines, call resolution, embedding coverage, and
   index runs timeline, plus semantic neighborhood payload metadata and
@@ -396,7 +405,8 @@ Current dashboard keys:
   empty, and error states.
 - `ratatui` test-backend rendering tests for key screens.
 - Rendering tests should assert semantic styling where practical: active tab,
-  selected row, success/warning/error labels, and table headers.
+  nested storage tab header, selected row, success/warning/error labels, and
+  table headers.
 - Add narrow-terminal render tests for 80x24 to ensure the richer widget layout
   remains usable without overlap.
 - CLI smoke test for `symdex tui --help` or equivalent launch path.

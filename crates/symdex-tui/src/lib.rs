@@ -1271,6 +1271,24 @@ fn render_repository_status_panel(frame: &mut ratatui::Frame<'_>, area: Rect, ap
 }
 
 fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+    let tabs = Tabs::new(StorageMode::tabs())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Storage Views"),
+        )
+        .select(app.storage.mode.tab_index())
+        .style(Style::new().fg(Color::DarkGray))
+        .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    frame.render_widget(tabs, chunks[0]);
+    render_storage_mode_panel(frame, chunks[1], app);
+}
+
+fn render_storage_mode_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     match app.storage.mode {
         StorageMode::Explorer => match &app.storage.explorer {
             StorageStatus::Completed(summary) => {
@@ -2450,10 +2468,11 @@ fn coverage_table(summary: &IndexCoverageSummary) -> Table<'_> {
     .header(table_header([
         "Path", "Chk", "Sym", "Call", "Vec", "Ex", "Status",
     ]))
-    .block(Block::default().borders(Borders::ALL).title(format!(
-        "Index Coverage | Files: {} | Tab next storage mode",
-        summary.files.len()
-    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Index Coverage | Files: {}", summary.files.len())),
+    )
     .column_spacing(1)
 }
 
@@ -2654,7 +2673,7 @@ fn outline_table(summary: &SymbolOutlineSummary) -> Table<'_> {
     )
     .header(table_header(["Symbol", "Kind", "Path", "Lines", "Kids"]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Symbol Outline | Symbols: {} | Tab next storage mode",
+        "Symbol Outline | Symbols: {}",
         summary.symbols.len()
     )))
     .column_spacing(1)
@@ -2746,7 +2765,7 @@ fn call_resolution_table(summary: &CallResolutionSummary) -> Table<'_> {
     )
     .header(table_header(["Resolution", "Conf", "Calls", "Avg"]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Call Resolution | Buckets: {} | Tab next storage mode",
+        "Call Resolution | Buckets: {}",
         summary.buckets.len()
     )))
     .column_spacing(1)
@@ -2857,10 +2876,11 @@ fn embedding_coverage_table(summary: &EmbeddingCoverageSummary) -> Table<'_> {
         ],
     )
     .header(table_header(["Metric", "Value", "Status"]))
-    .block(Block::default().borders(Borders::ALL).title(format!(
-        "Embedding Coverage | {} | Tab next storage mode",
-        summary.repository_id
-    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Embedding Coverage | {}", summary.repository_id)),
+    )
     .column_spacing(1)
 }
 
@@ -3067,7 +3087,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         "Started", "Status", "Seen", "Idx", "Emb", "Model", "Dim",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Index Runs Timeline | Runs: {} | Tab next storage mode",
+        "Index Runs Timeline | Runs: {}",
         summary.runs.len()
     )))
     .column_spacing(1)
@@ -3185,7 +3205,7 @@ fn semantic_neighborhood_table(summary: &SemanticNeighborhoodSummary) -> Table<'
         "Text Hash",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Semantic Neighborhood | Payloads: {} | Tab next storage mode",
+        "Semantic Neighborhood | Payloads: {}",
         summary.rows.len()
     )))
     .column_spacing(1)
@@ -3299,7 +3319,7 @@ fn cross_store_health_table(summary: &CrossStoreHealthSummary) -> Table<'_> {
     )
     .header(table_header(["Check", "Status", "Detail"]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Cross-Store Health | Checks: {} | Tab next storage mode",
+        "Cross-Store Health | Checks: {}",
         summary.rows.len()
     )))
     .column_spacing(1)
@@ -3814,7 +3834,7 @@ impl View {
                 "i index | x storage | d doctor | w query | g calls | p impact | o offline | s semantic | r refresh | q quit"
             }
             Self::Storage => {
-                "Tab/Shift+Tab mode | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
+                "Tab/Shift+Tab storage tabs | Up/Down select | i index | d doctor | w query | g calls | p impact | r refresh | q quit"
             }
             Self::Diagnostics => {
                 "Up/Down select | Enter details | d rerun | i index | x storage | w query | g calls | p impact | q quit"
@@ -3916,6 +3936,25 @@ enum StorageMode {
 }
 
 impl StorageMode {
+    fn tabs() -> [&'static str; 8] {
+        [
+            "Store", "Files", "Syms", "Calls", "Vecs", "Runs", "Near", "Health",
+        ]
+    }
+
+    fn tab_index(self) -> usize {
+        match self {
+            Self::Explorer => 0,
+            Self::Coverage => 1,
+            Self::Outline => 2,
+            Self::Calls => 3,
+            Self::Embeddings => 4,
+            Self::Runs => 5,
+            Self::Neighborhood => 6,
+            Self::Health => 7,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Explorer => "storage overview",
@@ -4383,13 +4422,19 @@ mod tests {
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
-        let backend = TestBackend::new(140, 24);
+        let backend = TestBackend::new(140, 30);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
         render(&mut terminal, &app).expect("render should succeed");
 
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Storage Views"));
+        assert!(rendered.contains("Store"));
+        assert!(rendered.contains("Files"));
+        assert!(rendered.contains("Syms"));
+        assert!(rendered.contains("Vecs"));
+        assert!(rendered.contains("Near"));
         assert!(rendered.contains("Storage Explorer"));
         assert!(rendered.contains("SQLite"));
         assert!(rendered.contains("Qdrant"));
@@ -4401,6 +4446,7 @@ mod tests {
             cell_fg_for_text(buffer, "missing-vector", None),
             Some(Color::Yellow)
         );
+        assert_eq!(cell_fg_for_text(buffer, "Store", None), Some(Color::Cyan));
     }
 
     #[test]
@@ -4643,7 +4689,7 @@ mod tests {
             sample_cross_store_health_summary(),
         );
         app.storage.mode = StorageMode::Coverage;
-        let backend = TestBackend::new(150, 24);
+        let backend = TestBackend::new(150, 32);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
         render(&mut terminal, &app).expect("render should succeed");
