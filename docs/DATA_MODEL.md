@@ -88,6 +88,10 @@ CREATE TABLE chunks (
 );
 ```
 
+`excluded_reason` is set when a chunk is kept as metadata but withheld from
+embedding. Chunks with an exclusion reason do not get a Qdrant point ID in the
+current implementation.
+
 ### `calls`
 
 ```sql

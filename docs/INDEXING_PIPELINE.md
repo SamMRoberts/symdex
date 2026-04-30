@@ -61,6 +61,12 @@ a file fallback chunk only when no function-like chunks exist. Files with
 tree-sitter syntax errors currently fail closed instead of producing partial
 chunks.
 
+Current implementation also scans each chunk for likely sensitive material
+before embedding. Private key markers, credential-looking assignments, token
+prefixes, and credentialed database connection strings set `excluded_reason` on
+the chunk. Excluded chunks are persisted to SQLite as metadata, but are not sent
+to Ollama and do not get Qdrant point IDs.
+
 ## Embeddings
 
 Use Ollama with `nomic-embed-text`.

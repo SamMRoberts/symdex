@@ -44,6 +44,12 @@ If a chunk is sensitive:
 - set `excluded_reason`
 - avoid returning snippets
 
+Current implementation uses conservative local heuristics for private key
+markers, credential-looking assignments, token prefixes, and credentialed
+database connection strings. These rules are intentionally broad enough to
+avoid embedding likely secrets, but they are not a substitute for a complete
+secret scanner.
+
 ## MCP-specific risks
 
 MCP tool inputs are untrusted. Validate every field.

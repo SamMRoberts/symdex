@@ -6,6 +6,7 @@ mod hash;
 mod model;
 mod parser;
 mod path;
+mod secrets;
 
 pub use discovery::{DiscoveredFile, DiscoveryOptions, discover_rust_files};
 pub use error::{CoreError, Result};
@@ -16,3 +17,4 @@ pub use model::{
 };
 pub use parser::{extract_rust_chunks, index_rust_file};
 pub use path::{NormalizedRepoPath, RepoRoot};
+pub use secrets::secret_exclusion_reason;

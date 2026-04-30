@@ -385,6 +385,11 @@ fn collect_index_reports(
 
 fn print_index_reports(reports: &[IndexReport]) {
     let chunks_seen: usize = reports.iter().map(|report| report.chunks.len()).sum();
+    let chunks_excluded_from_embedding: usize = reports
+        .iter()
+        .flat_map(|report| report.chunks.iter())
+        .filter(|chunk| chunk.excluded_reason.is_some())
+        .count();
     for report in reports.iter().take(20) {
         println!(
             "{} {} {} chunks={}",
@@ -395,11 +400,12 @@ fn print_index_reports(reports: &[IndexReport]) {
         );
         for chunk in report.chunks.iter().take(5) {
             println!(
-                "  chunk {} lines={}-{} symbol={}",
+                "  chunk {} lines={}-{} symbol={} excluded={}",
                 chunk.kind.as_str(),
                 chunk.line_range.start,
                 chunk.line_range.end,
-                chunk.symbol_name.as_deref().unwrap_or("<none>")
+                chunk.symbol_name.as_deref().unwrap_or("<none>"),
+                chunk.excluded_reason.as_deref().unwrap_or("<none>")
             );
         }
     }
@@ -407,17 +413,22 @@ fn print_index_reports(reports: &[IndexReport]) {
         println!("... {} more files", reports.len() - 20);
     }
     println!("chunks_seen: {chunks_seen}");
+    println!("chunks_excluded_from_embedding: {chunks_excluded_from_embedding}");
 }
 
 fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
     reports
         .iter()
         .flat_map(|report| {
-            report.chunks.iter().map(|chunk| ChunkText {
-                file: &report.file,
-                chunk,
-                text: report.source[chunk.byte_range.start..chunk.byte_range.end].to_owned(),
-            })
+            report
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.excluded_reason.is_none())
+                .map(|chunk| ChunkText {
+                    file: &report.file,
+                    chunk,
+                    text: report.source[chunk.byte_range.start..chunk.byte_range.end].to_owned(),
+                })
         })
         .collect()
 }
@@ -499,8 +510,12 @@ fn chunk_record(chunk: &CodeChunk) -> Result<ChunkRecord, String> {
         end_line: chunk.line_range.end,
         start_byte: chunk.byte_range.start,
         end_byte: chunk.byte_range.end,
-        qdrant_point_id: Some(qdrant_point_id(&chunk.id).map_err(|error| error.to_string())?),
-        excluded_reason: None,
+        qdrant_point_id: if chunk.excluded_reason.is_none() {
+            Some(qdrant_point_id(&chunk.id).map_err(|error| error.to_string())?)
+        } else {
+            None
+        },
+        excluded_reason: chunk.excluded_reason.clone(),
     })
 }
 
@@ -639,4 +654,71 @@ fn print_help() {
         "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use symdex_core::{
+        ByteRange, ChunkKind, CodeChunk, FileFacts, Language, LineRange, content_hash, stable_id,
+    };
+
+    use crate::{IndexReport, chunk_record, chunk_texts};
+
+    #[test]
+    fn chunk_texts_skip_secret_excluded_chunks() {
+        let file = sample_file();
+        let source = "pub fn public() {}\npub fn secret() {}\n".to_owned();
+        let public = sample_chunk("public", 0, 18, None);
+        let secret = sample_chunk("secret", 18, source.len(), Some("likely_access_token"));
+        let report = IndexReport {
+            file: file.clone(),
+            chunks: vec![public.clone(), secret.clone()],
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            source,
+        };
+
+        let reports = [report];
+        let chunks = chunk_texts(&reports);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk.id, public.id);
+        let public_record = chunk_record(&public).expect("public record");
+        let secret_record = chunk_record(&secret).expect("secret record");
+        assert!(public_record.qdrant_point_id.is_some());
+        assert!(secret_record.qdrant_point_id.is_none());
+        assert_eq!(
+            secret_record.excluded_reason.as_deref(),
+            Some("likely_access_token")
+        );
+    }
+
+    fn sample_file() -> FileFacts {
+        FileFacts {
+            id: "file-1".to_owned(),
+            relative_path: "src/lib.rs".to_owned(),
+            language: Language::Rust,
+            content_hash: "hash".to_owned(),
+        }
+    }
+
+    fn sample_chunk(
+        name: &str,
+        start_byte: usize,
+        end_byte: usize,
+        excluded_reason: Option<&str>,
+    ) -> CodeChunk {
+        CodeChunk {
+            id: stable_id(&["chunk", name]),
+            file_id: "file-1".to_owned(),
+            relative_path: "src/lib.rs".to_owned(),
+            symbol_id: None,
+            symbol_name: Some(name.to_owned()),
+            kind: ChunkKind::Function,
+            byte_range: ByteRange::new(start_byte, end_byte),
+            line_range: LineRange::new(1, 1),
+            text_hash: content_hash(name.as_bytes()),
+            excluded_reason: excluded_reason.map(str::to_owned),
+        }
+    }
 }

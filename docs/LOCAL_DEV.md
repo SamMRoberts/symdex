@@ -55,7 +55,9 @@ Implemented CLI commands currently include:
   function and method chunks, embeds chunk text with local Ollama, creates the
   Qdrant collection if needed, and upserts semantic vectors. Use
   `index --offline <repo>` for SQLite-backed discovery and chunking without
-  service calls; unchanged files are skipped by content hash.
+  service calls; unchanged files are skipped by content hash. Chunks flagged as
+  likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
+  metadata, and omitted from Ollama/Qdrant embedding.
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
   name and returns path and line ranges.

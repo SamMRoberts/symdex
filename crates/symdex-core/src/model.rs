@@ -77,6 +77,7 @@ pub struct CodeChunk {
     pub byte_range: ByteRange,
     pub line_range: LineRange,
     pub text_hash: String,
+    pub excluded_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2,7 +2,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::{
     ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, FileFacts, LineRange, ResolutionStatus,
-    Result, RustFileIndex, Symbol, SymbolKind, content_hash, stable_id,
+    Result, RustFileIndex, Symbol, SymbolKind, content_hash, secret_exclusion_reason, stable_id,
 };
 
 pub fn extract_rust_chunks(file: &FileFacts, source: &str) -> Result<Vec<CodeChunk>> {
@@ -109,6 +109,7 @@ fn function_facts(node: Node<'_>, file: &FileFacts, source: &str) -> (CodeChunk,
 
 fn file_fallback_chunk(file: &FileFacts, source: &str) -> CodeChunk {
     let text_hash = content_hash(source.as_bytes());
+    let excluded_reason = secret_exclusion_reason(&file.relative_path, source).map(str::to_owned);
     let end_line = source.lines().count().max(1);
     CodeChunk {
         id: stable_id(&[
@@ -126,6 +127,7 @@ fn file_fallback_chunk(file: &FileFacts, source: &str) -> CodeChunk {
         byte_range: ByteRange::new(0, source.len()),
         line_range: LineRange::new(1, end_line),
         text_hash,
+        excluded_reason,
     }
 }
 
@@ -139,7 +141,9 @@ fn chunk_for_node(
 ) -> CodeChunk {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
-    let text_hash = content_hash(&source.as_bytes()[start_byte..end_byte]);
+    let text = &source[start_byte..end_byte];
+    let text_hash = content_hash(text.as_bytes());
+    let excluded_reason = secret_exclusion_reason(&file.relative_path, text).map(str::to_owned);
     CodeChunk {
         id: stable_id(&[
             &file.id,
@@ -156,6 +160,7 @@ fn chunk_for_node(
         byte_range: ByteRange::new(start_byte, end_byte),
         line_range: LineRange::new(node.start_position().row + 1, node.end_position().row + 1),
         text_hash,
+        excluded_reason,
     }
 }
 
@@ -424,6 +429,20 @@ impl Counter {
 
         assert_eq!(first[0].id, second[0].id);
         assert_eq!(first[0].symbol_id, second[0].symbol_id);
+    }
+
+    #[test]
+    fn marks_sensitive_chunks_as_excluded_from_embedding() {
+        let source =
+            "pub fn token() {\n    let api_key = \"abcdefghijklmnopqrstuvwxyz123456\";\n}\n";
+
+        let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].excluded_reason.as_deref(),
+            Some("likely_credential_assignment")
+        );
     }
 
     #[test]
