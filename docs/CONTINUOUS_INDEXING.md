@@ -78,7 +78,8 @@ Current implementation status:
   skipped by content hash.
 - The TUI Indexing view exposes a `c` toggle with first-enable confirmation,
   explicit `on` / `off` labels, pending debounce state, queued event count,
-  last reindexed file, and latest error display.
+  last reindexed file, latest error display, and an animated activity indicator
+  while continuous indexing is on.
 
 ## Observability
 

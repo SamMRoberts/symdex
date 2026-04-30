@@ -107,7 +107,8 @@ footer rendering for shortcut hints plus status messages, 80x24 narrow-terminal
 rendering, bracket-based primary tab navigation with letter-key text input,
 the indexing confirmation reducer, and continuous-indexing reducer and render
 coverage for toggle confirmation, stopping an active watcher, on/off labels,
-pending debounce, queued event count, latest reindexed file, and watch errors.
+pending debounce, queued event count, latest reindexed file, watch errors, and
+the animated continuous-indexing activity indicator.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

@@ -72,6 +72,7 @@ pub struct App {
     screen: Screen,
     last_index_summary: Option<IndexSummary>,
     index_progress: Option<IndexProgress>,
+    animation_tick: usize,
     continuous: ContinuousIndexState,
     diagnostics: DiagnosticsState,
     diagnostics_selection: usize,
@@ -139,6 +140,7 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             index_progress: None,
+            animation_tick: 0,
             continuous: ContinuousIndexState::default(),
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
@@ -197,6 +199,7 @@ impl App {
             screen: Screen::Dashboard,
             last_index_summary: None,
             index_progress: None,
+            animation_tick: 0,
             continuous: ContinuousIndexState::default(),
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
@@ -238,17 +241,22 @@ impl App {
                 ),
                 Span::raw("press s"),
             ]),
-            Line::from(vec![
-                Span::styled(
+            Line::from({
+                let mut spans = vec![Span::styled(
                     "Continuous index: ",
                     Style::new().add_modifier(Modifier::BOLD),
-                ),
-                status_span(
+                )];
+                if let Some(indicator) = self.continuous_activity_span() {
+                    spans.push(indicator);
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(status_span(
                     self.continuous.status_label(),
                     self.continuous.status_tone(),
-                ),
-                Span::raw(" press c"),
-            ]),
+                ));
+                spans.push(Span::raw(" press c"));
+                spans
+            }),
             Line::from(vec![
                 Span::styled(
                     "Refresh status: ",
@@ -736,6 +744,22 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    fn tick_animation(&mut self) {
+        if self.continuous.is_on() {
+            self.animation_tick = self.animation_tick.wrapping_add(1);
+        }
+    }
+
+    fn continuous_activity_span(&self) -> Option<Span<'static>> {
+        if !self.continuous.is_on() {
+            return None;
+        }
+        Some(Span::styled(
+            format!("[{}]", continuous_activity_frame(self.animation_tick)),
+            tone_style(self.continuous.status_tone()).add_modifier(Modifier::BOLD),
+        ))
     }
 
     fn select_primary_tab(&mut self, reverse: bool) {
@@ -1354,17 +1378,30 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
 
             render_right_panel(frame, body_chunks[1], app);
 
+            let mut status_line = Vec::new();
+            if let Some(indicator) = app.continuous_activity_span() {
+                status_line.push(Span::styled(
+                    "ci ",
+                    Style::new()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                status_line.push(indicator);
+                status_line.push(Span::raw(" "));
+            }
+            status_line.extend([
+                status_span(app.view.footer_label(), StatusTone::Info),
+                Span::raw(" "),
+                Span::styled("status: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(app.message.as_str()),
+            ]);
+
             let footer = Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled("keys: ", Style::new().add_modifier(Modifier::BOLD)),
                     Span::raw(app.view.footer_help()),
                 ]),
-                Line::from(vec![
-                    status_span(app.view.footer_label(), StatusTone::Info),
-                    Span::raw(" "),
-                    Span::styled("status: ", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(app.message.as_str()),
-                ]),
+                Line::from(status_line),
             ])
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("Status"));
@@ -1772,6 +1809,7 @@ fn render_selectable_table(
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), String> {
     let mut app = app;
     loop {
+        app.tick_animation();
         app.poll_index_job();
         app.poll_continuous_index();
         app.poll_diagnostics();
@@ -4455,6 +4493,10 @@ impl Default for ContinuousIndexState {
 }
 
 impl ContinuousIndexState {
+    fn is_on(&self) -> bool {
+        self.enabled && !matches!(self.status, ContinuousIndexStatus::Off)
+    }
+
     fn status_label(&self) -> &'static str {
         self.status.label()
     }
@@ -4473,6 +4515,11 @@ impl ContinuousIndexState {
             self.latest_error.as_deref().unwrap_or("<none>")
         )
     }
+}
+
+fn continuous_activity_frame(tick: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+    FRAMES[tick % FRAMES.len()]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4612,7 +4659,7 @@ mod tests {
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
         GraphStatus, IndexMode, QueryStatus, Screen, StorageExplorerState, StorageMode, UiAction,
-        View, progress_percent, reduce_screen, render,
+        View, continuous_activity_frame, progress_percent, reduce_screen, render,
     };
 
     #[test]
@@ -5775,6 +5822,7 @@ mod tests {
     #[test]
     fn renders_continuous_indexing_status() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.animation_tick = 2;
         app.continuous.enabled = true;
         app.continuous.status = ContinuousIndexStatus::Pending;
         app.continuous.files_seen = 3;
@@ -5789,6 +5837,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Continuous index"));
+        assert!(rendered.contains("[|]"));
+        assert!(rendered.contains("ci"));
         assert!(rendered.contains("pending"));
         assert!(rendered.contains("queued=2"));
         assert!(rendered.contains("src/lib.rs"));
@@ -5797,6 +5847,22 @@ mod tests {
             cell_fg_for_text(buffer, "pending", None),
             Some(Color::Yellow)
         );
+    }
+
+    #[test]
+    fn continuous_indexing_animation_advances_only_when_on() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+
+        app.tick_animation();
+        assert_eq!(app.animation_tick, 0);
+
+        app.continuous.enabled = true;
+        app.continuous.status = ContinuousIndexStatus::Watching;
+        app.tick_animation();
+        app.tick_animation();
+
+        assert_eq!(app.animation_tick, 2);
+        assert_eq!(continuous_activity_frame(app.animation_tick), "|");
     }
 
     #[test]

@@ -298,6 +298,8 @@ represent the indexed repository.
 - Show running, completed, failed, and cancelled states.
 - Show continuous indexing state with explicit `on` / `off` labels, pending
   debounce state, last reindexed file, queued event count, and latest error.
+- When continuous indexing is on, show an animated ratatui-rendered activity
+  indicator in the Indexing controls and the global footer status row.
 - Show final counts for files, chunks, symbols, calls, excluded chunks, and
   embedding status.
 - Use a confirmation panel styled as a warning state.
