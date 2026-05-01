@@ -109,8 +109,34 @@ pub struct CallPathSummary {
 pub struct ImpactSummary {
     pub repository_id: String,
     pub query: String,
-    pub direct_callers: Vec<CallSearchRow>,
-    pub direct_callees: Vec<CallSearchRow>,
+    pub max_depth: usize,
+    pub direct_callers: Vec<ImpactCallEvidence>,
+    pub direct_callees: Vec<ImpactCallEvidence>,
+    pub transitive_callers: Vec<ImpactPathEvidence>,
+    pub transitive_callees: Vec<ImpactPathEvidence>,
+    pub related_files: Vec<ImpactRelatedFile>,
+    pub tests_likely: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpactCallEvidence {
+    pub row: CallSearchRow,
+    pub freshness: EvidenceFreshness,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpactPathEvidence {
+    pub path: CallPath,
+    pub edge_freshness: Vec<EvidenceFreshness>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpactRelatedFile {
+    pub path: String,
+    pub relationship_count: usize,
+    pub freshness: EvidenceFreshness,
+    pub provenance: Option<EvidenceProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,18 +246,46 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
+    let current_hashes = current_hashes(&root)?;
+    let max_depth = 4;
     let direct_callers = sqlite
         .callers(root.id(), query)
+        .map(|rows| impact_call_evidence(rows, &current_hashes))
         .map_err(|error| error.to_string())?;
     let direct_callees = sqlite
         .callees(root.id(), query)
+        .map(|rows| impact_call_evidence(rows, &current_hashes))
         .map_err(|error| error.to_string())?;
+    let transitive_callers = sqlite
+        .transitive_call_paths_to(root.id(), query, max_depth)
+        .map(|paths| impact_path_evidence(paths, &current_hashes))
+        .map_err(|error| error.to_string())?;
+    let transitive_callees = sqlite
+        .transitive_call_paths_from(root.id(), query, max_depth)
+        .map(|paths| impact_path_evidence(paths, &current_hashes))
+        .map_err(|error| error.to_string())?;
+    let related_files = impact_related_files(
+        &direct_callers,
+        &direct_callees,
+        &transitive_callers,
+        &transitive_callees,
+        &current_hashes,
+    );
 
     Ok(ImpactSummary {
         repository_id: root.id().to_owned(),
         query: query.to_owned(),
+        max_depth,
         direct_callers,
         direct_callees,
+        transitive_callers,
+        transitive_callees,
+        related_files,
+        tests_likely: Vec::new(),
+        notes: vec![
+            "metadata_only_no_source_text".to_owned(),
+            "likely_tests_unavailable_until_test_discovery_mapping_is_indexed".to_owned(),
+        ],
     })
 }
 
@@ -422,6 +476,110 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
     let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     Ok(sqlite)
+}
+
+fn current_hashes(root: &RepoRoot) -> Result<BTreeMap<String, String>, String> {
+    discover_rust_files(root, &DiscoveryOptions::default())
+        .map_err(|error| error.to_string())
+        .map(|files| {
+            files
+                .into_iter()
+                .map(|file| (file.facts.relative_path, file.facts.content_hash))
+                .collect()
+        })
+}
+
+fn freshness_for_provenance(
+    path: Option<&str>,
+    provenance: &EvidenceProvenance,
+    current_hashes: &BTreeMap<String, String>,
+) -> EvidenceFreshness {
+    let current = path.and_then(|path| current_hashes.get(path).map(String::as_str));
+    freshness_for_hash(provenance.content_hash.as_deref(), current)
+}
+
+fn impact_call_evidence(
+    rows: Vec<CallSearchRow>,
+    current_hashes: &BTreeMap<String, String>,
+) -> Vec<ImpactCallEvidence> {
+    rows.into_iter()
+        .map(|row| {
+            let freshness =
+                freshness_for_provenance(row.path.as_deref(), &row.provenance, current_hashes);
+            ImpactCallEvidence { row, freshness }
+        })
+        .collect()
+}
+
+fn impact_path_evidence(
+    paths: Vec<CallPath>,
+    current_hashes: &BTreeMap<String, String>,
+) -> Vec<ImpactPathEvidence> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let edge_freshness = path
+                .edges
+                .iter()
+                .map(|edge| {
+                    freshness_for_provenance(
+                        Some(edge.caller_path.as_str()),
+                        &edge.provenance,
+                        current_hashes,
+                    )
+                })
+                .collect();
+            ImpactPathEvidence {
+                path,
+                edge_freshness,
+            }
+        })
+        .collect()
+}
+
+fn impact_related_files(
+    direct_callers: &[ImpactCallEvidence],
+    direct_callees: &[ImpactCallEvidence],
+    transitive_callers: &[ImpactPathEvidence],
+    transitive_callees: &[ImpactPathEvidence],
+    current_hashes: &BTreeMap<String, String>,
+) -> Vec<ImpactRelatedFile> {
+    let mut files = BTreeMap::<String, (usize, Option<EvidenceProvenance>)>::new();
+    for evidence in direct_callers.iter().chain(direct_callees.iter()) {
+        if let Some(path) = &evidence.row.path {
+            let entry = files.entry(path.clone()).or_insert((0, None));
+            entry.0 += 1;
+            entry
+                .1
+                .get_or_insert_with(|| evidence.row.provenance.clone());
+        }
+    }
+    for path_evidence in transitive_callers.iter().chain(transitive_callees.iter()) {
+        for edge in &path_evidence.path.edges {
+            let caller = files.entry(edge.caller_path.clone()).or_insert((0, None));
+            caller.0 += 1;
+            caller.1.get_or_insert_with(|| edge.provenance.clone());
+            if let Some(callee_path) = &edge.callee_path {
+                let callee = files.entry(callee_path.clone()).or_insert((0, None));
+                callee.0 += 1;
+                callee.1.get_or_insert_with(|| edge.provenance.clone());
+            }
+        }
+    }
+    files
+        .into_iter()
+        .map(|(path, (relationship_count, provenance))| {
+            let freshness = provenance.as_ref().map_or(EvidenceFreshness::Unknown, |p| {
+                freshness_for_provenance(Some(path.as_str()), p, current_hashes)
+            });
+            ImpactRelatedFile {
+                path,
+                relationship_count,
+                freshness,
+                provenance,
+            }
+        })
+        .collect()
 }
 
 fn freshness_rows(

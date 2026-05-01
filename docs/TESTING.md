@@ -96,7 +96,7 @@ cargo run -p symdex-cli -- tui --help
 
 Current TUI tests cover dashboard rendering, doctor diagnostics rendering, query
 workbench rendering and input state, symbol/call graph rendering and input
-state, impact/context-pack rendering and input state, the storage explorer
+state, impact/call-path/context-pack rendering and input state, the storage explorer
 metric table, always-visible nested storage tab header, and detail panel,
 index coverage table and selected-file detail panel with chunk, symbol, and
 call metadata, symbol outline table and
@@ -117,9 +117,8 @@ aggregation over indexed and current file sets, returned symbol/call provenance,
 and the TUI evidence freshness panel.
 
 Current call path tests cover deterministic path order, unresolved terminal
-edges matched by callee text, cycle avoidance, and depth limits. Ambiguous edge
-coverage remains to be added before the Phase 12 traversal test item is fully
-complete.
+edges matched by callee text, ambiguous terminal edges matched by callee text,
+cycle avoidance, depth limits, and deterministic transitive impact paths.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

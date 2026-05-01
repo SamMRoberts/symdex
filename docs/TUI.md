@@ -112,7 +112,7 @@ terminal panes.
 - Style loading/running states distinctly from idle states.
 - Style empty states as deliberate placeholders, not blank panels.
 - Style failed states with a short red status line plus the error text.
-- Show selected query mode, graph direction, and impact/context mode as tabs or
+- Show selected query mode, graph direction, and impact/call-path/context mode as tabs or
   segmented controls rather than only inline prose.
 
 ### Accessibility and Terminal Compatibility
@@ -361,10 +361,14 @@ represent the indexed repository.
 - Use a table for symbol, path, line range, confidence, callee text, and
   resolution status.
 
-### Impact and Context Pack Viewer
+### Impact, Call Path, and Context Pack Viewer
 
-- Show the basic impact view using direct callers and callees from the Impact
-  tab with typed symbol text, `Tab` / `Shift+Tab`, and `Enter`.
+- Show impact using direct callers/callees, bounded transitive path counts,
+  freshness labels, and related-file metadata from the Impact tab with typed
+  symbol text, `Tab` / `Shift+Tab`, and `Enter`.
+- Show call path tracing from the same tab with typed `source -> target` input.
+  Render paths as rows with path number, hop number, edge, confidence, file,
+  call line, and resolution status.
 - Show `symdex.context_pack.v1` metadata with the same viewer controls.
 - Do not include source text by default.
 - Render impact sections as separate panels or tables for direct callers and
@@ -400,19 +404,19 @@ Current dashboard keys:
   neighborhood, and cross-store health in the storage explorer
 - `Tab` / `Shift+Tab`: toggle symbol and semantic query modes in the query workbench
 - `Tab` / `Shift+Tab`: toggle callers and callees in the symbol/call graph browser
-- `Tab` / `Shift+Tab`: toggle impact and context-pack modes in the impact/context-pack viewer
+- `Tab` / `Shift+Tab`: toggle impact, call-path, and context-pack modes in the impact/call-path/context-pack viewer
 - `Up` / `Down`: move the selected row in completed result and storage tables
 - `Enter`: start Doctor diagnostics when the Doctor tab has no result rows
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
-- typed text: edit the impact/context-pack viewer input
+- typed text: edit the impact/call-path/context-pack viewer input
 - `Backspace`: edit the query workbench input
 - `Backspace`: edit the symbol/call graph browser input
-- `Backspace`: edit the impact/context-pack viewer input
+- `Backspace`: edit the impact/call-path/context-pack viewer input
 - `Enter`: run the current query workbench query
 - `Enter`: run the current symbol/call graph lookup
-- `Enter`: run the current impact/context-pack lookup
+- `Enter`: run the current impact/call-path/context-pack lookup
 - `r`: refresh repository and storage status
 - `y`: confirm a pending indexing job
 - `n` or `Esc`: cancel a pending indexing job or continuous-indexing toggle

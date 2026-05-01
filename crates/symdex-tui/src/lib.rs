@@ -27,11 +27,12 @@ use symdex_index::{
     IndexSummary, run_continuous_index_until, run_index_with_progress,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, FreshnessSummary, ImpactSummary, QueryMode, QueryResult,
-    SemanticSearchSummary, SymbolSearchSummary, run_call_graph, run_call_resolution,
-    run_context_pack, run_cross_store_health, run_embedding_coverage, run_freshness_report,
-    run_impact, run_index_coverage, run_index_runs_timeline, run_semantic_neighborhood,
-    run_semantic_search, run_storage_explorer, run_symbol_outline, run_symbol_search,
+    CallDirection, CallGraphSummary, CallPathSummary, FreshnessSummary, ImpactSummary, QueryMode,
+    QueryResult, SemanticSearchSummary, SymbolSearchSummary, run_call_graph, run_call_path,
+    run_call_resolution, run_context_pack, run_cross_store_health, run_embedding_coverage,
+    run_freshness_report, run_impact, run_index_coverage, run_index_runs_timeline,
+    run_semantic_neighborhood, run_semantic_search, run_storage_explorer, run_symbol_outline,
+    run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
@@ -485,9 +486,9 @@ impl App {
                 Span::raw(format!("{} (Tab toggles)", self.evidence.mode.label())),
             ]),
             Line::from(vec![
-                Span::styled("Symbol: ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::styled("Input: ", Style::new().add_modifier(Modifier::BOLD)),
                 Span::raw(if self.evidence.input.is_empty() {
-                    "<type symbol name>".to_owned()
+                    "<type symbol or source -> target>".to_owned()
                 } else {
                     self.evidence.input.clone()
                 }),
@@ -502,7 +503,7 @@ impl App {
             EvidenceStatus::Idle => {
                 lines.push(Line::from(vec![
                     status_span("idle", StatusTone::Dim),
-                    Span::raw(" No impact or context-pack lookup has run."),
+                    Span::raw(" No impact, call-path, or context-pack lookup has run."),
                 ]));
             }
             EvidenceStatus::Running => {
@@ -1097,6 +1098,9 @@ impl App {
         thread::spawn(move || {
             let result = match mode {
                 EvidenceMode::Impact => run_impact(&repo, &query).map(EvidenceResult::Impact),
+                EvidenceMode::CallPath => parse_call_path_input(&query)
+                    .and_then(|(source, target)| run_call_path(&repo, &source, &target, 4))
+                    .map(EvidenceResult::CallPath),
                 EvidenceMode::ContextPack => {
                     run_context_pack(&repo, &query, 8).map(EvidenceResult::ContextPack)
                 }
@@ -1487,6 +1491,15 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     impact_result_count(summary),
                 );
             }
+            EvidenceStatus::Completed(EvidenceResult::CallPath(summary)) => {
+                render_selectable_table(
+                    frame,
+                    area,
+                    call_path_table(summary),
+                    app.evidence.selection,
+                    call_path_result_count(summary),
+                );
+            }
             EvidenceStatus::Completed(EvidenceResult::ContextPack(pack)) => {
                 render_selectable_table(
                     frame,
@@ -1496,7 +1509,12 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     context_pack_row_count(pack),
                 );
             }
-            _ => render_line_panel(frame, area, "Impact/Context Pack", app.evidence_lines()),
+            _ => render_line_panel(
+                frame,
+                area,
+                "Impact/Call Path/Context Pack",
+                app.evidence_lines(),
+            ),
         },
         View::Indexing => render_index_panel(frame, area, app),
     }
@@ -2371,6 +2389,7 @@ fn call_graph_lines(summary: &CallGraphSummary) -> Vec<Line<'_>> {
 fn evidence_result_lines(result: &EvidenceResult) -> Vec<Line<'_>> {
     match result {
         EvidenceResult::Impact(summary) => impact_lines(summary),
+        EvidenceResult::CallPath(summary) => call_path_lines(summary),
         EvidenceResult::ContextPack(pack) => context_pack_lines(pack),
     }
 }
@@ -2380,16 +2399,77 @@ fn impact_lines(summary: &ImpactSummary) -> Vec<Line<'_>> {
         Line::from(format!("Impact query: {}", summary.query)),
         Line::from(format!("Direct callers: {}", summary.direct_callers.len())),
     ];
-    lines.extend(summary.direct_callers.iter().take(5).map(compact_call_line));
+    lines.extend(
+        summary
+            .direct_callers
+            .iter()
+            .take(5)
+            .map(|evidence| compact_call_line(&evidence.row)),
+    );
     lines.push(Line::from(format!(
         "Direct callees: {}",
         summary.direct_callees.len()
     )));
-    lines.extend(summary.direct_callees.iter().take(5).map(compact_call_line));
+    lines.extend(
+        summary
+            .direct_callees
+            .iter()
+            .take(5)
+            .map(|evidence| compact_call_line(&evidence.row)),
+    );
+    lines.push(Line::from(format!(
+        "Transitive callers: {} Transitive callees: {} Related files: {}",
+        summary.transitive_callers.len(),
+        summary.transitive_callees.len(),
+        summary.related_files.len()
+    )));
     if summary.direct_callers.is_empty() && summary.direct_callees.is_empty() {
         lines.push(Line::from("No direct impact relationships matched."));
     }
     lines
+}
+
+fn call_path_lines(summary: &CallPathSummary) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(format!("Call path source: {}", summary.source_query)),
+        Line::from(format!("Target: {}", summary.target_query)),
+        Line::from(format!(
+            "Paths: {} max_depth: {}",
+            summary.paths.len(),
+            summary.max_depth
+        )),
+    ];
+    for path in summary.paths.iter().take(4) {
+        lines.push(Line::from(format!(
+            "hops={} min_confidence={:.2} terminal_status={}",
+            path.hops, path.min_confidence, path.terminal_resolution_status
+        )));
+    }
+    if summary.paths.is_empty() {
+        lines.push(Line::from("No bounded call paths matched."));
+    }
+    lines
+}
+
+fn parse_call_path_input(input: &str) -> Result<(String, String), String> {
+    if let Some((source, target)) = input.split_once("->") {
+        let source = source.trim();
+        let target = target.trim();
+        if !source.is_empty() && !target.is_empty() {
+            return Ok((source.to_owned(), target.to_owned()));
+        }
+    }
+    let mut parts = input.split_whitespace();
+    let Some(source) = parts.next() else {
+        return Err("call path requires source and target".to_owned());
+    };
+    let Some(target) = parts.next() else {
+        return Err("call path requires source and target".to_owned());
+    };
+    if parts.next().is_some() {
+        return Err("call path input must be 'source -> target'".to_owned());
+    }
+    Ok((source.to_owned(), target.to_owned()))
 }
 
 fn context_pack_lines(pack: &ContextPack) -> Vec<Line<'_>> {
@@ -3972,21 +4052,22 @@ fn impact_table(summary: &ImpactSummary) -> Table<'_> {
         .direct_callers
         .iter()
         .take(6)
-        .map(|row| impact_row("caller", row));
+        .map(|evidence| impact_row("caller", evidence));
     let callee_rows = summary
         .direct_callees
         .iter()
         .take(6)
-        .map(|row| impact_row("callee", row));
+        .map(|evidence| impact_row("callee", evidence));
     Table::new(
         caller_rows.chain(callee_rows),
         [
             Constraint::Length(8),
-            Constraint::Percentage(28),
-            Constraint::Length(8),
             Constraint::Percentage(24),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Percentage(22),
             Constraint::Length(12),
-            Constraint::Percentage(18),
+            Constraint::Percentage(15),
             Constraint::Length(16),
         ],
     )
@@ -3994,16 +4075,77 @@ fn impact_table(summary: &ImpactSummary) -> Table<'_> {
         "Edge",
         "Symbol",
         "Conf",
+        "Fresh",
         "Path",
         "Lines",
         "Callee",
         "Resolution",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Impact/Context Pack | Impact query: {} | Direct callers: {} | Direct callees: {}",
+        "Impact/Call Path/Context Pack | Impact query: {} | Direct callers: {} | Direct callees: {} | Paths: {}",
         summary.query,
         summary.direct_callers.len(),
-        summary.direct_callees.len()
+        summary.direct_callees.len(),
+        summary.transitive_callers.len() + summary.transitive_callees.len()
+    )))
+    .column_spacing(1)
+}
+
+fn call_path_table(summary: &CallPathSummary) -> Table<'_> {
+    let rows = summary
+        .paths
+        .iter()
+        .take(6)
+        .enumerate()
+        .flat_map(|(path_index, path)| {
+            path.edges
+                .iter()
+                .enumerate()
+                .map(move |(edge_index, edge)| {
+                    Row::new(vec![
+                        Cell::from((path_index + 1).to_string()),
+                        Cell::from((edge_index + 1).to_string()),
+                        Cell::from(format!(
+                            "{} -> {}",
+                            edge.caller_symbol_qualified_name,
+                            edge.callee_symbol_qualified_name
+                                .as_deref()
+                                .unwrap_or(&edge.callee_text)
+                        )),
+                        confidence_cell(edge.confidence),
+                        Cell::from(edge.caller_path.as_str()),
+                        Cell::from(edge.call_line.to_string()),
+                        resolution_cell(edge.resolution_status.as_str()),
+                    ])
+                })
+        });
+    Table::new(
+        rows,
+        [
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Percentage(34),
+            Constraint::Length(8),
+            Constraint::Percentage(28),
+            Constraint::Length(8),
+            Constraint::Length(18),
+        ],
+    )
+    .header(table_header([
+        "Path",
+        "Hop",
+        "Edge",
+        "Conf",
+        "File",
+        "Line",
+        "Resolution",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Impact/Call Path/Context Pack | Call path: {} -> {} | Paths: {} | Max depth: {}",
+        summary.source_query,
+        summary.target_query,
+        summary.paths.len(),
+        summary.max_depth
     )))
     .column_spacing(1)
 }
@@ -4053,7 +4195,7 @@ fn context_pack_table(pack: &ContextPack) -> Table<'_> {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Impact/Context Pack | Context Pack Metadata"),
+                .title("Impact/Call Path/Context Pack | Context Pack Metadata"),
         )
         .column_spacing(1)
 }
@@ -4073,7 +4215,8 @@ fn call_row(row: &symdex_store::CallSearchRow) -> Row<'_> {
     ])
 }
 
-fn impact_row<'a>(edge: &'static str, row: &'a symdex_store::CallSearchRow) -> Row<'a> {
+fn impact_row<'a>(edge: &'static str, evidence: &'a symdex_query::ImpactCallEvidence) -> Row<'a> {
+    let row = &evidence.row;
     Row::new(vec![
         Cell::from(edge),
         Cell::from(
@@ -4082,6 +4225,7 @@ fn impact_row<'a>(edge: &'static str, row: &'a symdex_store::CallSearchRow) -> R
                 .unwrap_or("<unresolved>"),
         ),
         confidence_cell(row.confidence),
+        Cell::from(evidence.freshness.label()),
         Cell::from(row.path.as_deref().unwrap_or("<unknown>")),
         Cell::from(optional_line_range(row.start_line, row.end_line)),
         Cell::from(row.callee_text.as_str()),
@@ -4164,6 +4308,15 @@ fn query_result_count(result: &QueryResult) -> usize {
 
 fn impact_result_count(summary: &ImpactSummary) -> usize {
     summary.direct_callers.len().min(6) + summary.direct_callees.len().min(6)
+}
+
+fn call_path_result_count(summary: &CallPathSummary) -> usize {
+    summary
+        .paths
+        .iter()
+        .take(6)
+        .map(|path| path.edges.len())
+        .sum()
 }
 
 fn context_pack_row_count(pack: &ContextPack) -> usize {
@@ -4256,7 +4409,7 @@ impl View {
                 "[ or ] tabs | Tab/Shift+Tab callers/callees | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
             }
             Self::Evidence => {
-                "[ or ] tabs | Tab/Shift+Tab impact/context | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
+                "[ or ] tabs | Tab/Shift+Tab impact/call-path/context | type symbol or source -> target | Up/Down select | Enter run | Esc clear/back | q quit"
             }
         }
     }
@@ -4572,6 +4725,7 @@ enum GraphStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvidenceMode {
     Impact,
+    CallPath,
     ContextPack,
 }
 
@@ -4579,13 +4733,15 @@ impl EvidenceMode {
     fn label(self) -> &'static str {
         match self {
             Self::Impact => "impact",
+            Self::CallPath => "call path",
             Self::ContextPack => "context pack",
         }
     }
 
     fn toggled(self) -> Self {
         match self {
-            Self::Impact => Self::ContextPack,
+            Self::Impact => Self::CallPath,
+            Self::CallPath => Self::ContextPack,
             Self::ContextPack => Self::Impact,
         }
     }
@@ -4615,6 +4771,9 @@ impl EvidenceViewerState {
             EvidenceStatus::Completed(EvidenceResult::Impact(summary)) => {
                 impact_result_count(summary)
             }
+            EvidenceStatus::Completed(EvidenceResult::CallPath(summary)) => {
+                call_path_result_count(summary)
+            }
             EvidenceStatus::Completed(EvidenceResult::ContextPack(pack)) => {
                 context_pack_row_count(pack)
             }
@@ -4632,6 +4791,7 @@ enum EvidenceStatus {
 
 enum EvidenceResult {
     Impact(ImpactSummary),
+    CallPath(CallPathSummary),
     ContextPack(ContextPack),
 }
 
@@ -4819,12 +4979,12 @@ mod tests {
     use ratatui::style::Color;
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
-        CallDirection, CallGraphSummary, FileFreshnessRow, FreshnessSummary, ImpactSummary,
-        QueryMode, QueryResult, SymbolSearchSummary,
+        CallDirection, CallGraphSummary, CallPathSummary, FileFreshnessRow, FreshnessSummary,
+        ImpactCallEvidence, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
     };
     use symdex_store::{
-        CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary, CallSearchRow,
-        ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits,
+        CallPath, CallPathEdge, CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary,
+        CallSearchRow, ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits,
         CrossStoreHealthSummary, EmbeddingCoverageSummary, EmbeddingExclusionRow,
         EvidenceFreshness, EvidenceProvenance, FileCallDetailRow, FileChunkDetailRow,
         FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
@@ -6424,8 +6584,16 @@ mod tests {
         app.evidence.status = EvidenceStatus::Completed(EvidenceResult::Impact(ImpactSummary {
             repository_id: "repo".to_owned(),
             query: "add".to_owned(),
-            direct_callers: vec![sample_call_row()],
+            max_depth: 4,
+            direct_callers: vec![sample_impact_call_evidence()],
             direct_callees: Vec::new(),
+            transitive_callers: Vec::new(),
+            transitive_callees: Vec::new(),
+            related_files: Vec::new(),
+            tests_likely: Vec::new(),
+            notes: vec![
+                "likely_tests_unavailable_until_test_discovery_mapping_is_indexed".to_owned(),
+            ],
         }));
         let backend = TestBackend::new(180, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -6434,11 +6602,32 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
-        assert!(rendered.contains("Impact/Context Pack"));
+        assert!(rendered.contains("Impact/Call Path/Context Pack"));
         assert!(rendered.contains("Impact query"));
         assert!(rendered.contains("Direct callers"));
         assert!(rendered.contains("Edge"));
         assert!(rendered.contains("Resolution"));
+        assert!(rendered.contains("resolved_exact"));
+        assert!(rendered.contains("fresh"));
+    }
+
+    #[test]
+    fn renders_call_path_results() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Evidence;
+        app.evidence.mode = EvidenceMode::CallPath;
+        app.evidence.input = "crate::caller -> crate::add".to_owned();
+        app.evidence.status =
+            EvidenceStatus::Completed(EvidenceResult::CallPath(sample_call_path_summary()));
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Call path"));
+        assert!(rendered.contains("crate::caller"));
+        assert!(rendered.contains("crate::add"));
         assert!(rendered.contains("resolved_exact"));
     }
 
@@ -6493,6 +6682,10 @@ mod tests {
         assert!(!app.handle_evidence_key(KeyCode::Char('d')));
         assert!(!app.handle_evidence_key(KeyCode::Char('d')));
         assert_eq!(app.evidence.input, "add");
+
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert_eq!(app.view, View::Evidence);
+        assert_eq!(app.evidence.mode, EvidenceMode::CallPath);
 
         assert!(!app.handle_key(KeyCode::Tab));
         assert_eq!(app.view, View::Evidence);
@@ -6929,6 +7122,53 @@ mod tests {
             path: Some("src/lib.rs".to_owned()),
             start_line: Some(5),
             end_line: Some(8),
+            provenance: sample_provenance(),
+        }
+    }
+
+    fn sample_impact_call_evidence() -> ImpactCallEvidence {
+        ImpactCallEvidence {
+            row: sample_call_row(),
+            freshness: EvidenceFreshness::Fresh,
+        }
+    }
+
+    fn sample_call_path_summary() -> CallPathSummary {
+        CallPathSummary {
+            repository_id: "repo".to_owned(),
+            source_query: "crate::caller".to_owned(),
+            target_query: "crate::add".to_owned(),
+            max_depth: 4,
+            paths: vec![CallPath {
+                hops: 1,
+                min_confidence: 1.0,
+                terminal_resolution_status: "resolved_exact".to_owned(),
+                edges: vec![sample_call_path_edge()],
+            }],
+        }
+    }
+
+    fn sample_call_path_edge() -> CallPathEdge {
+        CallPathEdge {
+            call_id: "call-1".to_owned(),
+            caller_symbol_id: "symbol-caller".to_owned(),
+            caller_symbol_name: "caller".to_owned(),
+            caller_symbol_qualified_name: "crate::caller".to_owned(),
+            caller_symbol_kind: "function".to_owned(),
+            caller_path: "src/lib.rs".to_owned(),
+            caller_start_line: 5,
+            caller_end_line: 8,
+            callee_text: "add".to_owned(),
+            callee_symbol_id: Some("symbol-add".to_owned()),
+            callee_symbol_name: Some("add".to_owned()),
+            callee_symbol_qualified_name: Some("crate::add".to_owned()),
+            callee_symbol_kind: Some("function".to_owned()),
+            callee_path: Some("src/lib.rs".to_owned()),
+            callee_start_line: Some(1),
+            callee_end_line: Some(3),
+            call_line: 7,
+            confidence: 1.0,
+            resolution_status: "resolved_exact".to_owned(),
             provenance: sample_provenance(),
         }
     }

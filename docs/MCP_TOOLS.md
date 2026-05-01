@@ -186,16 +186,21 @@ Input:
 }
 ```
 
-Output should separate:
+Output separates:
 
 - direct callers
+- direct callees
 - transitive callers
+- transitive callees
+- related files
 - same-file symbols
 - tests likely to cover the symbol
 - unresolved candidates
 
-The current MVP fills direct callers and direct callees. The other buckets are
-present but empty until deeper impact analysis is implemented.
+Direct and transitive evidence rows include provenance and freshness labels.
+Related-file rows include path, relationship count, freshness, and provenance.
+`tests_likely` stays empty and a note explains that likely-test claims require
+indexed test discovery and mapping first.
 
 ### `symdex_context_pack`
 

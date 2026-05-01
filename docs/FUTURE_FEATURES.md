@@ -30,12 +30,13 @@ Requirements:
 
 ### Impact Analysis
 
-Impact analysis should grow from direct callers/callees into a repeatable change
-impact report.
+Impact analysis has grown from direct callers/callees into a repeatable change
+impact report with bounded transitive paths and related files. Future work is
+focused on indexed test discovery and richer same-file symbol grouping.
 
 Requirements:
 
-- Include direct callers, direct callees, bounded transitive call paths, related
+- Keep direct callers, direct callees, bounded transitive call paths, related
   files, and likely tests when test mapping exists.
 - Keep the output deterministic for the same index version and query.
 - Explain evidence with paths, line ranges, relationship type, confidence, and
