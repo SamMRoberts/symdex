@@ -330,6 +330,53 @@ impl SqliteStore {
         Ok(missing.len())
     }
 
+    pub fn qdrant_point_ids_for_paths(
+        &self,
+        repository_id: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut point_ids = std::collections::BTreeSet::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT chunks.qdrant_point_id
+                 FROM chunks
+                 JOIN files ON chunks.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND files.path = ?2
+                   AND chunks.qdrant_point_id IS NOT NULL
+                 ORDER BY chunks.qdrant_point_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        for path in paths {
+            let rows = statement
+                .query_map(params![repository_id, path], |row| row.get::<_, String>(0))
+                .map_err(StoreError::Sqlite)?;
+            for row in rows {
+                point_ids.insert(row.map_err(StoreError::Sqlite)?);
+            }
+        }
+        Ok(point_ids.into_iter().collect())
+    }
+
+    pub fn qdrant_point_ids_for_missing_files(
+        &self,
+        repository_id: &str,
+        active_paths: &[String],
+    ) -> Result<Vec<String>> {
+        let existing = self.file_paths(repository_id)?;
+        let active: std::collections::BTreeSet<&str> =
+            active_paths.iter().map(String::as_str).collect();
+        let missing: Vec<String> = existing
+            .into_iter()
+            .filter(|path| !active.contains(path.as_str()))
+            .collect();
+        self.qdrant_point_ids_for_paths(repository_id, &missing)
+    }
+
     pub fn repository_status(&self, repository_id: &str) -> Result<RepositoryStatus> {
         let files_indexed: usize = self
             .connection
@@ -2328,6 +2375,35 @@ impl QdrantClient {
         Ok(())
     }
 
+    pub fn delete_points(&self, collection_name: &str, point_ids: &[String]) -> Result<()> {
+        validate_collection_name(collection_name)?;
+        if point_ids.is_empty() {
+            return Ok(());
+        }
+
+        let request = DeletePointsRequest { points: point_ids };
+        let response: QdrantResponse<OperationResult> = self
+            .http
+            .post(self.endpoint(&format!(
+                "/collections/{collection_name}/points/delete?wait=true"
+            )))
+            .json(&request)
+            .send()
+            .map_err(StoreError::HttpRequest)?
+            .error_for_status()
+            .map_err(StoreError::HttpStatus)?
+            .json()
+            .map_err(StoreError::Decode)?;
+
+        if response.status != "ok" {
+            return Err(StoreError::UnexpectedResponse(format!(
+                "status={} operation_status={}",
+                response.status, response.result.status
+            )));
+        }
+        Ok(())
+    }
+
     pub fn query_points(
         &self,
         collection_name: &str,
@@ -2488,6 +2564,11 @@ pub struct PointPayload {
 #[derive(Debug, Serialize)]
 struct UpsertPointsRequest<'a> {
     points: &'a [VectorPoint],
+}
+
+#[derive(Debug, Serialize)]
+struct DeletePointsRequest<'a> {
+    points: &'a [String],
 }
 
 #[derive(Debug, Deserialize)]
@@ -3283,10 +3364,10 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket, CreateCollectionRequest,
-        Distance, FileCoverageStatus, FileRecord, PointPayload, QdrantClient, QueryPointsRequest,
-        RepositoryRecord, SqliteStore, StorageHealthStatus, StoreConfig, StoreError, SymbolRecord,
-        UpsertPointsRequest, VectorParams, VectorPoint, qdrant_collection_name, qdrant_point_id,
-        validate_collection_name,
+        DeletePointsRequest, Distance, FileCoverageStatus, FileRecord, PointPayload, QdrantClient,
+        QueryPointsRequest, RepositoryRecord, SqliteStore, StorageHealthStatus, StoreConfig,
+        StoreError, SymbolRecord, UpsertPointsRequest, VectorParams, VectorPoint,
+        qdrant_collection_name, qdrant_point_id, validate_collection_name,
     };
 
     #[test]
@@ -3397,6 +3478,17 @@ mod tests {
         assert_eq!(json["limit"], 5);
         assert_eq!(json["with_payload"], true);
         assert_eq!(json["with_vector"], false);
+    }
+
+    #[test]
+    fn delete_points_request_uses_point_ids_without_source_text() {
+        let point_ids = vec!["01234567-89ab-cdef-fedc-ba9876543210".to_owned()];
+        let request = DeletePointsRequest { points: &point_ids };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(json["points"][0], "01234567-89ab-cdef-fedc-ba9876543210");
+        assert!(json.get("source_text").is_none());
     }
 
     #[test]
@@ -3522,6 +3614,43 @@ mod tests {
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 0);
         assert_eq!(status.chunks_indexed, 0);
+    }
+
+    #[test]
+    fn sqlite_collects_qdrant_point_ids_before_replacement_and_deletion() {
+        let db = TestDb::new("qdrant-point-cleanup");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let mut other_file = sample_file("hash-other");
+        other_file.id = "other-file".to_owned();
+        other_file.path = "src/other.rs".to_owned();
+        let mut other_chunk = sample_chunk("other-chunk");
+        other_chunk.file_id = "other-file".to_owned();
+        other_chunk.qdrant_point_id = Some("11111111-1111-1111-1111-111111111111".to_owned());
+
+        store
+            .replace_file_facts(&sample_file("hash-1"), &[], &[sample_chunk("chunk-1")], &[])
+            .expect("file chunks should persist");
+        store
+            .replace_file_facts(&other_file, &[], &[other_chunk], &[])
+            .expect("other file chunks should persist");
+
+        let replaced = store
+            .qdrant_point_ids_for_paths("repo", &["src/lib.rs".to_owned()])
+            .expect("point ids should load");
+        assert_eq!(replaced, vec!["01234567-89ab-cdef-fedc-ba9876543210"]);
+
+        let missing = store
+            .qdrant_point_ids_for_missing_files("repo", &["src/lib.rs".to_owned()])
+            .expect("missing point ids should load");
+        assert_eq!(missing, vec!["11111111-1111-1111-1111-111111111111"]);
     }
 
     #[test]

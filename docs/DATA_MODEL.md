@@ -128,6 +128,12 @@ CREATE TABLE chunks (
 embedding. Chunks with an exclusion reason do not get a Qdrant point ID in the
 current implementation.
 
+Before semantic indexing replaces changed-file chunk rows or removes deleted
+files, it reads existing non-null `qdrant_point_id` values for those chunks and
+uses them to delete stale Qdrant points. This keeps SQLite as the source of
+truth for vector lifecycle cleanup while avoiding source text in Qdrant payloads
+or cleanup reports.
+
 ### `calls`
 
 ```sql

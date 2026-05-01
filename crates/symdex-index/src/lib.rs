@@ -403,6 +403,30 @@ fn run_index_internal(
         .flat_map(|report| report.chunks.iter())
         .filter(|chunk| chunk.excluded_reason.is_some())
         .count();
+    if !options.offline
+        && let Err(error) = delete_stale_qdrant_points(
+            &sqlite,
+            &root,
+            &store_config,
+            &collection,
+            &embedding_model,
+            &mut on_progress,
+        )
+    {
+        finish_failed_index_run(
+            &sqlite,
+            &run_scope,
+            &parser_version_summary(&collection),
+            RunCounts {
+                files_seen: collection.files_seen,
+                files_indexed: 0,
+                chunks_embedded: 0,
+            },
+            "failed",
+            &error,
+        )?;
+        return Err(error);
+    }
     let persistence = match persist_structural_index(
         &mut sqlite,
         &root,
@@ -794,6 +818,75 @@ fn persist_semantic_index(
         qdrant_collection,
         chunks_embedded: points.len(),
     })
+}
+
+fn delete_stale_qdrant_points(
+    sqlite: &SqliteStore,
+    root: &RepoRoot,
+    store_config: &StoreConfig,
+    collection: &IndexCollection,
+    embedding_model: &str,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<usize, String> {
+    let changed_paths = collection
+        .reports
+        .iter()
+        .map(|report| report.file.relative_path.clone())
+        .collect::<Vec<_>>();
+    let mut point_ids = BTreeSet::new();
+    point_ids.extend(
+        sqlite
+            .qdrant_point_ids_for_paths(root.id(), &changed_paths)
+            .map_err(|error| error.to_string())?,
+    );
+    point_ids.extend(
+        sqlite
+            .qdrant_point_ids_for_missing_files(root.id(), &collection.active_paths)
+            .map_err(|error| error.to_string())?,
+    );
+
+    if point_ids.is_empty() {
+        on_progress(IndexProgress::new(
+            "qdrant_cleanup",
+            1,
+            1,
+            "No stale Qdrant points to delete",
+        ));
+        return Ok(0);
+    }
+
+    let qdrant = QdrantClient::new(store_config).map_err(|error| error.to_string())?;
+    let qdrant_collection = qdrant_collection_name(root.id(), embedding_model);
+    if !qdrant
+        .collection_exists(&qdrant_collection)
+        .map_err(|error| error.to_string())?
+    {
+        on_progress(IndexProgress::new(
+            "qdrant_cleanup",
+            1,
+            1,
+            format!("Skipped stale point deletion; collection {qdrant_collection} is missing"),
+        ));
+        return Ok(0);
+    }
+
+    let point_ids = point_ids.into_iter().collect::<Vec<_>>();
+    on_progress(IndexProgress::new(
+        "qdrant_cleanup",
+        0,
+        point_ids.len(),
+        format!("Deleting {} stale Qdrant points", point_ids.len()),
+    ));
+    qdrant
+        .delete_points(&qdrant_collection, &point_ids)
+        .map_err(|error| error.to_string())?;
+    on_progress(IndexProgress::new(
+        "qdrant_cleanup",
+        point_ids.len(),
+        point_ids.len(),
+        format!("Deleted {} stale Qdrant points", point_ids.len()),
+    ));
+    Ok(point_ids.len())
 }
 
 fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {

@@ -128,6 +128,13 @@ Payloads include repository, file, chunk, symbol, path, language, line range,
 chunk kind, and text hash metadata. Payloads intentionally do not include source
 text.
 
+Semantic indexing captures existing Qdrant point IDs from SQLite before changed
+file facts are replaced or deleted-file rows are removed. When the target
+collection exists, stale points for changed and deleted chunks are deleted from
+Qdrant before SQLite mutation so vector cleanup does not lose the old point IDs.
+If stale point deletion fails, semantic indexing fails before replacing SQLite
+facts and records the run failure in `index_runs`.
+
 Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
 with the embedded query vector, `with_payload: true`, and `with_vector: false`.
 
