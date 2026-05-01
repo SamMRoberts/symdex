@@ -214,6 +214,7 @@
 - [x] Resolve caller-module Rust scoped method calls.
 - [x] Resolve caller-module unqualified Rust function calls.
 - [x] Resolve cross-file caller-module Rust function and scoped method calls.
+- [x] Resolve cross-file Rust `self.method()` and `Self::method()` calls.
 - [ ] Improve broader module, trait, and method resolution.
 - [x] Add macro-aware limitations and diagnostics.
 - [x] Add Rust type-definition, trait, and impl-summary chunks.

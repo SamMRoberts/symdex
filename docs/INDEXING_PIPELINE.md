@@ -225,9 +225,11 @@ qualified match is upgraded to `resolved_exact`; multiple matches are preserved
 as `ambiguous`; unresolved calls without qualified module paths are left
 unchanged. Cross-file `self::` and `super::` calls, unqualified calls, and
 relative scoped calls use the caller symbol's module context before matching
-persisted symbols, matching the per-file resolver's caller-scope behavior.
-Symbols from files being replaced are ignored so incremental indexing does not
-resolve against stale facts.
+persisted symbols, matching the per-file resolver's caller-scope behavior. When
+the caller is a method, cross-file `self.method()` and `Self::method()` calls can
+also resolve to persisted unchanged methods on the same impl receiver. Symbols
+from files being replaced are ignored so incremental indexing does not resolve
+against stale facts.
 
 Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
 diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is

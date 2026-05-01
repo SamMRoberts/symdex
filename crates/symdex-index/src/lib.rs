@@ -964,12 +964,15 @@ fn cross_file_rust_callee_candidates(
         caller.and_then(|caller| cross_file_module_scoped_path_candidate(callee_text, caller));
     let module_unqualified_candidate =
         caller.and_then(|caller| cross_file_module_unqualified_path_candidate(callee_text, caller));
+    let receiver_method_candidate =
+        caller.and_then(|caller| cross_file_receiver_method_candidate(callee_text, caller));
     let module_candidates = caller
         .into_iter()
         .flat_map(|caller| cross_file_module_relative_candidates(callee_text, caller))
         .collect::<Vec<_>>();
     let suppress_plain_candidate = module_scoped_candidate.is_some()
         || module_unqualified_candidate.is_some()
+        || receiver_method_candidate.is_some()
         || (!module_candidates.is_empty() && is_cross_file_module_relative_path(callee_text));
 
     let mut candidates = BTreeSet::new();
@@ -984,6 +987,9 @@ fn cross_file_rust_callee_candidates(
     if let Some(module_unqualified_candidate) = module_unqualified_candidate {
         candidates.insert(module_unqualified_candidate);
     }
+    if let Some(receiver_method_candidate) = receiver_method_candidate {
+        candidates.insert(receiver_method_candidate);
+    }
     candidates
 }
 
@@ -997,6 +1003,7 @@ fn cross_file_requires_exact_rust_resolution(
     !cross_file_module_relative_candidates(callee_text, caller).is_empty()
         || cross_file_module_scoped_path_candidate(callee_text, caller).is_some()
         || cross_file_module_unqualified_path_candidate(callee_text, caller).is_some()
+        || cross_file_receiver_method_candidate(callee_text, caller).is_some()
 }
 
 fn is_cross_file_module_relative_path(callee_text: &str) -> bool {
@@ -1052,6 +1059,20 @@ fn cross_file_module_unqualified_path_candidate(
         return None;
     }
     join_cross_file_module_path(&module_path, callee_text)
+}
+
+fn cross_file_receiver_method_candidate(
+    callee_text: &str,
+    caller: &ResolutionSymbol,
+) -> Option<String> {
+    let receiver = caller.receiver_type()?;
+    if let Some(method_name) = callee_text.strip_prefix("self.") {
+        return Some(format!("{receiver}::{method_name}"));
+    }
+    if let Some(method_name) = callee_text.strip_prefix("Self::") {
+        return Some(format!("{receiver}::{method_name}"));
+    }
+    None
 }
 
 fn cross_file_module_super_path(module_path: &str) -> Option<String> {
@@ -1917,6 +1938,56 @@ mod tests {
             Some(outer_run.id.as_str())
         );
         assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+    }
+
+    #[test]
+    fn resolves_cross_file_receiver_method_calls_from_caller_receiver() {
+        let mut caller = sample_symbol("run");
+        caller.id = stable_id(&["symbol", "Worker::run"]);
+        caller.qualified_name = "Worker::run".to_owned();
+        caller.kind = SymbolKind::Method;
+        let mut self_call = sample_unresolved_call("Worker::run", "self.helper");
+        self_call.caller_symbol_id = caller.id.clone();
+        let mut self_type_call = sample_unresolved_call("Worker::run", "Self::static_helper");
+        self_type_call.caller_symbol_id = caller.id.clone();
+        let mut collection = collection_with_reports(vec![IndexReport {
+            file: FileFacts {
+                id: "file-worker-run".to_owned(),
+                relative_path: "src/worker.rs".to_owned(),
+                language: Language::Rust,
+                content_hash: content_hash(b"worker-run"),
+            },
+            chunks: Vec::new(),
+            symbols: vec![caller],
+            calls: vec![self_call, self_type_call],
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: String::new(),
+        }]);
+        let mut helper = sample_symbol_record("Worker::helper", "file-worker-methods");
+        helper.kind = SymbolKind::Method.as_str().to_owned();
+        let mut static_helper =
+            sample_symbol_record("Worker::static_helper", "file-worker-methods");
+        static_helper.kind = SymbolKind::Method.as_str().to_owned();
+
+        resolve_cross_file_rust_calls(&mut collection, &[helper.clone(), static_helper.clone()]);
+
+        let self_call = &collection.reports[0].calls[0];
+        assert_eq!(
+            self_call.callee_symbol_id.as_deref(),
+            Some(helper.id.as_str())
+        );
+        assert_eq!(self_call.resolution_status, ResolutionStatus::ResolvedExact);
+
+        let self_type_call = &collection.reports[0].calls[1];
+        assert_eq!(
+            self_type_call.callee_symbol_id.as_deref(),
+            Some(static_helper.id.as_str())
+        );
+        assert_eq!(
+            self_type_call.resolution_status,
+            ResolutionStatus::ResolvedExact
+        );
     }
 
     #[test]

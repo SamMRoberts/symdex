@@ -79,8 +79,10 @@ Fixtures should be tiny and purpose-built.
   from the current index batch, persisted unchanged Rust symbols used during
   incremental indexing, caller-scope `super::` calls resolved against persisted
   unchanged Rust symbols, caller-module unqualified and scoped calls resolved
-  against persisted unchanged Rust symbols, and stale persisted symbols ignored
-  for files being replaced.
+  against persisted unchanged Rust symbols, cross-file `self.method()` /
+  `Self::method()` calls resolved against persisted unchanged methods on the
+  same impl receiver, and stale persisted symbols ignored for files being
+  replaced.
 - Rust macro coverage for unresolved macro call edges and metadata-only
   diagnostics that macro invocations are preserved without expansion.
 - Rust chunking coverage for function, method, type-definition, trait,
