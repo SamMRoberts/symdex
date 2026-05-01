@@ -286,6 +286,7 @@ fn tool_call_path(arguments: &Value) -> Result<Value, String> {
 fn tool_impact(arguments: &Value) -> Result<Value, String> {
     let repo = required_string(arguments, "repo")?;
     let symbol = required_string(arguments, "symbol")?;
+    let max_depth = clamp_call_path_depth(optional_usize(arguments, "depth", 4));
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite()?;
     let callers = sqlite
@@ -294,13 +295,33 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
     let callees = sqlite
         .callees(root.id(), symbol)
         .map_err(|error| error.to_string())?;
+    let transitive_callers = sqlite
+        .transitive_call_paths_to(root.id(), symbol, max_depth)
+        .map_err(|error| error.to_string())?;
+    let transitive_callees = sqlite
+        .transitive_call_paths_from(root.id(), symbol, max_depth)
+        .map_err(|error| error.to_string())?;
+    let related_files = impact_related_files_json(
+        &root,
+        callers.iter().chain(callees.iter()),
+        transitive_callers.iter().chain(transitive_callees.iter()),
+    );
     Ok(json!({
+        "repository_id": root.id(),
+        "symbol": symbol,
+        "max_depth": max_depth,
         "direct_callers": call_rows(&root, callers),
         "direct_callees": call_rows(&root, callees),
-        "transitive_callers": [],
+        "transitive_callers": call_paths_json(&root, transitive_callers),
+        "transitive_callees": call_paths_json(&root, transitive_callees),
         "same_file_symbols": [],
+        "related_files": related_files,
         "tests_likely": [],
-        "unresolved_candidates": []
+        "unresolved_candidates": [],
+        "notes": [
+            "metadata_only_no_source_text",
+            "likely_tests_unavailable_until_test_discovery_mapping_is_indexed"
+        ]
     }))
 }
 
@@ -384,6 +405,83 @@ fn call_rows(root: &RepoRoot, rows: Vec<symdex_store::CallSearchRow>) -> Vec<Val
                 "end_line": row.end_line,
                 "freshness": freshness_label(root, row.path.as_deref(), &row.provenance),
                 "provenance": provenance_json(&row.provenance)
+            })
+        })
+        .collect()
+}
+
+fn call_paths_json(root: &RepoRoot, paths: Vec<symdex_store::CallPath>) -> Vec<Value> {
+    paths
+        .into_iter()
+        .map(|path| {
+            json!({
+                "hops": path.hops,
+                "min_confidence": path.min_confidence,
+                "terminal_resolution_status": path.terminal_resolution_status,
+                "edges": path.edges.into_iter().map(|edge| json!({
+                    "call_id": edge.call_id,
+                    "caller_symbol_id": edge.caller_symbol_id,
+                    "caller_symbol_name": edge.caller_symbol_name,
+                    "caller_symbol_qualified_name": edge.caller_symbol_qualified_name,
+                    "caller_symbol_kind": edge.caller_symbol_kind,
+                    "caller_path": edge.caller_path,
+                    "caller_start_line": edge.caller_start_line,
+                    "caller_end_line": edge.caller_end_line,
+                    "callee_text": edge.callee_text,
+                    "callee_symbol_id": edge.callee_symbol_id,
+                    "callee_symbol_name": edge.callee_symbol_name,
+                    "callee_symbol_qualified_name": edge.callee_symbol_qualified_name,
+                    "callee_symbol_kind": edge.callee_symbol_kind,
+                    "callee_path": edge.callee_path,
+                    "callee_start_line": edge.callee_start_line,
+                    "callee_end_line": edge.callee_end_line,
+                    "call_line": edge.call_line,
+                    "confidence": edge.confidence,
+                    "resolution_status": edge.resolution_status,
+                    "freshness": freshness_label(root, Some(&edge.caller_path), &edge.provenance),
+                    "provenance": provenance_json(&edge.provenance)
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}
+
+fn impact_related_files_json<'a>(
+    root: &RepoRoot,
+    call_rows: impl Iterator<Item = &'a symdex_store::CallSearchRow>,
+    paths: impl Iterator<Item = &'a symdex_store::CallPath>,
+) -> Vec<Value> {
+    let mut files = std::collections::BTreeMap::<String, (usize, EvidenceProvenance)>::new();
+    for row in call_rows {
+        if let Some(path) = &row.path {
+            let entry = files
+                .entry(path.clone())
+                .or_insert_with(|| (0, row.provenance.clone()));
+            entry.0 += 1;
+        }
+    }
+    for path in paths {
+        for edge in &path.edges {
+            let caller = files
+                .entry(edge.caller_path.clone())
+                .or_insert_with(|| (0, edge.provenance.clone()));
+            caller.0 += 1;
+            if let Some(callee_path) = &edge.callee_path {
+                let callee = files
+                    .entry(callee_path.clone())
+                    .or_insert_with(|| (0, edge.provenance.clone()));
+                callee.0 += 1;
+            }
+        }
+    }
+    files
+        .into_iter()
+        .map(|(path, (relationship_count, provenance))| {
+            json!({
+                "path": path,
+                "relationship_count": relationship_count,
+                "freshness": freshness_label(root, Some(&path), &provenance),
+                "provenance": provenance_json(&provenance)
             })
         })
         .collect()
@@ -504,17 +602,13 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool_definition(
             TOOL_IMPACT,
-            "Basic Impact",
-            "Return direct callers and direct callees for a symbol.",
+            "Impact Analysis",
+            "Return direct, bounded transitive, and related-file impact evidence for a symbol.",
             &["repo", "symbol"],
             vec![
                 ("repo", "string", "Repository root path"),
                 ("symbol", "string", "Symbol id, name, or qualified name"),
-                (
-                    "depth",
-                    "integer",
-                    "Accepted for compatibility; currently direct-only",
-                ),
+                ("depth", "integer", "Maximum traversal depth, capped at 8"),
             ],
         ),
         tool_definition(

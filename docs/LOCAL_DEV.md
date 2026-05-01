@@ -83,8 +83,10 @@ Implemented CLI commands currently include:
   depth is clamped to 1-8 hops, cycles are not followed, unresolved terminal
   edges can match the target by callee text, and output stays metadata-only with
   path, line, confidence, resolution, and provenance fields.
-- `impact <repo> <symbol>`: prints direct callers and direct callees as a basic
-  impact view.
+- `impact <repo> <symbol>`: prints direct callers, direct callees, bounded
+  transitive caller/callee paths, related files, provenance, and staleness
+  labels. Likely tests are intentionally empty until test discovery and mapping
+  are indexed.
 - `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
   context. The current format is `symdex.context_pack.v1` and includes focus
   symbols, direct callers, direct callees, involved files, section limits, and
@@ -97,7 +99,8 @@ Implemented CLI commands currently include:
   service configuration. Use `o` to confirm offline indexing, `s` to confirm
   semantic indexing, `c` to toggle continuous indexing, `[` / `]` to move
   between the Index, Storage, Doctor, Query, Calls, and Impact tabs, and
-  `Tab` / `Shift+Tab` to toggle view-local modes. In the Doctor tab, `Enter`
+  `Tab` / `Shift+Tab` to toggle view-local modes including impact, call-path,
+  and context-pack evidence modes. In the Doctor tab, `Enter`
   starts diagnostics when no result rows are available. The storage explorer
   always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs

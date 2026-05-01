@@ -336,3 +336,19 @@ Current behavior:
 - cycles are skipped by tracking visited symbol IDs per candidate path
 - returned edges include caller/callee metadata, call line, confidence,
   resolution status, and provenance; they never include source text
+
+## Impact traversal and related-file evidence
+
+Impact analysis reuses the same persisted call-edge graph. It keeps direct
+callers and direct callees as first-class evidence, then adds bounded
+transitive caller paths into the queried symbol and bounded transitive callee
+paths out of the queried symbol. Transitive paths use the same deterministic
+ordering, 1-8 hop clamp, cycle avoidance, unresolved terminal preservation, and
+metadata-only edge shape as call path tracing.
+
+Impact related files are derived from direct relationships and transitive path
+edges. Each related-file row includes a deterministic relationship count,
+freshness label, and the first available provenance record for that file. The
+impact report does not claim likely affected tests yet; `tests_likely` remains
+empty and output includes a note until test discovery and test-to-symbol mapping
+are indexed.

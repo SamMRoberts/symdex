@@ -134,12 +134,12 @@
 
 - [x] Call path tracing API over persisted call edges with bounded traversal depth.
 - [x] CLI command for call path tracing between source and target symbols.
-- [ ] TUI call path view with paths, hops, confidence, resolution status, and file/line evidence.
+- [x] TUI call path view with paths, hops, confidence, resolution status, and file/line evidence.
 - [x] MCP tool for compact call path tracing.
-- [ ] Expand impact analysis to include bounded transitive paths and related files.
-- [ ] Add test discovery and mapping design before claiming likely affected tests.
-- [ ] Impact output includes provenance and staleness labels for every evidence row.
-- [ ] Tests for deterministic traversal order, unresolved edges, ambiguous edges, cycles, and depth limits.
+- [x] Expand impact analysis to include bounded transitive paths and related files.
+- [x] Add test discovery and mapping design before claiming likely affected tests.
+- [x] Impact output includes provenance and staleness labels for every evidence row.
+- [x] Tests for deterministic traversal order, unresolved edges, ambiguous edges, cycles, and depth limits.
 
 ## Phase 13 — Debug context and runtime mapping
 

@@ -282,15 +282,72 @@ fn print_call_path_summary(summary: &CallPathSummary) {
 }
 
 fn print_impact_summary(summary: &ImpactSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!("query: {}", summary.query);
+    println!("max_depth: {}", summary.max_depth);
     println!("direct_callers");
     println!("callers: {}", summary.direct_callers.len());
-    for row in &summary.direct_callers {
-        print_call_row(row);
+    for evidence in &summary.direct_callers {
+        print_impact_call_evidence(evidence);
     }
     println!("direct_callees");
     println!("callees: {}", summary.direct_callees.len());
-    for row in &summary.direct_callees {
-        print_call_row(row);
+    for evidence in &summary.direct_callees {
+        print_impact_call_evidence(evidence);
+    }
+    println!("transitive_callers: {}", summary.transitive_callers.len());
+    for evidence in &summary.transitive_callers {
+        print_impact_path_evidence(evidence);
+    }
+    println!("transitive_callees: {}", summary.transitive_callees.len());
+    for evidence in &summary.transitive_callees {
+        print_impact_path_evidence(evidence);
+    }
+    println!("related_files: {}", summary.related_files.len());
+    for file in &summary.related_files {
+        println!(
+            "{} relationships={} freshness={} run={}",
+            file.path,
+            file.relationship_count,
+            file.freshness.label(),
+            file.provenance
+                .as_ref()
+                .and_then(|provenance| provenance.index_run_id.as_deref())
+                .unwrap_or("<none>")
+        );
+    }
+    println!("tests_likely: {}", summary.tests_likely.len());
+    for note in &summary.notes {
+        println!("note: {note}");
+    }
+}
+
+fn print_impact_call_evidence(evidence: &symdex_query::ImpactCallEvidence) {
+    print_call_row(&evidence.row);
+    println!("freshness={}", evidence.freshness.label());
+}
+
+fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
+    println!(
+        "path hops={} min_confidence={:.2} terminal_status={}",
+        evidence.path.hops, evidence.path.min_confidence, evidence.path.terminal_resolution_status
+    );
+    for (edge, freshness) in evidence.path.edges.iter().zip(&evidence.edge_freshness) {
+        println!(
+            "  {} -> {} line={} confidence={:.2} status={} freshness={} {}:{}-{} run={}",
+            edge.caller_symbol_qualified_name,
+            edge.callee_symbol_qualified_name
+                .as_deref()
+                .unwrap_or(&edge.callee_text),
+            edge.call_line,
+            edge.confidence,
+            edge.resolution_status,
+            freshness.label(),
+            edge.caller_path,
+            edge.caller_start_line,
+            edge.caller_end_line,
+            edge.provenance.index_run_id.as_deref().unwrap_or("<none>")
+        );
     }
 }
 
@@ -587,7 +644,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

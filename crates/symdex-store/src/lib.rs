@@ -609,6 +609,94 @@ impl SqliteStore {
         Ok(paths)
     }
 
+    pub fn transitive_call_paths_to(
+        &self,
+        repository_id: &str,
+        target_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let targets = self.resolve_symbol_refs(repository_id, target_query)?;
+        let target_ids = targets
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let sources = self.all_symbol_refs(repository_id)?;
+        let edges = self.call_path_edges(repository_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            if target_ids.contains(&source.id) {
+                continue;
+            }
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            let mut source_paths = Vec::new();
+            trace_call_paths(
+                &source.id,
+                max_depth,
+                &TraceContext {
+                    target_query,
+                    target_ids: &target_ids,
+                    edges_by_caller: &edges_by_caller,
+                },
+                &mut visited,
+                &mut stack,
+                &mut source_paths,
+            );
+            paths.extend(source_paths.into_iter().filter(|path| path.hops > 1));
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
+    pub fn transitive_call_paths_from(
+        &self,
+        repository_id: &str,
+        source_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let sources = self.resolve_symbol_refs(repository_id, source_query)?;
+        let edges = self.call_path_edges(repository_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            trace_reachable_call_paths(
+                &source.id,
+                max_depth,
+                &edges_by_caller,
+                &mut visited,
+                &mut stack,
+                &mut paths,
+            );
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
     fn resolve_symbol_refs(
         &self,
         repository_id: &str,
@@ -628,6 +716,26 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id, symbol_query], |row| {
+                Ok(SymbolRef { id: row.get(0)? })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn all_symbol_refs(&self, repository_id: &str) -> Result<Vec<SymbolRef>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id
+                  FROM symbols
+                  JOIN files ON symbols.file_id = files.id
+                 WHERE files.repository_id = ?1
+                 ORDER BY symbols.qualified_name, files.path, symbols.start_line
+                 LIMIT 500",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
                 Ok(SymbolRef { id: row.get(0)? })
             })
             .map_err(StoreError::Sqlite)?;
@@ -2413,6 +2521,48 @@ fn trace_call_paths(
     }
 }
 
+fn trace_reachable_call_paths(
+    current_symbol_id: &str,
+    remaining_depth: usize,
+    edges_by_caller: &std::collections::BTreeMap<String, Vec<CallPathEdge>>,
+    visited: &mut std::collections::BTreeSet<String>,
+    stack: &mut Vec<CallPathEdge>,
+    paths: &mut Vec<CallPath>,
+) {
+    if remaining_depth == 0 || paths.len() >= 50 {
+        return;
+    }
+    let Some(edges) = edges_by_caller.get(current_symbol_id) else {
+        return;
+    };
+    for edge in edges {
+        stack.push(edge.clone());
+        // Impact already reports direct callees separately, so this traversal
+        // only materializes bounded transitive paths.
+        if stack.len() > 1 {
+            paths.push(call_path_from_edges(stack));
+            if paths.len() >= 50 {
+                stack.pop();
+                return;
+            }
+        }
+        if let Some(next_symbol_id) = &edge.callee_symbol_id
+            && visited.insert(next_symbol_id.clone())
+        {
+            trace_reachable_call_paths(
+                next_symbol_id,
+                remaining_depth.saturating_sub(1),
+                edges_by_caller,
+                visited,
+                stack,
+                paths,
+            );
+            visited.remove(next_symbol_id);
+        }
+        stack.pop();
+    }
+}
+
 fn call_edge_reaches_target(
     edge: &CallPathEdge,
     target_query: &str,
@@ -3451,6 +3601,82 @@ mod tests {
         assert_eq!(paths[0].terminal_resolution_status, "unresolved");
         assert_eq!(paths[0].edges[0].callee_symbol_id, None);
         assert_eq!(paths[0].edges[0].callee_text, "missing");
+    }
+
+    #[test]
+    fn sqlite_traces_ambiguous_terminal_call_path_by_callee_text() {
+        let db = TestDb::new("call-paths-ambiguous");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![sample_symbol("a-symbol", "a", "crate::a")];
+        let mut ambiguous = unresolved_call("call-a-helper", "a-symbol", "helper", 10);
+        ambiguous.resolution_status = "ambiguous".to_owned();
+        ambiguous.confidence = 0.5;
+        store
+            .replace_file_facts(&sample_file("hash-1"), &symbols, &[], &[ambiguous])
+            .expect("calls should persist");
+
+        let paths = store
+            .call_paths("repo", "crate::a", "helper", 2)
+            .expect("ambiguous terminal path should trace");
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].hops, 1);
+        assert_eq!(paths[0].terminal_resolution_status, "ambiguous");
+        assert_eq!(paths[0].edges[0].callee_symbol_id, None);
+        assert_eq!(paths[0].edges[0].callee_text, "helper");
+    }
+
+    #[test]
+    fn sqlite_reports_transitive_impact_paths_deterministically() {
+        let db = TestDb::new("transitive-impact-paths");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![
+            sample_symbol("a-symbol", "a", "crate::a"),
+            sample_symbol("b-symbol", "b", "crate::b"),
+            sample_symbol("c-symbol", "c", "crate::c"),
+            sample_symbol("d-symbol", "d", "crate::d"),
+        ];
+        let calls = vec![
+            sample_call("call-a-b", "a-symbol", "b", Some("b-symbol"), 10),
+            sample_call("call-b-c", "b-symbol", "c", Some("c-symbol"), 20),
+            sample_call("call-c-d", "c-symbol", "d", Some("d-symbol"), 30),
+        ];
+        store
+            .replace_file_facts(&sample_file("hash-1"), &symbols, &[], &calls)
+            .expect("calls should persist");
+
+        let callers = store
+            .transitive_call_paths_to("repo", "crate::c", 3)
+            .expect("transitive callers should trace");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].hops, 2);
+        assert_eq!(callers[0].edges[0].call_id, "call-a-b");
+        assert_eq!(callers[0].edges[1].call_id, "call-b-c");
+
+        let callees = store
+            .transitive_call_paths_from("repo", "crate::a", 3)
+            .expect("transitive callees should trace");
+        assert_eq!(callees.len(), 2);
+        assert_eq!(callees[0].hops, 2);
+        assert_eq!(callees[0].edges[1].call_id, "call-b-c");
+        assert_eq!(callees[1].hops, 3);
+        assert_eq!(callees[1].edges[2].call_id, "call-c-d");
     }
 
     #[test]
