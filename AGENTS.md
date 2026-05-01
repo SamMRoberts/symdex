@@ -25,8 +25,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Ollama generates local embeddings with `nomic-embed-text`.
 - tree-sitter extracts syntax-aware chunks and symbol boundaries.
 - The system must work offline after dependencies and models are installed.
-- Support Rust repositories first.
-- Add other languages only after the Rust path is stable.
+- Rust remains the stable baseline and first fully validated language.
+- C#, JavaScript, and TypeScript are the next active language targets.
+- Future languages must use the same parser, chunker, symbol, call, indexing,
+  secret-detection, provenance, and evidence contracts.
 - Do not build a web UI in the MVP.
 - Do not add hosted, cloud, telemetry, or remote embedding features.
 

@@ -43,6 +43,9 @@ The examples below show the `data` payload for each tool. The envelope is always
 present on successful tool calls and is also advertised by `initialize` as
 `symdexContract`. The current schema and version are defined in `symdex-core`
 so CLI, TUI, diagnostics, and MCP share the same contract identifier.
+Parser-version examples below use Rust because Rust is the current implemented
+baseline; C#, JavaScript, and TypeScript evidence must use their own parser
+version strings when implemented.
 
 ### `symdex_search`
 
@@ -331,8 +334,8 @@ Output:
 }
 ```
 
-The tool parses panic/file locations, stack-frame symbols, Rust file paths, and
-failing test names. It maps frames to indexed SQLite file/symbol/call evidence,
+The tool parses panic/file locations, stack-frame symbols, indexed-language file
+paths, and failing test names. It maps frames to indexed SQLite file/symbol/call evidence,
 adds freshness and provenance, and returns source-free metadata only.
 
 ### `symdex_index_status`

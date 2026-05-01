@@ -2,10 +2,13 @@
 
 Verified sources for the chosen stack.
 
-## Rust parser
+## Parsers
 
 - tree-sitter Rust bindings: https://docs.rs/tree-sitter
 - tree-sitter project: https://github.com/tree-sitter/tree-sitter
+- tree-sitter C# grammar: https://github.com/tree-sitter/tree-sitter-c-sharp
+- tree-sitter JavaScript grammar: https://github.com/tree-sitter/tree-sitter-javascript
+- tree-sitter TypeScript grammar: https://github.com/tree-sitter/tree-sitter-typescript
 
 ## Vector database
 

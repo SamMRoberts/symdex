@@ -175,7 +175,8 @@ represent the indexed repository.
 
 ### Evidence Freshness View
 
-- Compare indexed file content hashes with the current eligible Rust files.
+- Compare indexed file content hashes with the current eligible files for
+  implemented languages.
 - Show fresh, stale, deleted, missing, and unknown labels with selected-row
   provenance details.
 - Include content hash, index run ID, parser version, and indexed timestamp

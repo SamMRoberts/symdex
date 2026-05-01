@@ -19,6 +19,9 @@ tests/fixtures/
   rust_calls/
   rust_ignore/
   rust_secrets/
+  csharp_basic/
+  javascript_basic/
+  typescript_basic/
 ```
 
 Fixtures should be tiny and purpose-built.
@@ -68,8 +71,9 @@ indexing should use mocked adapters or the existing opt-in local service test
 flags.
 
 Current continuous indexing tests cover snapshot diff coalescing, created-file
-and modified-file detection, ignored path skips, non-Rust path skips, and
-unchanged-content skips. TUI state/render tests cover continuous-indexing
+and modified-file detection, ignored path skips, unsupported-language path
+skips, and unchanged-content skips. TUI state/render tests cover
+continuous-indexing
 toggle confirmation, stopping an active watcher, pending debounce display,
 queued event count, and latest error rendering.
 
@@ -89,6 +93,11 @@ Service-dependent checks:
 SYMDEX_TEST_QDRANT=1 cargo test -p symdex-store qdrant
 SYMDEX_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
 ```
+
+When C#, JavaScript, and TypeScript implementation work starts, add tiny
+fixture-backed tests for discovery, chunking, symbol extraction, call extraction,
+secret exclusion, incremental indexing, continuous indexing, and MCP evidence
+for each language before marking that language supported.
 
 Future TUI checks:
 
