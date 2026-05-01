@@ -123,12 +123,12 @@
 ## Phase 11 — Evidence freshness and provenance
 
 - [x] Index provenance schema for files, chunks, symbols, calls, vectors, and index runs.
-- [ ] Store parser version, embedding model, vector dimension, content hash, index run ID, and indexed timestamp with returned evidence.
-- [ ] Staleness detection by comparing indexed content hashes against current eligible files.
-- [ ] CLI staleness report for repositories, files, symbols, and context packs.
-- [ ] TUI freshness/provenance panels for repository status, storage views, and evidence rows.
-- [ ] MCP response fields for freshness state and provenance metadata.
-- [ ] Tests for fresh, stale, deleted, missing, and unknown evidence states.
+- [x] Store parser version, embedding model, vector dimension, content hash, index run ID, and indexed timestamp with returned evidence.
+- [x] Staleness detection by comparing indexed content hashes against current eligible files.
+- [x] CLI staleness report for repositories, files, symbols, and context packs.
+- [x] TUI freshness/provenance panels for repository status, storage views, and evidence rows.
+- [x] MCP response fields for freshness state and provenance metadata.
+- [x] Tests for fresh, stale, deleted, missing, and unknown evidence states.
 
 ## Phase 12 — Explicit graph traversal and repeatable impact
 

@@ -39,6 +39,7 @@ cargo run -p symdex-cli -- index .
 cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- index --watch .
 cargo run -p symdex-cli -- index-status .
+cargo run -p symdex-cli -- staleness .
 cargo run -p symdex-cli -- symbol . "my_symbol"
 cargo run -p symdex-cli -- callers . "my_symbol"
 cargo run -p symdex-cli -- callees . "my_symbol"
@@ -68,8 +69,12 @@ Implemented CLI commands currently include:
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
   When a semantic index has completed, it also reports the latest embedding
   model and vector dimension recorded for that repository.
+- `staleness <repo> [symbol]`: compares indexed file content hashes against the
+  current eligible Rust files and reports fresh, stale, deleted, missing, and
+  unknown evidence states. With a symbol query, the report is scoped to files
+  involved in the matching symbols and compact context pack.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
-  name and returns path and line ranges.
+  name and returns path, line ranges, and provenance metadata.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct
   call relationships from the local SQLite index.
 - `impact <repo> <symbol>`: prints direct callers and direct callees as a basic
@@ -79,7 +84,8 @@ Implemented CLI commands currently include:
   symbols, direct callers, direct callees, involved files, section limits, and
   notes. It does not include source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
-  matches with scores, paths, line ranges, and symbol names.
+  matches with scores, paths, line ranges, symbol names, and provenance
+  metadata.
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
   opens a repository/status dashboard backed by SQLite metadata and local
   service configuration. Use `o` to confirm offline indexing, `s` to confirm
@@ -89,7 +95,7 @@ Implemented CLI commands currently include:
   starts diagnostics when no result rows are available. The storage explorer
   always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs
-  timeline/semantic neighborhood/cross-store health. Use `r` to refresh
+  timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r` to refresh
   repository/storage status, and `q` or `Esc` to quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,

@@ -164,6 +164,7 @@ Payload fields:
 - `start_line`
 - `end_line`
 - `text_hash`
+- `parser_version`
 - `content_hash`
 - `index_run_id`
 - `embedding_model`
@@ -171,6 +172,12 @@ Payload fields:
 - `indexed_at`
 
 Do not store source text in Qdrant payloads.
+
+Returned evidence rows now include compact provenance metadata where available:
+content hash, index run ID, parser version, indexed timestamp, embedding model,
+embedding dimension, and embedding timestamp. Freshness checks compare persisted
+content hashes with the current eligible file hashes and label rows as `fresh`,
+`stale`, `deleted`, `missing`, or `unknown`.
 
 Use cosine distance unless a selected embedding model requires otherwise.
 

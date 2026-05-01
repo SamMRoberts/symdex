@@ -45,6 +45,8 @@ Fixtures should be tiny and purpose-built.
 - TUI storage visualization state and render coverage for SQLite/Qdrant
   metadata, selected-row drill-down, empty stores, missing vectors, excluded
   chunks, and model/dimension drift
+- Evidence freshness coverage for fresh, stale, deleted, missing, and unknown
+  states, including metadata-only TUI rendering.
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -109,6 +111,9 @@ the indexing confirmation reducer, and continuous-indexing reducer and render
 coverage for toggle confirmation, stopping an active watcher, on/off labels,
 pending debounce, queued event count, latest reindexed file, watch errors, and
 the animated continuous-indexing activity indicator.
+Current freshness tests cover hash-to-state classification, file freshness
+aggregation over indexed and current file sets, returned symbol/call provenance,
+and the TUI evidence freshness panel.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic
