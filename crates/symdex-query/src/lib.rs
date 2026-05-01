@@ -1221,7 +1221,7 @@ mod tests {
                 .expect("stale file should be written");
             let db_path = base.join("symdex.sqlite");
             let root = RepoRoot::open(&root_path).expect("repo root should open");
-            let store = SqliteStore::open(&StoreConfig {
+            let mut store = SqliteStore::open(&StoreConfig {
                 sqlite_path: db_path.clone(),
                 qdrant_url: "http://localhost:6333".to_owned(),
             })
@@ -1234,7 +1234,7 @@ mod tests {
                 })
                 .expect("repo should persist");
             persist_file(
-                &store,
+                &mut store,
                 root.id(),
                 "file-fresh",
                 "src/fresh.rs",
@@ -1244,7 +1244,7 @@ mod tests {
                 "crate::fresh",
             );
             persist_file(
-                &store,
+                &mut store,
                 root.id(),
                 "file-stale",
                 "src/stale.rs",
@@ -1254,7 +1254,7 @@ mod tests {
                 "crate::stale",
             );
             persist_file(
-                &store,
+                &mut store,
                 root.id(),
                 "file-deleted",
                 "src/deleted.rs",
@@ -1274,13 +1274,13 @@ mod tests {
                         index_run_id: "run".to_owned(),
                         parser_version: "parser".to_owned(),
                     },
-                    &[],
                     &[sample_symbol(
                         "sym-callee",
                         "file-callee",
                         "callee",
                         "crate::callee",
                     )],
+                    &[],
                     &[],
                 )
                 .expect("callee file should persist");
@@ -1295,13 +1295,13 @@ mod tests {
                         index_run_id: "run".to_owned(),
                         parser_version: "parser".to_owned(),
                     },
-                    &[],
                     &[sample_symbol(
                         "sym-fresh",
                         "file-fresh",
                         "fresh",
                         "crate::fresh",
                     )],
+                    &[],
                     &[CallRecord {
                         id: "call-fresh-callee".to_owned(),
                         caller_symbol_id: "sym-fresh".to_owned(),
@@ -1335,7 +1335,7 @@ mod tests {
     }
 
     fn persist_file(
-        store: &SqliteStore,
+        store: &mut SqliteStore,
         repository_id: &str,
         file_id: &str,
         path: &str,
@@ -1355,13 +1355,13 @@ mod tests {
                     index_run_id: "run".to_owned(),
                     parser_version: "parser".to_owned(),
                 },
-                &[],
                 &[sample_symbol(
                     symbol_id,
                     file_id,
                     symbol_name,
                     qualified_name,
                 )],
+                &[],
                 &[],
             )
             .expect("file facts should persist");

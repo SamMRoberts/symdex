@@ -1564,6 +1564,7 @@ dependencies = [
  "serde_json",
  "symdex-core",
  "symdex-embed",
+ "symdex-query",
  "symdex-store",
 ]
 
@@ -1571,6 +1572,7 @@ dependencies = [
 name = "symdex-query"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "symdex-core",
  "symdex-embed",
  "symdex-store",

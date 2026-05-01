@@ -143,13 +143,13 @@
 
 ## Phase 13 — Debug context and runtime mapping
 
-- [ ] Runtime-to-source input parser for stack traces, panic locations, failing test names, frame symbols, and file paths.
-- [ ] Source mapping API that joins runtime frames to indexed files, symbols, calls, and likely tests when available.
-- [ ] Debug context pack format for reusable debugging evidence bundles.
-- [ ] CLI command for building debug context packs from runtime failure input.
+- [x] Runtime-to-source input parser for stack traces, panic locations, failing test names, frame symbols, and file paths.
+- [x] Source mapping API that joins runtime frames to indexed files, symbols, calls, and likely tests when available.
+- [x] Debug context pack format for reusable debugging evidence bundles.
+- [x] CLI command for building debug context packs from runtime failure input.
 - [ ] TUI debug context-pack viewer with matched frames, call paths, likely tests, provenance, and staleness.
-- [ ] MCP tool for debug context packs with compact context-window-safe output.
-- [ ] Tests for mapped frames, unmapped frames, stale frames, deleted files, and malformed stack traces.
+- [x] MCP tool for debug context packs with compact context-window-safe output.
+- [x] Tests for mapped frames, unmapped frames, stale frames, deleted files, and malformed stack traces.
 
 ## Phase 14 — Cross-agent local reuse
 

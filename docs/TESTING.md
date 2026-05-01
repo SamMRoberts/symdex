@@ -48,6 +48,9 @@ Fixtures should be tiny and purpose-built.
   chunks, and model/dimension drift
 - Evidence freshness coverage for fresh, stale, deleted, missing, and unknown
   states, including metadata-only TUI rendering.
+- Debug context coverage for parsed panic/file locations, stack-frame symbols,
+  failing test names, mapped frames, unmapped frames, stale frames, deleted
+  files, and malformed runtime input.
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -119,6 +122,9 @@ and the TUI evidence freshness panel.
 Current call path tests cover deterministic path order, unresolved terminal
 edges matched by callee text, ambiguous terminal edges matched by callee text,
 cycle avoidance, depth limits, and deterministic transitive impact paths.
+Current debug context tests cover runtime input parsing, mapped frame evidence,
+unmapped frames, fresh/stale/deleted freshness labels, calls at failing lines,
+and malformed runtime lines.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic
