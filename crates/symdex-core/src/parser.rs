@@ -615,7 +615,13 @@ fn callee_resolution_candidates(
 ) -> Vec<String> {
     let mut candidates = BTreeSet::new();
     candidates.insert(callee_text.to_owned());
-    candidates.insert(normalize_rust_path(callee_text));
+    let module_candidates = module_relative_candidates(callee_text, caller);
+    if module_candidates.is_empty() || !is_module_relative_path(callee_text) {
+        candidates.insert(normalize_rust_path(callee_text));
+    }
+    for module_candidate in module_candidates {
+        candidates.insert(module_candidate);
+    }
     if let Some(method_candidate) = receiver_method_candidate(callee_text, caller) {
         candidates.insert(method_candidate);
     }
@@ -627,6 +633,62 @@ fn callee_resolution_candidates(
         candidates.insert(target.clone());
     }
     candidates.into_iter().collect()
+}
+
+fn is_module_relative_path(callee_text: &str) -> bool {
+    callee_text.starts_with("self::") || callee_text.starts_with("super::")
+}
+
+fn module_relative_candidates(callee_text: &str, caller: &Symbol) -> Vec<String> {
+    let Some(module_path) = caller_module_path(caller) else {
+        return Vec::new();
+    };
+    let Some((prefix, tail)) = callee_text.split_once("::") else {
+        return Vec::new();
+    };
+    match prefix {
+        "self" => join_module_path(&module_path, tail).into_iter().collect(),
+        "super" => module_super_path(&module_path)
+            .and_then(|module| join_module_path(&module, tail))
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn caller_module_path(caller: &Symbol) -> Option<String> {
+    let (container, _) = caller.qualified_name.rsplit_once("::")?;
+    let module = if caller.kind == SymbolKind::Method {
+        caller_receiver_type(caller)
+            .and_then(|receiver| container.strip_suffix(receiver))
+            .map(|module| module.trim_end_matches("::"))
+            .unwrap_or("")
+    } else {
+        container
+    };
+    Some(module.to_owned())
+}
+
+fn module_super_path(module_path: &str) -> Option<String> {
+    if module_path.is_empty() {
+        return None;
+    }
+    module_path
+        .rsplit_once("::")
+        .map(|(parent, _)| parent.to_owned())
+        .or_else(|| Some(String::new()))
+}
+
+fn join_module_path(module_path: &str, tail: &str) -> Option<String> {
+    let tail = normalize_rust_path(tail);
+    if tail.is_empty() {
+        return None;
+    }
+    if module_path.is_empty() {
+        Some(tail)
+    } else {
+        Some(format!("{module_path}::{tail}"))
+    }
 }
 
 fn receiver_method_candidate(callee_text: &str, caller: &Symbol) -> Option<String> {
@@ -1366,6 +1428,62 @@ impl Worker {
             .expect("non-self receiver call should still be captured conservatively");
         assert_ne!(
             receiver_call.resolution_status,
+            ResolutionStatus::ResolvedExact
+        );
+    }
+
+    #[test]
+    fn resolves_rust_self_and_super_module_paths_from_caller_scope() {
+        let source = r#"pub fn helper() {}
+
+mod outer {
+    pub fn helper() {}
+
+    mod inner {
+        pub fn helper() {}
+
+        pub fn caller() {
+            self::helper();
+            super::helper();
+        }
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+        let inner_helper = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::inner::helper")
+            .expect("inner helper should be indexed");
+        let outer_helper = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::helper")
+            .expect("outer helper should be indexed");
+
+        let self_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "self::helper")
+            .expect("self::helper call should be captured");
+        assert_eq!(
+            self_call.callee_symbol_id.as_deref(),
+            Some(inner_helper.id.as_str())
+        );
+        assert_eq!(self_call.resolution_status, ResolutionStatus::ResolvedExact);
+
+        let super_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "super::helper")
+            .expect("super::helper call should be captured");
+        assert_eq!(
+            super_call.callee_symbol_id.as_deref(),
+            Some(outer_helper.id.as_str())
+        );
+        assert_eq!(
+            super_call.resolution_status,
             ResolutionStatus::ResolvedExact
         );
     }
