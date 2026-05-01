@@ -8,10 +8,10 @@ use symdex_index::{
     WatchChangeSet, run_continuous_index, run_index,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, ImpactSummary, run_call_graph, run_context_pack, run_impact,
-    run_semantic_search, run_symbol_search,
+    CallDirection, CallGraphSummary, FreshnessSummary, ImpactSummary, run_call_graph,
+    run_context_pack, run_freshness_report, run_impact, run_semantic_search, run_symbol_search,
 };
-use symdex_store::{SqliteStore, StoreConfig, sqlite_parent};
+use symdex_store::{EvidenceFreshness, SqliteStore, StoreConfig, sqlite_parent};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -36,6 +36,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "index-status" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             index_status(repo)
+        }
+        "staleness" | "freshness" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let symbol_query = args.get(2).map(String::as_str);
+            staleness(repo, symbol_query)
         }
         "symbol" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -158,6 +163,12 @@ fn index_status(repo: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn staleness(repo: &str, symbol_query: Option<&str>) -> Result<(), String> {
+    let summary = run_freshness_report(repo, symbol_query)?;
+    print_freshness_summary(&summary);
+    Ok(())
+}
+
 fn symbol(repo: &str, query: &str) -> Result<(), String> {
     let summary = run_symbol_search(repo, query).map_err(|error| {
         if error.contains("requires a query") {
@@ -275,15 +286,58 @@ fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {
     println!("results: {}", summary.results.len());
     for result in summary.results {
         println!(
-            "{:.4} {}:{}-{} {}",
+            "{:.4} {}:{}-{} {} run={}",
             result.score,
             result.path,
             result.start_line,
             result.end_line,
-            result.symbol_name.as_deref().unwrap_or("<none>")
+            result.symbol_name.as_deref().unwrap_or("<none>"),
+            result
+                .provenance
+                .index_run_id
+                .as_deref()
+                .unwrap_or("<none>")
         );
     }
     Ok(())
+}
+
+fn print_freshness_summary(summary: &FreshnessSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    if let Some(query) = &summary.symbol_query {
+        println!("symbol_query: {query}");
+        println!("focus_symbols: {}", summary.focus_symbols.len());
+        println!(
+            "context_pack_files: {}",
+            summary
+                .context_pack
+                .as_ref()
+                .map(|pack| pack.files.len())
+                .unwrap_or(0)
+        );
+    }
+    println!("files: {}", summary.files.len());
+    for freshness in [
+        EvidenceFreshness::Fresh,
+        EvidenceFreshness::Stale,
+        EvidenceFreshness::Deleted,
+        EvidenceFreshness::Missing,
+        EvidenceFreshness::Unknown,
+    ] {
+        println!("{}: {}", freshness.label(), summary.count(freshness));
+    }
+    for file in &summary.files {
+        println!(
+            "{} {} indexed={} current={} run={} parser={} indexed_at={}",
+            file.freshness.label(),
+            file.path,
+            file.indexed_content_hash.as_deref().unwrap_or("<none>"),
+            file.current_content_hash.as_deref().unwrap_or("<none>"),
+            file.index_run_id.as_deref().unwrap_or("<none>"),
+            file.parser_version.as_deref().unwrap_or("<none>"),
+            file.indexed_at.as_deref().unwrap_or("<never>")
+        );
+    }
 }
 
 fn print_index_summary(summary: &IndexSummary) {
@@ -475,7 +529,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

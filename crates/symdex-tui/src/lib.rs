@@ -4668,9 +4668,9 @@ mod tests {
         CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary, CallSearchRow,
         ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits,
         CrossStoreHealthSummary, EmbeddingCoverageSummary, EmbeddingExclusionRow,
-        FileCallDetailRow, FileChunkDetailRow, FileCoverageRow, FileCoverageStatus,
-        FileDetailSummary, FileSymbolDetailRow, IndexCoverageSummary, IndexRunTimelineRow,
-        IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus,
+        EvidenceProvenance, FileCallDetailRow, FileChunkDetailRow, FileCoverageRow,
+        FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow, IndexCoverageSummary,
+        IndexRunTimelineRow, IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus,
         SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
         StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
         SymbolOutlineSummary, SymbolSearchRow,
@@ -6000,6 +6000,7 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 start_line: 1,
                 end_line: 3,
+                provenance: sample_provenance(),
             }],
         }));
         let backend = TestBackend::new(100, 24);
@@ -6679,6 +6680,7 @@ mod tests {
             path: Some("src/lib.rs".to_owned()),
             start_line: Some(5),
             end_line: Some(8),
+            provenance: sample_provenance(),
         }
     }
 
@@ -6701,6 +6703,7 @@ mod tests {
             path: "src/lib.rs".to_owned(),
             start_line,
             end_line,
+            provenance: sample_provenance(),
         }
     }
 
@@ -6717,6 +6720,7 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 start_line: 1,
                 end_line: 3,
+                provenance: sample_provenance(),
             }],
             direct_callers: vec![sample_call_row()],
             direct_callees: Vec::new(),
@@ -6727,6 +6731,18 @@ mod tests {
                 max_callees: 8,
             },
             notes: vec!["metadata_only_no_source_text".to_owned()],
+        }
+    }
+
+    fn sample_provenance() -> EvidenceProvenance {
+        EvidenceProvenance {
+            content_hash: Some("content-hash".to_owned()),
+            index_run_id: Some("run".to_owned()),
+            parser_version: Some("parser".to_owned()),
+            indexed_at: Some("2026-04-30T00:00:00Z".to_owned()),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
         }
     }
 
