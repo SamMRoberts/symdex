@@ -194,9 +194,13 @@ single suffix/name matches are `resolved_local_candidate`, multiple matches are
 `ambiguous`, and all other calls are preserved as `unresolved`. Rust resolution
 also normalizes leading `crate::`, `self::`, and `super::` prefixes and applies
 simple file-local `use` aliases such as `use crate::module::function as alias;`
-or `use crate::module as alias;` before falling back to suffix matching. Rust
-macro invocations are preserved as unresolved call edges with low confidence;
-macro expansion is not analyzed. Each macro invocation also emits a
+or `use crate::module as alias;` before falling back to suffix matching. Inside
+Rust methods, calls through `self.method()` and `Self::method()` also add a
+candidate for the enclosing impl receiver, so they can resolve exactly when the
+target method is present in the same file. Other receiver expressions remain
+conservative because symdex does not perform type inference. Rust macro
+invocations are preserved as unresolved call edges with low confidence; macro
+expansion is not analyzed. Each macro invocation also emits a
 metadata-only diagnostic noting that the invocation was preserved without
 expansion.
 

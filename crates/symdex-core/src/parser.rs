@@ -515,10 +515,10 @@ fn collect_call_edges_from_node(
     calls: &mut Vec<CallEdge>,
 ) {
     if is_call_expression(language, node)
-        && let Some(callee_text) = callee_text(node, source)
+        && let Some(callee_text) = callee_text(language, node, source)
     {
         let (callee_symbol_id, resolution_status, confidence) =
-            resolve_callee(&callee_text, symbols, use_aliases);
+            resolve_callee(&callee_text, caller, symbols, use_aliases);
         let call_line = node.start_position().row + 1;
         calls.push(CallEdge {
             id: stable_id(&[
@@ -563,10 +563,11 @@ fn collect_call_edges_from_node(
 
 fn resolve_callee(
     callee_text: &str,
+    caller: &Symbol,
     symbols: &[Symbol],
     use_aliases: &BTreeMap<String, String>,
 ) -> (Option<String>, ResolutionStatus, f32) {
-    let candidates = callee_resolution_candidates(callee_text, use_aliases);
+    let candidates = callee_resolution_candidates(callee_text, caller, use_aliases);
     let exact: Vec<&Symbol> = symbols
         .iter()
         .filter(|symbol| candidates.contains(&symbol.qualified_name))
@@ -609,11 +610,15 @@ fn resolve_callee(
 
 fn callee_resolution_candidates(
     callee_text: &str,
+    caller: &Symbol,
     use_aliases: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let mut candidates = BTreeSet::new();
     candidates.insert(callee_text.to_owned());
     candidates.insert(normalize_rust_path(callee_text));
+    if let Some(method_candidate) = receiver_method_candidate(callee_text, caller) {
+        candidates.insert(method_candidate);
+    }
     if let Some((head, tail)) = callee_text.split_once("::") {
         if let Some(target) = use_aliases.get(head) {
             candidates.insert(format!("{target}::{tail}"));
@@ -622,6 +627,27 @@ fn callee_resolution_candidates(
         candidates.insert(target.clone());
     }
     candidates.into_iter().collect()
+}
+
+fn receiver_method_candidate(callee_text: &str, caller: &Symbol) -> Option<String> {
+    let receiver = caller_receiver_type(caller)?;
+    if let Some(method_name) = callee_text.strip_prefix("self.") {
+        return Some(format!("{receiver}::{method_name}"));
+    }
+    if let Some(method_name) = callee_text.strip_prefix("Self::") {
+        return Some(format!("{receiver}::{method_name}"));
+    }
+    None
+}
+
+fn caller_receiver_type(caller: &Symbol) -> Option<&str> {
+    if caller.kind != SymbolKind::Method {
+        return None;
+    }
+    caller
+        .qualified_name
+        .rsplit_once("::")
+        .map(|(receiver, _)| receiver)
 }
 
 fn collect_visible_use_aliases(
@@ -711,13 +737,16 @@ fn normalize_rust_path(path: &str) -> String {
     parts.join("::")
 }
 
-fn callee_text(call: Node<'_>, source: &str) -> Option<String> {
+fn callee_text(language: Language, call: Node<'_>, source: &str) -> Option<String> {
     let function = call
         .child_by_field_name("function")
         .or_else(|| call.named_child(0))?;
     Some(match function.kind() {
         "identifier" | "property_identifier" => node_text(function, source)?.to_owned(),
         "scoped_identifier" => node_text(function, source)?.replace(' ', ""),
+        "field_expression" if language == Language::Rust => {
+            rust_field_callee_text(function, source)?
+        }
         "field_expression" => function
             .child_by_field_name("field")
             .and_then(|field| node_text(field, source))
@@ -728,6 +757,17 @@ fn callee_text(call: Node<'_>, source: &str) -> Option<String> {
         }
         _ => node_text(function, source)?.replace(' ', ""),
     })
+}
+
+fn rust_field_callee_text(function: Node<'_>, source: &str) -> Option<String> {
+    let full_text = clean_expression_text(node_text(function, source)?);
+    if full_text.starts_with("self.") {
+        return Some(full_text);
+    }
+    function
+        .child_by_field_name("field")
+        .and_then(|field| node_text(field, source))
+        .map(str::to_owned)
 }
 
 fn is_macro_invocation(language: Language, node: Node<'_>) -> bool {
@@ -1225,6 +1265,46 @@ pub fn caller() {
                 .filter(|diagnostic| diagnostic.message.contains("preserved without expansion"))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn resolves_rust_self_and_self_type_method_calls_exactly() {
+        let source = r#"struct Worker;
+
+impl Worker {
+    fn helper(&self) {}
+    fn static_helper() {}
+
+    fn run(&self) {
+        self.helper();
+        Self::static_helper();
+        worker.helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["self.helper", "Self::static_helper"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+            assert_eq!(call.confidence, 1.0);
+        }
+
+        let receiver_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "helper" && call.call_line == 10)
+            .expect("non-self receiver call should still be captured conservatively");
+        assert_ne!(
+            receiver_call.resolution_status,
+            ResolutionStatus::ResolvedExact
         );
     }
 

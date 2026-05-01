@@ -70,7 +70,8 @@ Fixtures should be tiny and purpose-built.
   and impact likely-test evidence from direct indexed test calls.
 - Rust call-resolution coverage for exact local calls, unresolved calls,
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
-  and module aliases used in scoped calls.
+  module aliases used in scoped calls, and exact Rust `self.method()` /
+  `Self::method()` resolution to methods on the enclosing impl receiver.
 - Rust macro coverage for unresolved macro call edges and metadata-only
   diagnostics that macro invocations are preserved without expansion.
 - Rust chunking coverage for function, method, type-definition, trait,
