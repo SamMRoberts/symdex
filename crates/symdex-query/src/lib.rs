@@ -808,10 +808,12 @@ fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
 fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
     let digits = input
         .char_indices()
-        .take_while(|(_, character)| character.is_ascii_digit())
-        .map(|(index, character)| (index, character.len_utf8()))
-        .last()
-        .map(|(index, width)| index + width)?;
+        .find(|(_, character)| !character.is_ascii_digit())
+        .map(|(index, _)| index)
+        .unwrap_or(input.len());
+    if digits == 0 {
+        return None;
+    }
     let value = input[..digits].parse::<usize>().ok()?;
     Some((value, &input[digits..]))
 }
@@ -843,7 +845,10 @@ fn parse_failing_test(line: &str, in_failures: bool) -> Option<String> {
     {
         return Some(test.trim().to_owned());
     }
-    if in_failures && line.contains("::") && !line.contains(' ') {
+    if in_failures
+        && !line.contains(' ')
+        && (line.starts_with("tests::") || line.contains("::tests::"))
+    {
         return Some(line.to_owned());
     }
     None
@@ -853,7 +858,7 @@ fn looks_like_runtime_noise(line: &str) -> bool {
     line.contains("panicked")
         || line.contains("stack backtrace")
         || line.contains("FAILED")
-        || line.contains(".rs")
+        || line.contains(".rs:")
 }
 
 fn sqlite_for_read() -> Result<SqliteStore, String> {
@@ -1124,7 +1129,7 @@ mod tests {
              at src/stale.rs:2:1\n\
              at src/deleted.rs:2:1\n\
              at src/unknown.rs:9:1\n\
-             not a stack trace line with .rs text",
+             not a stack trace line with broken.rs: text",
             fixture.root.path().display()
         );
 
