@@ -569,9 +569,12 @@ fn impact_related_files(
     files
         .into_iter()
         .map(|(path, (relationship_count, provenance))| {
-            let freshness = provenance.as_ref().map_or(EvidenceFreshness::Unknown, |p| {
-                freshness_for_provenance(Some(path.as_str()), p, current_hashes)
-            });
+            let freshness = match &provenance {
+                Some(provenance) => {
+                    freshness_for_provenance(Some(path.as_str()), provenance, current_hashes)
+                }
+                None => EvidenceFreshness::Unknown,
+            };
             ImpactRelatedFile {
                 path,
                 relationship_count,

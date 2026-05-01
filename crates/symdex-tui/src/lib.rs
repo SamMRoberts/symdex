@@ -4998,7 +4998,8 @@ mod tests {
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
         GraphStatus, IndexMode, QueryStatus, Screen, StorageExplorerState, StorageMode, UiAction,
-        View, continuous_activity_frame, progress_percent, reduce_screen, render,
+        View, continuous_activity_frame, parse_call_path_input, progress_percent, reduce_screen,
+        render,
     };
 
     #[test]
@@ -6693,6 +6694,15 @@ mod tests {
 
         assert!(!app.handle_evidence_key(KeyCode::Backspace));
         assert_eq!(app.evidence.input, "ad");
+    }
+
+    #[test]
+    fn call_path_input_accepts_spaced_arrow_separator() {
+        let (source, target) =
+            parse_call_path_input("crate::caller -> crate::add").expect("input should parse");
+
+        assert_eq!(source, "crate::caller");
+        assert_eq!(target, "crate::add");
     }
 
     #[test]

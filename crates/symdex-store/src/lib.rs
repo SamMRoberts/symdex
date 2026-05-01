@@ -638,6 +638,7 @@ impl SqliteStore {
             }
             let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
             let mut stack = Vec::new();
+            let mut source_paths = Vec::new();
             trace_call_paths(
                 &source.id,
                 max_depth,
@@ -648,9 +649,9 @@ impl SqliteStore {
                 },
                 &mut visited,
                 &mut stack,
-                &mut paths,
+                &mut source_paths,
             );
-            paths.retain(|path| path.hops > 1);
+            paths.extend(source_paths.into_iter().filter(|path| path.hops > 1));
             if paths.len() >= 50 {
                 break;
             }
@@ -2536,6 +2537,8 @@ fn trace_reachable_call_paths(
     };
     for edge in edges {
         stack.push(edge.clone());
+        // Impact already reports direct callees separately, so this traversal
+        // only materializes bounded transitive paths.
         if stack.len() > 1 {
             paths.push(call_path_from_edges(stack));
             if paths.len() >= 50 {
