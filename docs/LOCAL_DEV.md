@@ -4,6 +4,7 @@
 
 - Rust toolchain
 - SQLite available through Rust crate bindings
+- `cargo-audit` installed for local dependency audits
 - Qdrant running locally
 - Ollama running locally
 - `nomic-embed-text` pulled into Ollama
@@ -11,6 +12,7 @@
 ## Local setup commands
 
 ```bash
+cargo install cargo-audit --locked
 ollama pull nomic-embed-text
 docker pull qdrant/qdrant
 docker run -p 6333:6333 -p 6334:6334 \
@@ -25,14 +27,25 @@ SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
+SYMDEX_RUST_ANALYZER=0
+SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
+
+`SYMDEX_RUST_ANALYZER=1` enables an optional `symdex doctor` readiness check for
+the configured rust-analyzer binary. The check runs `rust-analyzer --version`
+only. Indexing uses the same opt-in flag to report a metadata-only enrichment
+plan for changed Rust files, but does not run rust-analyzer project analysis by
+default.
 
 ## Expected commands
 
 ```bash
 cargo fmt --all
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --workspace --release
+cargo audit
 cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- doctor .
@@ -55,10 +68,17 @@ cargo run -p symdex-cli -- serve-mcp
 
 Implemented CLI commands currently include:
 
+Use top-level `--json` or `--output json` with read-only MCP-backed evidence
+commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
+`structuredContent`. JSON mode is currently supported for `index-status`,
+`search`, `symbol`, `callers`, `callees`, `call-path`, `impact`,
+`context-pack`, and `debug-context`.
+
 - `init`: creates the local state directory for the configured SQLite path.
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
-  service checks, the active MCP evidence contract version, and repo-specific
-  index freshness/provenance readiness when a repo path is provided.
+  service checks, optional rust-analyzer enrichment readiness when explicitly
+  enabled, the active MCP evidence contract version, and repo-specific index
+  freshness/provenance readiness when a repo path is provided.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
   applies built-in excludes and scoped simple `.gitignore` rules, hashes file
   contents, extracts tree-sitter function and method chunks where supported,
@@ -68,6 +88,9 @@ Implemented CLI commands currently include:
   service calls; unchanged files are skipped by content hash. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/Qdrant embedding.
+  When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
+  rust-analyzer enrichment readiness and eligible Rust file, symbol, and call
+  counts without applying rust-analyzer facts.
 - `index --watch <repo>`: starts continuous indexing. It polls local eligible
   Rust, C#, JavaScript, and TypeScript files, debounces event bursts, detects
   created/modified/deleted paths by content-hash snapshots, and reindexes
@@ -80,6 +103,14 @@ Implemented CLI commands currently include:
   current eligible files for implemented languages and reports fresh, stale,
   deleted, missing, and unknown evidence states. With a symbol query, the report
   is scoped to files involved in the matching symbols and compact context pack.
+- `qdrant-verify <repo>`: compares SQLite vector-backed chunk metadata against
+  live Qdrant point payloads for the configured embedding model. It reports
+  missing collections, missing points, stale payload metadata, and orphaned
+  points without printing source text or vectors.
+- `qdrant-repair <repo>`: runs the same verification first, deletes orphaned
+  Qdrant points, then runs semantic indexing when missing collections, missing
+  points, stale payload fields, model drift, or dimension drift require vectors
+  to be rebuilt. It finishes with a second verification report.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
   name and returns path, line ranges, and provenance metadata.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct
@@ -91,34 +122,41 @@ Implemented CLI commands currently include:
   path, line, confidence, resolution, and provenance fields.
 - `impact <repo> <symbol>`: prints direct callers, direct callees, bounded
   transitive caller/callee paths, related files, provenance, and staleness
-  labels. Likely tests are intentionally empty until test discovery and mapping
-  are indexed.
+  labels. Evidence rows include trust scores derived from freshness,
+  provenance completeness, confidence, and index metadata completeness, plus
+  compact reason tags explaining why each evidence row was returned. Likely tests
+  list indexed Rust tests that directly call the queried symbol when discovered
+  test metadata and resolved call evidence are present.
 - `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
   context. The current format is `symdex.context_pack.v1` and includes focus
   symbols, direct callers, direct callees, involved files, section limits, and
   notes. It does not include source text.
 - `debug-context <repo> <runtime-input|file|->`: parses runtime failure input
   such as stack traces, panic locations, failing test names, frame symbols, and
-  indexed-language file paths, then prints `symdex.debug_context.v1` JSON. The pack maps
-  frames to indexed files, symbols, calls at the failing line, freshness, and
-  provenance when available. Passing `-` reads from stdin; a single existing
-  path reads that file; otherwise remaining arguments are treated as inline
-  runtime text. It does not include source text.
+  indexed-language file paths, then prints `symdex.debug_context.v1` JSON. Rust
+  parsing covers common `cargo test`, panic-hook, `anyhow`, `tracing`, full
+  backtrace, and async stack-like output shapes. The pack maps frames to indexed
+  files, symbols, calls at the failing line, freshness, and provenance when
+  available. Passing `-` reads from stdin; a single existing path reads that
+  file; otherwise remaining arguments are treated as inline runtime text. Frame
+  matches include trust scores and reason tags, and the pack does not include
+  source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, symbol names, and provenance
-  metadata.
+  metadata. Text output also prints compact reason tags for each match.
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
-  opens a repository/status dashboard backed by SQLite metadata and local
-  service configuration. Use `o` to confirm offline indexing, `s` to confirm
-  semantic indexing, `c` to toggle continuous indexing, `[` / `]` to move
-  between the Index, Storage, Doctor, Query, Calls, and Impact tabs, and
-  `Tab` / `Shift+Tab` to toggle view-local modes including impact, call-path,
-  context-pack, and debug-context evidence modes. In the Doctor tab, `Enter`
-  starts diagnostics when no result rows are available. The storage explorer
-  always shows its own nested tab header for storage overview/index
+  opens an Overview tab backed by SQLite metadata and local service
+  configuration, then uses a compact repository summary beside or above the
+  active workflow on other tabs. Use `o` to confirm offline indexing, `s` to
+  confirm semantic indexing, `c` to toggle continuous indexing, `[` / `]` to
+  move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
+  tabs, and `Tab` / `Shift+Tab` to toggle view-local modes including impact,
+  call-path, context-pack, and debug-context evidence modes. In the Doctor tab,
+  `Enter` starts diagnostics when no result rows are available. The storage
+  explorer always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs
-  timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r` to refresh
-  repository/storage status, and `q` or `Esc` to quit.
+  timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
+  to refresh repository/storage status, and `q` or `Esc` to quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
@@ -128,6 +166,17 @@ Implemented CLI commands currently include:
 reachable, whether the configured embedding model is present, and whether vector
 dimension probing succeeds. These checks report diagnostic status and do not
 mutate repository data.
+
+## CI checks
+
+GitHub Actions runs the production hardening baseline on pull requests and on
+pushes to `main`:
+
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `cargo build --workspace --release`
+- `cargo audit`
 
 The TUI should surface these same diagnostics. Semantic search and semantic
 indexing views require local Ollama and Qdrant; status, structural queries, and
@@ -148,5 +197,6 @@ The app should not require network access beyond local loopback services during 
 - embedding model is available
 - vector dimension can be determined
 - active MCP evidence contract version is local-only and read-only
+- optional rust-analyzer enrichment readiness when `SYMDEX_RUST_ANALYZER=1`
 - configured repo root exists
 - repo-specific index freshness and provenance consistency when a repo is passed

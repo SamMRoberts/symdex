@@ -1,6 +1,8 @@
 //! Terminal UI state, rendering, events, and terminal lifecycle.
 
-use std::io::{self, Stdout};
+mod navigation;
+mod terminal;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -8,12 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+pub(crate) use navigation::{IndexMode, Screen, UiAction, reduce_screen};
 use ratatui::Terminal;
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,7 +23,8 @@ use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run
 use symdex_embed::EmbedConfig;
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexProgress,
-    IndexSummary, run_continuous_index_until, run_index_with_progress,
+    IndexSummary, RustAnalyzerEnrichmentSummary, run_continuous_index_until,
+    run_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
@@ -43,6 +43,8 @@ use symdex_store::{
     StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
     qdrant_collection_name,
 };
+pub use terminal::help_text;
+use terminal::{enter_terminal, leave_terminal};
 
 pub struct TuiOptions {
     pub repo: String,
@@ -54,10 +56,6 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
     let result = run_app(&mut terminal, app);
     leave_terminal(&mut terminal)?;
     result
-}
-
-pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    [         Switch to the previous primary tab\n    ]         Switch to the next primary tab\n    Tab       Switch to the next mode in the active view\n    Shift+Tab Switch to the previous mode in the active view\n    Up/Down   Move selected result row\n    Enter     Run lookup, run Doctor, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    c         Toggle continuous indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -138,8 +136,8 @@ impl App {
             ollama_url: embed_config.ollama_url,
             embed_model: embed_config.model,
             status,
-            message: "Dashboard loaded. Press q or Esc to quit.".to_owned(),
-            view: View::Indexing,
+            message: "Overview loaded. Press q or Esc to quit.".to_owned(),
+            view: View::Overview,
             screen: Screen::Dashboard,
             last_index_summary: None,
             index_progress: None,
@@ -199,8 +197,8 @@ impl App {
             ollama_url: "http://localhost:11434".to_owned(),
             embed_model: "nomic-embed-text".to_owned(),
             status,
-            message: "Dashboard loaded. Press q or Esc to quit.".to_owned(),
-            view: View::Indexing,
+            message: "Overview loaded. Press q or Esc to quit.".to_owned(),
+            view: View::Overview,
             screen: Screen::Dashboard,
             last_index_summary: None,
             index_progress: None,
@@ -274,6 +272,20 @@ impl App {
                 Span::styled("Watch: ", Style::new().add_modifier(Modifier::BOLD)),
                 Span::raw(self.continuous.summary()),
             ]),
+            Line::from({
+                let mut spans = vec![Span::styled(
+                    "Watch error: ",
+                    Style::new().add_modifier(Modifier::BOLD),
+                )];
+                if let Some(error) = &self.continuous.latest_error {
+                    spans.push(status_span("error", StatusTone::Error));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::raw(error.as_str()));
+                } else {
+                    spans.push(status_span("none", StatusTone::Dim));
+                }
+                spans
+            }),
             Line::from(""),
         ];
 
@@ -750,7 +762,7 @@ impl App {
             }
             KeyCode::Enter if self.screen.is_terminal_job_state() => {
                 self.screen = reduce_screen(self.screen, UiAction::Dismiss);
-                self.message = "Dashboard loaded. Press q or Esc to quit.".to_owned();
+                self.message = "Indexing controls ready.".to_owned();
             }
             KeyCode::Char('r') if !matches!(self.screen, Screen::IndexRunning(_)) => {
                 if let Err(error) = self.refresh_status() {
@@ -815,6 +827,9 @@ impl App {
                 self.evidence.status = EvidenceStatus::Idle;
                 self.evidence.selection = 0;
                 self.message = format!("Evidence mode set to {}.", self.evidence.mode.label());
+            }
+            View::Overview => {
+                self.message = "Overview has no alternate mode.".to_owned();
             }
             View::Indexing => {
                 self.message = "No alternate indexing mode is selected with Tab.".to_owned();
@@ -965,7 +980,7 @@ impl App {
                     let _ = progress_sender.send(IndexJobMessage::Progress(progress));
                 },
             );
-            let _ = sender.send(IndexJobMessage::Finished(result));
+            let _ = sender.send(IndexJobMessage::Finished(result.map(Box::new)));
         });
         self.index_receiver = Some(receiver);
         self.last_index_summary = None;
@@ -1135,7 +1150,7 @@ impl App {
                     summary.sqlite_chunks_indexed
                 );
                 let completed_message = self.message.clone();
-                self.last_index_summary = Some(summary);
+                self.last_index_summary = Some(*summary);
                 self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
                 if let Err(error) = self.refresh_status() {
@@ -1248,7 +1263,7 @@ impl App {
                 self.continuous.last_reindexed_file =
                     changes.paths().first().map(|path| (*path).to_owned());
                 self.continuous.latest_error = None;
-                self.last_index_summary = Some(summary);
+                self.last_index_summary = Some(*summary);
                 if let Err(error) = self.refresh_status() {
                     self.message =
                         format!("Continuous indexing completed, but refresh failed: {error}");
@@ -1385,20 +1400,37 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 .split(frame.area());
 
             let tabs = Tabs::new(View::tabs())
-                .block(Block::default().borders(Borders::ALL).title("symdex TUI"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(tone_style(StatusTone::Dim))
+                        .title(Line::from(vec![
+                            status_span("symdex", StatusTone::Info),
+                            Span::raw(" TUI"),
+                        ])),
+                )
                 .select(app.view.tab_index())
                 .style(Style::new().fg(Color::DarkGray))
-                .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                .highlight_style(tab_highlight_style());
             frame.render_widget(tabs, chunks[0]);
 
-            let body_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-                .split(chunks[1]);
-
-            render_repository_status_panel(frame, body_chunks[0], app);
-
-            render_right_panel(frame, body_chunks[1], app);
+            if app.view == View::Overview {
+                render_overview_panel(frame, chunks[1], app);
+            } else if chunks[1].width >= 110 {
+                let body_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(36), Constraint::Min(60)])
+                    .split(chunks[1]);
+                render_repository_summary_panel(frame, body_chunks[0], app);
+                render_right_panel(frame, body_chunks[1], app);
+            } else {
+                let body_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(6), Constraint::Min(8)])
+                    .split(chunks[1]);
+                render_repository_summary_panel(frame, body_chunks[0], app);
+                render_right_panel(frame, body_chunks[1], app);
+            }
 
             let mut status_line = Vec::new();
             if let Some(indicator) = app.continuous_activity_span() {
@@ -1423,20 +1455,14 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 .constraints([Constraint::Length(2), Constraint::Length(2)])
                 .split(chunks[2]);
 
-            let keys = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "keys ",
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(app.view.footer_help(), Style::new().fg(Color::White)),
-            ]))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(tone_style(StatusTone::Info))
-                    .title(Line::from(status_span("Keys", StatusTone::Info))),
-            );
+            let keys = Paragraph::new(Line::from(footer_key_spans(app.view)))
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(tone_style(StatusTone::Info))
+                        .title(Line::from(status_span("Keys", StatusTone::Info))),
+                );
             frame.render_widget(keys, footer_chunks[0]);
 
             let status = Paragraph::new(Line::from(status_line))
@@ -1455,6 +1481,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
 
 fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     match app.view {
+        View::Overview => render_overview_panel(frame, area, app),
         View::Storage => render_storage_panel(frame, area, app),
         View::Diagnostics => match &app.diagnostics {
             DiagnosticsState::Completed(report) => {
@@ -1464,9 +1491,30 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         },
         View::Query => match &app.query.status {
             QueryStatus::Completed(result) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(5)])
+                    .split(area);
+                render_mode_bar(
+                    frame,
+                    chunks[0],
+                    "Query Mode",
+                    vec![
+                        ("mode", app.query.mode.label().to_owned(), StatusTone::Info),
+                        (
+                            "input",
+                            if app.query.input.is_empty() {
+                                "<empty>".to_owned()
+                            } else {
+                                app.query.input.clone()
+                            },
+                            StatusTone::Dim,
+                        ),
+                    ],
+                );
                 render_selectable_table(
                     frame,
-                    area,
+                    chunks[1],
                     query_table(result),
                     app.query.selection,
                     query_result_count(result),
@@ -1476,9 +1524,34 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         },
         View::Graph => match &app.graph.status {
             GraphStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(5)])
+                    .split(area);
+                render_mode_bar(
+                    frame,
+                    chunks[0],
+                    "Calls Mode",
+                    vec![
+                        (
+                            "direction",
+                            app.graph.direction.label().to_owned(),
+                            StatusTone::Info,
+                        ),
+                        (
+                            "symbol",
+                            if app.graph.input.is_empty() {
+                                "<empty>".to_owned()
+                            } else {
+                                app.graph.input.clone()
+                            },
+                            StatusTone::Dim,
+                        ),
+                    ],
+                );
                 render_selectable_table(
                     frame,
-                    area,
+                    chunks[1],
                     call_graph_table(summary),
                     app.graph.selection,
                     summary.rows.len(),
@@ -1488,36 +1561,44 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         },
         View::Evidence => match &app.evidence.status {
             EvidenceStatus::Completed(EvidenceResult::Impact(summary)) => {
+                let chunks = evidence_result_chunks(area);
+                render_evidence_mode_bar(frame, chunks[0], app);
                 render_selectable_table(
                     frame,
-                    area,
+                    chunks[1],
                     impact_table(summary),
                     app.evidence.selection,
                     impact_result_count(summary),
                 );
             }
             EvidenceStatus::Completed(EvidenceResult::CallPath(summary)) => {
+                let chunks = evidence_result_chunks(area);
+                render_evidence_mode_bar(frame, chunks[0], app);
                 render_selectable_table(
                     frame,
-                    area,
+                    chunks[1],
                     call_path_table(summary),
                     app.evidence.selection,
                     call_path_result_count(summary),
                 );
             }
             EvidenceStatus::Completed(EvidenceResult::ContextPack(pack)) => {
+                let chunks = evidence_result_chunks(area);
+                render_evidence_mode_bar(frame, chunks[0], app);
                 render_selectable_table(
                     frame,
-                    area,
+                    chunks[1],
                     context_pack_table(pack),
                     app.evidence.selection,
                     context_pack_row_count(pack),
                 );
             }
             EvidenceStatus::Completed(EvidenceResult::DebugContext(pack)) => {
+                let chunks = evidence_result_chunks(area);
+                render_evidence_mode_bar(frame, chunks[0], app);
                 render_selectable_table(
                     frame,
-                    area,
+                    chunks[1],
                     debug_context_table(pack),
                     app.evidence.selection,
                     debug_context_row_count(pack),
@@ -1576,6 +1657,199 @@ fn render_repository_status_panel(frame: &mut ratatui::Frame<'_>, area: Rect, ap
 
     frame.render_widget(index_counts_table(app), chunks[1]);
     frame.render_widget(local_services_table(app), chunks[2]);
+}
+
+fn render_overview_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    if area.width >= 110 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(area);
+        render_repository_status_panel(frame, chunks[0], app);
+        render_overview_focus_panel(frame, chunks[1], app);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(12), Constraint::Min(6)])
+            .split(area);
+        render_repository_status_panel(frame, chunks[0], app);
+        render_overview_focus_panel(frame, chunks[1], app);
+    }
+}
+
+fn render_repository_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(tone_style(StatusTone::Dim))
+        .title(Line::from(status_span("Repo Summary", StatusTone::Info)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(vec![
+            status_span("repo", StatusTone::Info),
+            Span::raw(" "),
+            Span::raw(app.repo_root.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("indexed ", metadata_style()),
+            index_freshness_span(app.status.last_indexed_at.as_deref()),
+            Span::raw(" "),
+            Span::raw(app.status.last_indexed_at.as_deref().unwrap_or("<never>")),
+        ]),
+        Line::from(vec![
+            Span::styled("coverage ", metadata_style()),
+            status_span("files", StatusTone::Info),
+            Span::raw(format!(" {}  ", app.status.files_indexed)),
+            status_span("chunks", StatusTone::Info),
+            Span::raw(format!(" {}  ", app.status.chunks_indexed)),
+            status_span("symbols", StatusTone::Info),
+            Span::raw(format!(" {}", app.status.symbols_indexed)),
+        ]),
+        Line::from(vec![
+            Span::styled("services ", metadata_style()),
+            status_span("sqlite", StatusTone::Success),
+            Span::raw(" local  "),
+            status_span("qdrant", StatusTone::Success),
+            Span::raw(" local  "),
+            status_span("ollama", StatusTone::Success),
+            Span::raw(" local"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn render_overview_focus_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(tone_style(StatusTone::Info))
+        .title(Line::from(status_span(
+            "Operational Focus",
+            StatusTone::Info,
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Min(4),
+        ])
+        .split(inner);
+
+    render_mode_bar(
+        frame,
+        chunks[0],
+        "Current State",
+        vec![
+            (
+                "index",
+                app.status
+                    .last_indexed_at
+                    .as_deref()
+                    .unwrap_or("never")
+                    .to_owned(),
+                if app.status.last_indexed_at.is_some() {
+                    StatusTone::Success
+                } else {
+                    StatusTone::Warning
+                },
+            ),
+            (
+                "embedding",
+                index_embedding(&app.status),
+                if app.status.embedding_model.is_some() {
+                    StatusTone::Success
+                } else {
+                    StatusTone::Warning
+                },
+            ),
+            (
+                "watch",
+                app.continuous.summary(),
+                app.continuous.status_tone(),
+            ),
+        ],
+    );
+
+    let health_rows = vec![
+        Row::new(vec![
+            Cell::from("SQLite"),
+            Cell::from(status_span("local", StatusTone::Success)),
+            Cell::from(app.sqlite_path.clone()),
+        ]),
+        Row::new(vec![
+            Cell::from("Qdrant"),
+            Cell::from(status_span("local", StatusTone::Success)),
+            Cell::from(app.qdrant_url.clone()),
+        ]),
+        Row::new(vec![
+            Cell::from("Ollama"),
+            Cell::from(status_span("local", StatusTone::Success)),
+            Cell::from(app.ollama_url.clone()),
+        ]),
+    ];
+    let health = Table::new(
+        health_rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(16),
+        ],
+    )
+    .header(table_header(["Service", "State", "Target"]))
+    .block(panel_block("Local Services", StatusTone::Dim));
+    frame.render_widget(health, chunks[1]);
+
+    let view_rows = vec![
+        Row::new(vec![
+            Cell::from("Index"),
+            Cell::from(screen_label(app.screen)),
+            Cell::from(status_span("ready", StatusTone::Info)),
+        ]),
+        Row::new(vec![
+            Cell::from("Storage"),
+            Cell::from(app.storage.mode.label()),
+            Cell::from(status_span("loaded", StatusTone::Success)),
+        ]),
+        Row::new(vec![
+            Cell::from("Query"),
+            Cell::from(app.query.mode.label()),
+            Cell::from(status_span(
+                query_status_label(&app.query.status),
+                query_status_tone(&app.query.status),
+            )),
+        ]),
+        Row::new(vec![
+            Cell::from("Calls"),
+            Cell::from(app.graph.direction.label()),
+            Cell::from(status_span(
+                graph_status_label(&app.graph.status),
+                graph_status_tone(&app.graph.status),
+            )),
+        ]),
+        Row::new(vec![
+            Cell::from("Impact"),
+            Cell::from(app.evidence.mode.label()),
+            Cell::from(status_span(
+                evidence_status_label(&app.evidence.status),
+                evidence_status_tone(&app.evidence.status),
+            )),
+        ]),
+    ];
+    let views = Table::new(
+        view_rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(18),
+            Constraint::Min(10),
+        ],
+    )
+    .header(table_header(["View", "Mode", "State"]))
+    .block(panel_block("Mode Snapshot", StatusTone::Dim));
+    frame.render_widget(views, chunks[2]);
 }
 
 fn render_storage_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1867,8 +2141,67 @@ fn render_line_panel(
     lines: Vec<Line<'_>>,
 ) {
     let panel = List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(panel_block(title, StatusTone::Dim));
     frame.render_widget(panel, area);
+}
+
+fn render_mode_bar(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    items: Vec<(&'static str, String, StatusTone)>,
+) {
+    let mut spans = Vec::new();
+    for (index, (label, value, tone)) in items.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" | ", metadata_style()));
+        }
+        spans.push(Span::styled(
+            format!("{label} "),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            value,
+            tone_style(tone).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .wrap(Wrap { trim: true })
+            .block(panel_block(title, StatusTone::Info)),
+        area,
+    );
+}
+
+fn evidence_result_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area)
+}
+
+fn render_evidence_mode_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    render_mode_bar(
+        frame,
+        area,
+        "Impact Mode",
+        vec![
+            (
+                "mode",
+                app.evidence.mode.label().to_owned(),
+                StatusTone::Info,
+            ),
+            (
+                "input",
+                if app.evidence.input.is_empty() {
+                    "<empty>".to_owned()
+                } else {
+                    app.evidence.input.clone()
+                },
+                StatusTone::Dim,
+            ),
+        ],
+    );
 }
 
 fn render_selectable_table(
@@ -1912,25 +2245,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
             return Ok(());
         }
     }
-}
-
-fn enter_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
-    enable_raw_mode().map_err(|error| error.to_string())?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|error| {
-        let _ = disable_raw_mode();
-        error.to_string()
-    })?;
-    Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| {
-        let _ = disable_raw_mode();
-        error.to_string()
-    })
-}
-
-fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), String> {
-    disable_raw_mode().map_err(|error| error.to_string())?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|error| error.to_string())?;
-    terminal.show_cursor().map_err(|error| error.to_string())
 }
 
 fn index_embedding(status: &RepositoryStatus) -> String {
@@ -2252,6 +2566,31 @@ fn summary_lines(summary: &IndexSummary) -> Vec<Line<'static>> {
             summary.chunks_excluded_from_embedding
         )),
     ];
+    match &summary.rust_analyzer {
+        RustAnalyzerEnrichmentSummary::Disabled { .. } => {
+            lines.push(Line::from("Rust-analyzer enrichment: disabled"));
+        }
+        RustAnalyzerEnrichmentSummary::NotReady { reason, .. } => {
+            lines.push(Line::from(format!(
+                "Rust-analyzer enrichment: not ready ({reason})"
+            )));
+        }
+        RustAnalyzerEnrichmentSummary::SkippedNoRustFiles { .. } => {
+            lines.push(Line::from(
+                "Rust-analyzer enrichment: skipped (no Rust files)",
+            ));
+        }
+        RustAnalyzerEnrichmentSummary::Planned {
+            eligible_files,
+            eligible_symbols,
+            eligible_calls,
+            ..
+        } => {
+            lines.push(Line::from(format!(
+                "Rust-analyzer enrichment: planned files={eligible_files} symbols={eligible_symbols} calls={eligible_calls}"
+            )));
+        }
+    }
     match &summary.embedding {
         EmbeddingSummary::SkippedOffline => {
             lines.push(Line::from("Embedding: skipped (--offline)"));
@@ -4416,6 +4755,109 @@ fn table_header<const N: usize>(labels: [&'static str; N]) -> Row<'static> {
     .style(Style::new().fg(Color::Cyan))
 }
 
+fn panel_block(title: &'static str, tone: StatusTone) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(tone_style(tone))
+        .title(Line::from(status_span(title, tone)))
+}
+
+fn metadata_style() -> Style {
+    Style::new().fg(Color::DarkGray)
+}
+
+fn tab_highlight_style() -> Style {
+    Style::new()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+}
+
+fn footer_key_spans(view: View) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        "keys ",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )];
+    for (index, (key, label)) in view.footer_keys().iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", metadata_style()));
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*label, Style::new().fg(Color::White)));
+    }
+    spans
+}
+
+fn screen_label(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Dashboard => "idle",
+        Screen::ConfirmIndex(_) | Screen::ConfirmContinuous => "confirm",
+        Screen::IndexRunning(_) => "running",
+        Screen::IndexCompleted(_) => "complete",
+        Screen::IndexFailed(_) => "failed",
+    }
+}
+
+fn query_status_label(status: &QueryStatus) -> &'static str {
+    match status {
+        QueryStatus::Idle => "idle",
+        QueryStatus::Running => "running",
+        QueryStatus::Completed(_) => "complete",
+        QueryStatus::Failed(_) => "failed",
+    }
+}
+
+fn query_status_tone(status: &QueryStatus) -> StatusTone {
+    match status {
+        QueryStatus::Idle => StatusTone::Dim,
+        QueryStatus::Running => StatusTone::Info,
+        QueryStatus::Completed(_) => StatusTone::Success,
+        QueryStatus::Failed(_) => StatusTone::Error,
+    }
+}
+
+fn graph_status_label(status: &GraphStatus) -> &'static str {
+    match status {
+        GraphStatus::Idle => "idle",
+        GraphStatus::Running => "running",
+        GraphStatus::Completed(_) => "complete",
+        GraphStatus::Failed(_) => "failed",
+    }
+}
+
+fn graph_status_tone(status: &GraphStatus) -> StatusTone {
+    match status {
+        GraphStatus::Idle => StatusTone::Dim,
+        GraphStatus::Running => StatusTone::Info,
+        GraphStatus::Completed(_) => StatusTone::Success,
+        GraphStatus::Failed(_) => StatusTone::Error,
+    }
+}
+
+fn evidence_status_label(status: &EvidenceStatus) -> &'static str {
+    match status {
+        EvidenceStatus::Idle => "idle",
+        EvidenceStatus::Running => "running",
+        EvidenceStatus::Completed(_) => "complete",
+        EvidenceStatus::Failed(_) => "failed",
+    }
+}
+
+fn evidence_status_tone(status: &EvidenceStatus) -> StatusTone {
+    match status {
+        EvidenceStatus::Idle => StatusTone::Dim,
+        EvidenceStatus::Running => StatusTone::Info,
+        EvidenceStatus::Completed(_) => StatusTone::Success,
+        EvidenceStatus::Failed(_) => StatusTone::Error,
+    }
+}
+
 fn diagnostic_status(state: DiagnosticState) -> (&'static str, StatusTone) {
     match state {
         DiagnosticState::Ok => ("ok", StatusTone::Success),
@@ -4571,6 +5013,7 @@ fn matched_cell(matched: bool) -> Cell<'static> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
+    Overview,
     Indexing,
     Storage,
     Diagnostics,
@@ -4580,23 +5023,27 @@ enum View {
 }
 
 impl View {
-    fn tabs() -> [&'static str; 6] {
-        ["Index", "Storage", "Doctor", "Query", "Calls", "Impact"]
+    fn tabs() -> [&'static str; 7] {
+        [
+            "Overview", "Index", "Storage", "Doctor", "Query", "Calls", "Impact",
+        ]
     }
 
     fn tab_index(self) -> usize {
         match self {
-            Self::Indexing => 0,
-            Self::Storage => 1,
-            Self::Diagnostics => 2,
-            Self::Query => 3,
-            Self::Graph => 4,
-            Self::Evidence => 5,
+            Self::Overview => 0,
+            Self::Indexing => 1,
+            Self::Storage => 2,
+            Self::Diagnostics => 3,
+            Self::Query => 4,
+            Self::Graph => 5,
+            Self::Evidence => 6,
         }
     }
 
     fn footer_label(self) -> &'static str {
         match self {
+            Self::Overview => "overview",
             Self::Indexing => "index",
             Self::Storage => "storage",
             Self::Diagnostics => "doctor",
@@ -4606,43 +5053,74 @@ impl View {
         }
     }
 
-    fn footer_help(self) -> &'static str {
+    fn footer_keys(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Indexing => {
-                "[ or ] tabs | o offline | s semantic | c continuous | r refresh | q quit"
-            }
-            Self::Storage => {
-                "[ or ] tabs | Tab/Shift+Tab storage tabs | Up/Down select | r refresh | q quit"
-            }
-            Self::Diagnostics => {
-                "[ or ] tabs | Enter run/details | Up/Down select | r refresh | q quit"
-            }
-            Self::Query => {
-                "[ or ] tabs | Tab/Shift+Tab mode | type query | Up/Down select | Enter run | Esc clear/back | q quit"
-            }
-            Self::Graph => {
-                "[ or ] tabs | Tab/Shift+Tab callers/callees | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
-            }
-            Self::Evidence => {
-                "[ or ] tabs | Tab/Shift+Tab impact/call-path/context/debug | type symbol, source -> target, or runtime failure | Up/Down select | Enter run | Esc clear/back | q quit"
-            }
+            Self::Overview => &[("[ ]", "tabs"), ("r", "refresh"), ("q", "quit")],
+            Self::Indexing => &[
+                ("[ ]", "tabs"),
+                ("o", "offline"),
+                ("s", "semantic"),
+                ("c", "continuous"),
+                ("r", "refresh"),
+                ("q", "quit"),
+            ],
+            Self::Storage => &[
+                ("[ ]", "tabs"),
+                ("Tab", "storage view"),
+                ("Up/Down", "select"),
+                ("r", "refresh"),
+                ("q", "quit"),
+            ],
+            Self::Diagnostics => &[
+                ("[ ]", "tabs"),
+                ("Enter", "run/details"),
+                ("Up/Down", "select"),
+                ("r", "refresh"),
+                ("q", "quit"),
+            ],
+            Self::Query => &[
+                ("[ ]", "tabs"),
+                ("Tab", "mode"),
+                ("type", "query"),
+                ("Enter", "run"),
+                ("Up/Down", "select"),
+                ("Esc", "clear/back"),
+            ],
+            Self::Graph => &[
+                ("[ ]", "tabs"),
+                ("Tab", "direction"),
+                ("type", "symbol"),
+                ("Enter", "run"),
+                ("Up/Down", "select"),
+                ("Esc", "clear/back"),
+            ],
+            Self::Evidence => &[
+                ("[ ]", "tabs"),
+                ("Tab", "mode"),
+                ("type", "input"),
+                ("Enter", "run"),
+                ("Up/Down", "select"),
+                ("Esc", "clear/back"),
+            ],
         }
     }
 
     fn next(self) -> Self {
         match self {
+            Self::Overview => Self::Indexing,
             Self::Indexing => Self::Storage,
             Self::Storage => Self::Diagnostics,
             Self::Diagnostics => Self::Query,
             Self::Query => Self::Graph,
             Self::Graph => Self::Evidence,
-            Self::Evidence => Self::Indexing,
+            Self::Evidence => Self::Overview,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Indexing => Self::Evidence,
+            Self::Overview => Self::Evidence,
+            Self::Indexing => Self::Overview,
             Self::Storage => Self::Indexing,
             Self::Diagnostics => Self::Storage,
             Self::Query => Self::Diagnostics,
@@ -4653,6 +5131,7 @@ impl View {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Overview => "Overview",
             Self::Indexing => "Index",
             Self::Storage => "Storage",
             Self::Diagnostics => "Doctor",
@@ -5019,7 +5498,7 @@ enum EvidenceResult {
 
 enum IndexJobMessage {
     Progress(IndexProgress),
-    Finished(Result<IndexSummary, String>),
+    Finished(Result<Box<IndexSummary>, String>),
 }
 
 enum ContinuousIndexMessage {
@@ -5113,85 +5592,6 @@ impl ContinuousIndexStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexMode {
-    Offline,
-    Semantic,
-}
-
-impl IndexMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Offline => "offline",
-            Self::Semantic => "semantic",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Screen {
-    Dashboard,
-    ConfirmIndex(IndexMode),
-    ConfirmContinuous,
-    IndexRunning(IndexMode),
-    IndexCompleted(IndexMode),
-    IndexFailed(IndexMode),
-}
-
-impl Screen {
-    fn accepts_new_index_request(self) -> bool {
-        matches!(
-            self,
-            Self::Dashboard | Self::IndexCompleted(_) | Self::IndexFailed(_)
-        )
-    }
-
-    fn is_terminal_job_state(self) -> bool {
-        matches!(self, Self::IndexCompleted(_) | Self::IndexFailed(_))
-    }
-
-    fn index_mode(self) -> Option<IndexMode> {
-        match self {
-            Self::ConfirmIndex(mode)
-            | Self::IndexRunning(mode)
-            | Self::IndexCompleted(mode)
-            | Self::IndexFailed(mode) => Some(mode),
-            Self::Dashboard | Self::ConfirmContinuous => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UiAction {
-    RequestIndex(IndexMode),
-    RequestContinuous,
-    Confirm,
-    Cancel,
-    JobSucceeded,
-    JobFailed,
-    Dismiss,
-}
-
-fn reduce_screen(screen: Screen, action: UiAction) -> Screen {
-    match (screen, action) {
-        (screen, UiAction::RequestIndex(mode)) if screen.accepts_new_index_request() => {
-            Screen::ConfirmIndex(mode)
-        }
-        (screen, UiAction::RequestContinuous) if screen.accepts_new_index_request() => {
-            Screen::ConfirmContinuous
-        }
-        (Screen::ConfirmIndex(mode), UiAction::Confirm) => Screen::IndexRunning(mode),
-        (Screen::ConfirmContinuous, UiAction::Confirm) => Screen::Dashboard,
-        (Screen::ConfirmIndex(_) | Screen::ConfirmContinuous, UiAction::Cancel) => {
-            Screen::Dashboard
-        }
-        (Screen::IndexRunning(mode), UiAction::JobSucceeded) => Screen::IndexCompleted(mode),
-        (Screen::IndexRunning(mode), UiAction::JobFailed) => Screen::IndexFailed(mode),
-        (screen, UiAction::Dismiss) if screen.is_terminal_job_state() => Screen::Dashboard,
-        (screen, _) => screen,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
@@ -5202,7 +5602,7 @@ mod tests {
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
         CallDirection, CallGraphSummary, CallPathSummary, DebugContextLimits, DebugContextPack,
-        DebugFrameCallPath, DebugFrameMatch, FileFreshnessRow, FreshnessSummary,
+        DebugFrameCallPath, DebugFrameMatch, EvidenceTrust, FileFreshnessRow, FreshnessSummary,
         ImpactCallEvidence, ImpactSummary, QueryMode, QueryResult, RuntimeFrame,
         SymbolSearchSummary,
     };
@@ -5257,7 +5657,8 @@ mod tests {
         assert!(rendered.contains("State"));
         assert!(rendered.contains("SQLite"));
         assert!(rendered.contains("ready"));
-        assert!(rendered.contains("Indexing"));
+        assert!(rendered.contains("Operational Focus"));
+        assert!(rendered.contains("Mode Snapshot"));
         assert!(rendered.contains("nomic-embed-text"));
         assert_eq!(cell_fg_for_text(buffer, "ready", None), Some(Color::Green));
     }
@@ -5272,6 +5673,7 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Overview"));
         assert!(rendered.contains("Index"));
         assert!(rendered.contains("Storage"));
         assert!(rendered.contains("Doctor"));
@@ -5279,7 +5681,7 @@ mod tests {
         assert!(rendered.contains("Calls"));
         assert!(rendered.contains("Impact"));
         assert_eq!(
-            cell_fg_for_text(buffer, "Index", Some(1)),
+            cell_fg_for_text(buffer, "Overview", Some(1)),
             Some(Color::Cyan)
         );
     }
@@ -5298,9 +5700,10 @@ mod tests {
         assert!(rendered.contains("Keys"));
         assert!(rendered.contains("keys"));
         assert!(rendered.contains("query"));
-        assert!(rendered.contains("[ or ] tabs"));
-        assert!(rendered.contains("Tab/Shift+Tab mode"));
-        assert!(rendered.contains("Enter run"));
+        assert!(rendered.contains("[Tab]"));
+        assert!(rendered.contains("mode"));
+        assert!(rendered.contains("[Enter]"));
+        assert!(rendered.contains("run"));
         assert!(rendered.contains("Status"));
         assert!(rendered.contains("status:"));
         assert_eq!(cell_fg_for_text(buffer, "Keys", None), Some(Color::Cyan));
@@ -5371,7 +5774,8 @@ mod tests {
         render(&mut terminal, &app).expect("render should succeed");
 
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("Enter run/details"));
+        assert!(rendered.contains("[Enter]"));
+        assert!(rendered.contains("run/details"));
     }
 
     #[test]
@@ -6433,6 +6837,7 @@ mod tests {
     #[test]
     fn renders_index_confirmation_panel_with_warning_style() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Indexing;
         app.screen = Screen::ConfirmIndex(IndexMode::Semantic);
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
@@ -6520,6 +6925,7 @@ mod tests {
     #[test]
     fn renders_continuous_indexing_status() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Indexing;
         app.animation_tick = 2;
         app.continuous.enabled = true;
         app.continuous.status = ContinuousIndexStatus::Pending;
@@ -6566,6 +6972,7 @@ mod tests {
     #[test]
     fn renders_running_index_progress_gauge() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Indexing;
         app.screen = Screen::IndexRunning(IndexMode::Semantic);
         app.index_progress = Some(symdex_index::IndexProgress {
             phase: "parse",
@@ -7519,6 +7926,8 @@ mod tests {
         ImpactCallEvidence {
             row: sample_call_row(),
             freshness: EvidenceFreshness::Fresh,
+            trust: sample_trust(),
+            reasons: vec!["relationship:direct_caller".to_owned()],
         }
     }
 
@@ -7629,6 +8038,8 @@ mod tests {
                     normalized_path: Some("src/lib.rs".to_owned()),
                     file_freshness: EvidenceFreshness::Fresh,
                     file_provenance: Some(sample_provenance()),
+                    trust: sample_trust(),
+                    reasons: vec!["symbols_at_runtime_location".to_owned()],
                     matched_symbols: vec![SymbolSearchRow {
                         id: "symbol-caller".to_owned(),
                         name: "caller".to_owned(),
@@ -7659,6 +8070,8 @@ mod tests {
                     normalized_path: Some("src/lib.rs".to_owned()),
                     file_freshness: EvidenceFreshness::Stale,
                     file_provenance: Some(sample_provenance()),
+                    trust: sample_trust(),
+                    reasons: vec!["symbols_at_runtime_location".to_owned()],
                     matched_symbols: vec![sample_symbol(
                         "symbol-add".to_owned(),
                         "crate::add".to_owned(),
@@ -7696,6 +8109,14 @@ mod tests {
             embedding_model: None,
             embedding_dimension: None,
             embedded_at: None,
+        }
+    }
+
+    fn sample_trust() -> EvidenceTrust {
+        EvidenceTrust {
+            score: 1.0,
+            level: "high".to_owned(),
+            factors: vec!["freshness:fresh".to_owned()],
         }
     }
 

@@ -31,7 +31,9 @@ Successful tool call `structuredContent` uses the stable cross-agent envelope:
     "index_access": "shared_local_sqlite_and_qdrant",
     "path_policy": "repository_root_required",
     "freshness": "included_when_available",
-    "provenance": "included_when_available"
+    "provenance": "included_when_available",
+    "trust": "included_when_available",
+    "reasons": "included_when_available"
   },
   "data": {
     "results": []
@@ -45,6 +47,11 @@ present on successful tool calls and is also advertised by `initialize` as
 so CLI, TUI, diagnostics, and MCP share the same contract identifier.
 Parser-version examples below use Rust, but C#, JavaScript, and TypeScript
 evidence uses each language's parser version string.
+
+The CLI mirrors this envelope when run with top-level `--json` or
+`--output json` for MCP-backed read-only commands. For example,
+`symdex --json search <repo> <query>` prints the same
+`symdex.mcp.evidence.v1` object that MCP returns in `structuredContent`.
 
 ### `symdex_search`
 
@@ -74,6 +81,18 @@ Output:
       "chunk_kind": "function",
       "text_hash": "sha256:...",
       "freshness": "fresh",
+      "trust": {
+        "score": 0.93,
+        "level": "high",
+        "factors": ["freshness:fresh", "confidence:0.82"]
+      },
+      "reasons": [
+        "semantic_vector_match",
+        "semantic_score:0.8200",
+        "path:crates/foo/src/lib.rs",
+        "chunk_kind:function",
+        "symbol_payload:foo::retry::run_with_backoff"
+      ],
       "provenance": {
         "content_hash": "sha256:...",
         "index_run_id": "repo-semantic-...",
@@ -90,7 +109,8 @@ Output:
 
 The search tool embeds the query with the configured local Ollama model and
 queries the local Qdrant collection. It returns chunk metadata, freshness state,
-and provenance only; it does not return source excerpts in the current MVP.
+trust, reason tags, and provenance only; it does not return source excerpts in
+the current MVP.
 
 ### `symdex_find_symbol`
 
@@ -106,8 +126,8 @@ Input:
 }
 ```
 
-Output rows include `freshness` plus `provenance` with content hash, index run
-ID, parser version, and indexed timestamp.
+Output rows include `freshness`, `trust`, `reasons`, and `provenance` with
+content hash, index run ID, parser version, and indexed timestamp.
 
 ### `symdex_callers`
 
@@ -122,8 +142,8 @@ Input:
 }
 ```
 
-Output rows include call confidence/resolution data, `freshness`, and
-`provenance`.
+Output rows include call confidence/resolution data, `freshness`, `trust`,
+`reasons`, and `provenance`.
 
 ### `symdex_callees`
 
@@ -138,8 +158,8 @@ Input:
 }
 ```
 
-Output rows include call confidence/resolution data, `freshness`, and
-`provenance`.
+Output rows include call confidence/resolution data, `freshness`, `trust`,
+`reasons`, and `provenance`.
 
 ### `symdex_call_path`
 
@@ -181,6 +201,19 @@ Output:
           "confidence": 1.0,
           "resolution_status": "resolved_exact",
           "freshness": "fresh",
+          "trust": {
+            "score": 1.0,
+            "level": "high",
+            "factors": ["freshness:fresh", "confidence:1.00"]
+          },
+          "reasons": [
+            "relationship:call_path_edge",
+            "persisted_path_edge",
+            "caller:foo::api::handler",
+            "callee:foo::service::run",
+            "resolution_status:resolved_exact",
+            "confidence:1.00"
+          ],
           "provenance": {
             "content_hash": "sha256:...",
             "index_run_id": "repo-semantic-...",
@@ -200,7 +233,8 @@ Output:
 `max_depth` is clamped to 1-8 hops. Traversal follows resolved persisted call
 edges, avoids cycles, returns paths in deterministic index order, and keeps
 unresolved or ambiguous edges as terminal evidence when their `callee_text`
-matches the target query. The tool does not return source text.
+matches the target query. Path and edge rows include reason tags that explain
+the relationship and traversal evidence. The tool does not return source text.
 
 ### `symdex_impact`
 
@@ -227,10 +261,13 @@ Output separates:
 - tests likely to cover the symbol
 - unresolved candidates
 
-Direct and transitive evidence rows include provenance and freshness labels.
-Related-file rows include path, relationship count, freshness, and provenance.
-`tests_likely` stays empty and a note explains that likely-test claims require
-indexed test discovery and mapping first.
+Direct and transitive evidence rows include provenance, freshness labels, and
+trust scores. Related-file rows include path, relationship count, freshness,
+trust, and provenance.
+`tests_likely` contains indexed Rust test qualified names when a discovered test
+directly calls the queried symbol through resolved call evidence. When no direct
+indexed test evidence is available, the list stays empty and a note explains
+that no likely-test evidence was found.
 
 ### `symdex_context_pack`
 
@@ -328,14 +365,16 @@ Output:
   },
   "notes": [
     "metadata_only_no_source_text",
-    "likely_tests_limited_to_runtime_failure_names_until_test_mapping_is_indexed"
+    "likely_tests_mapped_to_indexed_tests"
   ]
 }
 ```
 
 The tool parses panic/file locations, stack-frame symbols, indexed-language file
-paths, and failing test names. It maps frames to indexed SQLite file/symbol/call evidence,
-adds freshness and provenance, and returns source-free metadata only.
+paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
+evidence, maps failing test names to indexed Rust tests when available, keeps
+unmatched runtime test names as fallbacks, adds freshness, trust, and
+provenance, and returns source-free metadata only.
 
 ### `symdex_index_status`
 

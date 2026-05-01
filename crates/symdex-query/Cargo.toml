@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 symdex-core = { path = "../symdex-core" }
 symdex-embed = { path = "../symdex-embed" }
 symdex-store = { path = "../symdex-store" }

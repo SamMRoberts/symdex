@@ -72,9 +72,13 @@ terminal panes.
 - Use gauges or ratio labels only when backed by real counts, such as embedded
   chunks divided by embeddable chunks.
 - Prefer split panes for workflows that compare data:
-  - repository/status summary on the left
-  - active view details on the right
+  - full repository/status detail in the Dashboard/Overview view
+  - compact repository/status summary beside or above data-heavy active views
   - two-container footer at the bottom
+- Use adaptive body layouts rather than a fixed permanent status pane. Wide
+  terminals should reserve most horizontal space for the active workflow, while
+  narrow terminals should stack the compact repository summary above the active
+  panel.
 - Keep footer help persistent and concise. It should show current-view keys,
   not the entire global key list.
 - The footer must be two separate stacked containers:
@@ -121,6 +125,9 @@ terminal panes.
 - Style failed states with a short red status line plus the error text.
 - Show selected query mode, graph direction, and impact/call-path/context/debug mode as tabs or
   segmented controls rather than only inline prose.
+- Completed Query, Calls, and Impact-style result views should keep a visible
+  mode/status bar above the result table so the selected mode remains obvious
+  after results render.
 
 ### Accessibility and Terminal Compatibility
 
@@ -145,6 +152,12 @@ terminal panes.
   plain paragraphs.
 - Keep repository identity, index freshness, counts, service targets, and
   embedding readiness visually grouped inside the status pane.
+- The Dashboard/Overview tab is the full home surface for repository and local
+  service status. Other tabs should use a compact repository summary so active
+  tables and detail panes get more screen space.
+- The Overview should surface compact operational state for indexing,
+  continuous indexing, storage mode, query mode, call direction, and evidence
+  mode without showing source text.
 
 ### Storage Explorer
 

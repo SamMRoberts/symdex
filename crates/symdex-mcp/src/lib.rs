@@ -1,5 +1,6 @@
 //! Read-only MCP tool contract boundary.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, Write};
 
@@ -7,7 +8,7 @@ use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_query::run_debug_context_pack;
+use symdex_query::{evidence_trust, run_debug_context_pack};
 use symdex_store::{
     EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
     freshness_for_hash, qdrant_collection_name,
@@ -37,6 +38,10 @@ pub fn tool_names() -> [&'static str; 9] {
         TOOL_DEBUG_CONTEXT,
         TOOL_INDEX_STATUS,
     ]
+}
+
+pub fn evidence_tool_result(name: &str, arguments: &Value) -> Result<Value, String> {
+    dispatch_tool(name, arguments).map(versioned_tool_result)
 }
 
 pub fn serve_stdio() -> Result<(), String> {
@@ -175,6 +180,9 @@ fn tool_search(arguments: &Value) -> Result<Value, String> {
         "results": results.into_iter().map(|result| {
             let payload = result.payload;
             let path = payload.path;
+            let symbol_name = payload.symbol_name;
+            let chunk_kind = payload.chunk_kind;
+            let reasons = semantic_reasons(result.score, &path, symbol_name.as_deref(), &chunk_kind);
             let provenance = EvidenceProvenance {
                 content_hash: payload.content_hash,
                 index_run_id: payload.index_run_id,
@@ -184,15 +192,18 @@ fn tool_search(arguments: &Value) -> Result<Value, String> {
                 embedding_dimension: payload.embedding_dimension,
                 embedded_at: None,
             };
+            let freshness = evidence_freshness(&root, Some(&path), &provenance);
             json!({
                 "path": path.clone(),
                 "start_line": payload.start_line,
                 "end_line": payload.end_line,
-                "symbol": payload.symbol_name,
+                "symbol": symbol_name,
                 "score": result.score,
-                "chunk_kind": payload.chunk_kind,
+                "chunk_kind": chunk_kind,
                 "text_hash": payload.text_hash,
-                "freshness": freshness_label(&root, Some(&path), &provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &provenance, Some(result.score)),
+                "reasons": reasons,
                 "provenance": provenance_json(&provenance)
             })
         }).collect::<Vec<_>>()
@@ -210,7 +221,10 @@ fn tool_find_symbol(arguments: &Value) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     symbols.truncate(limit);
     Ok(json!({
-        "results": symbols.into_iter().map(|symbol| json!({
+        "results": symbols.into_iter().map(|symbol| {
+            let freshness = evidence_freshness(&root, Some(&symbol.path), &symbol.provenance);
+            let reasons = symbol_reasons(name, &symbol);
+            json!({
             "id": symbol.id,
             "name": symbol.name,
             "qualified_name": symbol.qualified_name,
@@ -218,9 +232,11 @@ fn tool_find_symbol(arguments: &Value) -> Result<Value, String> {
             "path": symbol.path,
             "start_line": symbol.start_line,
             "end_line": symbol.end_line,
-            "freshness": freshness_label(&root, Some(&symbol.path), &symbol.provenance),
+            "freshness": freshness.label(),
+            "trust": trust_json(freshness, &symbol.provenance, None),
+            "reasons": reasons,
             "provenance": provenance_json(&symbol.provenance)
-        })).collect::<Vec<_>>()
+        })}).collect::<Vec<_>>()
     }))
 }
 
@@ -231,7 +247,7 @@ fn tool_callers(arguments: &Value) -> Result<Value, String> {
     let rows = sqlite()?
         .callers(root.id(), symbol)
         .map_err(|error| error.to_string())?;
-    Ok(json!({ "results": call_rows(&root, rows) }))
+    Ok(json!({ "results": call_rows(&root, rows, "direct_caller") }))
 }
 
 fn tool_callees(arguments: &Value) -> Result<Value, String> {
@@ -241,7 +257,7 @@ fn tool_callees(arguments: &Value) -> Result<Value, String> {
     let rows = sqlite()?
         .callees(root.id(), symbol)
         .map_err(|error| error.to_string())?;
-    Ok(json!({ "results": call_rows(&root, rows) }))
+    Ok(json!({ "results": call_rows(&root, rows, "direct_callee") }))
 }
 
 fn tool_call_path(arguments: &Value) -> Result<Value, String> {
@@ -258,11 +274,16 @@ fn tool_call_path(arguments: &Value) -> Result<Value, String> {
         "source": source,
         "target": target,
         "max_depth": max_depth,
-        "paths": paths.into_iter().map(|path| json!({
+        "paths": paths.into_iter().map(|path| {
+            let reasons = path_reasons(&path, "call_path");
+            json!({
             "hops": path.hops,
             "min_confidence": path.min_confidence,
             "terminal_resolution_status": path.terminal_resolution_status,
-            "edges": path.edges.into_iter().map(|edge| json!({
+            "reasons": reasons,
+            "edges": path.edges.into_iter().map(|edge| {
+                let freshness = evidence_freshness(&root, Some(&edge.caller_path), &edge.provenance);
+                json!({
                 "call_id": edge.call_id,
                 "caller_symbol_id": edge.caller_symbol_id,
                 "caller_symbol_name": edge.caller_symbol_name,
@@ -282,10 +303,12 @@ fn tool_call_path(arguments: &Value) -> Result<Value, String> {
                 "call_line": edge.call_line,
                 "confidence": edge.confidence,
                 "resolution_status": edge.resolution_status,
-                "freshness": freshness_label(&root, Some(&edge.caller_path), &edge.provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &edge.provenance, Some(edge.confidence)),
+                "reasons": edge_reasons(&edge, "call_path_edge"),
                 "provenance": provenance_json(&edge.provenance)
-            })).collect::<Vec<_>>()
-        })).collect::<Vec<_>>()
+            })}).collect::<Vec<_>>()
+        })}).collect::<Vec<_>>()
     }))
 }
 
@@ -312,21 +335,34 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         callers.iter().chain(callees.iter()),
         transitive_callers.iter().chain(transitive_callees.iter()),
     );
+    let tests_likely = sqlite
+        .likely_tests_for_symbol(root.id(), symbol)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|test| test.qualified_name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let test_note = if tests_likely.is_empty() {
+        "likely_tests_unavailable_without_indexed_direct_test_evidence"
+    } else {
+        "likely_tests_from_indexed_direct_test_calls"
+    };
     Ok(json!({
         "repository_id": root.id(),
         "symbol": symbol,
         "max_depth": max_depth,
-        "direct_callers": call_rows(&root, callers),
-        "direct_callees": call_rows(&root, callees),
-        "transitive_callers": call_paths_json(&root, transitive_callers),
-        "transitive_callees": call_paths_json(&root, transitive_callees),
+        "direct_callers": call_rows(&root, callers, "direct_caller"),
+        "direct_callees": call_rows(&root, callees, "direct_callee"),
+        "transitive_callers": call_paths_json(&root, transitive_callers, "transitive_caller"),
+        "transitive_callees": call_paths_json(&root, transitive_callees, "transitive_callee"),
         "same_file_symbols": [],
         "related_files": related_files,
-        "tests_likely": [],
+        "tests_likely": tests_likely,
         "unresolved_candidates": [],
         "notes": [
             "metadata_only_no_source_text",
-            "likely_tests_unavailable_until_test_discovery_mapping_is_indexed"
+            test_note
         ]
     }))
 }
@@ -387,13 +423,118 @@ fn provenance_json(provenance: &EvidenceProvenance) -> Value {
     })
 }
 
-fn freshness_label(
+fn evidence_freshness(
     root: &RepoRoot,
     path: Option<&str>,
     provenance: &EvidenceProvenance,
-) -> &'static str {
+) -> symdex_store::EvidenceFreshness {
     let current_hash = path.and_then(|path| current_content_hash(root, path).ok().flatten());
-    freshness_for_hash(provenance.content_hash.as_deref(), current_hash.as_deref()).label()
+    freshness_for_hash(provenance.content_hash.as_deref(), current_hash.as_deref())
+}
+
+fn trust_json(
+    freshness: symdex_store::EvidenceFreshness,
+    provenance: &EvidenceProvenance,
+    confidence: Option<f64>,
+) -> Value {
+    serde_json::to_value(evidence_trust(freshness, Some(provenance), confidence))
+        .expect("evidence trust should serialize")
+}
+
+fn semantic_reasons(
+    score: f64,
+    path: &str,
+    symbol_name: Option<&str>,
+    chunk_kind: &str,
+) -> Vec<String> {
+    let mut reasons = vec![
+        "semantic_vector_match".to_owned(),
+        format!("semantic_score:{score:.4}"),
+        format!("path:{path}"),
+        format!("chunk_kind:{chunk_kind}"),
+    ];
+    if let Some(symbol_name) = symbol_name {
+        reasons.push(format!("symbol_payload:{symbol_name}"));
+    } else {
+        reasons.push("symbol_payload:missing".to_owned());
+    }
+    reasons
+}
+
+fn symbol_reasons(query: &str, symbol: &symdex_store::SymbolSearchRow) -> Vec<String> {
+    let mut reasons = vec![
+        "symbol_index_match".to_owned(),
+        format!("kind:{}", symbol.kind),
+        format!("path:{}", symbol.path),
+    ];
+    if symbol.qualified_name == query {
+        reasons.push("query_match:qualified_name_exact".to_owned());
+    } else if symbol.name == query {
+        reasons.push("query_match:name_exact".to_owned());
+    } else if symbol.qualified_name.ends_with(query) {
+        reasons.push("query_match:qualified_name_suffix".to_owned());
+    } else {
+        reasons.push("query_match:sqlite_like".to_owned());
+    }
+    reasons
+}
+
+fn call_reasons(row: &symdex_store::CallSearchRow, relationship: &str) -> Vec<String> {
+    let mut reasons = vec![
+        format!("relationship:{relationship}"),
+        "persisted_call_edge".to_owned(),
+        format!("callee_text:{}", row.callee_text),
+        format!("resolution_status:{}", row.resolution_status),
+        format!("confidence:{:.2}", row.confidence),
+    ];
+    if let Some(symbol) = &row.symbol_qualified_name {
+        reasons.push(format!("symbol_match:{symbol}"));
+    } else if let Some(symbol) = &row.symbol_name {
+        reasons.push(format!("symbol_match:{symbol}"));
+    } else {
+        reasons.push("symbol_match:unresolved".to_owned());
+    }
+    if let Some(path) = &row.path {
+        reasons.push(format!("path:{path}"));
+    }
+    reasons
+}
+
+fn edge_reasons(edge: &symdex_store::CallPathEdge, relationship: &str) -> Vec<String> {
+    vec![
+        format!("relationship:{relationship}"),
+        "persisted_path_edge".to_owned(),
+        format!("caller:{}", edge.caller_symbol_qualified_name),
+        format!(
+            "callee:{}",
+            edge.callee_symbol_qualified_name
+                .as_deref()
+                .unwrap_or(&edge.callee_text)
+        ),
+        format!("resolution_status:{}", edge.resolution_status),
+        format!("confidence:{:.2}", edge.confidence),
+    ]
+}
+
+fn path_reasons(path: &symdex_store::CallPath, relationship: &str) -> Vec<String> {
+    vec![
+        format!("relationship:{relationship}"),
+        "bounded_transitive_call_path".to_owned(),
+        format!("hops:{}", path.hops),
+        format!("min_confidence:{:.2}", path.min_confidence),
+        format!(
+            "terminal_resolution_status:{}",
+            path.terminal_resolution_status
+        ),
+    ]
+}
+
+fn related_file_reasons(relationship_count: usize) -> Vec<String> {
+    vec![
+        "related_file_from_call_evidence".to_owned(),
+        format!("relationship_count:{relationship_count}"),
+        "provenance:first_related_edge".to_owned(),
+    ]
 }
 
 fn current_content_hash(root: &RepoRoot, path: &str) -> Result<Option<String>, String> {
@@ -409,9 +550,15 @@ fn current_content_hash(root: &RepoRoot, path: &str) -> Result<Option<String>, S
     Ok(Some(content_hash(&bytes)))
 }
 
-fn call_rows(root: &RepoRoot, rows: Vec<symdex_store::CallSearchRow>) -> Vec<Value> {
+fn call_rows(
+    root: &RepoRoot,
+    rows: Vec<symdex_store::CallSearchRow>,
+    relationship: &str,
+) -> Vec<Value> {
     rows.into_iter()
         .map(|row| {
+            let freshness = evidence_freshness(root, row.path.as_deref(), &row.provenance);
+            let reasons = call_reasons(&row, relationship);
             json!({
                 "callee_text": row.callee_text,
                 "call_line": row.call_line,
@@ -424,22 +571,33 @@ fn call_rows(root: &RepoRoot, rows: Vec<symdex_store::CallSearchRow>) -> Vec<Val
                 "path": row.path,
                 "start_line": row.start_line,
                 "end_line": row.end_line,
-                "freshness": freshness_label(root, row.path.as_deref(), &row.provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &row.provenance, Some(row.confidence)),
+                "reasons": reasons,
                 "provenance": provenance_json(&row.provenance)
             })
         })
         .collect()
 }
 
-fn call_paths_json(root: &RepoRoot, paths: Vec<symdex_store::CallPath>) -> Vec<Value> {
+fn call_paths_json(
+    root: &RepoRoot,
+    paths: Vec<symdex_store::CallPath>,
+    relationship: &str,
+) -> Vec<Value> {
     paths
         .into_iter()
         .map(|path| {
+            let reasons = path_reasons(&path, relationship);
             json!({
                 "hops": path.hops,
                 "min_confidence": path.min_confidence,
                 "terminal_resolution_status": path.terminal_resolution_status,
-                "edges": path.edges.into_iter().map(|edge| json!({
+                "reasons": reasons,
+                "edges": path.edges.into_iter().map(|edge| {
+                    let freshness = evidence_freshness(root, Some(&edge.caller_path), &edge.provenance);
+                    let reasons = edge_reasons(&edge, relationship);
+                    json!({
                     "call_id": edge.call_id,
                     "caller_symbol_id": edge.caller_symbol_id,
                     "caller_symbol_name": edge.caller_symbol_name,
@@ -459,9 +617,11 @@ fn call_paths_json(root: &RepoRoot, paths: Vec<symdex_store::CallPath>) -> Vec<V
                     "call_line": edge.call_line,
                     "confidence": edge.confidence,
                     "resolution_status": edge.resolution_status,
-                    "freshness": freshness_label(root, Some(&edge.caller_path), &edge.provenance),
+                    "freshness": freshness.label(),
+                    "trust": trust_json(freshness, &edge.provenance, Some(edge.confidence)),
+                    "reasons": reasons,
                     "provenance": provenance_json(&edge.provenance)
-                })).collect::<Vec<_>>()
+                })}).collect::<Vec<_>>()
             })
         })
         .collect()
@@ -498,10 +658,13 @@ fn impact_related_files_json<'a>(
     files
         .into_iter()
         .map(|(path, (relationship_count, provenance))| {
+            let freshness = evidence_freshness(root, Some(&path), &provenance);
             json!({
                 "path": path,
                 "relationship_count": relationship_count,
-                "freshness": freshness_label(root, Some(&path), &provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &provenance, None),
+                "reasons": related_file_reasons(relationship_count),
                 "provenance": provenance_json(&provenance)
             })
         })
@@ -577,7 +740,8 @@ fn evidence_contract_json() -> Value {
         "index_access": "shared_local_sqlite_and_qdrant",
         "path_policy": "repository_root_required",
         "freshness": "included_when_available",
-        "provenance": "included_when_available"
+        "provenance": "included_when_available",
+        "reasons": "included_when_available"
     })
 }
 
@@ -834,6 +998,10 @@ mod tests {
         assert_eq!(
             result["structuredContent"]["contract"]["source_text"],
             "omitted_by_default"
+        );
+        assert_eq!(
+            result["structuredContent"]["contract"]["reasons"],
+            "included_when_available"
         );
         assert_eq!(result["structuredContent"]["data"]["results"], json!([]));
         assert!(

@@ -29,6 +29,7 @@ Fixtures should be tiny and purpose-built.
 ## Required test areas
 
 - syntax chunk line ranges
+- partial parse diagnostics for syntax-error files without aborting indexing
 - stable IDs across repeated runs
 - changed file reindex
 - continuous indexing reindexes modified files
@@ -53,9 +54,46 @@ Fixtures should be tiny and purpose-built.
   chunks, and model/dimension drift
 - Evidence freshness coverage for fresh, stale, deleted, missing, and unknown
   states, including metadata-only TUI rendering.
+- Evidence trust scoring coverage for freshness, provenance completeness,
+  confidence, and index metadata completeness, including impact and
+  debug-context evidence rows.
+- Evidence explainability coverage for semantic result reasons, direct impact
+  call reasons, related-file reasons, MCP contract reason availability, and
+  debug-context frame match reasons.
 - Debug context coverage for parsed panic/file locations, stack-frame symbols,
   failing test names, mapped frames, unmapped frames, stale frames, deleted
-  files, malformed runtime input, and TUI debug context pack rendering.
+  files, malformed runtime input, common Rust `cargo test`, `anyhow`, `tracing`,
+  full backtrace, panic-hook, and async stack-like output, and TUI debug context
+  pack rendering.
+- Rust test discovery coverage for recognized test attributes, module-qualified
+  test names, SQLite test persistence/replacement, failing-test name mapping,
+  and impact likely-test evidence from direct indexed test calls.
+- Rust call-resolution coverage for exact local calls, unresolved calls,
+  normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
+  module aliases used in scoped calls, simple grouped `use` aliases,
+  module-relative `use` aliases from caller scope, caller-scope Rust `self::` /
+  `super::` module calls, caller-module relative `helper()` and `Type::method()`
+  calls, and exact Rust `self.method()` / `Self::method()` resolution to methods
+  on the enclosing impl receiver.
+- Rust cross-file call-resolution coverage for qualified module calls resolved
+  from the current index batch, persisted unchanged Rust symbols used during
+  incremental indexing, caller-scope `super::` calls resolved against persisted
+  unchanged Rust symbols, caller-module unqualified and scoped calls resolved
+  against persisted unchanged Rust symbols, cross-file `self.method()` /
+  `Self::method()` calls resolved against persisted unchanged methods on the
+  same impl receiver, and stale persisted symbols ignored for files being
+  replaced.
+- Rust macro coverage for unresolved macro call edges and metadata-only
+  diagnostics that macro invocations are preserved without expansion.
+- Rust chunking coverage for function, method, type-definition, trait,
+  impl-summary, trait impl-summary names, trait impl method qualified names, and
+  fallback chunks.
+- Optional rust-analyzer readiness coverage for default-off behavior, explicit
+  truthy opt-in flags, command override parsing, and doctor check status without
+  requiring rust-analyzer in ordinary tests.
+- Optional rust-analyzer enrichment planning coverage for disabled, not-ready,
+  no-Rust-file, and planned eligible Rust file/symbol/call count states without
+  requiring rust-analyzer in ordinary tests.
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -87,7 +125,21 @@ Default local checks:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --workspace --release
+cargo audit
 ```
+
+The CI workflow runs the same production hardening baseline on pull requests and
+pushes to `main`, and installs `cargo-audit` before running the dependency
+audit. Service-dependent checks remain opt-in so ordinary CI does not require
+local Qdrant or Ollama services.
+
+Qdrant verifier unit tests keep the comparison logic deterministic by building
+SQLite expected-point manifests and Qdrant payload rows in memory. Live Qdrant
+scroll behavior remains part of the service-dependent adapter checks. Repair
+uses the verifier's captured point IDs for orphan deletion and the existing
+semantic index path for vector rebuilds, so focused tests cover the repair plan
+classification while live end-to-end repair remains service-dependent.
 
 Service-dependent checks:
 
@@ -100,6 +152,8 @@ Current multi-language tests cover discovery, parser dispatch, syntax-aware
 chunking, symbol extraction, conservative call extraction, runtime path parsing,
 and continuous-indexing snapshots for C#, JavaScript, and TypeScript. Broaden
 these fixture-backed tests when adding deeper language-specific behavior.
+Current parser tests also cover syntax-error files returning partial indexes
+with metadata-only parse diagnostics instead of failing closed.
 
 Future TUI checks:
 
@@ -108,8 +162,9 @@ cargo test -p symdex-tui
 cargo run -p symdex-cli -- tui --help
 ```
 
-Current TUI tests cover dashboard rendering, doctor diagnostics rendering, query
-workbench rendering and input state, symbol/call graph rendering and input
+Current TUI tests cover Overview/dashboard rendering, adaptive compact summary
+rendering, compact key-chip footer rendering, doctor diagnostics rendering,
+query workbench rendering and input state, symbol/call graph rendering and input
 state, impact/call-path/context-pack/debug-context rendering and input state, the storage explorer
 metric table, always-visible nested storage tab header, and detail panel,
 index coverage table and selected-file detail panel with chunk, symbol, and
@@ -129,18 +184,22 @@ pending debounce, queued event count, latest reindexed file, watch errors, and
 the animated continuous-indexing activity indicator.
 Current freshness tests cover hash-to-state classification, file freshness
 aggregation over indexed and current file sets, returned symbol/call provenance,
-and the TUI evidence freshness panel.
+trust scoring, explainability reason tags, and the TUI evidence freshness panel.
 Current cross-agent reuse tests cover the shared MCP evidence contract envelope,
 read-only tool annotations, underscore-only tool names, repo root validation,
 and two independent MCP readers using the same SQLite index-status path without
 write-capable tools.
+Current diagnostics tests cover optional rust-analyzer readiness configuration
+without invoking project analysis or requiring rust-analyzer to be installed.
 
 Current call path tests cover deterministic path order, unresolved terminal
 edges matched by callee text, ambiguous terminal edges matched by callee text,
 cycle avoidance, depth limits, and deterministic transitive impact paths.
 Current debug context tests cover runtime input parsing, mapped frame evidence,
 unmapped frames, fresh/stale/deleted freshness labels, calls at failing lines,
-and malformed runtime lines.
+malformed runtime lines, indexed failing-test mapping, unmatched failing-test
+fallbacks, common Rust runtime output shapes, and impact likely-test evidence
+from direct indexed test calls.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

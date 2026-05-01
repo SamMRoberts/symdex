@@ -1,9 +1,11 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use tree_sitter::{Node, Parser};
 
 use crate::{
-    ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, FileFacts, Language, LineRange,
-    ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind, content_hash,
-    secret_exclusion_reason, stable_id,
+    ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, DiscoveredTest, FileFacts, Language,
+    LineRange, ParseDiagnostic, ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind,
+    content_hash, secret_exclusion_reason, stable_id,
 };
 
 pub fn extract_chunks(file: &FileFacts, source: &str) -> Result<Vec<CodeChunk>> {
@@ -27,19 +29,32 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
         .ok_or_else(|| CoreError::ParseFailed {
             path: file.relative_path.clone(),
         })?;
-    if tree.root_node().has_error() {
-        return Err(CoreError::ParseFailed {
-            path: file.relative_path.clone(),
-        });
-    }
+    let mut parse_diagnostics = collect_parse_diagnostics(tree.root_node());
+    parse_diagnostics.extend(collect_macro_diagnostics(
+        file.language,
+        tree.root_node(),
+        source,
+    ));
+    sort_parse_diagnostics(&mut parse_diagnostics);
 
     let mut functions = Vec::new();
     collect_function_nodes(file.language, tree.root_node(), &mut functions);
+    let mut structural_chunks = Vec::new();
+    collect_structural_chunk_nodes(file.language, tree.root_node(), &mut structural_chunks);
 
     let mut chunks = Vec::new();
     let mut symbols = Vec::new();
+    let mut tests = Vec::new();
+    chunks.extend(
+        structural_chunks
+            .iter()
+            .map(|chunk| structural_chunk_facts(chunk.node, file, source, chunk.kind)),
+    );
     for function in &functions {
         let (chunk, symbol) = function_facts(function.node, file, source, function.symbol_kind);
+        if let Some(test) = test_facts(function.node, file, source, &symbol) {
+            tests.push(test);
+        }
         chunks.push(chunk);
         symbols.push(symbol);
     }
@@ -50,11 +65,19 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
 
     let mut calls = Vec::new();
     for (function, symbol) in functions.iter().zip(symbols.iter()) {
+        let use_aliases = collect_visible_use_aliases(
+            file.language,
+            function.node,
+            tree.root_node(),
+            source,
+            symbol,
+        );
         collect_call_edges(
             function.node,
             file.language,
             symbol,
             &symbols,
+            &use_aliases,
             source,
             &mut calls,
         );
@@ -63,12 +86,92 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
     chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
     symbols.sort_by_key(|symbol| (symbol.byte_range.start, symbol.byte_range.end));
     calls.sort_by_key(|call| (call.call_line, call.callee_text.clone()));
+    tests.sort_by_key(|test| (test.line_range.start, test.qualified_name.clone()));
 
     Ok(SourceFileIndex {
         chunks,
         symbols,
         calls,
+        parse_diagnostics,
+        tests,
     })
+}
+
+fn collect_parse_diagnostics(root: Node<'_>) -> Vec<ParseDiagnostic> {
+    let mut diagnostics = Vec::new();
+    collect_parse_diagnostics_from_node(root, &mut diagnostics);
+    sort_parse_diagnostics(&mut diagnostics);
+    diagnostics
+}
+
+fn sort_parse_diagnostics(diagnostics: &mut [ParseDiagnostic]) {
+    diagnostics.sort_by_key(|diagnostic| {
+        (
+            diagnostic.byte_range.start,
+            diagnostic.byte_range.end,
+            diagnostic.message.clone(),
+        )
+    });
+}
+
+fn collect_parse_diagnostics_from_node(node: Node<'_>, diagnostics: &mut Vec<ParseDiagnostic>) {
+    if node.is_error() || node.is_missing() {
+        diagnostics.push(ParseDiagnostic {
+            byte_range: ByteRange::new(node.start_byte(), node.end_byte()),
+            line_range: LineRange::new(node.start_position().row + 1, node.end_position().row + 1),
+            message: parse_diagnostic_message(node),
+        });
+    }
+
+    if !node.has_error() {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_parse_diagnostics_from_node(child, diagnostics);
+    }
+}
+
+fn parse_diagnostic_message(node: Node<'_>) -> String {
+    if node.is_missing() {
+        format!("tree-sitter missing `{}`", node.kind())
+    } else {
+        format!("tree-sitter parse error `{}`", node.kind())
+    }
+}
+
+fn collect_macro_diagnostics(
+    language: Language,
+    root: Node<'_>,
+    source: &str,
+) -> Vec<ParseDiagnostic> {
+    let mut diagnostics = Vec::new();
+    collect_macro_diagnostics_from_node(language, root, source, &mut diagnostics);
+    diagnostics
+}
+
+fn collect_macro_diagnostics_from_node(
+    language: Language,
+    node: Node<'_>,
+    source: &str,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+) {
+    if is_macro_invocation(language, node)
+        && let Some(callee_text) = macro_callee_text(node, source)
+    {
+        diagnostics.push(ParseDiagnostic {
+            byte_range: ByteRange::new(node.start_byte(), node.end_byte()),
+            line_range: LineRange::new(node.start_position().row + 1, node.end_position().row + 1),
+            message: format!("macro invocation `{callee_text}` preserved without expansion"),
+        });
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_macro_diagnostics_from_node(language, child, source, diagnostics);
+    }
 }
 
 fn set_parser_language(parser: &mut Parser, language: Language, tsx: bool) -> Result<()> {
@@ -90,6 +193,12 @@ fn set_parser_language(parser: &mut Parser, language: Language, tsx: bool) -> Re
 struct FunctionNode<'tree> {
     node: Node<'tree>,
     symbol_kind: SymbolKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StructuralChunkNode<'tree> {
+    node: Node<'tree>,
+    kind: ChunkKind,
 }
 
 fn collect_function_nodes<'tree>(
@@ -137,6 +246,53 @@ fn function_symbol_kind(language: Language, node: Node<'_>) -> Option<SymbolKind
         },
         _ => None,
     }
+}
+
+fn collect_structural_chunk_nodes<'tree>(
+    language: Language,
+    node: Node<'tree>,
+    chunks: &mut Vec<StructuralChunkNode<'tree>>,
+) {
+    if let Some(kind) = structural_chunk_kind(language, node) {
+        chunks.push(StructuralChunkNode { node, kind });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_structural_chunk_nodes(language, child, chunks);
+    }
+}
+
+fn structural_chunk_kind(language: Language, node: Node<'_>) -> Option<ChunkKind> {
+    match language {
+        Language::Rust => match node.kind() {
+            "impl_item" => Some(ChunkKind::ImplSummary),
+            "struct_item" | "enum_item" | "union_item" | "type_item" | "trait_item" => {
+                Some(ChunkKind::TypeDefinition)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn structural_chunk_facts(
+    node: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    kind: ChunkKind,
+) -> CodeChunk {
+    let symbol_name = structural_chunk_name(node, source);
+    chunk_for_node(node, file, source, kind, symbol_name, None)
+}
+
+fn structural_chunk_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "impl_item" {
+        return impl_display_name(node, source).map(|name| format!("impl {name}"));
+    }
+    named_node_text(node, source)
+        .map(clean_expression_text)
+        .filter(|name| !name.is_empty())
 }
 
 fn function_facts(
@@ -262,17 +418,95 @@ fn symbol_for_node(
     }
 }
 
+fn test_facts(
+    node: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    symbol: &Symbol,
+) -> Option<DiscoveredTest> {
+    let framework = test_framework(file.language, node, source)?;
+    Some(DiscoveredTest {
+        id: stable_id(&[
+            &file.id,
+            "test",
+            &symbol.qualified_name,
+            &node.start_byte().to_string(),
+        ]),
+        file_id: file.id.clone(),
+        relative_path: file.relative_path.clone(),
+        symbol_id: Some(symbol.id.clone()),
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+        framework,
+        language: file.language,
+        byte_range: symbol.byte_range,
+        line_range: symbol.line_range,
+    })
+}
+
+fn test_framework(language: Language, node: Node<'_>, source: &str) -> Option<String> {
+    match language {
+        Language::Rust => rust_test_framework(node, source),
+        _ => None,
+    }
+}
+
+fn rust_test_framework(node: Node<'_>, source: &str) -> Option<String> {
+    rust_attribute_texts(node, source)
+        .into_iter()
+        .find_map(|attribute| rust_test_framework_from_attribute(&attribute))
+}
+
+fn rust_attribute_texts(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "attribute_item"
+            && let Some(text) = node_text(child, source)
+        {
+            attributes.push(text.to_owned());
+        }
+    }
+
+    let mut sibling = node.prev_named_sibling();
+    while let Some(current) = sibling {
+        if current.kind() != "attribute_item" {
+            break;
+        }
+        if let Some(text) = node_text(current, source) {
+            attributes.push(text.to_owned());
+        }
+        sibling = current.prev_named_sibling();
+    }
+    attributes
+}
+
+fn rust_test_framework_from_attribute(attribute: &str) -> Option<String> {
+    let attribute = clean_expression_text(attribute);
+    let inner = attribute
+        .trim_start_matches('#')
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let path = inner.split('(').next().unwrap_or(inner).trim();
+    if path == "test" {
+        return Some("rust_test".to_owned());
+    }
+    path.strip_suffix("::test")
+        .map(|prefix| format!("{prefix}::test"))
+}
+
 fn collect_call_edges(
     function: Node<'_>,
     language: Language,
     caller: &Symbol,
     symbols: &[Symbol],
+    use_aliases: &BTreeMap<String, String>,
     source: &str,
     calls: &mut Vec<CallEdge>,
 ) {
     let mut cursor = function.walk();
     for child in function.children(&mut cursor) {
-        collect_call_edges_from_node(child, language, caller, symbols, source, calls);
+        collect_call_edges_from_node(child, language, caller, symbols, use_aliases, source, calls);
     }
 }
 
@@ -281,14 +515,15 @@ fn collect_call_edges_from_node(
     language: Language,
     caller: &Symbol,
     symbols: &[Symbol],
+    use_aliases: &BTreeMap<String, String>,
     source: &str,
     calls: &mut Vec<CallEdge>,
 ) {
     if is_call_expression(language, node)
-        && let Some(callee_text) = callee_text(node, source)
+        && let Some(callee_text) = callee_text(language, node, source)
     {
         let (callee_symbol_id, resolution_status, confidence) =
-            resolve_callee(&callee_text, symbols);
+            resolve_callee(&callee_text, language, caller, symbols, use_aliases);
         let call_line = node.start_position().row + 1;
         calls.push(CallEdge {
             id: stable_id(&[
@@ -304,21 +539,44 @@ fn collect_call_edges_from_node(
             confidence,
             resolution_status,
         });
+    } else if is_macro_invocation(language, node)
+        && let Some(callee_text) = macro_callee_text(node, source)
+    {
+        let call_line = node.start_position().row + 1;
+        calls.push(CallEdge {
+            id: stable_id(&[
+                &caller.id,
+                &callee_text,
+                &call_line.to_string(),
+                &node.start_byte().to_string(),
+            ]),
+            caller_symbol_id: caller.id.clone(),
+            callee_text,
+            callee_symbol_id: None,
+            call_line,
+            confidence: 0.2,
+            resolution_status: ResolutionStatus::Unresolved,
+        });
+        return;
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_call_edges_from_node(child, language, caller, symbols, source, calls);
+        collect_call_edges_from_node(child, language, caller, symbols, use_aliases, source, calls);
     }
 }
 
 fn resolve_callee(
     callee_text: &str,
+    language: Language,
+    caller: &Symbol,
     symbols: &[Symbol],
+    use_aliases: &BTreeMap<String, String>,
 ) -> (Option<String>, ResolutionStatus, f32) {
+    let candidates = callee_resolution_candidates(callee_text, language, caller, use_aliases);
     let exact: Vec<&Symbol> = symbols
         .iter()
-        .filter(|symbol| symbol.qualified_name == callee_text)
+        .filter(|symbol| candidates.contains(&symbol.qualified_name))
         .collect();
     if exact.len() == 1 {
         return (
@@ -330,14 +588,24 @@ fn resolve_callee(
     if exact.len() > 1 {
         return (None, ResolutionStatus::Ambiguous, 0.2);
     }
+    if language == Language::Rust
+        && requires_exact_rust_resolution(callee_text, caller, use_aliases)
+    {
+        return (None, ResolutionStatus::Unresolved, 0.25);
+    }
 
-    let suffix = symbol_suffix(callee_text);
+    let suffixes = candidates
+        .iter()
+        .map(|candidate| symbol_suffix(candidate).to_owned())
+        .collect::<BTreeSet<_>>();
     let candidates: Vec<&Symbol> = symbols
         .iter()
         .filter(|symbol| {
-            symbol.name == suffix
-                || symbol.qualified_name.ends_with(callee_text)
-                || symbol_suffix(&symbol.qualified_name) == suffix
+            suffixes.contains(&symbol.name)
+                || candidates
+                    .iter()
+                    .any(|candidate| symbol.qualified_name.ends_with(candidate))
+                || suffixes.contains(symbol_suffix(&symbol.qualified_name))
         })
         .collect();
     match candidates.as_slice() {
@@ -351,13 +619,404 @@ fn resolve_callee(
     }
 }
 
-fn callee_text(call: Node<'_>, source: &str) -> Option<String> {
+fn callee_resolution_candidates(
+    callee_text: &str,
+    language: Language,
+    caller: &Symbol,
+    use_aliases: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    let scoped_alias = (language == Language::Rust)
+        .then(|| rust_scoped_alias(callee_text, use_aliases))
+        .flatten();
+    let module_scoped_candidate = (language == Language::Rust)
+        .then(|| module_scoped_path_candidate(callee_text, caller, use_aliases))
+        .flatten();
+    let module_unqualified_candidate = (language == Language::Rust)
+        .then(|| module_unqualified_path_candidate(callee_text, caller))
+        .flatten();
+    let suppress_plain_scoped_candidate = scoped_alias.is_some()
+        || module_scoped_candidate.is_some()
+        || module_unqualified_candidate.is_some();
+    if !suppress_plain_scoped_candidate {
+        candidates.insert(callee_text.to_owned());
+    }
+    let module_candidates = if language == Language::Rust {
+        module_relative_candidates(callee_text, caller)
+    } else {
+        Vec::new()
+    };
+    if !suppress_plain_scoped_candidate
+        && (module_candidates.is_empty() || !is_module_relative_path(callee_text))
+    {
+        candidates.insert(normalize_rust_path(callee_text));
+    }
+    for module_candidate in module_candidates {
+        candidates.insert(module_candidate);
+    }
+    if let Some(module_scoped_candidate) = module_scoped_candidate {
+        candidates.insert(module_scoped_candidate);
+    }
+    if let Some(module_unqualified_candidate) = module_unqualified_candidate {
+        candidates.insert(module_unqualified_candidate);
+    }
+    if let Some(method_candidate) = receiver_method_candidate(callee_text, caller) {
+        candidates.insert(method_candidate);
+    }
+    if let Some((target, tail)) = scoped_alias {
+        candidates.insert(format!("{target}::{tail}"));
+    } else if let Some(target) = use_aliases.get(callee_text) {
+        candidates.insert(target.clone());
+    }
+    candidates.into_iter().collect()
+}
+
+fn requires_exact_rust_resolution(
+    callee_text: &str,
+    caller: &Symbol,
+    use_aliases: &BTreeMap<String, String>,
+) -> bool {
+    rust_scoped_alias(callee_text, use_aliases).is_some()
+        || use_aliases.contains_key(callee_text)
+        || !module_relative_candidates(callee_text, caller).is_empty()
+        || module_scoped_path_candidate(callee_text, caller, use_aliases).is_some()
+        || module_unqualified_path_candidate(callee_text, caller).is_some()
+}
+
+fn rust_scoped_alias<'a>(
+    callee_text: &'a str,
+    use_aliases: &'a BTreeMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    let (head, tail) = callee_text.split_once("::")?;
+    use_aliases.get(head).map(|target| (target.as_str(), tail))
+}
+
+fn module_scoped_path_candidate(
+    callee_text: &str,
+    caller: &Symbol,
+    use_aliases: &BTreeMap<String, String>,
+) -> Option<String> {
+    let (head, _) = callee_text.split_once("::")?;
+    if matches!(head, "crate" | "self" | "super" | "Self") || use_aliases.contains_key(head) {
+        return None;
+    }
+    let module_path = caller_module_path(caller)?;
+    if module_path.is_empty() {
+        return None;
+    }
+    join_module_path(&module_path, callee_text)
+}
+
+fn module_unqualified_path_candidate(callee_text: &str, caller: &Symbol) -> Option<String> {
+    if callee_text.contains("::") || callee_text.contains('.') || callee_text.ends_with('!') {
+        return None;
+    }
+    let module_path = caller_module_path(caller)?;
+    if module_path.is_empty() {
+        return None;
+    }
+    join_module_path(&module_path, callee_text)
+}
+
+fn is_module_relative_path(callee_text: &str) -> bool {
+    callee_text.starts_with("self::") || callee_text.starts_with("super::")
+}
+
+fn module_relative_candidates(callee_text: &str, caller: &Symbol) -> Vec<String> {
+    let Some(module_path) = caller_module_path(caller) else {
+        return Vec::new();
+    };
+    let Some((prefix, tail)) = callee_text.split_once("::") else {
+        return Vec::new();
+    };
+    match prefix {
+        "self" => join_module_path(&module_path, tail).into_iter().collect(),
+        "super" => module_super_path(&module_path)
+            .and_then(|module| join_module_path(&module, tail))
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn caller_module_path(caller: &Symbol) -> Option<String> {
+    let (container, _) = caller.qualified_name.rsplit_once("::")?;
+    let module = if caller.kind == SymbolKind::Method {
+        caller_receiver_type(caller)
+            .and_then(|receiver| container.strip_suffix(receiver))
+            .map(|module| module.trim_end_matches("::"))
+            .unwrap_or("")
+    } else {
+        container
+    };
+    Some(module.to_owned())
+}
+
+fn module_super_path(module_path: &str) -> Option<String> {
+    if module_path.is_empty() {
+        return None;
+    }
+    module_path
+        .rsplit_once("::")
+        .map(|(parent, _)| parent.to_owned())
+        .or_else(|| Some(String::new()))
+}
+
+fn join_module_path(module_path: &str, tail: &str) -> Option<String> {
+    let tail = normalize_rust_path(tail);
+    if tail.is_empty() {
+        return None;
+    }
+    if module_path.is_empty() {
+        Some(tail)
+    } else {
+        Some(format!("{module_path}::{tail}"))
+    }
+}
+
+fn receiver_method_candidate(callee_text: &str, caller: &Symbol) -> Option<String> {
+    let receiver = caller_receiver_type(caller)?;
+    if let Some(method_name) = callee_text.strip_prefix("self.") {
+        return Some(format!("{receiver}::{method_name}"));
+    }
+    if let Some(method_name) = callee_text.strip_prefix("Self::") {
+        return Some(format!("{receiver}::{method_name}"));
+    }
+    None
+}
+
+fn caller_receiver_type(caller: &Symbol) -> Option<&str> {
+    if caller.kind != SymbolKind::Method {
+        return None;
+    }
+    caller
+        .qualified_name
+        .rsplit_once("::")
+        .map(|(receiver, _)| receiver)
+}
+
+fn collect_visible_use_aliases(
+    language: Language,
+    function: Node<'_>,
+    root: Node<'_>,
+    source: &str,
+    caller: &Symbol,
+) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+    if language != Language::Rust {
+        return aliases;
+    }
+    let scope = rust_function_module_scope(function).unwrap_or(root);
+    let module_path = caller_module_path(caller).unwrap_or_default();
+    collect_use_aliases_from_scope(scope, source, &module_path, &mut aliases);
+    collect_use_aliases_from_scope(function, source, &module_path, &mut aliases);
+    aliases
+}
+
+fn rust_function_module_scope(function: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = function.parent();
+    while let Some(current) = parent {
+        if current.kind() == "mod_item" {
+            return Some(current);
+        }
+        parent = current.parent();
+    }
+    None
+}
+
+fn collect_use_aliases_from_scope(
+    node: Node<'_>,
+    source: &str,
+    module_path: &str,
+    aliases: &mut BTreeMap<String, String>,
+) {
+    if node.kind() == "use_declaration"
+        && let Some(text) = node_text(node, source)
+    {
+        for (alias, target) in parse_rust_use_declaration(text, module_path) {
+            aliases.insert(alias, target);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.id() != node.id()
+            && matches!(child.kind(), "function_item" | "impl_item" | "mod_item")
+        {
+            continue;
+        }
+        collect_use_aliases_from_scope(child, source, module_path, aliases);
+    }
+}
+
+fn parse_rust_use_declaration(text: &str, module_path: &str) -> Vec<(String, String)> {
+    let Some(path) = text.trim().strip_prefix("use ") else {
+        return Vec::new();
+    };
+    let path = path.trim_end_matches(';').trim();
+    if path.contains('*') || path.is_empty() {
+        return Vec::new();
+    }
+    if path.contains('{') || path.contains('}') {
+        return parse_grouped_rust_use_declaration(path, module_path);
+    }
+    let (target, alias) = if let Some((target, alias)) = path.rsplit_once(" as ") {
+        (clean_expression_text(target), clean_expression_text(alias))
+    } else {
+        let path = clean_expression_text(path);
+        let Some(alias) = path.rsplit("::").find(|part| !part.is_empty()) else {
+            return Vec::new();
+        };
+        (path.clone(), alias.to_owned())
+    };
+    let target = normalize_rust_use_target(target.trim_end_matches("::"), module_path);
+    if target.is_empty() || alias.is_empty() {
+        Vec::new()
+    } else {
+        vec![(alias, target)]
+    }
+}
+
+fn parse_grouped_rust_use_declaration(path: &str, module_path: &str) -> Vec<(String, String)> {
+    let Some(open) = path.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = path.rfind('}') else {
+        return Vec::new();
+    };
+    if close <= open || path[open + 1..close].contains('{') || path[close + 1..].contains('}') {
+        return Vec::new();
+    }
+
+    let prefix = clean_expression_text(&path[..open])
+        .trim_end_matches("::")
+        .to_owned();
+    let entries = split_rust_use_group_entries(&path[open + 1..close]);
+    entries
+        .into_iter()
+        .filter_map(|entry| parse_rust_use_group_entry(&prefix, entry, module_path))
+        .collect()
+}
+
+fn split_rust_use_group_entries(group: &str) -> Vec<&str> {
+    group
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn parse_rust_use_group_entry(
+    prefix: &str,
+    entry: &str,
+    module_path: &str,
+) -> Option<(String, String)> {
+    if entry.contains('{') || entry.contains('}') || entry.contains('*') {
+        return None;
+    }
+    let (entry_target, alias) = if let Some((target, alias)) = entry.rsplit_once(" as ") {
+        (clean_expression_text(target), clean_expression_text(alias))
+    } else {
+        let target = clean_expression_text(entry);
+        let alias = if target == "self" {
+            prefix
+                .rsplit("::")
+                .find(|part| !part.is_empty())?
+                .to_owned()
+        } else {
+            target
+                .rsplit("::")
+                .find(|part| !part.is_empty())?
+                .to_owned()
+        };
+        (target, alias)
+    };
+    if alias.is_empty() {
+        return None;
+    }
+
+    let target = if entry_target == "self" {
+        normalize_rust_use_target(prefix, module_path)
+    } else {
+        normalize_rust_use_target(&join_rust_use_path(prefix, &entry_target), module_path)
+    };
+    if target.is_empty() {
+        None
+    } else {
+        Some((alias, target))
+    }
+}
+
+fn join_rust_use_path(prefix: &str, entry: &str) -> String {
+    let prefix = prefix.trim_end_matches("::");
+    let entry = entry.trim_start_matches("::");
+    if prefix.is_empty() {
+        entry.to_owned()
+    } else if entry.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}::{entry}")
+    }
+}
+
+fn normalize_rust_use_target(path: &str, module_path: &str) -> String {
+    let path = clean_expression_text(path);
+    if let Some(tail) = path.strip_prefix("crate::") {
+        return normalize_rust_path(tail);
+    }
+    if path == "crate" {
+        return String::new();
+    }
+
+    let mut remainder = path.as_str();
+    let mut module = module_path.to_owned();
+    loop {
+        if let Some(tail) = remainder.strip_prefix("self::") {
+            remainder = tail;
+        } else if remainder == "self" {
+            return module;
+        } else if let Some(tail) = remainder.strip_prefix("super::") {
+            let Some(parent) = module_super_path(&module) else {
+                return String::new();
+            };
+            module = parent;
+            remainder = tail;
+        } else if remainder == "super" {
+            return module_super_path(&module).unwrap_or_default();
+        } else {
+            break;
+        }
+    }
+
+    let tail = normalize_rust_path(remainder);
+    if path.starts_with("self::") || path.starts_with("super::") {
+        join_module_path(&module, &tail).unwrap_or_default()
+    } else {
+        tail
+    }
+}
+
+fn normalize_rust_path(path: &str) -> String {
+    let mut parts = path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    while matches!(parts.first(), Some(&"crate" | &"self" | &"super")) {
+        parts.remove(0);
+    }
+    parts.join("::")
+}
+
+fn callee_text(language: Language, call: Node<'_>, source: &str) -> Option<String> {
     let function = call
         .child_by_field_name("function")
         .or_else(|| call.named_child(0))?;
     Some(match function.kind() {
         "identifier" | "property_identifier" => node_text(function, source)?.to_owned(),
         "scoped_identifier" => node_text(function, source)?.replace(' ', ""),
+        "field_expression" if language == Language::Rust => {
+            rust_field_callee_text(function, source)?
+        }
         "field_expression" => function
             .child_by_field_name("field")
             .and_then(|field| node_text(field, source))
@@ -368,6 +1027,32 @@ fn callee_text(call: Node<'_>, source: &str) -> Option<String> {
         }
         _ => node_text(function, source)?.replace(' ', ""),
     })
+}
+
+fn rust_field_callee_text(function: Node<'_>, source: &str) -> Option<String> {
+    let full_text = clean_expression_text(node_text(function, source)?);
+    if full_text.starts_with("self.") {
+        return Some(full_text);
+    }
+    function
+        .child_by_field_name("field")
+        .and_then(|field| node_text(field, source))
+        .map(str::to_owned)
+}
+
+fn is_macro_invocation(language: Language, node: Node<'_>) -> bool {
+    language == Language::Rust && node.kind() == "macro_invocation"
+}
+
+fn macro_callee_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = node_text(node, source)?;
+    let macro_path = text.split_once('!')?.0;
+    let macro_path = clean_expression_text(macro_path);
+    if macro_path.is_empty() {
+        None
+    } else {
+        Some(format!("{macro_path}!"))
+    }
 }
 
 fn qualified_name(
@@ -406,9 +1091,14 @@ fn container_parts(language: Language, node: Node<'_>, source: &str) -> Vec<Stri
     let mut parent = node.parent();
     while let Some(current) = parent {
         match language {
+            Language::Rust if current.kind() == "mod_item" => {
+                if let Some(name) = named_node_text(current, source) {
+                    parts.push(clean_expression_text(name));
+                }
+            }
             Language::Rust if current.kind() == "impl_item" => {
-                if let Some(type_name) = impl_type_name(current, source) {
-                    parts.push(type_name);
+                if let Some(container_name) = impl_container_name(current, source) {
+                    parts.push(container_name);
                 }
             }
             Language::CSharp
@@ -455,6 +1145,31 @@ fn impl_type_name(node: Node<'_>, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn impl_trait_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("trait")
+        .and_then(|trait_node| node_text(trait_node, source))
+        .map(clean_expression_text)
+        .filter(|trait_name| !trait_name.is_empty())
+}
+
+fn impl_display_name(node: Node<'_>, source: &str) -> Option<String> {
+    let type_name = impl_type_name(node, source)?;
+    if let Some(trait_name) = impl_trait_name(node, source) {
+        Some(format!("{trait_name} for {type_name}"))
+    } else {
+        Some(type_name)
+    }
+}
+
+fn impl_container_name(node: Node<'_>, source: &str) -> Option<String> {
+    let type_name = impl_type_name(node, source)?;
+    if let Some(trait_name) = impl_trait_name(node, source) {
+        Some(format!("<{type_name} as {trait_name}>"))
+    } else {
+        Some(type_name)
+    }
 }
 
 fn signature_text(node: Node<'_>, source: &str) -> Option<String> {
@@ -587,19 +1302,36 @@ impl Counter {
 
         let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
 
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].kind, ChunkKind::Function);
         assert_eq!(chunks[0].symbol_name.as_deref(), Some("free_function"));
         assert_eq!(chunks[0].line_range.start, 1);
         assert_eq!(chunks[0].line_range.end, 3);
-        assert_eq!(chunks[1].kind, ChunkKind::Method);
-        assert_eq!(chunks[1].symbol_name.as_deref(), Some("increment"));
-        assert_eq!(chunks[1].line_range.start, 8);
+        assert_eq!(chunks[1].kind, ChunkKind::TypeDefinition);
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("Counter"));
+        assert_eq!(chunks[2].kind, ChunkKind::ImplSummary);
+        assert_eq!(chunks[2].symbol_name.as_deref(), Some("impl Counter"));
+        assert_eq!(chunks[3].kind, ChunkKind::Method);
+        assert_eq!(chunks[3].symbol_name.as_deref(), Some("increment"));
+        assert_eq!(chunks[3].line_range.start, 8);
     }
 
     #[test]
-    fn emits_file_fallback_when_no_function_chunks_exist() {
+    fn extracts_type_definition_chunks_without_file_fallback() {
         let source = "pub struct OnlyData;\n";
+
+        let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, ChunkKind::TypeDefinition);
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("OnlyData"));
+        assert_eq!(chunks[0].line_range.start, 1);
+        assert_eq!(chunks[0].line_range.end, 1);
+    }
+
+    #[test]
+    fn emits_file_fallback_when_no_chunkable_units_exist() {
+        let source = "pub const ANSWER: i32 = 42;\n";
 
         let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
 
@@ -607,6 +1339,78 @@ impl Counter {
         assert_eq!(chunks[0].kind, ChunkKind::FileFallback);
         assert_eq!(chunks[0].line_range.start, 1);
         assert_eq!(chunks[0].line_range.end, 1);
+    }
+
+    #[test]
+    fn extracts_rust_type_trait_and_impl_summary_chunks() {
+        let source = r#"pub enum Mode {
+    Fast,
+}
+
+pub type Count = usize;
+
+pub trait Runnable {
+    fn run(&self);
+}
+
+impl Runnable for Mode {
+    fn run(&self) {}
+}
+"#;
+
+        let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::TypeDefinition && chunk.symbol_name.as_deref() == Some("Mode")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::TypeDefinition && chunk.symbol_name.as_deref() == Some("Count")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::TypeDefinition
+                && chunk.symbol_name.as_deref() == Some("Runnable")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::ImplSummary
+                && chunk.symbol_name.as_deref() == Some("impl Runnable for Mode")
+        }));
+    }
+
+    #[test]
+    fn qualifies_rust_trait_impl_methods_with_trait_context() {
+        let source = r#"trait Runnable {
+    fn helper(&self);
+    fn run(&self);
+}
+
+struct Worker;
+
+impl Runnable for Worker {
+    fn helper(&self) {}
+
+    fn run(&self) {
+        self.helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        assert!(index.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "<Worker as Runnable>::helper"
+                && symbol.kind == SymbolKind::Method
+        }));
+        assert!(index.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "<Worker as Runnable>::run"
+                && symbol.kind == SymbolKind::Method
+        }));
+        let call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "self.helper")
+            .expect("self.helper call should be captured");
+        assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+        assert!(call.callee_symbol_id.is_some());
     }
 
     #[test]
@@ -635,12 +1439,71 @@ impl Counter {
     }
 
     #[test]
-    fn syntax_errors_fail_closed() {
+    fn discovers_rust_tests_with_module_qualified_names() {
+        let source = r#"pub fn target() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn covers_target() {
+        target();
+    }
+
+    #[tokio::test]
+    async fn covers_target_async() {
+        target();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        assert_eq!(index.tests.len(), 2);
+        assert!(index.tests.iter().any(|test| {
+            test.name == "covers_target"
+                && test.qualified_name == "tests::covers_target"
+                && test.framework == "rust_test"
+        }));
+        assert!(index.tests.iter().any(|test| {
+            test.name == "covers_target_async"
+                && test.qualified_name == "tests::covers_target_async"
+                && test.framework == "tokio::test"
+        }));
+        assert!(index.tests.iter().all(|test| test.symbol_id.is_some()));
+    }
+
+    #[test]
+    fn syntax_errors_emit_partial_index_with_diagnostics() {
         let source = "pub fn broken( {}\n";
 
-        let error = extract_rust_chunks(&file(), source).expect_err("syntax errors should fail");
+        let index = index_rust_file(&file(), source).expect("syntax errors should index partially");
 
-        assert!(error.to_string().contains("failed to parse source file"));
+        assert!(!index.chunks.is_empty());
+        assert!(!index.parse_diagnostics.is_empty());
+        assert!(
+            index
+                .parse_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("tree-sitter"))
+        );
+    }
+
+    #[test]
+    fn partial_parse_preserves_valid_functions_around_errors() {
+        let source = r#"pub fn before() {}
+
+pub fn broken( {}
+
+pub fn after() {}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("partial parse should succeed");
+
+        assert!(!index.parse_diagnostics.is_empty());
+        assert!(index.symbols.iter().any(|symbol| symbol.name == "before"));
+        assert!(index.symbols.iter().any(|symbol| symbol.name == "after"));
     }
 
     #[test]
@@ -703,6 +1566,360 @@ pub fn caller() {
             ResolutionStatus::Unresolved
         );
         assert!(external_call.callee_symbol_id.is_none());
+    }
+
+    #[test]
+    fn preserves_rust_macro_invocations_as_unresolved_calls_and_diagnostics() {
+        let source = r#"pub fn helper() -> i32 { 1 }
+
+pub fn caller() {
+    println!("{}", helper());
+    assert_eq!(helper(), 1);
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["println!", "assert_eq!"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} macro call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::Unresolved);
+            assert!(call.callee_symbol_id.is_none());
+            assert_eq!(call.confidence, 0.2);
+        }
+
+        assert_eq!(
+            index
+                .parse_diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("preserved without expansion"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn resolves_rust_scoped_method_calls_from_caller_module() {
+        let source = r#"struct Worker;
+
+impl Worker {
+    pub fn run() {}
+}
+
+mod outer {
+    pub struct Worker;
+
+    impl Worker {
+        pub fn run() {}
+    }
+
+    pub fn caller() {
+        Worker::run();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+        let outer_run = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::Worker::run")
+            .expect("outer Worker::run should be indexed");
+        let call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "Worker::run")
+            .expect("Worker::run call should exist");
+
+        assert_eq!(
+            call.callee_symbol_id.as_deref(),
+            Some(outer_run.id.as_str())
+        );
+        assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+    }
+
+    #[test]
+    fn resolves_unqualified_rust_calls_from_caller_module() {
+        let source = r#"pub fn helper() {}
+
+mod outer {
+    pub fn helper() {}
+
+    pub fn caller() {
+        helper();
+    }
+}
+
+mod sibling {
+    pub fn caller() {
+        helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+        let outer_helper = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::helper")
+            .expect("outer helper should be indexed");
+
+        let outer_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "helper" && call.call_line == 7)
+            .expect("outer helper call should exist");
+        assert_eq!(
+            outer_call.callee_symbol_id.as_deref(),
+            Some(outer_helper.id.as_str())
+        );
+        assert_eq!(
+            outer_call.resolution_status,
+            ResolutionStatus::ResolvedExact
+        );
+
+        let sibling_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "helper" && call.call_line == 13)
+            .expect("sibling helper call should exist");
+        assert_eq!(sibling_call.resolution_status, ResolutionStatus::Unresolved);
+        assert!(sibling_call.callee_symbol_id.is_none());
+    }
+
+    #[test]
+    fn resolves_rust_self_and_self_type_method_calls_exactly() {
+        let source = r#"struct Worker;
+
+impl Worker {
+    fn helper(&self) {}
+    fn static_helper() {}
+
+    fn run(&self) {
+        self.helper();
+        Self::static_helper();
+        worker.helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["self.helper", "Self::static_helper"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+            assert_eq!(call.confidence, 1.0);
+        }
+
+        let receiver_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "helper" && call.call_line == 10)
+            .expect("non-self receiver call should still be captured conservatively");
+        assert_ne!(
+            receiver_call.resolution_status,
+            ResolutionStatus::ResolvedExact
+        );
+    }
+
+    #[test]
+    fn resolves_rust_self_and_super_module_paths_from_caller_scope() {
+        let source = r#"pub fn helper() {}
+
+mod outer {
+    pub fn helper() {}
+
+    mod inner {
+        pub fn helper() {}
+
+        pub fn caller() {
+            self::helper();
+            super::helper();
+        }
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+        let inner_helper = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::inner::helper")
+            .expect("inner helper should be indexed");
+        let outer_helper = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::helper")
+            .expect("outer helper should be indexed");
+
+        let self_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "self::helper")
+            .expect("self::helper call should be captured");
+        assert_eq!(
+            self_call.callee_symbol_id.as_deref(),
+            Some(inner_helper.id.as_str())
+        );
+        assert_eq!(self_call.resolution_status, ResolutionStatus::ResolvedExact);
+
+        let super_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "super::helper")
+            .expect("super::helper call should be captured");
+        assert_eq!(
+            super_call.callee_symbol_id.as_deref(),
+            Some(outer_helper.id.as_str())
+        );
+        assert_eq!(
+            super_call.resolution_status,
+            ResolutionStatus::ResolvedExact
+        );
+    }
+
+    #[test]
+    fn resolves_rust_calls_through_crate_prefixes_and_use_aliases() {
+        let source = r#"mod inner {
+    pub fn helper() {}
+    pub fn other() {}
+}
+
+use crate::inner::helper as run_helper;
+use crate::inner as aliased_inner;
+
+pub fn caller() {
+    crate::inner::helper();
+    run_helper();
+    aliased_inner::other();
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["crate::inner::helper", "run_helper", "aliased_inner::other"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+        }
+    }
+
+    #[test]
+    fn resolves_rust_calls_through_grouped_use_aliases() {
+        let source = r#"mod inner {
+    pub fn helper() {}
+    pub fn other() {}
+}
+
+use crate::inner::{helper, other as renamed_other, self as inner_mod};
+
+pub fn caller() {
+    helper();
+    renamed_other();
+    inner_mod::other();
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["helper", "renamed_other", "inner_mod::other"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+        }
+    }
+
+    #[test]
+    fn resolves_rust_module_relative_use_aliases_from_caller_scope() {
+        let source = r#"mod outer {
+    mod inner {
+        pub fn helper() {}
+        pub fn other() {}
+    }
+
+    mod child {
+        use super::inner::{helper, other as renamed_other, self as inner_mod};
+
+        pub fn caller() {
+            helper();
+            renamed_other();
+            inner_mod::other();
+        }
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["helper", "renamed_other", "inner_mod::other"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+        }
+    }
+
+    #[test]
+    fn keeps_rust_use_alias_resolution_scoped_to_visible_modules() {
+        let source = r#"mod inner {
+    pub fn helper() {}
+}
+
+mod first {
+    use crate::inner::helper as local_helper;
+
+    pub fn caller() {
+        local_helper();
+    }
+}
+
+mod second {
+    pub fn caller() {
+        local_helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        let resolved_alias_calls = index
+            .calls
+            .iter()
+            .filter(|call| {
+                call.callee_text == "local_helper"
+                    && call.resolution_status == ResolutionStatus::ResolvedExact
+            })
+            .count();
+        let unresolved_alias_calls = index
+            .calls
+            .iter()
+            .filter(|call| {
+                call.callee_text == "local_helper"
+                    && call.resolution_status == ResolutionStatus::Unresolved
+            })
+            .count();
+
+        assert_eq!(resolved_alias_calls, 1);
+        assert_eq!(unresolved_alias_calls, 1);
     }
 
     #[test]

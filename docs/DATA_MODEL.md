@@ -45,16 +45,20 @@ CREATE TABLE index_runs (
 );
 ```
 
-Successful semantic indexing runs are recorded here with the embedding model,
-vector dimension, and embedded chunk count. `index-status` and
-`symdex_index_status` expose the latest successful embedding model and
-dimension when present.
+Indexing records a row when a run starts and finalizes it when the run finishes.
+Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
+Successful semantic runs include the embedding model, vector dimension, and
+embedded chunk count. Semantic runs with no changed embeddable chunks finish as
+`skipped`. Semantic failures after SQLite persistence finish as `partial` with a
+metadata-only `error_summary`; earlier recorded failures finish as `failed`.
+`index-status` and `symdex_index_status` expose the latest successful embedding
+model and dimension when present.
 
-Continuous indexing should also record compact batch summaries in `index_runs`
-or a compatible future run-history table so watch-driven updates are visible in
-storage views. At minimum, the UI should be able to distinguish manual indexing
-from continuous indexing batches, show status, timestamps, files seen/indexed,
-chunks embedded, model, dimension, and any error summary.
+Continuous indexing records compact batch summaries in `index_runs` through the
+same indexing path, so watch-driven updates are visible in storage views. The UI
+can distinguish manual/offline and semantic batches through `run_kind`, status,
+timestamps, files seen/indexed, chunks embedded, model, dimension, and any
+metadata-only error summary.
 
 ### `files`
 
@@ -124,6 +128,12 @@ CREATE TABLE chunks (
 embedding. Chunks with an exclusion reason do not get a Qdrant point ID in the
 current implementation.
 
+Before semantic indexing replaces changed-file chunk rows or removes deleted
+files, it reads existing non-null `qdrant_point_id` values for those chunks and
+uses them to delete stale Qdrant points. This keeps SQLite as the source of
+truth for vector lifecycle cleanup while avoiding source text in Qdrant payloads
+or cleanup reports.
+
 ### `calls`
 
 ```sql
@@ -139,6 +149,36 @@ CREATE TABLE calls (
   parser_version TEXT
 );
 ```
+
+### `tests`
+
+```sql
+CREATE TABLE tests (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  symbol_id TEXT,
+  name TEXT NOT NULL,
+  qualified_name TEXT NOT NULL,
+  framework TEXT NOT NULL,
+  language TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  start_byte INTEGER NOT NULL,
+  end_byte INTEGER NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+The current write path stores Rust test metadata for functions with recognized
+test attributes. Test rows are structural facts only: they include names,
+framework labels, paths, ranges, provenance, and optional symbol linkage, but no
+source text. The `tests` table supports exact/suffix failing-test name lookup
+for debug context packs and direct test-to-symbol call lookup for impact
+summaries.
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
@@ -186,12 +226,40 @@ embedding dimension, and embedding timestamp. Freshness checks compare persisted
 content hashes with the current eligible file hashes and label rows as `fresh`,
 `stale`, `deleted`, `missing`, or `unknown`.
 
+Returned impact and debug-context evidence also includes an `EvidenceTrust`
+score where the query layer has enough metadata to evaluate it. The score is a
+deterministic 0.0-1.0 heuristic over freshness, provenance completeness,
+confidence when the evidence is call or semantic evidence, and index metadata
+completeness from `index_run_id` plus `parser_version`. Trust levels are
+`high`, `medium`, `low`, and `minimal`. The score is not a correctness proof;
+it is a compact ordering aid for agents deciding which metadata-only evidence is
+fresh, well-provenanced, and directly supported by indexed facts.
+
+Query-time evidence rows also include compact `reasons` tags where available.
+These tags explain why the row was returned without adding source text or new
+storage schema. Examples include `semantic_vector_match`,
+`relationship:direct_caller`, `bounded_transitive_call_path`,
+`symbols_at_runtime_location`, `symbol_name_fallback_match`, and
+`related_file_from_call_evidence`.
+
 Use cosine distance unless a selected embedding model requires otherwise.
 
 Before writing vectors, symdex checks the latest successful run for the same
 repository and embedding model. If the vector dimension changed, indexing fails
 closed with a reset/reindex message instead of mixing incompatible points in the
 same Qdrant collection. Different model names use different collection names.
+
+The Qdrant verifier treats SQLite as the expected vector manifest. It compares
+each non-null `chunks.qdrant_point_id` with Qdrant payload rows filtered by
+`repository_id`, checking point ID, chunk ID, path, line range, text hash,
+embedding model, and embedding dimension. Missing collections and missing
+points are errors; stale payload fields and orphaned Qdrant points are warnings.
+The report is metadata-only and does not request vectors or source text.
+
+The Qdrant repair command uses verifier metadata as its repair plan. Orphaned
+point IDs are deleted from Qdrant. Missing or stale expected points, including
+payload model or dimension drift, are rebuilt through semantic indexing rather
+than by a separate write path so SQLite remains the structural source of truth.
 
 ## TUI visualization mapping
 
@@ -268,6 +336,9 @@ Compare SQLite chunk metadata with Qdrant collection metadata:
 Surface missing collections, missing points, model drift, and dimension drift
 as warning or error rows.
 
+The CLI `qdrant-verify` command implements this live comparison against Qdrant.
+The TUI can use the same status labels when it grows live cross-store actions.
+
 The first TUI implementation uses SQLite metadata and recorded Qdrant point IDs
 to show total, embeddable, vector-backed, missing-vector, and excluded chunk
 counts plus latest model, dimension, collection, run count, exclusion reasons,
@@ -342,7 +413,8 @@ Current behavior:
   `callee_text` matches the target query
 - cycles are skipped by tracking visited symbol IDs per candidate path
 - returned edges include caller/callee metadata, call line, confidence,
-  resolution status, and provenance; they never include source text
+  resolution status, freshness, trust, reason tags, and provenance; they never
+  include source text
 
 ## Impact traversal and related-file evidence
 
@@ -355,10 +427,14 @@ metadata-only edge shape as call path tracing.
 
 Impact related files are derived from direct relationships and transitive path
 edges. Each related-file row includes a deterministic relationship count,
-freshness label, and the first available provenance record for that file. The
-impact report does not claim likely affected tests yet; `tests_likely` remains
-empty and output includes a note until test discovery and test-to-symbol mapping
-are indexed.
+freshness label, trust score, and the first available provenance record for that
+file. Direct call rows, transitive paths, path edges, and related-file rows also
+carry reason tags that distinguish direct caller/callee evidence, bounded
+transitive paths, and file relationships derived from call evidence. The impact
+report also includes indexed Rust tests that directly call the queried symbol
+through resolved call edges. When no direct indexed test evidence is available,
+`tests_likely` remains empty and the output includes an explanatory note instead
+of guessing.
 
 ## Debug context packs
 
@@ -368,10 +444,22 @@ paths, line numbers, and columns. Relative paths are normalized with repository
 path rules; absolute paths are accepted only when they are under the selected
 repository root.
 
+The Rust-oriented parser recognizes common `cargo test` output, panic-hook
+locations, `RUST_BACKTRACE=1` and `RUST_BACKTRACE=full` frame lines, `anyhow`
+cause lists without treating each cause as a stack frame, tracing-style
+`target=... file=... line=... column=...` metadata, and async stack-like lines
+that include a symbol followed by `at path:line:column`.
+
 The current `symdex.debug_context.v1` format joins parsed frames to existing
 SQLite `files`, `symbols`, and `calls` rows. Returned frame evidence includes
 the normalized path, matched symbols covering the runtime line, calls recorded
 at that line, freshness labels from current file hashes, and provenance
-metadata. Likely tests are limited to failing test names found in runtime input
-until indexed test discovery and mapping are available. Debug context packs do
-not include source text and do not mutate index state.
+metadata. Failing test names found in runtime input are mapped to indexed Rust
+test facts when an exact or suffix match exists; unmatched runtime names are
+kept as fallbacks and labeled with a note. Frame matches include trust scores so
+agents can distinguish fresh, fully provenanced runtime evidence from stale,
+deleted, or weakly provenanced matches. They also include reason tags that
+identify path normalization, file provenance matches, symbol-at-location
+matches, symbol-name fallback matches, calls at the runtime line, and unmatched
+frames. Debug context packs do not include source text and do not mutate index
+state.

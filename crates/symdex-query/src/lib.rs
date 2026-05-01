@@ -9,9 +9,10 @@ use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
-    IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, SemanticNeighborhoodSummary,
-    SqliteStore, StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
-    clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
+    IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, QdrantExpectedPoint,
+    RetrievedPoint, SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary,
+    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
+    TestSearchRow, clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +89,7 @@ pub struct SemanticSearchResult {
     pub symbol_name: Option<String>,
     pub chunk_kind: String,
     pub provenance: EvidenceProvenance,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,16 +123,39 @@ pub struct ImpactSummary {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QdrantVerifySummary {
+    pub repository_id: String,
+    pub collection_name: String,
+    pub embedding_model: String,
+    pub collection_exists: bool,
+    pub expected_vector_points: usize,
+    pub qdrant_payload_points: usize,
+    pub missing_points: usize,
+    pub stale_payload_points: usize,
+    pub orphaned_points: usize,
+    pub missing_point_ids: Vec<String>,
+    pub stale_payload_point_ids: Vec<String>,
+    pub orphaned_point_ids: Vec<String>,
+    pub rows: Vec<StorageHealthRow>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImpactCallEvidence {
     pub row: CallSearchRow,
     pub freshness: EvidenceFreshness,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImpactPathEvidence {
     pub path: CallPath,
     pub edge_freshness: Vec<EvidenceFreshness>,
+    pub edge_trust: Vec<EvidenceTrust>,
+    pub edge_reasons: Vec<Vec<String>>,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +164,15 @@ pub struct ImpactRelatedFile {
     pub relationship_count: usize,
     pub freshness: EvidenceFreshness,
     pub provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvidenceTrust {
+    pub score: f64,
+    pub level: String,
+    pub factors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +218,8 @@ pub struct DebugFrameMatch {
     pub normalized_path: Option<String>,
     pub file_freshness: EvidenceFreshness,
     pub file_provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
     pub matched_symbols: Vec<SymbolSearchRow>,
     pub calls_at_line: Vec<CallPath>,
     pub matched: bool,
@@ -304,23 +340,31 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    let current_hashes = current_hashes(&root)?;
+    build_impact_summary(&root, &sqlite, query)
+}
+
+fn build_impact_summary(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    query: &str,
+) -> Result<ImpactSummary, String> {
+    let current_hashes = current_hashes(root)?;
     let max_depth = 4;
     let direct_callers = sqlite
         .callers(root.id(), query)
-        .map(|rows| impact_call_evidence(rows, &current_hashes))
+        .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_caller"))
         .map_err(|error| error.to_string())?;
     let direct_callees = sqlite
         .callees(root.id(), query)
-        .map(|rows| impact_call_evidence(rows, &current_hashes))
+        .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_callee"))
         .map_err(|error| error.to_string())?;
     let transitive_callers = sqlite
         .transitive_call_paths_to(root.id(), query, max_depth)
-        .map(|paths| impact_path_evidence(paths, &current_hashes))
+        .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_caller"))
         .map_err(|error| error.to_string())?;
     let transitive_callees = sqlite
         .transitive_call_paths_from(root.id(), query, max_depth)
-        .map(|paths| impact_path_evidence(paths, &current_hashes))
+        .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_callee"))
         .map_err(|error| error.to_string())?;
     let related_files = impact_related_files(
         &direct_callers,
@@ -329,6 +373,16 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
         &transitive_callees,
         &current_hashes,
     );
+    let tests_likely = sqlite
+        .likely_tests_for_symbol(root.id(), query)
+        .map(test_names)
+        .map_err(|error| error.to_string())?;
+    let mut notes = vec!["metadata_only_no_source_text".to_owned()];
+    if tests_likely.is_empty() {
+        notes.push("likely_tests_unavailable_without_indexed_direct_test_evidence".to_owned());
+    } else {
+        notes.push("likely_tests_from_indexed_direct_test_calls".to_owned());
+    }
 
     Ok(ImpactSummary {
         repository_id: root.id().to_owned(),
@@ -339,11 +393,8 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
         transitive_callers,
         transitive_callees,
         related_files,
-        tests_likely: Vec::new(),
-        notes: vec![
-            "metadata_only_no_source_text".to_owned(),
-            "likely_tests_unavailable_until_test_discovery_mapping_is_indexed".to_owned(),
-        ],
+        tests_likely,
+        notes,
     })
 }
 
@@ -365,6 +416,7 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
     let mut malformed_lines = Vec::new();
     let mut pending_symbol: Option<(usize, String, String)> = None;
     let mut in_failures = false;
+    let mut in_backtrace = false;
 
     for (index, line) in input.lines().enumerate() {
         let trimmed = line.trim();
@@ -373,10 +425,36 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
         }
         if trimmed == "failures:" {
             in_failures = true;
+            in_backtrace = false;
+            continue;
+        }
+        if is_backtrace_header(trimmed) {
+            in_backtrace = true;
             continue;
         }
         if let Some(test) = parse_failing_test(trimmed, in_failures) {
             failing_tests.insert(test);
+        }
+        if let Some((symbol, path, line_number, column)) = parse_inline_symbol_location(trimmed) {
+            if let Some((_, raw, pending)) = pending_symbol.take() {
+                frames.push(RuntimeFrame {
+                    ordinal: frames.len(),
+                    raw,
+                    symbol: Some(pending),
+                    path: None,
+                    line: None,
+                    column: None,
+                });
+            }
+            frames.push(RuntimeFrame {
+                ordinal: frames.len(),
+                raw: trimmed.to_owned(),
+                symbol: Some(symbol),
+                path: Some(path),
+                line: Some(line_number),
+                column,
+            });
+            continue;
         }
         if let Some((path, line_number, column)) = parse_file_location(trimmed) {
             let (raw, symbol) = pending_symbol
@@ -393,7 +471,7 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
             });
             continue;
         }
-        if let Some(symbol) = parse_stack_symbol(trimmed) {
+        if let Some(symbol) = parse_stack_symbol(trimmed, in_backtrace) {
             if let Some((_, raw, pending)) = pending_symbol.take() {
                 frames.push(RuntimeFrame {
                     ordinal: frames.len(),
@@ -557,6 +635,227 @@ pub fn run_cross_store_health(repo: &str) -> Result<CrossStoreHealthSummary, Str
         .map_err(|error| error.to_string())
 }
 
+pub fn run_qdrant_verify(repo: &str) -> Result<QdrantVerifySummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let embed_config = EmbedConfig::from_env();
+    let expected = sqlite
+        .qdrant_expected_points(root.id())
+        .map_err(|error| error.to_string())?;
+    let store_config = StoreConfig::from_env();
+    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
+    let collection_name = qdrant_collection_name(root.id(), &embed_config.model);
+    let collection_exists = qdrant
+        .collection_exists(&collection_name)
+        .map_err(|error| error.to_string())?;
+    if !collection_exists {
+        return Ok(qdrant_verify_summary(
+            root.id(),
+            collection_name,
+            embed_config.model,
+            false,
+            expected,
+            Vec::new(),
+        ));
+    }
+    let actual = qdrant
+        .scroll_points_for_repository(&collection_name, root.id())
+        .map_err(|error| error.to_string())?;
+
+    Ok(qdrant_verify_summary(
+        root.id(),
+        collection_name,
+        embed_config.model,
+        true,
+        expected,
+        actual,
+    ))
+}
+
+fn qdrant_verify_summary(
+    repository_id: &str,
+    collection_name: String,
+    embedding_model: String,
+    collection_exists: bool,
+    expected: Vec<QdrantExpectedPoint>,
+    actual: Vec<RetrievedPoint>,
+) -> QdrantVerifySummary {
+    let expected_by_id = expected
+        .iter()
+        .map(|point| (point.qdrant_point_id.clone(), point))
+        .collect::<BTreeMap<_, _>>();
+    let actual_by_id = actual
+        .iter()
+        .map(|point| (qdrant_value_id(&point.id), point))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    let mut missing_points = 0usize;
+    let mut stale_payload_points = 0usize;
+    let mut orphaned_points = 0usize;
+    let mut missing_point_ids = Vec::new();
+    let mut stale_payload_point_ids = Vec::new();
+    let mut orphaned_point_ids = Vec::new();
+
+    if !collection_exists {
+        if expected.is_empty() {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Warning,
+                label: "collection_missing".to_owned(),
+                detail: format!(
+                    "Qdrant collection {collection_name} is missing, and SQLite has no vector-backed chunks for this model."
+                ),
+            });
+        } else {
+            missing_points = expected.len();
+            missing_point_ids.extend(expected.iter().map(|point| point.qdrant_point_id.clone()));
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Error,
+                label: "collection_missing".to_owned(),
+                detail: format!(
+                    "Qdrant collection {collection_name} is missing for {} SQLite vector-backed chunks.",
+                    expected.len()
+                ),
+            });
+        }
+    } else {
+        for expected_point in &expected {
+            let Some(actual_point) = actual_by_id.get(&expected_point.qdrant_point_id) else {
+                missing_points += 1;
+                missing_point_ids.push(expected_point.qdrant_point_id.clone());
+                rows.push(StorageHealthRow {
+                    status: StorageHealthStatus::Error,
+                    label: "missing_point".to_owned(),
+                    detail: format!(
+                        "SQLite chunk {} expects Qdrant point {} at {}:{}-{}, but the point was not returned.",
+                        expected_point.chunk_id,
+                        expected_point.qdrant_point_id,
+                        expected_point.path,
+                        expected_point.start_line,
+                        expected_point.end_line
+                    ),
+                });
+                continue;
+            };
+
+            let mismatches = qdrant_payload_mismatches(expected_point, &actual_point.payload);
+            if !mismatches.is_empty() {
+                stale_payload_points += 1;
+                stale_payload_point_ids.push(expected_point.qdrant_point_id.clone());
+                rows.push(StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "stale_payload".to_owned(),
+                    detail: format!(
+                        "Qdrant point {} for chunk {} has stale payload fields: {}.",
+                        expected_point.qdrant_point_id,
+                        expected_point.chunk_id,
+                        mismatches.join(", ")
+                    ),
+                });
+            }
+        }
+
+        for point_id in actual_by_id.keys() {
+            if !expected_by_id.contains_key(point_id) {
+                orphaned_points += 1;
+                orphaned_point_ids.push(point_id.clone());
+                rows.push(StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "orphaned_point".to_owned(),
+                    detail: format!(
+                        "Qdrant point {point_id} has repository payload {repository_id} but no matching SQLite chunk."
+                    ),
+                });
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Ok,
+            label: "qdrant_verify_ok".to_owned(),
+            detail: format!(
+                "SQLite vector-backed chunks and Qdrant payload metadata are aligned for {collection_name}."
+            ),
+        });
+    }
+
+    QdrantVerifySummary {
+        repository_id: repository_id.to_owned(),
+        collection_name,
+        embedding_model,
+        collection_exists,
+        expected_vector_points: expected.len(),
+        qdrant_payload_points: actual.len(),
+        missing_points,
+        stale_payload_points,
+        orphaned_points,
+        missing_point_ids,
+        stale_payload_point_ids,
+        orphaned_point_ids,
+        rows,
+    }
+}
+
+fn qdrant_payload_mismatches(
+    expected: &QdrantExpectedPoint,
+    actual: &symdex_store::PointPayload,
+) -> Vec<&'static str> {
+    let mut mismatches = Vec::new();
+    if actual.chunk_id != expected.chunk_id {
+        mismatches.push("chunk_id");
+    }
+    if actual.path != expected.path {
+        mismatches.push("path");
+    }
+    if actual.start_line != expected.start_line {
+        mismatches.push("start_line");
+    }
+    if actual.end_line != expected.end_line {
+        mismatches.push("end_line");
+    }
+    if actual.text_hash != expected.text_hash {
+        mismatches.push("text_hash");
+    }
+    if let Some(expected_model) = &expected.embedding_model
+        && actual.embedding_model.as_ref() != Some(expected_model)
+    {
+        mismatches.push("embedding_model");
+    }
+    if let Some(expected_dimension) = expected.embedding_dimension
+        && actual.embedding_dimension != Some(expected_dimension)
+    {
+        mismatches.push("embedding_dimension");
+    }
+    mismatches
+}
+
+fn qdrant_value_id(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn semantic_reasons(
+    score: f64,
+    path: &str,
+    symbol_name: Option<&str>,
+    chunk_kind: &str,
+) -> Vec<String> {
+    let mut reasons = vec![
+        "semantic_vector_match".to_owned(),
+        format!("semantic_score:{score:.4}"),
+        format!("path:{path}"),
+        format!("chunk_kind:{chunk_kind}"),
+    ];
+    if let Some(symbol_name) = symbol_name {
+        reasons.push(format!("symbol_payload:{symbol_name}"));
+    } else {
+        reasons.push("symbol_payload:missing".to_owned());
+    }
+    reasons
+}
+
 pub fn run_semantic_search(
     repo: &str,
     query: &str,
@@ -585,22 +884,29 @@ pub fn run_semantic_search(
         .query_points(&qdrant_collection, vector, limit)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .map(|point| SemanticSearchResult {
-            score: point.score,
-            path: point.payload.path,
-            start_line: point.payload.start_line,
-            end_line: point.payload.end_line,
-            symbol_name: point.payload.symbol_name,
-            chunk_kind: point.payload.chunk_kind,
-            provenance: EvidenceProvenance {
-                content_hash: point.payload.content_hash,
-                index_run_id: point.payload.index_run_id,
-                parser_version: point.payload.parser_version,
-                indexed_at: point.payload.indexed_at,
-                embedding_model: point.payload.embedding_model,
-                embedding_dimension: point.payload.embedding_dimension,
-                embedded_at: None,
-            },
+        .map(|point| {
+            let path = point.payload.path;
+            let symbol_name = point.payload.symbol_name;
+            let chunk_kind = point.payload.chunk_kind;
+            let reasons = semantic_reasons(point.score, &path, symbol_name.as_deref(), &chunk_kind);
+            SemanticSearchResult {
+                score: point.score,
+                path,
+                start_line: point.payload.start_line,
+                end_line: point.payload.end_line,
+                symbol_name,
+                chunk_kind,
+                provenance: EvidenceProvenance {
+                    content_hash: point.payload.content_hash,
+                    index_run_id: point.payload.index_run_id,
+                    parser_version: point.payload.parser_version,
+                    indexed_at: point.payload.indexed_at,
+                    embedding_model: point.payload.embedding_model,
+                    embedding_dimension: point.payload.embedding_dimension,
+                    embedded_at: None,
+                },
+                reasons,
+            }
         })
         .collect();
 
@@ -620,6 +926,7 @@ fn build_debug_context_pack(
     current_hashes: &BTreeMap<String, String>,
 ) -> Result<DebugContextPack, String> {
     let parsed = parse_runtime_input(runtime_input);
+    let mapped_tests = map_failing_tests(sqlite, root.id(), &parsed.failing_tests)?;
     let max_frames = limit.clamp(1, 25);
     let max_symbols = limit.clamp(1, 10);
     let max_calls = limit.clamp(1, 10);
@@ -636,18 +943,25 @@ fn build_debug_context_pack(
                 .map_err(|error| error.to_string())?,
             None => None,
         };
+        let mut symbol_match_reason = None;
         let mut matched_symbols = match (normalized_path.as_deref(), frame.line) {
             (Some(path), Some(line)) => sqlite
                 .symbols_at_location(root.id(), path, line)
                 .map_err(|error| error.to_string())?,
             _ => Vec::new(),
         };
+        if !matched_symbols.is_empty() {
+            symbol_match_reason = Some("symbols_at_runtime_location");
+        }
         if matched_symbols.is_empty()
             && let Some(symbol) = frame.symbol.as_deref()
         {
             matched_symbols = sqlite
                 .find_symbols(root.id(), symbol)
                 .map_err(|error| error.to_string())?;
+            if !matched_symbols.is_empty() {
+                symbol_match_reason = Some("symbol_name_fallback_match");
+            }
         }
         matched_symbols.truncate(max_symbols);
 
@@ -679,14 +993,25 @@ fn build_debug_context_pack(
                 .and_then(|provenance| provenance.content_hash.as_deref()),
             current_hash,
         );
+        let trust = evidence_trust(file_freshness, provenance.as_ref(), None);
         let matched =
             file_provenance.is_some() || !matched_symbols.is_empty() || !calls_at_line.is_empty();
+        let reasons = debug_frame_reasons(
+            frame,
+            normalized_path.as_deref(),
+            file_provenance.is_some(),
+            symbol_match_reason,
+            calls_at_line.len(),
+            matched,
+        );
 
         frames.push(DebugFrameMatch {
             frame: frame.clone(),
             normalized_path,
             file_freshness,
             file_provenance: provenance,
+            trust,
+            reasons,
             matched_symbols,
             calls_at_line,
             matched,
@@ -719,10 +1044,13 @@ fn build_debug_context_pack(
         }
     }
 
-    let mut notes = vec![
-        "metadata_only_no_source_text".to_owned(),
-        "likely_tests_limited_to_runtime_failure_names_until_test_mapping_is_indexed".to_owned(),
-    ];
+    let mut notes = vec!["metadata_only_no_source_text".to_owned()];
+    if mapped_tests.used_indexed_tests {
+        notes.push("likely_tests_mapped_to_indexed_tests".to_owned());
+    }
+    if mapped_tests.used_runtime_fallbacks {
+        notes.push("likely_tests_include_unmatched_runtime_failure_names".to_owned());
+    }
     if parsed.frames.is_empty() {
         notes.push("no_runtime_frames_parsed".to_owned());
     }
@@ -735,7 +1063,7 @@ fn build_debug_context_pack(
         repository_id: root.id().to_owned(),
         frames,
         call_paths_between_frames,
-        likely_tests: parsed.failing_tests,
+        likely_tests: mapped_tests.tests,
         limits: DebugContextLimits {
             max_frames,
             max_symbols_per_frame: max_symbols,
@@ -744,6 +1072,77 @@ fn build_debug_context_pack(
         },
         notes,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MappedTests {
+    tests: Vec<String>,
+    used_indexed_tests: bool,
+    used_runtime_fallbacks: bool,
+}
+
+fn map_failing_tests(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    failing_tests: &[String],
+) -> Result<MappedTests, String> {
+    let mut tests = BTreeSet::new();
+    let mut used_indexed_tests = false;
+    let mut used_runtime_fallbacks = false;
+    for failing_test in failing_tests {
+        let mut matches = Vec::new();
+        for candidate in runtime_test_name_candidates(failing_test) {
+            matches.extend(
+                sqlite
+                    .tests_matching_name(repository_id, &candidate)
+                    .map_err(|error| error.to_string())?,
+            );
+            if !matches.is_empty() {
+                break;
+            }
+        }
+        if matches.is_empty() {
+            used_runtime_fallbacks = true;
+            tests.insert(failing_test.clone());
+        } else {
+            used_indexed_tests = true;
+            for test in matches {
+                tests.insert(test.qualified_name);
+            }
+        }
+    }
+    Ok(MappedTests {
+        tests: tests.into_iter().collect(),
+        used_indexed_tests,
+        used_runtime_fallbacks,
+    })
+}
+
+fn runtime_test_name_candidates(name: &str) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    let trimmed = name.trim().trim_matches(':');
+    if !trimmed.is_empty() {
+        candidates.insert(trimmed.to_owned());
+        let parts = trimmed
+            .split("::")
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        for start in 1..parts.len() {
+            candidates.insert(parts[start..].join("::"));
+        }
+        if let Some(last) = parts.last() {
+            candidates.insert((*last).to_owned());
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+fn test_names(rows: Vec<TestSearchRow>) -> Vec<String> {
+    rows.into_iter()
+        .map(|test| test.qualified_name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn call_path_from_edge(edge: &symdex_store::CallPathEdge) -> CallPath {
@@ -784,14 +1183,12 @@ fn normalize_runtime_path(root: &RepoRoot, path: &str) -> Option<String> {
 }
 
 fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
+    if let Some(location) = parse_tracing_field_location(line) {
+        return Some(location);
+    }
     let (marker_start, extension_len) = runtime_path_marker(line)?;
     let path_end = marker_start + extension_len;
-    let path_start = line[..marker_start]
-        .rfind(|character: char| {
-            character.is_whitespace() || matches!(character, '\'' | '"' | '(' | ')' | '[' | ']')
-        })
-        .map(|index| index + 1)
-        .unwrap_or(0);
+    let path_start = runtime_path_start(line, marker_start);
     let path = line[path_start..path_end]
         .trim_start_matches("at ")
         .trim()
@@ -802,6 +1199,95 @@ fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
         .strip_prefix(':')
         .and_then(|rest| parse_usize_prefix(rest).map(|(column, _)| column));
     Some((path, line_number, column))
+}
+
+fn runtime_path_start(line: &str, marker_start: usize) -> usize {
+    line[..marker_start]
+        .rfind(|character: char| {
+            character.is_whitespace() || matches!(character, '\'' | '"' | '(' | ')' | '[' | ']')
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn parse_inline_symbol_location(line: &str) -> Option<(String, String, usize, Option<usize>)> {
+    if let Some((path, line_number, column)) = parse_tracing_field_location(line)
+        && let Some(symbol) = parse_tracing_symbol(line)
+    {
+        return Some((symbol, path, line_number, column));
+    }
+
+    let (marker_start, _) = runtime_path_marker(line)?;
+    let path_start = runtime_path_start(line, marker_start);
+    let before_path = line[..path_start].trim_end();
+    let candidate = before_path
+        .strip_suffix(" at")
+        .or_else(|| before_path.strip_suffix("@"))?
+        .trim()
+        .rsplit_once(|character: char| character.is_whitespace())
+        .map(|(_, symbol)| symbol)
+        .unwrap_or_else(|| before_path.trim_end_matches(" at").trim());
+    let symbol = normalize_stack_symbol(candidate)?;
+    if !looks_like_rust_symbol(&symbol) {
+        return None;
+    }
+    let (path, line_number, column) = parse_file_location(line)?;
+    Some((symbol, path, line_number, column))
+}
+
+fn parse_tracing_field_location(line: &str) -> Option<(String, usize, Option<usize>)> {
+    let path = parse_named_field(line, "file")?;
+    if !has_supported_runtime_path_extension(&path) {
+        return None;
+    }
+    let line_number = parse_named_usize(line, "line")?;
+    let column = parse_named_usize(line, "column");
+    Some((path, line_number, column))
+}
+
+fn has_supported_runtime_path_extension(path: &str) -> bool {
+    [
+        ".tsx", ".mts", ".cts", ".jsx", ".mjs", ".cjs", ".rs", ".cs", ".ts", ".js",
+    ]
+    .iter()
+    .any(|extension| path.ends_with(extension))
+}
+
+fn parse_tracing_symbol(line: &str) -> Option<String> {
+    for key in ["target", "span", "module_path"] {
+        if let Some(symbol) =
+            parse_named_field(line, key).and_then(|value| normalize_stack_symbol(&value))
+            && looks_like_rust_symbol(&symbol)
+        {
+            return Some(symbol);
+        }
+    }
+    None
+}
+
+fn parse_named_usize(line: &str, key: &str) -> Option<usize> {
+    parse_named_field(line, key)?.parse::<usize>().ok()
+}
+
+fn parse_named_field(line: &str, key: &str) -> Option<String> {
+    let assignment = format!("{key}=");
+    let start = line.find(&assignment)? + assignment.len();
+    let rest = line[start..].trim_start();
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_owned());
+    }
+    let end = rest
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace() || matches!(character, ',' | ';'))
+        .map(|(index, _)| index)
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim_matches('"');
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }
 
 fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
@@ -826,7 +1312,7 @@ fn runtime_path_marker(line: &str) -> Option<(usize, usize)> {
     .min_by_key(|(start, _)| *start)
 }
 
-fn parse_stack_symbol(line: &str) -> Option<String> {
+fn parse_stack_symbol(line: &str, in_backtrace: bool) -> Option<String> {
     let colon = line.find(':')?;
     if !line[..colon]
         .trim()
@@ -839,7 +1325,41 @@ fn parse_stack_symbol(line: &str) -> Option<String> {
     if symbol.is_empty() || symbol.starts_with("at ") {
         return None;
     }
-    Some(symbol.to_owned())
+    let symbol = normalize_stack_symbol(symbol)?;
+    if !in_backtrace && !looks_like_rust_symbol(&symbol) {
+        return None;
+    }
+    Some(symbol)
+}
+
+fn normalize_stack_symbol(symbol: &str) -> Option<String> {
+    let symbol = symbol.trim();
+    let symbol = if let Some((address, symbol)) = symbol.split_once(" - ") {
+        if address.trim_start().starts_with("0x") {
+            symbol.trim()
+        } else {
+            symbol
+        }
+    } else {
+        symbol
+    };
+    let symbol = symbol.trim();
+    if symbol.is_empty() || symbol.starts_with("at ") {
+        None
+    } else {
+        Some(symbol.to_owned())
+    }
+}
+
+fn looks_like_rust_symbol(symbol: &str) -> bool {
+    symbol.contains("::") || symbol.starts_with('<')
+}
+
+fn is_backtrace_header(line: &str) -> bool {
+    line == "stack backtrace:"
+        || line == "backtrace:"
+        || line.contains("RUST_BACKTRACE=full")
+        || line.contains("RUST_BACKTRACE=1")
 }
 
 fn parse_failing_test(line: &str, in_failures: bool) -> Option<String> {
@@ -853,19 +1373,28 @@ fn parse_failing_test(line: &str, in_failures: bool) -> Option<String> {
     {
         return Some(test.trim().to_owned());
     }
-    if in_failures
-        && !line.contains(' ')
-        && (line.starts_with("tests::") || line.contains("::tests::"))
-    {
+    if in_failures && !line.contains(' ') && is_probable_test_name(line) {
         return Some(line.to_owned());
     }
     None
+}
+
+fn is_probable_test_name(line: &str) -> bool {
+    let trimmed = line.trim_matches(':');
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | ':'))
+        && (trimmed.starts_with("tests::")
+            || trimmed.contains("::tests::")
+            || trimmed.contains("::"))
 }
 
 fn looks_like_runtime_noise(line: &str) -> bool {
     line.contains("panicked")
         || line.contains("stack backtrace")
         || line.contains("FAILED")
+        || line.contains("RUST_BACKTRACE")
         || runtime_path_marker(line).is_some()
 }
 
@@ -896,15 +1425,217 @@ fn freshness_for_provenance(
     freshness_for_hash(provenance.content_hash.as_deref(), current)
 }
 
+pub fn evidence_trust(
+    freshness: EvidenceFreshness,
+    provenance: Option<&EvidenceProvenance>,
+    confidence: Option<f64>,
+) -> EvidenceTrust {
+    let freshness_score = match freshness {
+        EvidenceFreshness::Fresh => 1.0,
+        EvidenceFreshness::Stale => 0.55,
+        EvidenceFreshness::Deleted => 0.25,
+        EvidenceFreshness::Missing => 0.2,
+        EvidenceFreshness::Unknown => 0.45,
+    };
+    let provenance_score = provenance.map_or(0.0, provenance_completeness);
+    let index_score = provenance.map_or(0.0, index_metadata_completeness);
+    let confidence_score = confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+    let score = round_trust_score(
+        freshness_score * 0.35
+            + provenance_score * 0.25
+            + confidence_score * 0.25
+            + index_score * 0.15,
+    );
+    let level = if score >= 0.85 {
+        "high"
+    } else if score >= 0.65 {
+        "medium"
+    } else if score >= 0.35 {
+        "low"
+    } else {
+        "minimal"
+    };
+    let mut factors = vec![format!("freshness:{}", freshness.label())];
+    if let Some(confidence) = confidence {
+        factors.push(format!("confidence:{:.2}", confidence.clamp(0.0, 1.0)));
+    } else {
+        factors.push("confidence:not_applicable".to_owned());
+    }
+    match provenance {
+        Some(provenance) => {
+            factors.push(format!(
+                "provenance:{}",
+                completeness_label(provenance_completeness(provenance))
+            ));
+            factors.push(format!(
+                "index_metadata:{}",
+                completeness_label(index_metadata_completeness(provenance))
+            ));
+        }
+        None => {
+            factors.push("provenance:missing".to_owned());
+            factors.push("index_metadata:missing".to_owned());
+        }
+    }
+    EvidenceTrust {
+        score,
+        level: level.to_owned(),
+        factors,
+    }
+}
+
+fn provenance_completeness(provenance: &EvidenceProvenance) -> f64 {
+    let present = [
+        provenance.content_hash.is_some(),
+        provenance.index_run_id.is_some(),
+        provenance.parser_version.is_some(),
+        provenance.indexed_at.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    present as f64 / 4.0
+}
+
+fn index_metadata_completeness(provenance: &EvidenceProvenance) -> f64 {
+    match (
+        provenance.index_run_id.is_some(),
+        provenance.parser_version.is_some(),
+    ) {
+        (true, true) => 1.0,
+        (true, false) | (false, true) => 0.6,
+        (false, false) => 0.0,
+    }
+}
+
+fn completeness_label(score: f64) -> &'static str {
+    if score >= 1.0 {
+        "complete"
+    } else if score >= 0.5 {
+        "partial"
+    } else {
+        "missing"
+    }
+}
+
+fn round_trust_score(score: f64) -> f64 {
+    (score * 100.0).round() / 100.0
+}
+
+fn call_reasons(row: &CallSearchRow, relationship: &str) -> Vec<String> {
+    let mut reasons = vec![
+        format!("relationship:{relationship}"),
+        "persisted_call_edge".to_owned(),
+        format!("callee_text:{}", row.callee_text),
+        format!("resolution_status:{}", row.resolution_status),
+        format!("confidence:{:.2}", row.confidence),
+    ];
+    if let Some(symbol) = &row.symbol_qualified_name {
+        reasons.push(format!("symbol_match:{symbol}"));
+    } else if let Some(symbol) = &row.symbol_name {
+        reasons.push(format!("symbol_match:{symbol}"));
+    } else {
+        reasons.push("symbol_match:unresolved".to_owned());
+    }
+    if let Some(path) = &row.path {
+        reasons.push(format!("path:{path}"));
+    }
+    reasons
+}
+
+fn path_reasons(path: &CallPath, relationship: &str) -> Vec<String> {
+    vec![
+        format!("relationship:{relationship}"),
+        "bounded_transitive_call_path".to_owned(),
+        format!("hops:{}", path.hops),
+        format!("min_confidence:{:.2}", path.min_confidence),
+        format!(
+            "terminal_resolution_status:{}",
+            path.terminal_resolution_status
+        ),
+    ]
+}
+
+fn edge_reasons(edge: &symdex_store::CallPathEdge, relationship: &str) -> Vec<String> {
+    vec![
+        format!("relationship:{relationship}"),
+        "persisted_path_edge".to_owned(),
+        format!("caller:{}", edge.caller_symbol_qualified_name),
+        format!(
+            "callee:{}",
+            edge.callee_symbol_qualified_name
+                .as_deref()
+                .unwrap_or(&edge.callee_text)
+        ),
+        format!("resolution_status:{}", edge.resolution_status),
+        format!("confidence:{:.2}", edge.confidence),
+    ]
+}
+
+fn related_file_reasons(
+    relationship_count: usize,
+    provenance: Option<&EvidenceProvenance>,
+) -> Vec<String> {
+    let mut reasons = vec![
+        "related_file_from_call_evidence".to_owned(),
+        format!("relationship_count:{relationship_count}"),
+    ];
+    if provenance.is_some() {
+        reasons.push("provenance:first_related_edge".to_owned());
+    } else {
+        reasons.push("provenance:missing".to_owned());
+    }
+    reasons
+}
+
+fn debug_frame_reasons(
+    frame: &RuntimeFrame,
+    normalized_path: Option<&str>,
+    has_file_provenance: bool,
+    symbol_match_reason: Option<&'static str>,
+    calls_at_line: usize,
+    matched: bool,
+) -> Vec<String> {
+    let mut reasons = vec![format!("runtime_frame:{}", frame.ordinal)];
+    if let Some(path) = normalized_path {
+        reasons.push(format!("runtime_path_normalized:{path}"));
+    } else if frame.path.is_some() {
+        reasons.push("runtime_path_outside_or_unindexed".to_owned());
+    } else {
+        reasons.push("runtime_path:missing".to_owned());
+    }
+    if has_file_provenance {
+        reasons.push("file_provenance_match".to_owned());
+    }
+    if let Some(reason) = symbol_match_reason {
+        reasons.push(reason.to_owned());
+    }
+    if calls_at_line > 0 {
+        reasons.push(format!("calls_at_runtime_line:{calls_at_line}"));
+    }
+    if !matched {
+        reasons.push("unmatched_runtime_frame".to_owned());
+    }
+    reasons
+}
+
 fn impact_call_evidence(
     rows: Vec<CallSearchRow>,
     current_hashes: &BTreeMap<String, String>,
+    relationship: &str,
 ) -> Vec<ImpactCallEvidence> {
     rows.into_iter()
         .map(|row| {
             let freshness =
                 freshness_for_provenance(row.path.as_deref(), &row.provenance, current_hashes);
-            ImpactCallEvidence { row, freshness }
+            let trust = evidence_trust(freshness, Some(&row.provenance), Some(row.confidence));
+            let reasons = call_reasons(&row, relationship);
+            ImpactCallEvidence {
+                row,
+                freshness,
+                trust,
+                reasons,
+            }
         })
         .collect()
 }
@@ -912,27 +1643,72 @@ fn impact_call_evidence(
 fn impact_path_evidence(
     paths: Vec<CallPath>,
     current_hashes: &BTreeMap<String, String>,
+    relationship: &str,
 ) -> Vec<ImpactPathEvidence> {
     paths
         .into_iter()
         .map(|path| {
-            let edge_freshness = path
+            let edge_pairs = path
                 .edges
                 .iter()
                 .map(|edge| {
-                    freshness_for_provenance(
+                    let freshness = freshness_for_provenance(
                         Some(edge.caller_path.as_str()),
                         &edge.provenance,
                         current_hashes,
-                    )
+                    );
+                    let trust =
+                        evidence_trust(freshness, Some(&edge.provenance), Some(edge.confidence));
+                    let reasons = edge_reasons(edge, relationship);
+                    (freshness, trust, reasons)
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let edge_freshness = edge_pairs
+                .iter()
+                .map(|(freshness, _, _)| *freshness)
+                .collect::<Vec<_>>();
+            let edge_trust = edge_pairs
+                .iter()
+                .map(|(_, trust, _)| trust.clone())
+                .collect::<Vec<_>>();
+            let edge_reasons = edge_pairs
+                .iter()
+                .map(|(_, _, reasons)| reasons.clone())
+                .collect::<Vec<_>>();
+            let trust = aggregate_trust(&edge_trust);
+            let reasons = path_reasons(&path, relationship);
             ImpactPathEvidence {
                 path,
                 edge_freshness,
+                edge_trust,
+                edge_reasons,
+                trust,
+                reasons,
             }
         })
         .collect()
+}
+
+fn aggregate_trust(trust: &[EvidenceTrust]) -> EvidenceTrust {
+    if trust.is_empty() {
+        return evidence_trust(EvidenceFreshness::Unknown, None, None);
+    }
+    let score =
+        round_trust_score(trust.iter().map(|trust| trust.score).sum::<f64>() / trust.len() as f64);
+    let level = if score >= 0.85 {
+        "high"
+    } else if score >= 0.65 {
+        "medium"
+    } else if score >= 0.35 {
+        "low"
+    } else {
+        "minimal"
+    };
+    EvidenceTrust {
+        score,
+        level: level.to_owned(),
+        factors: vec![format!("aggregate_edges:{}", trust.len())],
+    }
 }
 
 fn impact_related_files(
@@ -973,11 +1749,15 @@ fn impact_related_files(
                 }
                 None => EvidenceFreshness::Unknown,
             };
+            let trust = evidence_trust(freshness, provenance.as_ref(), None);
+            let reasons = related_file_reasons(relationship_count, provenance.as_ref());
             ImpactRelatedFile {
                 path,
                 relationship_count,
                 freshness,
                 provenance,
+                trust,
+                reasons,
             }
         })
         .collect()
@@ -1033,14 +1813,16 @@ mod tests {
 
     use symdex_core::RepoRoot;
     use symdex_store::{
-        CallRecord, EvidenceFreshness, FileFreshnessSnapshot, FileRecord, RepositoryRecord,
-        SqliteStore, StoreConfig, SymbolRecord,
+        CallRecord, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot, FileRecord,
+        PointPayload, QdrantExpectedPoint, RepositoryRecord, RetrievedPoint, SqliteStore,
+        StorageHealthStatus, StoreConfig, SymbolRecord, TestRecord,
     };
 
     use crate::{
-        CallDirection, QueryMode, build_debug_context_pack, freshness_rows, parse_runtime_input,
-        run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_impact,
-        run_semantic_search, run_symbol_search,
+        CallDirection, QueryMode, build_debug_context_pack, build_impact_summary, evidence_trust,
+        freshness_rows, parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
+        run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
+        run_symbol_search, semantic_reasons,
     };
 
     #[test]
@@ -1092,6 +1874,73 @@ mod tests {
     }
 
     #[test]
+    fn evidence_trust_combines_freshness_provenance_confidence_and_index_metadata() {
+        let high = evidence_trust(
+            EvidenceFreshness::Fresh,
+            Some(&complete_provenance()),
+            Some(1.0),
+        );
+        assert_eq!(high.score, 1.0);
+        assert_eq!(high.level, "high");
+        assert!(
+            high.factors
+                .iter()
+                .any(|factor| factor == "provenance:complete")
+        );
+        assert!(
+            high.factors
+                .iter()
+                .any(|factor| factor == "index_metadata:complete")
+        );
+
+        let partial = evidence_trust(
+            EvidenceFreshness::Stale,
+            Some(&partial_provenance()),
+            Some(0.5),
+        );
+        assert_eq!(partial.score, 0.44);
+        assert_eq!(partial.level, "low");
+        assert!(
+            partial
+                .factors
+                .iter()
+                .any(|factor| factor == "provenance:partial")
+        );
+
+        let missing = evidence_trust(EvidenceFreshness::Unknown, None, None);
+        assert_eq!(missing.score, 0.41);
+        assert_eq!(missing.level, "low");
+        assert!(
+            missing
+                .factors
+                .iter()
+                .any(|factor| factor == "provenance:missing")
+        );
+    }
+
+    #[test]
+    fn semantic_reasons_explain_vector_result_metadata() {
+        let reasons = semantic_reasons(0.81234, "src/lib.rs", Some("crate::run"), "function");
+
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "semantic_vector_match")
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "semantic_score:0.8123")
+        );
+        assert!(reasons.iter().any(|reason| reason == "chunk_kind:function"));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "symbol_payload:crate::run")
+        );
+    }
+
+    #[test]
     fn context_pack_rejects_empty_query() {
         let error = run_context_pack(".", " ", 8).expect_err("empty query should fail");
         assert!(error.contains("requires a symbol query"));
@@ -1101,6 +1950,89 @@ mod tests {
     fn debug_context_rejects_empty_input() {
         let error = run_debug_context_pack(".", " ", 8).expect_err("empty input should fail");
         assert!(error.contains("requires runtime failure input"));
+    }
+
+    #[test]
+    fn qdrant_verify_summary_detects_missing_stale_and_orphaned_points() {
+        let aligned = expected_point("point-ok", "chunk-ok", "hash-ok");
+        let stale = expected_point("point-stale", "chunk-stale", "hash-current");
+        let missing = expected_point("point-missing", "chunk-missing", "hash-missing");
+        let summary = qdrant_verify_summary(
+            "repo",
+            "symdex_repo_model".to_owned(),
+            "nomic-embed-text".to_owned(),
+            true,
+            vec![aligned.clone(), stale.clone(), missing],
+            vec![
+                retrieved_point("point-ok", payload_for(&aligned, "hash-ok")),
+                retrieved_point("point-stale", payload_for(&stale, "old-hash")),
+                retrieved_point("point-orphan", payload_for(&aligned, "hash-ok")),
+            ],
+        );
+
+        assert_eq!(summary.expected_vector_points, 3);
+        assert_eq!(summary.qdrant_payload_points, 3);
+        assert_eq!(summary.missing_points, 1);
+        assert_eq!(summary.stale_payload_points, 1);
+        assert_eq!(summary.orphaned_points, 1);
+        assert_eq!(summary.missing_point_ids, vec!["point-missing"]);
+        assert_eq!(summary.stale_payload_point_ids, vec!["point-stale"]);
+        assert_eq!(summary.orphaned_point_ids, vec!["point-orphan"]);
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Error && row.label == "missing_point"
+        }));
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Warning && row.label == "stale_payload"
+        }));
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Warning && row.label == "orphaned_point"
+        }));
+        assert!(!format!("{summary:?}").contains("source_text"));
+    }
+
+    #[test]
+    fn qdrant_verify_summary_reports_ok_when_payloads_align() {
+        let expected = expected_point("point-ok", "chunk-ok", "hash-ok");
+        let summary = qdrant_verify_summary(
+            "repo",
+            "symdex_repo_model".to_owned(),
+            "nomic-embed-text".to_owned(),
+            true,
+            vec![expected.clone()],
+            vec![retrieved_point(
+                "point-ok",
+                payload_for(&expected, "hash-ok"),
+            )],
+        );
+
+        assert_eq!(summary.missing_points, 0);
+        assert_eq!(summary.stale_payload_points, 0);
+        assert_eq!(summary.orphaned_points, 0);
+        assert!(summary.missing_point_ids.is_empty());
+        assert!(summary.stale_payload_point_ids.is_empty());
+        assert!(summary.orphaned_point_ids.is_empty());
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Ok && row.label == "qdrant_verify_ok"
+        }));
+    }
+
+    #[test]
+    fn qdrant_verify_summary_marks_missing_collection_points_repairable() {
+        let expected = expected_point("point-missing", "chunk-missing", "hash-missing");
+        let summary = qdrant_verify_summary(
+            "repo",
+            "symdex_repo_model".to_owned(),
+            "nomic-embed-text".to_owned(),
+            false,
+            vec![expected],
+            Vec::new(),
+        );
+
+        assert_eq!(summary.missing_points, 1);
+        assert_eq!(summary.missing_point_ids, vec!["point-missing"]);
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Error && row.label == "collection_missing"
+        }));
     }
 
     #[test]
@@ -1123,6 +2055,65 @@ mod tests {
             parsed.frames[1].symbol.as_deref(),
             Some("crate::module::run")
         );
+    }
+
+    #[test]
+    fn runtime_parser_handles_common_rust_debug_outputs() {
+        let parsed = parse_runtime_input(
+            "running 1 test\n\
+             test tests::unit::fails ... FAILED\n\
+             ---- tests::unit::fails stdout ----\n\
+             thread 'tests::unit::fails' panicked at crates/app/src/lib.rs:18:9:\n\
+             Error: request failed\n\
+             Caused by:\n\
+                 0: while handling request\n\
+                 1: disk full\n\
+             stack backtrace:\n\
+                0:     0x0000000100000000 - std::panicking::begin_panic\n\
+                1: my_crate::service::run::{{closure}}\n\
+                   at crates/app/src/service.rs:44:13\n\
+                2: <my_crate::Worker as my_crate::Job>::poll\n\
+                   at crates/app/src/worker.rs:51:5\n\
+             tracing::event target=\"my_crate::worker\" file=\"crates/app/src/worker.rs\" line=52 column=7\n\
+             async stack: my_crate::tasks::spawned at crates/app/src/tasks.rs:9:3\n\
+             failures:\n\
+                 tests::unit::fails\n",
+        );
+
+        assert_eq!(parsed.failing_tests, vec!["tests::unit::fails"]);
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.path.as_deref() == Some("crates/app/src/lib.rs")
+                && frame.line == Some(18)
+                && frame.column == Some(9)
+        }));
+        assert!(parsed.frames.iter().all(|frame| {
+            frame.symbol.as_deref() != Some("while handling request")
+                && frame.symbol.as_deref() != Some("disk full")
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("my_crate::service::run::{{closure}}")
+                && frame.path.as_deref() == Some("crates/app/src/service.rs")
+                && frame.line == Some(44)
+                && frame.column == Some(13)
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("<my_crate::Worker as my_crate::Job>::poll")
+                && frame.path.as_deref() == Some("crates/app/src/worker.rs")
+                && frame.line == Some(51)
+                && frame.column == Some(5)
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("my_crate::worker")
+                && frame.path.as_deref() == Some("crates/app/src/worker.rs")
+                && frame.line == Some(52)
+                && frame.column == Some(7)
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("my_crate::tasks::spawned")
+                && frame.path.as_deref() == Some("crates/app/src/tasks.rs")
+                && frame.line == Some(9)
+                && frame.column == Some(3)
+        }));
     }
 
     #[test]
@@ -1187,11 +2178,104 @@ mod tests {
             "crate::fresh"
         );
         assert_eq!(pack.frames[0].calls_at_line.len(), 1);
+        assert_eq!(pack.frames[0].trust.score, 1.0);
+        assert_eq!(pack.frames[0].trust.level, "high");
+        assert!(pack.frames[0].reasons.iter().any(|reason| {
+            reason == "file_provenance_match"
+                || reason == "symbols_at_runtime_location"
+                || reason == "calls_at_runtime_line:1"
+        }));
+        assert_eq!(pack.frames[1].trust.score, 0.84);
+        assert_eq!(pack.frames[1].trust.level, "medium");
         assert!(!pack.frames[3].matched);
+        assert!(
+            pack.frames[3]
+                .reasons
+                .iter()
+                .any(|reason| reason == "unmatched_runtime_frame")
+        );
         assert!(
             pack.notes
                 .iter()
                 .any(|note| note == "malformed_runtime_lines_ignored")
+        );
+    }
+
+    #[test]
+    fn debug_context_maps_runtime_failures_to_indexed_tests_when_available() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+        let input = "test tests::covers_callee ... FAILED\ntest tests::missing_case ... FAILED\n";
+
+        let pack =
+            build_debug_context_pack(&fixture.root, &fixture.store, input, 8, &BTreeMap::new())
+                .expect("debug context should build");
+
+        assert_eq!(
+            pack.likely_tests,
+            vec!["crate::tests::covers_callee", "tests::missing_case"]
+        );
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| note == "likely_tests_mapped_to_indexed_tests")
+        );
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| { note == "likely_tests_include_unmatched_runtime_failure_names" })
+        );
+    }
+
+    #[test]
+    fn impact_includes_tests_that_directly_call_target_symbol() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+
+        let summary = build_impact_summary(&fixture.root, &fixture.store, "callee")
+            .expect("impact summary should build");
+
+        assert_eq!(summary.tests_likely, vec!["crate::tests::covers_callee"]);
+        let test_caller = summary
+            .direct_callers
+            .iter()
+            .find(|evidence| {
+                evidence.row.symbol_qualified_name.as_deref() == Some("crate::tests::covers_callee")
+            })
+            .expect("test caller should be included");
+        assert_eq!(test_caller.trust.level, "medium");
+        assert_eq!(test_caller.trust.score, 0.74);
+        assert!(
+            test_caller
+                .reasons
+                .iter()
+                .any(|reason| reason == "relationship:direct_caller")
+        );
+        assert!(
+            test_caller
+                .reasons
+                .iter()
+                .any(|reason| { reason == "symbol_match:crate::tests::covers_callee" })
+        );
+        assert!(
+            summary
+                .related_files
+                .iter()
+                .all(|file| !file.trust.factors.is_empty())
+        );
+        assert!(
+            summary
+                .related_files
+                .iter()
+                .all(|file| !file.reasons.is_empty())
+        );
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note == "likely_tests_from_indexed_direct_test_calls")
         );
     }
 
@@ -1410,6 +2494,48 @@ mod tests {
         qualified_name: &'a str,
     }
 
+    fn expected_point(point_id: &str, chunk_id: &str, text_hash: &str) -> QdrantExpectedPoint {
+        QdrantExpectedPoint {
+            qdrant_point_id: point_id.to_owned(),
+            chunk_id: chunk_id.to_owned(),
+            path: "src/lib.rs".to_owned(),
+            start_line: 1,
+            end_line: 3,
+            text_hash: text_hash.to_owned(),
+            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_dimension: Some(768),
+        }
+    }
+
+    fn payload_for(expected: &QdrantExpectedPoint, text_hash: &str) -> PointPayload {
+        PointPayload {
+            repository_id: "repo".to_owned(),
+            file_id: "file".to_owned(),
+            chunk_id: expected.chunk_id.clone(),
+            symbol_id: None,
+            symbol_name: None,
+            path: expected.path.clone(),
+            language: "rust".to_owned(),
+            chunk_kind: "function".to_owned(),
+            start_line: expected.start_line,
+            end_line: expected.end_line,
+            text_hash: text_hash.to_owned(),
+            parser_version: Some("parser".to_owned()),
+            content_hash: Some("content-hash".to_owned()),
+            index_run_id: Some("run".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_dimension: Some(768),
+            indexed_at: Some("123".to_owned()),
+        }
+    }
+
+    fn retrieved_point(id: &str, payload: PointPayload) -> RetrievedPoint {
+        RetrievedPoint {
+            id: serde_json::Value::String(id.to_owned()),
+            payload,
+        }
+    }
+
     fn sample_symbol(id: &str, file_id: &str, name: &str, qualified_name: &str) -> SymbolRecord {
         SymbolRecord {
             id: id.to_owned(),
@@ -1425,6 +2551,81 @@ mod tests {
             end_byte: 16,
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
+        }
+    }
+
+    fn persist_test_calling_callee(store: &mut SqliteStore, repository_id: &str) {
+        store
+            .replace_file_facts_with_tests(
+                &FileRecord {
+                    id: "file-test".to_owned(),
+                    repository_id: repository_id.to_owned(),
+                    path: "src/fresh_tests.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: "hash-test".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-test",
+                    "file-test",
+                    "covers_callee",
+                    "crate::tests::covers_callee",
+                )],
+                &[],
+                &[CallRecord {
+                    id: "call-test-callee".to_owned(),
+                    caller_symbol_id: "sym-test".to_owned(),
+                    callee_text: "callee".to_owned(),
+                    callee_symbol_id: Some("sym-callee".to_owned()),
+                    call_line: 3,
+                    confidence: 1.0,
+                    resolution_status: "resolved_exact".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                }],
+                &[TestRecord {
+                    id: "test-covers-callee".to_owned(),
+                    repository_id: repository_id.to_owned(),
+                    file_id: "file-test".to_owned(),
+                    path: "src/fresh_tests.rs".to_owned(),
+                    symbol_id: Some("sym-test".to_owned()),
+                    name: "covers_callee".to_owned(),
+                    qualified_name: "crate::tests::covers_callee".to_owned(),
+                    framework: "rust_test".to_owned(),
+                    language: "rust".to_owned(),
+                    start_line: 2,
+                    end_line: 4,
+                    start_byte: 0,
+                    end_byte: 32,
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                }],
+            )
+            .expect("test file should persist");
+    }
+
+    fn complete_provenance() -> EvidenceProvenance {
+        EvidenceProvenance {
+            content_hash: Some("hash".to_owned()),
+            index_run_id: Some("run".to_owned()),
+            parser_version: Some("parser".to_owned()),
+            indexed_at: Some("now".to_owned()),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        }
+    }
+
+    fn partial_provenance() -> EvidenceProvenance {
+        EvidenceProvenance {
+            content_hash: Some("hash".to_owned()),
+            index_run_id: None,
+            parser_version: None,
+            indexed_at: Some("now".to_owned()),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
         }
     }
 }

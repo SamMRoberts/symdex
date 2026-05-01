@@ -1,13 +1,18 @@
 //! Local diagnostic checks shared by the CLI and TUI.
 
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_query::FreshnessSummary;
 use symdex_store::{EvidenceFreshness, QdrantClient, StoreConfig, sqlite_parent};
+
+const RUST_ANALYZER_ENABLE_ENV: &str = "SYMDEX_RUST_ANALYZER";
+const RUST_ANALYZER_CMD_ENV: &str = "SYMDEX_RUST_ANALYZER_CMD";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticReport {
@@ -68,6 +73,9 @@ pub fn run_diagnostics_for_repo(repo: Option<&str>) -> Result<DiagnosticReport, 
     checks.push(sqlite_database_check(&store.sqlite_path));
     checks.extend(ollama_checks(&embed));
     checks.push(qdrant_check(&store));
+    checks.push(rust_analyzer_check(
+        &RustAnalyzerDiagnosticsConfig::from_env(),
+    ));
     checks.push(mcp_contract_check());
     checks.extend(cross_agent_repo_checks(repo));
 
@@ -317,14 +325,108 @@ fn qdrant_check(config: &StoreConfig) -> DiagnosticCheck {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustAnalyzerDiagnosticsConfig {
+    enabled: bool,
+    command: String,
+}
+
+impl RustAnalyzerDiagnosticsConfig {
+    fn from_env() -> Self {
+        Self::from_values(
+            env::var(RUST_ANALYZER_ENABLE_ENV).ok().as_deref(),
+            env::var(RUST_ANALYZER_CMD_ENV).ok().as_deref(),
+        )
+    }
+
+    fn from_values(enabled: Option<&str>, command: Option<&str>) -> Self {
+        Self {
+            enabled: enabled.is_some_and(env_flag_enabled),
+            command: command
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .unwrap_or("rust-analyzer")
+                .to_owned(),
+        }
+    }
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn rust_analyzer_check(config: &RustAnalyzerDiagnosticsConfig) -> DiagnosticCheck {
+    if !config.enabled {
+        return DiagnosticCheck {
+            label: "rust_analyzer_enrichment".to_owned(),
+            state: DiagnosticState::Skipped,
+            message: format!(
+                "set {RUST_ANALYZER_ENABLE_ENV}=1 to enable optional rust-analyzer readiness checks"
+            ),
+        };
+    }
+
+    match Command::new(&config.command).arg("--version").output() {
+        Ok(output) if output.status.success() => DiagnosticCheck {
+            label: "rust_analyzer_enrichment".to_owned(),
+            state: DiagnosticState::Ok,
+            message: rust_analyzer_version_message(&config.command, &output),
+        },
+        Ok(output) => DiagnosticCheck {
+            label: "rust_analyzer_enrichment".to_owned(),
+            state: DiagnosticState::Error,
+            message: format!(
+                "{} --version exited with {}",
+                config.command,
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_owned(), |code| format!("status {code}"))
+            ),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DiagnosticCheck {
+            label: "rust_analyzer_enrichment".to_owned(),
+            state: DiagnosticState::Missing,
+            message: format!(
+                "{} not found; set {RUST_ANALYZER_CMD_ENV} to an installed rust-analyzer binary",
+                config.command
+            ),
+        },
+        Err(error) => DiagnosticCheck {
+            label: "rust_analyzer_enrichment".to_owned(),
+            state: DiagnosticState::Error,
+            message: error.to_string(),
+        },
+    }
+}
+
+fn rust_analyzer_version_message(command: &str, output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let version = if stdout.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    if version.is_empty() {
+        command.to_owned()
+    } else {
+        version.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use symdex_query::{FileFreshnessRow, FreshnessSummary};
     use symdex_store::EvidenceFreshness;
 
     use crate::{
-        DiagnosticState, index_freshness_check, provenance_consistency_check,
-        sqlite_database_check, writable_dir_check,
+        DiagnosticState, RustAnalyzerDiagnosticsConfig, env_flag_enabled, index_freshness_check,
+        provenance_consistency_check, rust_analyzer_check, sqlite_database_check,
+        writable_dir_check,
     };
 
     #[test]
@@ -383,6 +485,43 @@ mod tests {
 
         assert_eq!(check.state, DiagnosticState::Error);
         assert!(check.message.contains("incomplete_provenance=1"));
+    }
+
+    #[test]
+    fn rust_analyzer_config_is_disabled_by_default_and_honors_command_override() {
+        let default = RustAnalyzerDiagnosticsConfig::from_values(None, None);
+        assert!(!default.enabled);
+        assert_eq!(default.command, "rust-analyzer");
+
+        let configured =
+            RustAnalyzerDiagnosticsConfig::from_values(Some("yes"), Some("/bin/rust-analyzer"));
+        assert!(configured.enabled);
+        assert_eq!(configured.command, "/bin/rust-analyzer");
+    }
+
+    #[test]
+    fn rust_analyzer_readiness_check_is_skipped_when_not_enabled() {
+        let check = rust_analyzer_check(&RustAnalyzerDiagnosticsConfig {
+            enabled: false,
+            command: "definitely-not-run".to_owned(),
+        });
+
+        assert_eq!(check.label, "rust_analyzer_enrichment");
+        assert_eq!(check.state, DiagnosticState::Skipped);
+        assert!(check.message.contains("SYMDEX_RUST_ANALYZER"));
+    }
+
+    #[test]
+    fn rust_analyzer_env_flag_accepts_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(env_flag_enabled(value), "{value} should enable the flag");
+        }
+        for value in ["", "0", "false", "off", "no"] {
+            assert!(
+                !env_flag_enabled(value),
+                "{value} should not enable the flag"
+            );
+        }
     }
 
     fn freshness_summary(files: Vec<FileFreshnessRow>) -> FreshnessSummary {

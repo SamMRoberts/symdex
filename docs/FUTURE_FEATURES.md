@@ -31,8 +31,9 @@ Requirements:
 ### Impact Analysis
 
 Impact analysis has grown from direct callers/callees into a repeatable change
-impact report with bounded transitive paths and related files. Future work is
-focused on indexed test discovery and richer same-file symbol grouping.
+impact report with bounded transitive paths, related files, and direct indexed
+Rust test evidence. Future work is focused on broader test discovery, richer
+same-file symbol grouping, and deeper explanation metadata.
 
 Requirements:
 
@@ -41,7 +42,8 @@ Requirements:
 - Keep the output deterministic for the same index version and query.
 - Explain evidence with paths, line ranges, relationship type, confidence, and
   staleness status.
-- Avoid claiming affected tests until test discovery and mapping are indexed.
+- Avoid claiming affected tests beyond indexed test evidence and documented
+  mapping limits.
 
 ### Debug Context Packs
 

@@ -178,6 +178,56 @@
   incremental indexing, continuous indexing, and MCP evidence for C#,
   JavaScript, and TypeScript.
 
+## Suggested next steps, prioritized
+
+### P0 — Production hardening foundation
+
+- [x] Add CI for fmt, clippy, tests, release build, and dependency audit.
+- [x] Add JSON CLI output mirroring MCP contracts.
+- [x] Record failed and partial index runs, not only successful summaries.
+- [x] Implement Qdrant delete, verify, and repair lifecycle for changed or deleted chunks.
+  - [x] Delete stale Qdrant points for changed and deleted chunks before SQLite cleanup.
+  - [x] Verify SQLite/Qdrant vector lifecycle state.
+  - [x] Repair missing, stale, orphaned, or drifted vectors.
+- [x] Split large store and TUI files into modules.
+
+### P1 — Debugging credibility
+
+- [x] Add partial parsing with diagnostics instead of fail-closed syntax errors.
+- [x] Add test discovery and failing-test mapping.
+- [x] Add evidence trust scoring combining freshness, provenance, confidence, and parse/index completeness.
+- [x] Add explainability metadata for why results were returned.
+- [x] Improve debug-context parsing for common Rust outputs: `cargo test`, `anyhow`, `tracing`, `RUST_BACKTRACE=full`, panic hooks, and async stack-like output.
+
+### P2 — Semantic precision
+
+- [x] Add optional rust-analyzer enrichment readiness gate.
+- [x] Add opt-in rust-analyzer enrichment planning and reporting.
+- [ ] Add opt-in rust-analyzer symbol and call fact application.
+- [x] Improve Rust crate-prefix and simple `use` alias call resolution.
+- [x] Add conservative Rust `self.method()` and `Self::method()` local resolution.
+- [x] Preserve Rust trait impl context in impl-summary and method names.
+- [x] Resolve Rust `self::` and `super::` module calls from caller scope.
+- [x] Resolve cross-file Rust `self::` and `super::` calls from caller scope.
+- [x] Resolve simple grouped Rust `use` aliases.
+- [x] Resolve module-relative Rust `use` aliases from caller scope.
+- [x] Resolve caller-module Rust scoped method calls.
+- [x] Resolve caller-module unqualified Rust function calls.
+- [x] Resolve cross-file caller-module Rust function and scoped method calls.
+- [x] Resolve cross-file Rust `self.method()` and `Self::method()` calls.
+- [ ] Improve broader module, trait, and method resolution.
+- [x] Add macro-aware limitations and diagnostics.
+- [x] Add Rust type-definition, trait, and impl-summary chunks.
+- [x] Add cross-file and cross-module call resolution.
+
+### P3 — Operational polish
+
+- [ ] Add structured logging and metrics.
+- [ ] Add benchmarks and large-repo tests.
+- [ ] Add install and release packaging.
+- [ ] Improve the config model and CLI parser.
+- [ ] Continue TUI modularization and UX polish for warnings, stale rows, failed runs, and repair actions.
+
 ## Do not start yet
 
 - web UI

@@ -11,12 +11,14 @@ repo root
   -> parse with tree-sitter
   -> extract symbols
   -> extract call-like references
+  -> discover tests
   -> build chunks
   -> detect sensitive chunks
   -> embed allowed chunks with Ollama
   -> persist facts to SQLite
   -> upsert vectors to Qdrant
-  -> write index run summary
+  -> start index run summary
+  -> finish index run summary as success, skipped, partial, or failed
 ```
 
 ## File discovery
@@ -76,9 +78,22 @@ Every chunk must include:
 
 Current implementation extracts Rust `function_item` syntax nodes as function
 chunks, classifies functions under `impl_item` nodes as method chunks, and emits
-a file fallback chunk only when no function-like chunks exist. Files with
-tree-sitter syntax errors currently fail closed instead of producing partial
-chunks.
+Rust structural chunks for `struct`, `enum`, `union`, `type`, `trait`, and
+`impl` items. `impl` items use `impl_summary` chunks, while type aliases,
+nominal types, and traits use `type_definition` chunks. Trait impl summaries
+preserve both sides of the implementation, for example `impl Runnable for Mode`.
+A file fallback chunk is emitted only when no better chunkable unit exists.
+Files with tree-sitter syntax errors produce partial chunks where possible and
+return metadata-only parse diagnostics with line and byte ranges instead of
+failing the whole index run.
+
+Rust test discovery is metadata-only and conservative. Functions with Rust test
+attributes such as `#[test]`, `#[tokio::test]`, `#[async_std::test]`, or
+`#[actix_rt::test]` are persisted as indexed test facts with symbol linkage,
+qualified names, byte ranges, and line ranges. C#, JavaScript, and TypeScript
+test discovery is intentionally not claimed yet; future support must use the
+same parser, symbol, call, secret-detection, provenance, and path-boundary
+contracts.
 
 Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token
@@ -105,10 +120,14 @@ Store:
 
 If model name or vector dimension changes, require full reindex or collection migration.
 
-Current implementation records successful semantic index runs in SQLite. Before
-upserting vectors, it rejects a same-repository, same-model dimension change so
-an existing Qdrant collection is not reused with incompatible vector sizes.
-Different model names map to different Qdrant collection names.
+Current implementation records started and finished index runs in SQLite. Runs
+finish as `success`, `skipped`, `partial`, or `failed`. Offline indexing records
+successful structural runs, semantic indexing records skipped runs when there
+are no chunks to embed, and semantic failures after SQLite persistence are
+recorded as partial runs with metadata-only error summaries. Before upserting
+vectors, semantic indexing rejects a same-repository, same-model dimension
+change so an existing Qdrant collection is not reused with incompatible vector
+sizes. Different model names map to different Qdrant collection names.
 
 ## Qdrant Collections
 
@@ -122,6 +141,27 @@ Point IDs are deterministic UUID strings derived from chunk stable hashes.
 Payloads include repository, file, chunk, symbol, path, language, line range,
 chunk kind, and text hash metadata. Payloads intentionally do not include source
 text.
+
+Semantic indexing captures existing Qdrant point IDs from SQLite before changed
+file facts are replaced or deleted-file rows are removed. When the target
+collection exists, stale points for changed and deleted chunks are deleted from
+Qdrant before SQLite mutation so vector cleanup does not lose the old point IDs.
+If stale point deletion fails, semantic indexing fails before replacing SQLite
+facts and records the run failure in `index_runs`.
+
+`symdex qdrant-verify <repo>` performs a metadata-only lifecycle check for the
+configured embedding model. It derives the expected point manifest from SQLite
+chunks with `qdrant_point_id`, scrolls Qdrant payloads filtered by
+`repository_id`, and reports missing collections, missing points, stale payload
+fields, and orphaned points. The verifier requests payloads only, not vectors,
+and never returns source text.
+
+`symdex qdrant-repair <repo>` starts from that verification report. Orphaned
+Qdrant points are deleted directly because SQLite has no matching chunk for
+them. Missing collections, missing points, stale payload fields, and payload
+model or dimension drift are repaired by running the normal semantic indexing
+path, preserving the same parser, hashing, secret-detection, embedding,
+provenance, and index-run lifecycle behavior as `symdex index <repo>`.
 
 Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
 with the embedded query vector, `with_payload: true`, and `with_vector: false`.
@@ -149,12 +189,57 @@ Never drop unresolved calls. They are useful evidence.
 
 Current implementation extracts Rust function and method symbols from
 `function_item` nodes. Free functions use module-derived qualified names, while
-methods include the enclosing `impl` type when tree-sitter exposes it. Call
-extraction records `call_expression` nodes inside indexed functions. Resolution
-is local and conservative: exact qualified-name matches are
-`resolved_exact`, single suffix/name matches are `resolved_local_candidate`,
-multiple matches are `ambiguous`, and all other calls are preserved as
-`unresolved`.
+methods include the enclosing `impl` container when tree-sitter exposes it.
+Trait impl methods use Rust-like containers such as `<Mode as Runnable>::run`
+so trait methods do not collapse into inherent method names. Call extraction
+records `call_expression` nodes inside indexed functions. Resolution
+is local and conservative: exact qualified-name matches are `resolved_exact`,
+single suffix/name matches are `resolved_local_candidate`, multiple matches are
+`ambiguous`, and all other calls are preserved as `unresolved`. Rust resolution
+also normalizes leading `crate::`, `self::`, and `super::` prefixes and applies
+simple file-local `use` aliases such as `use crate::module::function as alias;`
+or `use crate::module as alias;` before falling back to suffix matching. `self::`
+and `super::` targets in `use` declarations are interpreted from the caller
+module scope. It also handles simple one-level grouped imports such as
+`use crate::module::{function, other as alias, self as module_alias};`. Within
+Rust modules, `self::name()` and `super::name()` calls add candidates from the
+caller module and immediate parent module, so nested modules do not collapse to
+unrelated same-named root symbols. Unqualified calls such as `helper()` and
+relative scoped calls such as `Type::method()` inside a module add caller-module
+candidates such as `module::helper` and `module::Type::method`, so same-named
+root symbols are not treated as exact matches from nested modules. Inside Rust
+methods, calls through `self.method()` and `Self::method()` also add a candidate
+for the enclosing impl receiver, so they can resolve exactly when the target
+method is present in the same file. Other receiver expressions remain
+conservative because symdex does not perform type inference. Rust macro
+invocations are preserved as unresolved call edges with low confidence; macro
+expansion is not analyzed. Each macro invocation also emits a
+metadata-only diagnostic noting that the invocation was preserved without
+expansion.
+
+After per-file parsing, the indexer performs a conservative Rust cross-file
+resolution pass before persisting SQLite facts. Qualified module calls such as
+`crate::module::function()` are normalized and matched against Rust symbols from
+the current index batch plus already persisted unchanged Rust files. A single
+qualified match is upgraded to `resolved_exact`; multiple matches are preserved
+as `ambiguous`; unresolved calls without qualified module paths are left
+unchanged. Cross-file `self::` and `super::` calls, unqualified calls, and
+relative scoped calls use the caller symbol's module context before matching
+persisted symbols, matching the per-file resolver's caller-scope behavior. When
+the caller is a method, cross-file `self.method()` and `Self::method()` calls can
+also resolve to persisted unchanged methods on the same impl receiver. Symbols
+from files being replaced are ignored so incremental indexing does not resolve
+against stale facts.
+
+Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
+diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is
+available when `SYMDEX_RUST_ANALYZER=1` is set, but indexing does not invoke
+project analysis by default. Index runs also report a metadata-only enrichment
+plan when explicitly enabled: disabled, not ready, skipped because no changed
+Rust files were indexed, or planned with eligible Rust file, symbol, and call
+counts. This plan is reporting only; it does not mutate persisted symbols or
+calls. Future symbol and call fact application must keep this opt-in boundary,
+preserve source-text privacy, and avoid executing indexed repository code.
 
 ## Incremental indexing
 
@@ -174,6 +259,12 @@ removes SQLite rows for deleted files. Semantic `symdex index` currently parses
 and embeds all discovered chunks so Qdrant can be rebuilt even when SQLite
 already has matching structural facts. Same-model dimension changes fail closed;
 automated collection migration/reset remains future hardening.
+
+Files indexed from tree-sitter error trees are included in normal structural and
+semantic indexing summaries with parse diagnostics. These diagnostics are not
+source previews; they contain only the diagnostic message, line range, and byte
+range so downstream agents can account for parse completeness without receiving
+file contents.
 
 Current SQLite migrations include indexes for file cleanup, symbol lookup,
 caller/callee traversal, and index-run metadata. This keeps structural queries

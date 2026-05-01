@@ -52,6 +52,11 @@ Persistence adapters:
 - vector upserts and searches
 - repository index metadata
 
+The crate keeps Qdrant REST client code and Qdrant request/response DTOs in
+`src/qdrant.rs`, re-exporting only the stable adapter types and helpers through
+`lib.rs`. SQLite schema, row mapping, and storage summaries remain in `lib.rs`
+until they are split into dedicated modules.
+
 Keep database DTOs separate from domain types.
 
 ### `symdex-diagnostics`
@@ -62,6 +67,7 @@ Local diagnostics:
 - SQLite parent path checks
 - Ollama model and embedding dimension checks
 - Qdrant health checks
+- optional rust-analyzer enrichment readiness checks when explicitly enabled
 
 Do not mutate repository data. Keep diagnostics local and reusable by CLI and
 TUI.
@@ -126,6 +132,10 @@ Terminal UI:
 - view orchestration for dashboard, indexing controls, diagnostics, queries, impact, and context packs
 - continuous indexing toggle, confirmation state, watch status, and watch error display
 - metadata-only storage visualizations for index coverage, file details, symbol outlines, call resolution, embedding coverage, and index runs
+
+The crate keeps terminal setup/help in `src/terminal.rs` and index-job screen
+navigation reducers in `src/navigation.rs`. The main `lib.rs` owns app state,
+event orchestration, and rendering until larger view modules are split out.
 
 Do not shell out to the `symdex` binary. Call Rust library APIs directly.
 
