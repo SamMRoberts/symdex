@@ -1236,32 +1236,38 @@ mod tests {
             persist_file(
                 &mut store,
                 root.id(),
-                "file-fresh",
-                "src/fresh.rs",
-                "hash-fresh",
-                "sym-fresh",
-                "fresh",
-                "crate::fresh",
+                FileFixture {
+                    file_id: "file-fresh",
+                    path: "src/fresh.rs",
+                    content_hash: "hash-fresh",
+                    symbol_id: "sym-fresh",
+                    symbol_name: "fresh",
+                    qualified_name: "crate::fresh",
+                },
             );
             persist_file(
                 &mut store,
                 root.id(),
-                "file-stale",
-                "src/stale.rs",
-                "hash-old",
-                "sym-stale",
-                "stale",
-                "crate::stale",
+                FileFixture {
+                    file_id: "file-stale",
+                    path: "src/stale.rs",
+                    content_hash: "hash-old",
+                    symbol_id: "sym-stale",
+                    symbol_name: "stale",
+                    qualified_name: "crate::stale",
+                },
             );
             persist_file(
                 &mut store,
                 root.id(),
-                "file-deleted",
-                "src/deleted.rs",
-                "hash-deleted",
-                "sym-deleted",
-                "deleted",
-                "crate::deleted",
+                FileFixture {
+                    file_id: "file-deleted",
+                    path: "src/deleted.rs",
+                    content_hash: "hash-deleted",
+                    symbol_id: "sym-deleted",
+                    symbol_name: "deleted",
+                    qualified_name: "crate::deleted",
+                },
             );
             store
                 .replace_file_facts(
@@ -1334,37 +1340,37 @@ mod tests {
         }
     }
 
-    fn persist_file(
-        store: &mut SqliteStore,
-        repository_id: &str,
-        file_id: &str,
-        path: &str,
-        content_hash: &str,
-        symbol_id: &str,
-        symbol_name: &str,
-        qualified_name: &str,
-    ) {
+    fn persist_file(store: &mut SqliteStore, repository_id: &str, fixture: FileFixture<'_>) {
         store
             .replace_file_facts(
                 &FileRecord {
-                    id: file_id.to_owned(),
+                    id: fixture.file_id.to_owned(),
                     repository_id: repository_id.to_owned(),
-                    path: path.to_owned(),
+                    path: fixture.path.to_owned(),
                     language: "rust".to_owned(),
-                    content_hash: content_hash.to_owned(),
+                    content_hash: fixture.content_hash.to_owned(),
                     index_run_id: "run".to_owned(),
                     parser_version: "parser".to_owned(),
                 },
                 &[sample_symbol(
-                    symbol_id,
-                    file_id,
-                    symbol_name,
-                    qualified_name,
+                    fixture.symbol_id,
+                    fixture.file_id,
+                    fixture.symbol_name,
+                    fixture.qualified_name,
                 )],
                 &[],
                 &[],
             )
             .expect("file facts should persist");
+    }
+
+    struct FileFixture<'a> {
+        file_id: &'a str,
+        path: &'a str,
+        content_hash: &'a str,
+        symbol_id: &'a str,
+        symbol_name: &'a str,
+        qualified_name: &'a str,
     }
 
     fn sample_symbol(id: &str, file_id: &str, name: &str, qualified_name: &str) -> SymbolRecord {
