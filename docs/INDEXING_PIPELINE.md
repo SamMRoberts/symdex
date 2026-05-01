@@ -217,8 +217,10 @@ resolution pass before persisting SQLite facts. Qualified module calls such as
 the current index batch plus already persisted unchanged Rust files. A single
 qualified match is upgraded to `resolved_exact`; multiple matches are preserved
 as `ambiguous`; unresolved calls without qualified module paths are left
-unchanged. Symbols from files being replaced are ignored so incremental indexing
-does not resolve against stale facts.
+unchanged. Cross-file `self::` and `super::` calls use the caller symbol's module
+context before matching persisted symbols, matching the per-file resolver's
+caller-scope behavior. Symbols from files being replaced are ignored so
+incremental indexing does not resolve against stale facts.
 
 Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
 diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is

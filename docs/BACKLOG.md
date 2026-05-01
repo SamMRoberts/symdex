@@ -208,6 +208,7 @@
 - [x] Add conservative Rust `self.method()` and `Self::method()` local resolution.
 - [x] Preserve Rust trait impl context in impl-summary and method names.
 - [x] Resolve Rust `self::` and `super::` module calls from caller scope.
+- [x] Resolve cross-file Rust `self::` and `super::` calls from caller scope.
 - [ ] Improve broader module, trait, and method resolution.
 - [x] Add macro-aware limitations and diagnostics.
 - [x] Add Rust type-definition, trait, and impl-summary chunks.

@@ -75,7 +75,8 @@ Fixtures should be tiny and purpose-built.
   methods on the enclosing impl receiver.
 - Rust cross-file call-resolution coverage for qualified module calls resolved
   from the current index batch, persisted unchanged Rust symbols used during
-  incremental indexing, and stale persisted symbols ignored for files being
+  incremental indexing, caller-scope `super::` calls resolved against persisted
+  unchanged Rust symbols, and stale persisted symbols ignored for files being
   replaced.
 - Rust macro coverage for unresolved macro call edges and metadata-only
   diagnostics that macro invocations are preserved without expansion.
