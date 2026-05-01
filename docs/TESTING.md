@@ -57,6 +57,9 @@ Fixtures should be tiny and purpose-built.
 - Debug context coverage for parsed panic/file locations, stack-frame symbols,
   failing test names, mapped frames, unmapped frames, stale frames, deleted
   files, malformed runtime input, and TUI debug context pack rendering.
+- Rust test discovery coverage for recognized test attributes, module-qualified
+  test names, SQLite test persistence/replacement, failing-test name mapping,
+  and impact likely-test evidence from direct indexed test calls.
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -157,7 +160,8 @@ edges matched by callee text, ambiguous terminal edges matched by callee text,
 cycle avoidance, depth limits, and deterministic transitive impact paths.
 Current debug context tests cover runtime input parsing, mapped frame evidence,
 unmapped frames, fresh/stale/deleted freshness labels, calls at failing lines,
-and malformed runtime lines.
+malformed runtime lines, indexed failing-test mapping, unmatched failing-test
+fallbacks, and impact likely-test evidence from direct indexed test calls.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

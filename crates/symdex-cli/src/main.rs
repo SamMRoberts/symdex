@@ -497,6 +497,9 @@ fn print_impact_summary(summary: &ImpactSummary) {
         );
     }
     println!("tests_likely: {}", summary.tests_likely.len());
+    for test in &summary.tests_likely {
+        println!("test: {test}");
+    }
     for note in &summary.notes {
         println!("note: {note}");
     }

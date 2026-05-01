@@ -1,5 +1,6 @@
 //! Read-only MCP tool contract boundary.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, Write};
 
@@ -316,6 +317,19 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         callers.iter().chain(callees.iter()),
         transitive_callers.iter().chain(transitive_callees.iter()),
     );
+    let tests_likely = sqlite
+        .likely_tests_for_symbol(root.id(), symbol)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|test| test.qualified_name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let test_note = if tests_likely.is_empty() {
+        "likely_tests_unavailable_without_indexed_direct_test_evidence"
+    } else {
+        "likely_tests_from_indexed_direct_test_calls"
+    };
     Ok(json!({
         "repository_id": root.id(),
         "symbol": symbol,
@@ -326,11 +340,11 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         "transitive_callees": call_paths_json(&root, transitive_callees),
         "same_file_symbols": [],
         "related_files": related_files,
-        "tests_likely": [],
+        "tests_likely": tests_likely,
         "unresolved_candidates": [],
         "notes": [
             "metadata_only_no_source_text",
-            "likely_tests_unavailable_until_test_discovery_mapping_is_indexed"
+            test_note
         ]
     }))
 }

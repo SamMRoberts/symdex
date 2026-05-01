@@ -6,14 +6,14 @@ use std::thread;
 use std::time::Duration;
 
 use symdex_core::{
-    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, ParseDiagnostic, RepoRoot, Symbol,
-    discover_indexable_files, index_source_file,
+    CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, ParseDiagnostic, RepoRoot,
+    Symbol, discover_indexable_files, index_source_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
-    RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, VectorPoint, current_timestamp,
-    qdrant_collection_name, qdrant_point_id,
+    RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, TestRecord, VectorPoint,
+    current_timestamp, qdrant_collection_name, qdrant_point_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +601,7 @@ fn collect_index_reports(
             chunks: file_index.chunks,
             symbols: file_index.symbols,
             calls: file_index.calls,
+            tests: file_index.tests,
             parse_diagnostics: file_index.parse_diagnostics,
             source,
         });
@@ -703,11 +704,23 @@ fn persist_structural_index(
             .iter()
             .map(|call| call_record(call, index_run_id, report.file.language.parser_version()))
             .collect::<Vec<_>>();
+        let tests = report
+            .tests
+            .iter()
+            .map(|test| {
+                test_record(
+                    root.id(),
+                    test,
+                    index_run_id,
+                    report.file.language.parser_version(),
+                )
+            })
+            .collect::<Vec<_>>();
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
         calls_indexed += calls.len();
         sqlite
-            .replace_file_facts(&file, &symbols, &chunks, &calls)
+            .replace_file_facts_with_tests(&file, &symbols, &chunks, &calls, &tests)
             .map_err(|error| error.to_string())?;
         on_progress(IndexProgress::new(
             "sqlite",
@@ -1031,6 +1044,31 @@ fn call_record(call: &CallEdge, index_run_id: &str, parser_version: &str) -> Cal
     }
 }
 
+fn test_record(
+    repository_id: &str,
+    test: &DiscoveredTest,
+    index_run_id: &str,
+    parser_version: &str,
+) -> TestRecord {
+    TestRecord {
+        id: test.id.clone(),
+        repository_id: repository_id.to_owned(),
+        file_id: test.file_id.clone(),
+        symbol_id: test.symbol_id.clone(),
+        name: test.name.clone(),
+        qualified_name: test.qualified_name.clone(),
+        framework: test.framework.clone(),
+        language: test.language.as_str().to_owned(),
+        path: test.relative_path.clone(),
+        start_line: test.line_range.start,
+        end_line: test.line_range.end,
+        start_byte: test.byte_range.start,
+        end_byte: test.byte_range.end,
+        index_run_id: index_run_id.to_owned(),
+        parser_version: parser_version.to_owned(),
+    }
+}
+
 fn parser_version_summary(collection: &IndexCollection) -> String {
     if collection.parser_versions.is_empty() {
         return "none".to_owned();
@@ -1115,6 +1153,7 @@ struct IndexReport {
     chunks: Vec<CodeChunk>,
     symbols: Vec<Symbol>,
     calls: Vec<CallEdge>,
+    tests: Vec<DiscoveredTest>,
     parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
 }
@@ -1153,6 +1192,7 @@ mod tests {
             chunks: vec![public.clone(), secret.clone()],
             symbols: Vec::new(),
             calls: Vec::new(),
+            tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
         };

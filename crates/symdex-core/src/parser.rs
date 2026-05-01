@@ -1,9 +1,9 @@
 use tree_sitter::{Node, Parser};
 
 use crate::{
-    ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, FileFacts, Language, LineRange,
-    ParseDiagnostic, ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind, content_hash,
-    secret_exclusion_reason, stable_id,
+    ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, DiscoveredTest, FileFacts, Language,
+    LineRange, ParseDiagnostic, ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind,
+    content_hash, secret_exclusion_reason, stable_id,
 };
 
 pub fn extract_chunks(file: &FileFacts, source: &str) -> Result<Vec<CodeChunk>> {
@@ -34,8 +34,12 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
 
     let mut chunks = Vec::new();
     let mut symbols = Vec::new();
+    let mut tests = Vec::new();
     for function in &functions {
         let (chunk, symbol) = function_facts(function.node, file, source, function.symbol_kind);
+        if let Some(test) = test_facts(function.node, file, source, &symbol) {
+            tests.push(test);
+        }
         chunks.push(chunk);
         symbols.push(symbol);
     }
@@ -59,12 +63,14 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
     chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
     symbols.sort_by_key(|symbol| (symbol.byte_range.start, symbol.byte_range.end));
     calls.sort_by_key(|call| (call.call_line, call.callee_text.clone()));
+    tests.sort_by_key(|test| (test.line_range.start, test.qualified_name.clone()));
 
     Ok(SourceFileIndex {
         chunks,
         symbols,
         calls,
         parse_diagnostics,
+        tests,
     })
 }
 
@@ -299,6 +305,83 @@ fn symbol_for_node(
     }
 }
 
+fn test_facts(
+    node: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    symbol: &Symbol,
+) -> Option<DiscoveredTest> {
+    let framework = test_framework(file.language, node, source)?;
+    Some(DiscoveredTest {
+        id: stable_id(&[
+            &file.id,
+            "test",
+            &symbol.qualified_name,
+            &node.start_byte().to_string(),
+        ]),
+        file_id: file.id.clone(),
+        relative_path: file.relative_path.clone(),
+        symbol_id: Some(symbol.id.clone()),
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+        framework,
+        language: file.language,
+        byte_range: symbol.byte_range,
+        line_range: symbol.line_range,
+    })
+}
+
+fn test_framework(language: Language, node: Node<'_>, source: &str) -> Option<String> {
+    match language {
+        Language::Rust => rust_test_framework(node, source),
+        _ => None,
+    }
+}
+
+fn rust_test_framework(node: Node<'_>, source: &str) -> Option<String> {
+    rust_attribute_texts(node, source)
+        .into_iter()
+        .find_map(|attribute| rust_test_framework_from_attribute(&attribute))
+}
+
+fn rust_attribute_texts(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "attribute_item"
+            && let Some(text) = node_text(child, source)
+        {
+            attributes.push(text.to_owned());
+        }
+    }
+
+    let mut sibling = node.prev_named_sibling();
+    while let Some(current) = sibling {
+        if current.kind() != "attribute_item" {
+            break;
+        }
+        if let Some(text) = node_text(current, source) {
+            attributes.push(text.to_owned());
+        }
+        sibling = current.prev_named_sibling();
+    }
+    attributes
+}
+
+fn rust_test_framework_from_attribute(attribute: &str) -> Option<String> {
+    let attribute = clean_expression_text(attribute);
+    let inner = attribute
+        .trim_start_matches('#')
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let path = inner.split('(').next().unwrap_or(inner).trim();
+    if path == "test" {
+        return Some("rust_test".to_owned());
+    }
+    path.strip_suffix("::test")
+        .map(|prefix| format!("{prefix}::test"))
+}
+
 fn collect_call_edges(
     function: Node<'_>,
     language: Language,
@@ -443,6 +526,11 @@ fn container_parts(language: Language, node: Node<'_>, source: &str) -> Vec<Stri
     let mut parent = node.parent();
     while let Some(current) = parent {
         match language {
+            Language::Rust if current.kind() == "mod_item" => {
+                if let Some(name) = named_node_text(current, source) {
+                    parts.push(clean_expression_text(name));
+                }
+            }
             Language::Rust if current.kind() == "impl_item" => {
                 if let Some(type_name) = impl_type_name(current, source) {
                     parts.push(type_name);
@@ -669,6 +757,42 @@ impl Counter {
             chunks[0].excluded_reason.as_deref(),
             Some("likely_credential_assignment")
         );
+    }
+
+    #[test]
+    fn discovers_rust_tests_with_module_qualified_names() {
+        let source = r#"pub fn target() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn covers_target() {
+        target();
+    }
+
+    #[tokio::test]
+    async fn covers_target_async() {
+        target();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        assert_eq!(index.tests.len(), 2);
+        assert!(index.tests.iter().any(|test| {
+            test.name == "covers_target"
+                && test.qualified_name == "tests::covers_target"
+                && test.framework == "rust_test"
+        }));
+        assert!(index.tests.iter().any(|test| {
+            test.name == "covers_target_async"
+                && test.qualified_name == "tests::covers_target_async"
+                && test.framework == "tokio::test"
+        }));
+        assert!(index.tests.iter().all(|test| test.symbol_id.is_some()));
     }
 
     #[test]

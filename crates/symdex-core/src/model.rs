@@ -170,12 +170,27 @@ pub struct ParseDiagnostic {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredTest {
+    pub id: String,
+    pub file_id: String,
+    pub relative_path: String,
+    pub symbol_id: Option<String>,
+    pub name: String,
+    pub qualified_name: String,
+    pub framework: String,
+    pub language: Language,
+    pub byte_range: ByteRange,
+    pub line_range: LineRange,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceFileIndex {
     pub chunks: Vec<CodeChunk>,
     pub symbols: Vec<Symbol>,
     pub calls: Vec<CallEdge>,
     pub parse_diagnostics: Vec<ParseDiagnostic>,
+    pub tests: Vec<DiscoveredTest>,
 }
 
 pub type RustFileIndex = SourceFileIndex;

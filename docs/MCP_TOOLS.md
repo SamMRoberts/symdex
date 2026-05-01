@@ -234,8 +234,10 @@ Output separates:
 
 Direct and transitive evidence rows include provenance and freshness labels.
 Related-file rows include path, relationship count, freshness, and provenance.
-`tests_likely` stays empty and a note explains that likely-test claims require
-indexed test discovery and mapping first.
+`tests_likely` contains indexed Rust test qualified names when a discovered test
+directly calls the queried symbol through resolved call evidence. When no direct
+indexed test evidence is available, the list stays empty and a note explains
+that no likely-test evidence was found.
 
 ### `symdex_context_pack`
 
@@ -333,14 +335,16 @@ Output:
   },
   "notes": [
     "metadata_only_no_source_text",
-    "likely_tests_limited_to_runtime_failure_names_until_test_mapping_is_indexed"
+    "likely_tests_mapped_to_indexed_tests"
   ]
 }
 ```
 
 The tool parses panic/file locations, stack-frame symbols, indexed-language file
-paths, and failing test names. It maps frames to indexed SQLite file/symbol/call evidence,
-adds freshness and provenance, and returns source-free metadata only.
+paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
+evidence, maps failing test names to indexed Rust tests when available, keeps
+unmatched runtime test names as fallbacks, adds freshness and provenance, and
+returns source-free metadata only.
 
 ### `symdex_index_status`
 

@@ -153,6 +153,17 @@ impl SqliteStore {
         chunks: &[ChunkRecord],
         calls: &[CallRecord],
     ) -> Result<()> {
+        self.replace_file_facts_with_tests(file, symbols, chunks, calls, &[])
+    }
+
+    pub fn replace_file_facts_with_tests(
+        &mut self,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         transaction
             .execute(
@@ -186,6 +197,9 @@ impl SqliteStore {
                  WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
                 params![file.id],
             )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute("DELETE FROM tests WHERE file_id = ?1", params![file.id])
             .map_err(StoreError::Sqlite)?;
         transaction
             .execute("DELETE FROM chunks WHERE file_id = ?1", params![file.id])
@@ -292,6 +306,41 @@ impl SqliteStore {
                         call.resolution_status,
                         call.index_run_id,
                         call.parser_version,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO tests (
+                        id, repository_id, file_id, symbol_id, name, qualified_name, framework,
+                        language, path, start_line, end_line, start_byte, end_byte,
+                        index_run_id, parser_version, indexed_at
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for test in tests {
+                statement
+                    .execute(params![
+                        test.id,
+                        test.repository_id,
+                        test.file_id,
+                        test.symbol_id,
+                        test.name,
+                        test.qualified_name,
+                        test.framework,
+                        test.language,
+                        test.path,
+                        test.start_line as i64,
+                        test.end_line as i64,
+                        test.start_byte as i64,
+                        test.end_byte as i64,
+                        test.index_run_id,
+                        test.parser_version,
+                        timestamp(),
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -805,6 +854,69 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id, symbol_query], call_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn tests_matching_name(
+        &self,
+        repository_id: &str,
+        test_name: &str,
+    ) -> Result<Vec<TestSearchRow>> {
+        let suffix = format!("%::{test_name}");
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT tests.id, tests.name, tests.qualified_name, tests.framework,
+                        tests.language, tests.path, tests.start_line, tests.end_line,
+                        files.content_hash, tests.index_run_id, tests.parser_version, tests.indexed_at
+                   FROM tests
+                   JOIN files ON tests.file_id = files.id
+                  WHERE tests.repository_id = ?1
+                    AND (tests.name = ?2 OR tests.qualified_name = ?2 OR tests.qualified_name LIKE ?3)
+                  ORDER BY
+                    CASE
+                      WHEN tests.qualified_name = ?2 THEN 0
+                      WHEN tests.name = ?2 THEN 1
+                      ELSE 2
+                    END,
+                    tests.path,
+                    tests.start_line
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, test_name, suffix], test_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn likely_tests_for_symbol(
+        &self,
+        repository_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<TestSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT tests.id, tests.name, tests.qualified_name, tests.framework,
+                        tests.language, tests.path, tests.start_line, tests.end_line,
+                        files.content_hash, tests.index_run_id, tests.parser_version, tests.indexed_at
+                   FROM tests
+                   JOIN files ON tests.file_id = files.id
+                   LEFT JOIN calls ON calls.caller_symbol_id = tests.symbol_id
+                   LEFT JOIN symbols target ON calls.callee_symbol_id = target.id
+                  WHERE tests.repository_id = ?1
+                    AND (
+                      tests.id = ?2 OR tests.name = ?2 OR tests.qualified_name = ?2
+                      OR target.id = ?2 OR target.name = ?2 OR target.qualified_name = ?2
+                    )
+                  ORDER BY tests.path, tests.start_line, tests.qualified_name
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, symbol_query], test_search_row)
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }
@@ -1887,6 +1999,38 @@ pub struct CallRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub file_id: String,
+    pub symbol_id: Option<String>,
+    pub name: String,
+    pub qualified_name: String,
+    pub framework: String,
+    pub language: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub index_run_id: String,
+    pub parser_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TestSearchRow {
+    pub id: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub framework: String,
+    pub language: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub provenance: EvidenceProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryStatus {
     pub repository_id: String,
     pub files_indexed: usize,
@@ -2409,6 +2553,28 @@ fn call_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSearchRow> {
             index_run_id: row.get(12)?,
             parser_version: row.get(13)?,
             indexed_at: row.get(14)?,
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        },
+    })
+}
+
+fn test_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestSearchRow> {
+    Ok(TestSearchRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        qualified_name: row.get(2)?,
+        framework: row.get(3)?,
+        language: row.get(4)?,
+        path: row.get(5)?,
+        start_line: row.get::<_, i64>(6)? as usize,
+        end_line: row.get::<_, i64>(7)? as usize,
+        provenance: EvidenceProvenance {
+            content_hash: row.get(8)?,
+            index_run_id: row.get(9)?,
+            parser_version: row.get(10)?,
+            indexed_at: row.get(11)?,
             embedding_model: None,
             embedding_dimension: None,
             embedded_at: None,
@@ -3051,6 +3217,28 @@ CREATE TABLE IF NOT EXISTS calls (
   parser_version TEXT
 );
 
+CREATE TABLE IF NOT EXISTS tests (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    symbol_id TEXT,
+    name TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    framework TEXT NOT NULL,
+    language TEXT NOT NULL,
+    path TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    start_byte INTEGER NOT NULL,
+    end_byte INTEGER NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    indexed_at TEXT NOT NULL,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
 CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
@@ -3058,6 +3246,10 @@ CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_calls_caller_symbol_id ON calls(caller_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_calls_callee_symbol_id ON calls(callee_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_tests_repository_name ON tests(repository_id, name);
+CREATE INDEX IF NOT EXISTS idx_tests_repository_qualified_name ON tests(repository_id, qualified_name);
+CREATE INDEX IF NOT EXISTS idx_tests_file_id ON tests(file_id);
+CREATE INDEX IF NOT EXISTS idx_tests_symbol_id ON tests(symbol_id);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
 "#;
@@ -3094,7 +3286,7 @@ mod tests {
         DeletePointsRequest, Distance, FileCoverageStatus, FileRecord, MatchValue, PointPayload,
         QdrantClient, QueryPointsRequest, RepositoryFilter, RepositoryFilterCondition,
         RepositoryRecord, ScrollPointsRequest, SqliteStore, StorageHealthStatus, StoreConfig,
-        StoreError, SymbolRecord, UpsertPointsRequest, VectorParams, VectorPoint,
+        StoreError, SymbolRecord, TestRecord, UpsertPointsRequest, VectorParams, VectorPoint,
         qdrant_collection_name, qdrant_point_id, validate_collection_name,
     };
 
@@ -3291,6 +3483,10 @@ mod tests {
             "idx_symbols_qualified_name",
             "idx_calls_caller_symbol_id",
             "idx_calls_callee_symbol_id",
+            "idx_tests_repository_name",
+            "idx_tests_repository_qualified_name",
+            "idx_tests_file_id",
+            "idx_tests_symbol_id",
             "idx_index_runs_repository_status",
             "idx_index_runs_repository_model_status",
         ] {
@@ -3322,6 +3518,11 @@ mod tests {
             ("chunks", "embedded_at"),
             ("calls", "index_run_id"),
             ("calls", "parser_version"),
+            ("tests", "repository_id"),
+            ("tests", "symbol_id"),
+            ("tests", "qualified_name"),
+            ("tests", "framework"),
+            ("tests", "parser_version"),
         ] {
             assert!(
                 store
@@ -3371,6 +3572,55 @@ mod tests {
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 0);
         assert_eq!(status.chunks_indexed, 0);
+    }
+
+    #[test]
+    fn sqlite_persists_replaces_and_queries_tests() {
+        let db = TestDb::new("tests");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let symbols = vec![
+            sample_symbol("target-symbol", "target", "target"),
+            sample_symbol("test-symbol", "covers_target", "tests::covers_target"),
+        ];
+        let calls = vec![sample_call(
+            "call-test-target",
+            "test-symbol",
+            "target",
+            Some("target-symbol"),
+            8,
+        )];
+        let tests = vec![sample_test("test-1", "test-symbol", "tests::covers_target")];
+        store
+            .replace_file_facts_with_tests(&sample_file("hash-1"), &symbols, &[], &calls, &tests)
+            .expect("test facts should persist");
+
+        let matched = store
+            .tests_matching_name("repo", "tests::covers_target")
+            .expect("test lookup should run");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].framework, "rust_test");
+        let likely = store
+            .likely_tests_for_symbol("repo", "target")
+            .expect("likely tests should load");
+        assert_eq!(likely.len(), 1);
+        assert_eq!(likely[0].qualified_name, "tests::covers_target");
+
+        store
+            .replace_file_facts_with_tests(&sample_file("hash-2"), &symbols[..1], &[], &[], &[])
+            .expect("replacement should remove tests");
+        assert!(
+            store
+                .likely_tests_for_symbol("repo", "target")
+                .expect("likely tests should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4688,6 +4938,30 @@ mod tests {
             call_line,
             confidence: 1.0,
             resolution_status: "resolved_exact".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        }
+    }
+
+    fn sample_test(id: &str, symbol_id: &str, qualified_name: &str) -> TestRecord {
+        TestRecord {
+            id: id.to_owned(),
+            repository_id: "repo".to_owned(),
+            file_id: "file".to_owned(),
+            symbol_id: Some(symbol_id.to_owned()),
+            name: qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            framework: "rust_test".to_owned(),
+            language: "rust".to_owned(),
+            path: "src/lib.rs".to_owned(),
+            start_line: 6,
+            end_line: 10,
+            start_byte: 64,
+            end_byte: 128,
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
         }

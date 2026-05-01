@@ -110,8 +110,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   path, line, confidence, resolution, and provenance fields.
 - `impact <repo> <symbol>`: prints direct callers, direct callees, bounded
   transitive caller/callee paths, related files, provenance, and staleness
-  labels. Likely tests are intentionally empty until test discovery and mapping
-  are indexed.
+  labels. Likely tests list indexed Rust tests that directly call the queried
+  symbol when discovered test metadata and resolved call evidence are present.
 - `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
   context. The current format is `symdex.context_pack.v1` and includes focus
   symbols, direct callers, direct callees, involved files, section limits, and

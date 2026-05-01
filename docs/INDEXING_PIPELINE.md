@@ -11,6 +11,7 @@ repo root
   -> parse with tree-sitter
   -> extract symbols
   -> extract call-like references
+  -> discover tests
   -> build chunks
   -> detect sensitive chunks
   -> embed allowed chunks with Ollama
@@ -81,6 +82,14 @@ a file fallback chunk only when no function-like chunks exist. Files with
 tree-sitter syntax errors produce partial chunks where possible and return
 metadata-only parse diagnostics with line and byte ranges instead of failing the
 whole index run.
+
+Rust test discovery is metadata-only and conservative. Functions with Rust test
+attributes such as `#[test]`, `#[tokio::test]`, `#[async_std::test]`, or
+`#[actix_rt::test]` are persisted as indexed test facts with symbol linkage,
+qualified names, byte ranges, and line ranges. C#, JavaScript, and TypeScript
+test discovery is intentionally not claimed yet; future support must use the
+same parser, symbol, call, secret-detection, provenance, and path-boundary
+contracts.
 
 Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token

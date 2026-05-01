@@ -194,7 +194,7 @@
 ### P1 — Debugging credibility
 
 - [x] Add partial parsing with diagnostics instead of fail-closed syntax errors.
-- [ ] Add test discovery and failing-test mapping.
+- [x] Add test discovery and failing-test mapping.
 - [ ] Add evidence trust scoring combining freshness, provenance, confidence, and parse/index completeness.
 - [ ] Add explainability metadata for why results were returned.
 - [ ] Improve debug-context parsing for common Rust outputs: `cargo test`, `anyhow`, `tracing`, `RUST_BACKTRACE=full`, panic hooks, and async stack-like output.

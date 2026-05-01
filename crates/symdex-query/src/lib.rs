@@ -12,7 +12,7 @@ use symdex_store::{
     IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, QdrantExpectedPoint,
     RetrievedPoint, SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary,
     StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
-    clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
+    TestSearchRow, clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +322,15 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    let current_hashes = current_hashes(&root)?;
+    build_impact_summary(&root, &sqlite, query)
+}
+
+fn build_impact_summary(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    query: &str,
+) -> Result<ImpactSummary, String> {
+    let current_hashes = current_hashes(root)?;
     let max_depth = 4;
     let direct_callers = sqlite
         .callers(root.id(), query)
@@ -347,6 +355,16 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
         &transitive_callees,
         &current_hashes,
     );
+    let tests_likely = sqlite
+        .likely_tests_for_symbol(root.id(), query)
+        .map(test_names)
+        .map_err(|error| error.to_string())?;
+    let mut notes = vec!["metadata_only_no_source_text".to_owned()];
+    if tests_likely.is_empty() {
+        notes.push("likely_tests_unavailable_without_indexed_direct_test_evidence".to_owned());
+    } else {
+        notes.push("likely_tests_from_indexed_direct_test_calls".to_owned());
+    }
 
     Ok(ImpactSummary {
         repository_id: root.id().to_owned(),
@@ -357,11 +375,8 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
         transitive_callers,
         transitive_callees,
         related_files,
-        tests_likely: Vec::new(),
-        notes: vec![
-            "metadata_only_no_source_text".to_owned(),
-            "likely_tests_unavailable_until_test_discovery_mapping_is_indexed".to_owned(),
-        ],
+        tests_likely,
+        notes,
     })
 }
 
@@ -839,6 +854,7 @@ fn build_debug_context_pack(
     current_hashes: &BTreeMap<String, String>,
 ) -> Result<DebugContextPack, String> {
     let parsed = parse_runtime_input(runtime_input);
+    let mapped_tests = map_failing_tests(sqlite, root.id(), &parsed.failing_tests)?;
     let max_frames = limit.clamp(1, 25);
     let max_symbols = limit.clamp(1, 10);
     let max_calls = limit.clamp(1, 10);
@@ -938,10 +954,13 @@ fn build_debug_context_pack(
         }
     }
 
-    let mut notes = vec![
-        "metadata_only_no_source_text".to_owned(),
-        "likely_tests_limited_to_runtime_failure_names_until_test_mapping_is_indexed".to_owned(),
-    ];
+    let mut notes = vec!["metadata_only_no_source_text".to_owned()];
+    if mapped_tests.used_indexed_tests {
+        notes.push("likely_tests_mapped_to_indexed_tests".to_owned());
+    }
+    if mapped_tests.used_runtime_fallbacks {
+        notes.push("likely_tests_include_unmatched_runtime_failure_names".to_owned());
+    }
     if parsed.frames.is_empty() {
         notes.push("no_runtime_frames_parsed".to_owned());
     }
@@ -954,7 +973,7 @@ fn build_debug_context_pack(
         repository_id: root.id().to_owned(),
         frames,
         call_paths_between_frames,
-        likely_tests: parsed.failing_tests,
+        likely_tests: mapped_tests.tests,
         limits: DebugContextLimits {
             max_frames,
             max_symbols_per_frame: max_symbols,
@@ -963,6 +982,77 @@ fn build_debug_context_pack(
         },
         notes,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MappedTests {
+    tests: Vec<String>,
+    used_indexed_tests: bool,
+    used_runtime_fallbacks: bool,
+}
+
+fn map_failing_tests(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    failing_tests: &[String],
+) -> Result<MappedTests, String> {
+    let mut tests = BTreeSet::new();
+    let mut used_indexed_tests = false;
+    let mut used_runtime_fallbacks = false;
+    for failing_test in failing_tests {
+        let mut matches = Vec::new();
+        for candidate in runtime_test_name_candidates(failing_test) {
+            matches.extend(
+                sqlite
+                    .tests_matching_name(repository_id, &candidate)
+                    .map_err(|error| error.to_string())?,
+            );
+            if !matches.is_empty() {
+                break;
+            }
+        }
+        if matches.is_empty() {
+            used_runtime_fallbacks = true;
+            tests.insert(failing_test.clone());
+        } else {
+            used_indexed_tests = true;
+            for test in matches {
+                tests.insert(test.qualified_name);
+            }
+        }
+    }
+    Ok(MappedTests {
+        tests: tests.into_iter().collect(),
+        used_indexed_tests,
+        used_runtime_fallbacks,
+    })
+}
+
+fn runtime_test_name_candidates(name: &str) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    let trimmed = name.trim().trim_matches(':');
+    if !trimmed.is_empty() {
+        candidates.insert(trimmed.to_owned());
+        let parts = trimmed
+            .split("::")
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        for start in 1..parts.len() {
+            candidates.insert(parts[start..].join("::"));
+        }
+        if let Some(last) = parts.last() {
+            candidates.insert((*last).to_owned());
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+fn test_names(rows: Vec<TestSearchRow>) -> Vec<String> {
+    rows.into_iter()
+        .map(|test| test.qualified_name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn call_path_from_edge(edge: &symdex_store::CallPathEdge) -> CallPath {
@@ -1254,13 +1344,14 @@ mod tests {
     use symdex_store::{
         CallRecord, EvidenceFreshness, FileFreshnessSnapshot, FileRecord, PointPayload,
         QdrantExpectedPoint, RepositoryRecord, RetrievedPoint, SqliteStore, StorageHealthStatus,
-        StoreConfig, SymbolRecord,
+        StoreConfig, SymbolRecord, TestRecord,
     };
 
     use crate::{
-        CallDirection, QueryMode, build_debug_context_pack, freshness_rows, parse_runtime_input,
-        qdrant_verify_summary, run_call_graph, run_call_path, run_context_pack,
-        run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
+        CallDirection, QueryMode, build_debug_context_pack, build_impact_summary, freshness_rows,
+        parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
+        run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
+        run_symbol_search,
     };
 
     #[test]
@@ -1495,6 +1586,51 @@ mod tests {
             pack.notes
                 .iter()
                 .any(|note| note == "malformed_runtime_lines_ignored")
+        );
+    }
+
+    #[test]
+    fn debug_context_maps_runtime_failures_to_indexed_tests_when_available() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+        let input = "test tests::covers_callee ... FAILED\ntest tests::missing_case ... FAILED\n";
+
+        let pack =
+            build_debug_context_pack(&fixture.root, &fixture.store, input, 8, &BTreeMap::new())
+                .expect("debug context should build");
+
+        assert_eq!(
+            pack.likely_tests,
+            vec!["crate::tests::covers_callee", "tests::missing_case"]
+        );
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| note == "likely_tests_mapped_to_indexed_tests")
+        );
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| { note == "likely_tests_include_unmatched_runtime_failure_names" })
+        );
+    }
+
+    #[test]
+    fn impact_includes_tests_that_directly_call_target_symbol() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+
+        let summary = build_impact_summary(&fixture.root, &fixture.store, "callee")
+            .expect("impact summary should build");
+
+        assert_eq!(summary.tests_likely, vec!["crate::tests::covers_callee"]);
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note == "likely_tests_from_indexed_direct_test_calls")
         );
     }
 
@@ -1771,5 +1907,56 @@ mod tests {
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
         }
+    }
+
+    fn persist_test_calling_callee(store: &mut SqliteStore, repository_id: &str) {
+        store
+            .replace_file_facts_with_tests(
+                &FileRecord {
+                    id: "file-test".to_owned(),
+                    repository_id: repository_id.to_owned(),
+                    path: "src/fresh_tests.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: "hash-test".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-test",
+                    "file-test",
+                    "covers_callee",
+                    "crate::tests::covers_callee",
+                )],
+                &[],
+                &[CallRecord {
+                    id: "call-test-callee".to_owned(),
+                    caller_symbol_id: "sym-test".to_owned(),
+                    callee_text: "callee".to_owned(),
+                    callee_symbol_id: Some("sym-callee".to_owned()),
+                    call_line: 3,
+                    confidence: 1.0,
+                    resolution_status: "resolved_exact".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                }],
+                &[TestRecord {
+                    id: "test-covers-callee".to_owned(),
+                    repository_id: repository_id.to_owned(),
+                    file_id: "file-test".to_owned(),
+                    path: "src/fresh_tests.rs".to_owned(),
+                    symbol_id: Some("sym-test".to_owned()),
+                    name: "covers_callee".to_owned(),
+                    qualified_name: "crate::tests::covers_callee".to_owned(),
+                    framework: "rust_test".to_owned(),
+                    language: "rust".to_owned(),
+                    start_line: 2,
+                    end_line: 4,
+                    start_byte: 0,
+                    end_byte: 32,
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                }],
+            )
+            .expect("test file should persist");
     }
 }

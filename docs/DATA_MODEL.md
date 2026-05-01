@@ -150,6 +150,36 @@ CREATE TABLE calls (
 );
 ```
 
+### `tests`
+
+```sql
+CREATE TABLE tests (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  symbol_id TEXT,
+  name TEXT NOT NULL,
+  qualified_name TEXT NOT NULL,
+  framework TEXT NOT NULL,
+  language TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  start_byte INTEGER NOT NULL,
+  end_byte INTEGER NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+The current write path stores Rust test metadata for functions with recognized
+test attributes. Test rows are structural facts only: they include names,
+framework labels, paths, ranges, provenance, and optional symbol linkage, but no
+source text. The `tests` table supports exact/suffix failing-test name lookup
+for debug context packs and direct test-to-symbol call lookup for impact
+summaries.
+
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
 files, chunks, symbols, and calls. Semantic indexing also fills chunk embedding
@@ -381,9 +411,10 @@ metadata-only edge shape as call path tracing.
 Impact related files are derived from direct relationships and transitive path
 edges. Each related-file row includes a deterministic relationship count,
 freshness label, and the first available provenance record for that file. The
-impact report does not claim likely affected tests yet; `tests_likely` remains
-empty and output includes a note until test discovery and test-to-symbol mapping
-are indexed.
+impact report also includes indexed Rust tests that directly call the queried
+symbol through resolved call edges. When no direct indexed test evidence is
+available, `tests_likely` remains empty and the output includes an explanatory
+note instead of guessing.
 
 ## Debug context packs
 
@@ -397,6 +428,7 @@ The current `symdex.debug_context.v1` format joins parsed frames to existing
 SQLite `files`, `symbols`, and `calls` rows. Returned frame evidence includes
 the normalized path, matched symbols covering the runtime line, calls recorded
 at that line, freshness labels from current file hashes, and provenance
-metadata. Likely tests are limited to failing test names found in runtime input
-until indexed test discovery and mapping are available. Debug context packs do
-not include source text and do not mutate index state.
+metadata. Failing test names found in runtime input are mapped to indexed Rust
+test facts when an exact or suffix match exists; unmatched runtime names are
+kept as fallbacks and labeled with a note. Debug context packs do not include
+source text and do not mutate index state.
