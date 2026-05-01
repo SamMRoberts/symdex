@@ -194,7 +194,11 @@ single suffix/name matches are `resolved_local_candidate`, multiple matches are
 `ambiguous`, and all other calls are preserved as `unresolved`. Rust resolution
 also normalizes leading `crate::`, `self::`, and `super::` prefixes and applies
 simple file-local `use` aliases such as `use crate::module::function as alias;`
-or `use crate::module as alias;` before falling back to suffix matching.
+or `use crate::module as alias;` before falling back to suffix matching. Rust
+macro invocations are preserved as unresolved call edges with low confidence;
+macro expansion is not analyzed. Each macro invocation also emits a
+metadata-only diagnostic noting that the invocation was preserved without
+expansion.
 
 Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
 diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is

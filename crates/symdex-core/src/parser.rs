@@ -29,7 +29,13 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
         .ok_or_else(|| CoreError::ParseFailed {
             path: file.relative_path.clone(),
         })?;
-    let parse_diagnostics = collect_parse_diagnostics(tree.root_node());
+    let mut parse_diagnostics = collect_parse_diagnostics(tree.root_node());
+    parse_diagnostics.extend(collect_macro_diagnostics(
+        file.language,
+        tree.root_node(),
+        source,
+    ));
+    sort_parse_diagnostics(&mut parse_diagnostics);
 
     let mut functions = Vec::new();
     collect_function_nodes(file.language, tree.root_node(), &mut functions);
@@ -89,6 +95,11 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
 fn collect_parse_diagnostics(root: Node<'_>) -> Vec<ParseDiagnostic> {
     let mut diagnostics = Vec::new();
     collect_parse_diagnostics_from_node(root, &mut diagnostics);
+    sort_parse_diagnostics(&mut diagnostics);
+    diagnostics
+}
+
+fn sort_parse_diagnostics(diagnostics: &mut [ParseDiagnostic]) {
     diagnostics.sort_by_key(|diagnostic| {
         (
             diagnostic.byte_range.start,
@@ -96,7 +107,6 @@ fn collect_parse_diagnostics(root: Node<'_>) -> Vec<ParseDiagnostic> {
             diagnostic.message.clone(),
         )
     });
-    diagnostics
 }
 
 fn collect_parse_diagnostics_from_node(node: Node<'_>, diagnostics: &mut Vec<ParseDiagnostic>) {
@@ -123,6 +133,39 @@ fn parse_diagnostic_message(node: Node<'_>) -> String {
         format!("tree-sitter missing `{}`", node.kind())
     } else {
         format!("tree-sitter parse error `{}`", node.kind())
+    }
+}
+
+fn collect_macro_diagnostics(
+    language: Language,
+    root: Node<'_>,
+    source: &str,
+) -> Vec<ParseDiagnostic> {
+    let mut diagnostics = Vec::new();
+    collect_macro_diagnostics_from_node(language, root, source, &mut diagnostics);
+    diagnostics
+}
+
+fn collect_macro_diagnostics_from_node(
+    language: Language,
+    node: Node<'_>,
+    source: &str,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+) {
+    if is_macro_invocation(language, node)
+        && let Some(callee_text) = macro_callee_text(node, source)
+    {
+        diagnostics.push(ParseDiagnostic {
+            byte_range: ByteRange::new(node.start_byte(), node.end_byte()),
+            line_range: LineRange::new(node.start_position().row + 1, node.end_position().row + 1),
+            message: format!("macro invocation `{callee_text}` preserved without expansion"),
+        });
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_macro_diagnostics_from_node(language, child, source, diagnostics);
     }
 }
 
@@ -491,6 +534,25 @@ fn collect_call_edges_from_node(
             confidence,
             resolution_status,
         });
+    } else if is_macro_invocation(language, node)
+        && let Some(callee_text) = macro_callee_text(node, source)
+    {
+        let call_line = node.start_position().row + 1;
+        calls.push(CallEdge {
+            id: stable_id(&[
+                &caller.id,
+                &callee_text,
+                &call_line.to_string(),
+                &node.start_byte().to_string(),
+            ]),
+            caller_symbol_id: caller.id.clone(),
+            callee_text,
+            callee_symbol_id: None,
+            call_line,
+            confidence: 0.2,
+            resolution_status: ResolutionStatus::Unresolved,
+        });
+        return;
     }
 
     let mut cursor = node.walk();
@@ -666,6 +728,21 @@ fn callee_text(call: Node<'_>, source: &str) -> Option<String> {
         }
         _ => node_text(function, source)?.replace(' ', ""),
     })
+}
+
+fn is_macro_invocation(language: Language, node: Node<'_>) -> bool {
+    language == Language::Rust && node.kind() == "macro_invocation"
+}
+
+fn macro_callee_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = node_text(node, source)?;
+    let macro_path = text.split_once('!')?.0;
+    let macro_path = clean_expression_text(macro_path);
+    if macro_path.is_empty() {
+        None
+    } else {
+        Some(format!("{macro_path}!"))
+    }
 }
 
 fn qualified_name(
@@ -1117,6 +1194,38 @@ pub fn caller() {
             ResolutionStatus::Unresolved
         );
         assert!(external_call.callee_symbol_id.is_none());
+    }
+
+    #[test]
+    fn preserves_rust_macro_invocations_as_unresolved_calls_and_diagnostics() {
+        let source = r#"pub fn helper() -> i32 { 1 }
+
+pub fn caller() {
+    println!("{}", helper());
+    assert_eq!(helper(), 1);
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["println!", "assert_eq!"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} macro call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::Unresolved);
+            assert!(call.callee_symbol_id.is_none());
+            assert_eq!(call.confidence, 0.2);
+        }
+        assert_eq!(
+            index
+                .parse_diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("preserved without expansion"))
+                .count(),
+            2
+        );
     }
 
     #[test]
