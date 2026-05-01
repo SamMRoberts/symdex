@@ -39,6 +39,10 @@ pub fn tool_names() -> [&'static str; 9] {
     ]
 }
 
+pub fn evidence_tool_result(name: &str, arguments: &Value) -> Result<Value, String> {
+    dispatch_tool(name, arguments).map(versioned_tool_result)
+}
+
 pub fn serve_stdio() -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

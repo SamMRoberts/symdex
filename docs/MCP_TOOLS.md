@@ -46,6 +46,11 @@ so CLI, TUI, diagnostics, and MCP share the same contract identifier.
 Parser-version examples below use Rust, but C#, JavaScript, and TypeScript
 evidence uses each language's parser version string.
 
+The CLI mirrors this envelope when run with top-level `--json` or
+`--output json` for MCP-backed read-only commands. For example,
+`symdex --json search <repo> <query>` prints the same
+`symdex.mcp.evidence.v1` object that MCP returns in `structuredContent`.
+
 ### `symdex_search`
 
 Semantic search over indexed chunks.

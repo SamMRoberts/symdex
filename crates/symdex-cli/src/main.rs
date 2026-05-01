@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Read;
 
+use serde_json::json;
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
@@ -25,49 +26,62 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
+    let invocation = parse_cli_invocation(args)?;
+    let output = invocation.output;
+    let args = invocation.args;
     let Some(command) = args.first().map(String::as_str) else {
         print_help();
         return Ok(());
     };
 
     match command {
-        "doctor" => doctor(args.get(1).map(String::as_str)),
-        "init" => init(),
+        "doctor" => {
+            require_text_output(command, output)?;
+            doctor(args.get(1).map(String::as_str))
+        }
+        "init" => {
+            require_text_output(command, output)?;
+            init()
+        }
         "index" => {
+            require_text_output(command, output)?;
             let index_args = parse_index_args(&args[1..]);
             index(&index_args)
         }
         "index-status" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            index_status(repo)
+            index_status(repo, output)
         }
         "staleness" | "freshness" => {
+            require_text_output(command, output)?;
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let symbol_query = args.get(2).map(String::as_str);
             staleness(repo, symbol_query)
         }
         "qdrant-verify" => {
+            require_text_output(command, output)?;
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             qdrant_verify(repo)
         }
         "qdrant-repair" => {
+            require_text_output(command, output)?;
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             qdrant_repair(repo)
         }
         "symbol" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
-            symbol(repo, query)
+            symbol(repo, query, output)
         }
         "callers" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
-            callers(repo, query)
+            callers(repo, query, output)
         }
         "callees" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
-            callees(repo, query)
+            callees(repo, query, output)
         }
         "call-path" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -77,33 +91,37 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .get(4)
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(4);
-            call_path(repo, source, target, max_depth)
+            call_path(repo, source, target, max_depth, output)
         }
         "impact" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
-            impact(repo, query)
+            impact(repo, query, output)
         }
         "context-pack" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
-            context_pack(repo, query)
+            context_pack(repo, query, output)
         }
         "debug-context" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let input_parts = if args.len() > 2 { &args[2..] } else { &[] };
-            debug_context(repo, input_parts)
+            debug_context(repo, input_parts, output)
         }
         "search" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query_parts = if args.len() > 2 { &args[2..] } else { &[] };
-            search(repo, query_parts)
+            search(repo, query_parts, output)
         }
         "tui" => {
+            require_text_output(command, output)?;
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             tui(repo)
         }
-        "serve-mcp" => serve_mcp(),
+        "serve-mcp" => {
+            require_text_output(command, output)?;
+            serve_mcp()
+        }
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -114,6 +132,64 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         unknown => Err(format!("unknown command `{unknown}`\n\nrun `symdex help`")),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliInvocation {
+    output: OutputMode,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Text,
+    Json,
+}
+
+fn parse_cli_invocation(args: Vec<String>) -> Result<CliInvocation, String> {
+    let mut output = OutputMode::Text;
+    let mut remaining = Vec::new();
+    let mut iterator = args.into_iter();
+    while let Some(arg) = iterator.next() {
+        match arg.as_str() {
+            "--json" => output = OutputMode::Json,
+            "--output" => {
+                let Some(value) = iterator.next() else {
+                    return Err("--output requires a value".to_owned());
+                };
+                output = parse_output_value(&value)?;
+            }
+            value if value.starts_with("--output=") => {
+                output = parse_output_value(value.trim_start_matches("--output="))?;
+            }
+            _ => {
+                remaining.push(arg);
+                remaining.extend(iterator);
+                break;
+            }
+        }
+    }
+    Ok(CliInvocation {
+        output,
+        args: remaining,
+    })
+}
+
+fn parse_output_value(value: &str) -> Result<OutputMode, String> {
+    match value {
+        "text" => Ok(OutputMode::Text),
+        "json" => Ok(OutputMode::Json),
+        other => Err(format!("unsupported output format `{other}`")),
+    }
+}
+
+fn require_text_output(command: &str, output: OutputMode) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return Err(format!(
+            "{command} does not support MCP evidence JSON output"
+        ));
+    }
+    Ok(())
 }
 
 fn doctor(repo: Option<&str>) -> Result<(), String> {
@@ -158,7 +234,10 @@ fn continuous_index(args: &IndexArgs) -> Result<(), String> {
     )
 }
 
-fn index_status(repo: &str) -> Result<(), String> {
+fn index_status(repo: &str, output: OutputMode) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(symdex_mcp::TOOL_INDEX_STATUS, json!({ "repo": repo }));
+    }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
     let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
@@ -240,7 +319,13 @@ fn delete_orphaned_qdrant_points(summary: &QdrantVerifySummary) -> Result<usize,
     Ok(summary.orphaned_point_ids.len())
 }
 
-fn symbol(repo: &str, query: &str) -> Result<(), String> {
+fn symbol(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_FIND_SYMBOL,
+            json!({ "repo": repo, "name": query, "limit": 10 }),
+        );
+    }
     let summary = run_symbol_search(repo, query).map_err(|error| {
         if error.contains("requires a query") {
             "symbol requires a symbol query".to_owned()
@@ -258,7 +343,13 @@ fn symbol(repo: &str, query: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn callers(repo: &str, query: &str) -> Result<(), String> {
+fn callers(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_CALLERS,
+            json!({ "repo": repo, "symbol": query }),
+        );
+    }
     let summary = run_call_graph(repo, query, CallDirection::Callers).map_err(|error| {
         if error.contains("requires a symbol query") {
             "callers requires a symbol query".to_owned()
@@ -270,7 +361,13 @@ fn callers(repo: &str, query: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn callees(repo: &str, query: &str) -> Result<(), String> {
+fn callees(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_CALLEES,
+            json!({ "repo": repo, "symbol": query }),
+        );
+    }
     let summary = run_call_graph(repo, query, CallDirection::Callees).map_err(|error| {
         if error.contains("requires a symbol query") {
             "callees requires a symbol query".to_owned()
@@ -282,7 +379,24 @@ fn callees(repo: &str, query: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn call_path(repo: &str, source: &str, target: &str, max_depth: usize) -> Result<(), String> {
+fn call_path(
+    repo: &str,
+    source: &str,
+    target: &str,
+    max_depth: usize,
+    output: OutputMode,
+) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_CALL_PATH,
+            json!({
+                "repo": repo,
+                "source": source,
+                "target": target,
+                "max_depth": max_depth
+            }),
+        );
+    }
     let summary = run_call_path(repo, source, target, max_depth).map_err(|error| {
         if error.contains("source symbol query") {
             "call-path requires a source symbol query".to_owned()
@@ -296,7 +410,13 @@ fn call_path(repo: &str, source: &str, target: &str, max_depth: usize) -> Result
     Ok(())
 }
 
-fn impact(repo: &str, query: &str) -> Result<(), String> {
+fn impact(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_IMPACT,
+            json!({ "repo": repo, "symbol": query, "depth": 4 }),
+        );
+    }
     let summary = run_impact(repo, query).map_err(|error| {
         if error.contains("requires a symbol query") {
             "impact requires a symbol query".to_owned()
@@ -439,7 +559,13 @@ fn storage_health_status_label(status: symdex_store::StorageHealthStatus) -> &'s
     }
 }
 
-fn context_pack(repo: &str, query: &str) -> Result<(), String> {
+fn context_pack(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_CONTEXT_PACK,
+            json!({ "repo": repo, "symbol": query, "limit": 8 }),
+        );
+    }
     let pack = run_context_pack(repo, query, 8).map_err(|error| {
         if error.contains("requires a symbol query") {
             "context-pack requires a symbol query".to_owned()
@@ -452,8 +578,14 @@ fn context_pack(repo: &str, query: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn debug_context(repo: &str, input_parts: &[String]) -> Result<(), String> {
+fn debug_context(repo: &str, input_parts: &[String], output: OutputMode) -> Result<(), String> {
     let input = runtime_input(input_parts)?;
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_DEBUG_CONTEXT,
+            json!({ "repo": repo, "input": input, "limit": 8 }),
+        );
+    }
     let pack = run_debug_context_pack(repo, &input, 8)?;
     let json = serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())?;
     println!("{json}");
@@ -501,8 +633,14 @@ fn print_call_graph_summary(summary: &CallGraphSummary) {
     }
 }
 
-fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {
+fn search(repo: &str, query_parts: &[String], output: OutputMode) -> Result<(), String> {
     let query = query_parts.join(" ");
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_SEARCH,
+            json!({ "repo": repo, "query": query, "limit": 10 }),
+        );
+    }
     let summary = run_semantic_search(repo, &query, 10).map_err(|error| {
         if error.contains("requires a query") {
             "search requires a query".to_owned()
@@ -529,6 +667,13 @@ fn search(repo: &str, query_parts: &[String]) -> Result<(), String> {
                 .unwrap_or("<none>")
         );
     }
+    Ok(())
+}
+
+fn print_mcp_json_tool(name: &str, arguments: serde_json::Value) -> Result<(), String> {
+    let result = symdex_mcp::evidence_tool_result(name, &arguments)?;
+    let json = serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?;
+    println!("{json}");
     Ok(())
 }
 
@@ -759,7 +904,47 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutputMode, parse_cli_invocation};
+
+    #[test]
+    fn cli_invocation_parses_leading_json_flag() {
+        let invocation = parse_cli_invocation(vec![
+            "--json".to_owned(),
+            "symbol".to_owned(),
+            ".".to_owned(),
+            "run".to_owned(),
+        ])
+        .expect("json invocation should parse");
+
+        assert_eq!(invocation.output, OutputMode::Json);
+        assert_eq!(invocation.args, vec!["symbol", ".", "run"]);
+    }
+
+    #[test]
+    fn cli_invocation_parses_output_json_flag() {
+        let invocation = parse_cli_invocation(vec![
+            "--output=json".to_owned(),
+            "index-status".to_owned(),
+            ".".to_owned(),
+        ])
+        .expect("output invocation should parse");
+
+        assert_eq!(invocation.output, OutputMode::Json);
+        assert_eq!(invocation.args, vec!["index-status", "."]);
+    }
+
+    #[test]
+    fn cli_invocation_rejects_unknown_output_format() {
+        let error = parse_cli_invocation(vec!["--output=xml".to_owned()])
+            .expect_err("unknown output should fail");
+
+        assert!(error.contains("unsupported output format"));
+    }
 }

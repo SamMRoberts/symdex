@@ -60,6 +60,12 @@ cargo run -p symdex-cli -- serve-mcp
 
 Implemented CLI commands currently include:
 
+Use top-level `--json` or `--output json` with read-only MCP-backed evidence
+commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
+`structuredContent`. JSON mode is currently supported for `index-status`,
+`search`, `symbol`, `callers`, `callees`, `call-path`, `impact`,
+`context-pack`, and `debug-context`.
+
 - `init`: creates the local state directory for the configured SQLite path.
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
   service checks, the active MCP evidence contract version, and repo-specific

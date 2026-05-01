@@ -183,7 +183,7 @@
 ### P0 — Production hardening foundation
 
 - [x] Add CI for fmt, clippy, tests, release build, and dependency audit.
-- [ ] Add JSON CLI output mirroring MCP contracts.
+- [x] Add JSON CLI output mirroring MCP contracts.
 - [x] Record failed and partial index runs, not only successful summaries.
 - [x] Implement Qdrant delete, verify, and repair lifecycle for changed or deleted chunks.
   - [x] Delete stale Qdrant points for changed and deleted chunks before SQLite cleanup.
