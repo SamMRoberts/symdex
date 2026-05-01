@@ -5101,7 +5101,7 @@ mod tests {
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
         CallDirection, CallGraphSummary, CallPathSummary, DebugContextLimits, DebugContextPack,
-        DebugFrameCallPath, DebugFrameMatch, FileFreshnessRow, FreshnessSummary,
+        DebugFrameCallPath, DebugFrameMatch, EvidenceTrust, FileFreshnessRow, FreshnessSummary,
         ImpactCallEvidence, ImpactSummary, QueryMode, QueryResult, RuntimeFrame,
         SymbolSearchSummary,
     };
@@ -7418,6 +7418,7 @@ mod tests {
         ImpactCallEvidence {
             row: sample_call_row(),
             freshness: EvidenceFreshness::Fresh,
+            trust: sample_trust(),
         }
     }
 
@@ -7528,6 +7529,7 @@ mod tests {
                     normalized_path: Some("src/lib.rs".to_owned()),
                     file_freshness: EvidenceFreshness::Fresh,
                     file_provenance: Some(sample_provenance()),
+                    trust: sample_trust(),
                     matched_symbols: vec![SymbolSearchRow {
                         id: "symbol-caller".to_owned(),
                         name: "caller".to_owned(),
@@ -7558,6 +7560,7 @@ mod tests {
                     normalized_path: Some("src/lib.rs".to_owned()),
                     file_freshness: EvidenceFreshness::Stale,
                     file_provenance: Some(sample_provenance()),
+                    trust: sample_trust(),
                     matched_symbols: vec![sample_symbol(
                         "symbol-add".to_owned(),
                         "crate::add".to_owned(),
@@ -7595,6 +7598,14 @@ mod tests {
             embedding_model: None,
             embedding_dimension: None,
             embedded_at: None,
+        }
+    }
+
+    fn sample_trust() -> EvidenceTrust {
+        EvidenceTrust {
+            score: 1.0,
+            level: "high".to_owned(),
+            factors: vec!["freshness:fresh".to_owned()],
         }
     }
 

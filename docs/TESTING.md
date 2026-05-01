@@ -54,6 +54,9 @@ Fixtures should be tiny and purpose-built.
   chunks, and model/dimension drift
 - Evidence freshness coverage for fresh, stale, deleted, missing, and unknown
   states, including metadata-only TUI rendering.
+- Evidence trust scoring coverage for freshness, provenance completeness,
+  confidence, and index metadata completeness, including impact and
+  debug-context evidence rows.
 - Debug context coverage for parsed panic/file locations, stack-frame symbols,
   failing test names, mapped frames, unmapped frames, stale frames, deleted
   files, malformed runtime input, and TUI debug context pack rendering.
@@ -149,7 +152,7 @@ pending debounce, queued event count, latest reindexed file, watch errors, and
 the animated continuous-indexing activity indicator.
 Current freshness tests cover hash-to-state classification, file freshness
 aggregation over indexed and current file sets, returned symbol/call provenance,
-and the TUI evidence freshness panel.
+trust scoring, and the TUI evidence freshness panel.
 Current cross-agent reuse tests cover the shared MCP evidence contract envelope,
 read-only tool annotations, underscore-only tool names, repo root validation,
 and two independent MCP readers using the same SQLite index-status path without

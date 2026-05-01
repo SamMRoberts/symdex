@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_query::run_debug_context_pack;
+use symdex_query::{evidence_trust, run_debug_context_pack};
 use symdex_store::{
     EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
     freshness_for_hash, qdrant_collection_name,
@@ -189,6 +189,7 @@ fn tool_search(arguments: &Value) -> Result<Value, String> {
                 embedding_dimension: payload.embedding_dimension,
                 embedded_at: None,
             };
+            let freshness = evidence_freshness(&root, Some(&path), &provenance);
             json!({
                 "path": path.clone(),
                 "start_line": payload.start_line,
@@ -197,7 +198,8 @@ fn tool_search(arguments: &Value) -> Result<Value, String> {
                 "score": result.score,
                 "chunk_kind": payload.chunk_kind,
                 "text_hash": payload.text_hash,
-                "freshness": freshness_label(&root, Some(&path), &provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &provenance, Some(result.score)),
                 "provenance": provenance_json(&provenance)
             })
         }).collect::<Vec<_>>()
@@ -215,7 +217,9 @@ fn tool_find_symbol(arguments: &Value) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     symbols.truncate(limit);
     Ok(json!({
-        "results": symbols.into_iter().map(|symbol| json!({
+        "results": symbols.into_iter().map(|symbol| {
+            let freshness = evidence_freshness(&root, Some(&symbol.path), &symbol.provenance);
+            json!({
             "id": symbol.id,
             "name": symbol.name,
             "qualified_name": symbol.qualified_name,
@@ -223,9 +227,10 @@ fn tool_find_symbol(arguments: &Value) -> Result<Value, String> {
             "path": symbol.path,
             "start_line": symbol.start_line,
             "end_line": symbol.end_line,
-            "freshness": freshness_label(&root, Some(&symbol.path), &symbol.provenance),
+            "freshness": freshness.label(),
+            "trust": trust_json(freshness, &symbol.provenance, None),
             "provenance": provenance_json(&symbol.provenance)
-        })).collect::<Vec<_>>()
+        })}).collect::<Vec<_>>()
     }))
 }
 
@@ -267,7 +272,9 @@ fn tool_call_path(arguments: &Value) -> Result<Value, String> {
             "hops": path.hops,
             "min_confidence": path.min_confidence,
             "terminal_resolution_status": path.terminal_resolution_status,
-            "edges": path.edges.into_iter().map(|edge| json!({
+            "edges": path.edges.into_iter().map(|edge| {
+                let freshness = evidence_freshness(&root, Some(&edge.caller_path), &edge.provenance);
+                json!({
                 "call_id": edge.call_id,
                 "caller_symbol_id": edge.caller_symbol_id,
                 "caller_symbol_name": edge.caller_symbol_name,
@@ -287,9 +294,10 @@ fn tool_call_path(arguments: &Value) -> Result<Value, String> {
                 "call_line": edge.call_line,
                 "confidence": edge.confidence,
                 "resolution_status": edge.resolution_status,
-                "freshness": freshness_label(&root, Some(&edge.caller_path), &edge.provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &edge.provenance, Some(edge.confidence)),
                 "provenance": provenance_json(&edge.provenance)
-            })).collect::<Vec<_>>()
+            })}).collect::<Vec<_>>()
         })).collect::<Vec<_>>()
     }))
 }
@@ -405,13 +413,22 @@ fn provenance_json(provenance: &EvidenceProvenance) -> Value {
     })
 }
 
-fn freshness_label(
+fn evidence_freshness(
     root: &RepoRoot,
     path: Option<&str>,
     provenance: &EvidenceProvenance,
-) -> &'static str {
+) -> symdex_store::EvidenceFreshness {
     let current_hash = path.and_then(|path| current_content_hash(root, path).ok().flatten());
-    freshness_for_hash(provenance.content_hash.as_deref(), current_hash.as_deref()).label()
+    freshness_for_hash(provenance.content_hash.as_deref(), current_hash.as_deref())
+}
+
+fn trust_json(
+    freshness: symdex_store::EvidenceFreshness,
+    provenance: &EvidenceProvenance,
+    confidence: Option<f64>,
+) -> Value {
+    serde_json::to_value(evidence_trust(freshness, Some(provenance), confidence))
+        .expect("evidence trust should serialize")
 }
 
 fn current_content_hash(root: &RepoRoot, path: &str) -> Result<Option<String>, String> {
@@ -430,6 +447,7 @@ fn current_content_hash(root: &RepoRoot, path: &str) -> Result<Option<String>, S
 fn call_rows(root: &RepoRoot, rows: Vec<symdex_store::CallSearchRow>) -> Vec<Value> {
     rows.into_iter()
         .map(|row| {
+            let freshness = evidence_freshness(root, row.path.as_deref(), &row.provenance);
             json!({
                 "callee_text": row.callee_text,
                 "call_line": row.call_line,
@@ -442,7 +460,8 @@ fn call_rows(root: &RepoRoot, rows: Vec<symdex_store::CallSearchRow>) -> Vec<Val
                 "path": row.path,
                 "start_line": row.start_line,
                 "end_line": row.end_line,
-                "freshness": freshness_label(root, row.path.as_deref(), &row.provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &row.provenance, Some(row.confidence)),
                 "provenance": provenance_json(&row.provenance)
             })
         })
@@ -457,7 +476,9 @@ fn call_paths_json(root: &RepoRoot, paths: Vec<symdex_store::CallPath>) -> Vec<V
                 "hops": path.hops,
                 "min_confidence": path.min_confidence,
                 "terminal_resolution_status": path.terminal_resolution_status,
-                "edges": path.edges.into_iter().map(|edge| json!({
+                "edges": path.edges.into_iter().map(|edge| {
+                    let freshness = evidence_freshness(root, Some(&edge.caller_path), &edge.provenance);
+                    json!({
                     "call_id": edge.call_id,
                     "caller_symbol_id": edge.caller_symbol_id,
                     "caller_symbol_name": edge.caller_symbol_name,
@@ -477,9 +498,10 @@ fn call_paths_json(root: &RepoRoot, paths: Vec<symdex_store::CallPath>) -> Vec<V
                     "call_line": edge.call_line,
                     "confidence": edge.confidence,
                     "resolution_status": edge.resolution_status,
-                    "freshness": freshness_label(root, Some(&edge.caller_path), &edge.provenance),
+                    "freshness": freshness.label(),
+                    "trust": trust_json(freshness, &edge.provenance, Some(edge.confidence)),
                     "provenance": provenance_json(&edge.provenance)
-                })).collect::<Vec<_>>()
+                })}).collect::<Vec<_>>()
             })
         })
         .collect()
@@ -516,10 +538,12 @@ fn impact_related_files_json<'a>(
     files
         .into_iter()
         .map(|(path, (relationship_count, provenance))| {
+            let freshness = evidence_freshness(root, Some(&path), &provenance);
             json!({
                 "path": path,
                 "relationship_count": relationship_count,
-                "freshness": freshness_label(root, Some(&path), &provenance),
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &provenance, None),
                 "provenance": provenance_json(&provenance)
             })
         })

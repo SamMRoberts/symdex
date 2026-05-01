@@ -486,10 +486,12 @@ fn print_impact_summary(summary: &ImpactSummary) {
     println!("related_files: {}", summary.related_files.len());
     for file in &summary.related_files {
         println!(
-            "{} relationships={} freshness={} run={}",
+            "{} relationships={} freshness={} trust={:.2}/{} run={}",
             file.path,
             file.relationship_count,
             file.freshness.label(),
+            file.trust.score,
+            file.trust.level,
             file.provenance
                 .as_ref()
                 .and_then(|provenance| provenance.index_run_id.as_deref())
@@ -507,17 +509,32 @@ fn print_impact_summary(summary: &ImpactSummary) {
 
 fn print_impact_call_evidence(evidence: &symdex_query::ImpactCallEvidence) {
     print_call_row(&evidence.row);
-    println!("freshness={}", evidence.freshness.label());
+    println!(
+        "freshness={} trust={:.2}/{}",
+        evidence.freshness.label(),
+        evidence.trust.score,
+        evidence.trust.level
+    );
 }
 
 fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
     println!(
-        "path hops={} min_confidence={:.2} terminal_status={}",
-        evidence.path.hops, evidence.path.min_confidence, evidence.path.terminal_resolution_status
+        "path hops={} min_confidence={:.2} terminal_status={} trust={:.2}/{}",
+        evidence.path.hops,
+        evidence.path.min_confidence,
+        evidence.path.terminal_resolution_status,
+        evidence.trust.score,
+        evidence.trust.level
     );
-    for (edge, freshness) in evidence.path.edges.iter().zip(&evidence.edge_freshness) {
+    for ((edge, freshness), trust) in evidence
+        .path
+        .edges
+        .iter()
+        .zip(&evidence.edge_freshness)
+        .zip(&evidence.edge_trust)
+    {
         println!(
-            "  {} -> {} line={} confidence={:.2} status={} freshness={} {}:{}-{} run={}",
+            "  {} -> {} line={} confidence={:.2} status={} freshness={} trust={:.2}/{} {}:{}-{} run={}",
             edge.caller_symbol_qualified_name,
             edge.callee_symbol_qualified_name
                 .as_deref()
@@ -526,6 +543,8 @@ fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
             edge.confidence,
             edge.resolution_status,
             freshness.label(),
+            trust.score,
+            trust.level,
             edge.caller_path,
             edge.caller_start_line,
             edge.caller_end_line,

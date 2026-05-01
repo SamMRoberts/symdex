@@ -143,12 +143,15 @@ pub struct QdrantVerifySummary {
 pub struct ImpactCallEvidence {
     pub row: CallSearchRow,
     pub freshness: EvidenceFreshness,
+    pub trust: EvidenceTrust,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImpactPathEvidence {
     pub path: CallPath,
     pub edge_freshness: Vec<EvidenceFreshness>,
+    pub edge_trust: Vec<EvidenceTrust>,
+    pub trust: EvidenceTrust,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +160,14 @@ pub struct ImpactRelatedFile {
     pub relationship_count: usize,
     pub freshness: EvidenceFreshness,
     pub provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvidenceTrust {
+    pub score: f64,
+    pub level: String,
+    pub factors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +213,7 @@ pub struct DebugFrameMatch {
     pub normalized_path: Option<String>,
     pub file_freshness: EvidenceFreshness,
     pub file_provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
     pub matched_symbols: Vec<SymbolSearchRow>,
     pub calls_at_line: Vec<CallPath>,
     pub matched: bool,
@@ -914,6 +926,7 @@ fn build_debug_context_pack(
                 .and_then(|provenance| provenance.content_hash.as_deref()),
             current_hash,
         );
+        let trust = evidence_trust(file_freshness, provenance.as_ref(), None);
         let matched =
             file_provenance.is_some() || !matched_symbols.is_empty() || !calls_at_line.is_empty();
 
@@ -922,6 +935,7 @@ fn build_debug_context_pack(
             normalized_path,
             file_freshness,
             file_provenance: provenance,
+            trust,
             matched_symbols,
             calls_at_line,
             matched,
@@ -1205,6 +1219,103 @@ fn freshness_for_provenance(
     freshness_for_hash(provenance.content_hash.as_deref(), current)
 }
 
+pub fn evidence_trust(
+    freshness: EvidenceFreshness,
+    provenance: Option<&EvidenceProvenance>,
+    confidence: Option<f64>,
+) -> EvidenceTrust {
+    let freshness_score = match freshness {
+        EvidenceFreshness::Fresh => 1.0,
+        EvidenceFreshness::Stale => 0.55,
+        EvidenceFreshness::Deleted => 0.25,
+        EvidenceFreshness::Missing => 0.2,
+        EvidenceFreshness::Unknown => 0.45,
+    };
+    let provenance_score = provenance.map_or(0.0, provenance_completeness);
+    let index_score = provenance.map_or(0.0, index_metadata_completeness);
+    let confidence_score = confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+    let score = round_trust_score(
+        freshness_score * 0.35
+            + provenance_score * 0.25
+            + confidence_score * 0.25
+            + index_score * 0.15,
+    );
+    let level = if score >= 0.85 {
+        "high"
+    } else if score >= 0.65 {
+        "medium"
+    } else if score >= 0.35 {
+        "low"
+    } else {
+        "minimal"
+    };
+    let mut factors = vec![format!("freshness:{}", freshness.label())];
+    if let Some(confidence) = confidence {
+        factors.push(format!("confidence:{:.2}", confidence.clamp(0.0, 1.0)));
+    } else {
+        factors.push("confidence:not_applicable".to_owned());
+    }
+    match provenance {
+        Some(provenance) => {
+            factors.push(format!(
+                "provenance:{}",
+                completeness_label(provenance_completeness(provenance))
+            ));
+            factors.push(format!(
+                "index_metadata:{}",
+                completeness_label(index_metadata_completeness(provenance))
+            ));
+        }
+        None => {
+            factors.push("provenance:missing".to_owned());
+            factors.push("index_metadata:missing".to_owned());
+        }
+    }
+    EvidenceTrust {
+        score,
+        level: level.to_owned(),
+        factors,
+    }
+}
+
+fn provenance_completeness(provenance: &EvidenceProvenance) -> f64 {
+    let present = [
+        provenance.content_hash.is_some(),
+        provenance.index_run_id.is_some(),
+        provenance.parser_version.is_some(),
+        provenance.indexed_at.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    present as f64 / 4.0
+}
+
+fn index_metadata_completeness(provenance: &EvidenceProvenance) -> f64 {
+    match (
+        provenance.index_run_id.is_some(),
+        provenance.parser_version.is_some(),
+    ) {
+        (true, true) => 1.0,
+        (true, false) | (false, true) => 0.6,
+        (false, false) => 0.0,
+    }
+}
+
+fn completeness_label(score: f64) -> &'static str {
+    if score >= 1.0 {
+        "complete"
+    } else if score >= 0.5 {
+        "partial"
+    } else {
+        "missing"
+    }
+}
+
+fn round_trust_score(score: f64) -> f64 {
+    (score * 100.0).round() / 100.0
+}
+
 fn impact_call_evidence(
     rows: Vec<CallSearchRow>,
     current_hashes: &BTreeMap<String, String>,
@@ -1213,7 +1324,12 @@ fn impact_call_evidence(
         .map(|row| {
             let freshness =
                 freshness_for_provenance(row.path.as_deref(), &row.provenance, current_hashes);
-            ImpactCallEvidence { row, freshness }
+            let trust = evidence_trust(freshness, Some(&row.provenance), Some(row.confidence));
+            ImpactCallEvidence {
+                row,
+                freshness,
+                trust,
+            }
         })
         .collect()
 }
@@ -1225,23 +1341,59 @@ fn impact_path_evidence(
     paths
         .into_iter()
         .map(|path| {
-            let edge_freshness = path
+            let edge_pairs = path
                 .edges
                 .iter()
                 .map(|edge| {
-                    freshness_for_provenance(
+                    let freshness = freshness_for_provenance(
                         Some(edge.caller_path.as_str()),
                         &edge.provenance,
                         current_hashes,
-                    )
+                    );
+                    let trust =
+                        evidence_trust(freshness, Some(&edge.provenance), Some(edge.confidence));
+                    (freshness, trust)
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let edge_freshness = edge_pairs
+                .iter()
+                .map(|(freshness, _)| *freshness)
+                .collect::<Vec<_>>();
+            let edge_trust = edge_pairs
+                .iter()
+                .map(|(_, trust)| trust.clone())
+                .collect::<Vec<_>>();
+            let trust = aggregate_trust(&edge_trust);
             ImpactPathEvidence {
                 path,
                 edge_freshness,
+                edge_trust,
+                trust,
             }
         })
         .collect()
+}
+
+fn aggregate_trust(trust: &[EvidenceTrust]) -> EvidenceTrust {
+    if trust.is_empty() {
+        return evidence_trust(EvidenceFreshness::Unknown, None, None);
+    }
+    let score =
+        round_trust_score(trust.iter().map(|trust| trust.score).sum::<f64>() / trust.len() as f64);
+    let level = if score >= 0.85 {
+        "high"
+    } else if score >= 0.65 {
+        "medium"
+    } else if score >= 0.35 {
+        "low"
+    } else {
+        "minimal"
+    };
+    EvidenceTrust {
+        score,
+        level: level.to_owned(),
+        factors: vec![format!("aggregate_edges:{}", trust.len())],
+    }
 }
 
 fn impact_related_files(
@@ -1282,11 +1434,13 @@ fn impact_related_files(
                 }
                 None => EvidenceFreshness::Unknown,
             };
+            let trust = evidence_trust(freshness, provenance.as_ref(), None);
             ImpactRelatedFile {
                 path,
                 relationship_count,
                 freshness,
                 provenance,
+                trust,
             }
         })
         .collect()
@@ -1342,14 +1496,14 @@ mod tests {
 
     use symdex_core::RepoRoot;
     use symdex_store::{
-        CallRecord, EvidenceFreshness, FileFreshnessSnapshot, FileRecord, PointPayload,
-        QdrantExpectedPoint, RepositoryRecord, RetrievedPoint, SqliteStore, StorageHealthStatus,
-        StoreConfig, SymbolRecord, TestRecord,
+        CallRecord, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot, FileRecord,
+        PointPayload, QdrantExpectedPoint, RepositoryRecord, RetrievedPoint, SqliteStore,
+        StorageHealthStatus, StoreConfig, SymbolRecord, TestRecord,
     };
 
     use crate::{
-        CallDirection, QueryMode, build_debug_context_pack, build_impact_summary, freshness_rows,
-        parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
+        CallDirection, QueryMode, build_debug_context_pack, build_impact_summary, evidence_trust,
+        freshness_rows, parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
         run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
         run_symbol_search,
     };
@@ -1400,6 +1554,51 @@ mod tests {
     fn impact_rejects_empty_query() {
         let error = run_impact(".", " ").expect_err("empty query should fail");
         assert!(error.contains("requires a symbol query"));
+    }
+
+    #[test]
+    fn evidence_trust_combines_freshness_provenance_confidence_and_index_metadata() {
+        let high = evidence_trust(
+            EvidenceFreshness::Fresh,
+            Some(&complete_provenance()),
+            Some(1.0),
+        );
+        assert_eq!(high.score, 1.0);
+        assert_eq!(high.level, "high");
+        assert!(
+            high.factors
+                .iter()
+                .any(|factor| factor == "provenance:complete")
+        );
+        assert!(
+            high.factors
+                .iter()
+                .any(|factor| factor == "index_metadata:complete")
+        );
+
+        let partial = evidence_trust(
+            EvidenceFreshness::Stale,
+            Some(&partial_provenance()),
+            Some(0.5),
+        );
+        assert_eq!(partial.score, 0.44);
+        assert_eq!(partial.level, "low");
+        assert!(
+            partial
+                .factors
+                .iter()
+                .any(|factor| factor == "provenance:partial")
+        );
+
+        let missing = evidence_trust(EvidenceFreshness::Unknown, None, None);
+        assert_eq!(missing.score, 0.41);
+        assert_eq!(missing.level, "low");
+        assert!(
+            missing
+                .factors
+                .iter()
+                .any(|factor| factor == "provenance:missing")
+        );
     }
 
     #[test]
@@ -1581,6 +1780,10 @@ mod tests {
             "crate::fresh"
         );
         assert_eq!(pack.frames[0].calls_at_line.len(), 1);
+        assert_eq!(pack.frames[0].trust.score, 1.0);
+        assert_eq!(pack.frames[0].trust.level, "high");
+        assert_eq!(pack.frames[1].trust.score, 0.84);
+        assert_eq!(pack.frames[1].trust.level, "medium");
         assert!(!pack.frames[3].matched);
         assert!(
             pack.notes
@@ -1626,6 +1829,21 @@ mod tests {
             .expect("impact summary should build");
 
         assert_eq!(summary.tests_likely, vec!["crate::tests::covers_callee"]);
+        let test_caller = summary
+            .direct_callers
+            .iter()
+            .find(|evidence| {
+                evidence.row.symbol_qualified_name.as_deref() == Some("crate::tests::covers_callee")
+            })
+            .expect("test caller should be included");
+        assert_eq!(test_caller.trust.level, "medium");
+        assert_eq!(test_caller.trust.score, 0.74);
+        assert!(
+            summary
+                .related_files
+                .iter()
+                .all(|file| !file.trust.factors.is_empty())
+        );
         assert!(
             summary
                 .notes
@@ -1958,5 +2176,29 @@ mod tests {
                 }],
             )
             .expect("test file should persist");
+    }
+
+    fn complete_provenance() -> EvidenceProvenance {
+        EvidenceProvenance {
+            content_hash: Some("hash".to_owned()),
+            index_run_id: Some("run".to_owned()),
+            parser_version: Some("parser".to_owned()),
+            indexed_at: Some("now".to_owned()),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        }
+    }
+
+    fn partial_provenance() -> EvidenceProvenance {
+        EvidenceProvenance {
+            content_hash: Some("hash".to_owned()),
+            index_run_id: None,
+            parser_version: None,
+            indexed_at: Some("now".to_owned()),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        }
     }
 }

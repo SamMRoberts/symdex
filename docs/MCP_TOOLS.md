@@ -31,7 +31,8 @@ Successful tool call `structuredContent` uses the stable cross-agent envelope:
     "index_access": "shared_local_sqlite_and_qdrant",
     "path_policy": "repository_root_required",
     "freshness": "included_when_available",
-    "provenance": "included_when_available"
+    "provenance": "included_when_available",
+    "trust": "included_when_available"
   },
   "data": {
     "results": []
@@ -95,7 +96,8 @@ Output:
 
 The search tool embeds the query with the configured local Ollama model and
 queries the local Qdrant collection. It returns chunk metadata, freshness state,
-and provenance only; it does not return source excerpts in the current MVP.
+trust, and provenance only; it does not return source excerpts in the current
+MVP.
 
 ### `symdex_find_symbol`
 
@@ -111,8 +113,8 @@ Input:
 }
 ```
 
-Output rows include `freshness` plus `provenance` with content hash, index run
-ID, parser version, and indexed timestamp.
+Output rows include `freshness`, `trust`, and `provenance` with content hash,
+index run ID, parser version, and indexed timestamp.
 
 ### `symdex_callers`
 
@@ -127,7 +129,7 @@ Input:
 }
 ```
 
-Output rows include call confidence/resolution data, `freshness`, and
+Output rows include call confidence/resolution data, `freshness`, `trust`, and
 `provenance`.
 
 ### `symdex_callees`
@@ -143,7 +145,7 @@ Input:
 }
 ```
 
-Output rows include call confidence/resolution data, `freshness`, and
+Output rows include call confidence/resolution data, `freshness`, `trust`, and
 `provenance`.
 
 ### `symdex_call_path`
@@ -232,8 +234,9 @@ Output separates:
 - tests likely to cover the symbol
 - unresolved candidates
 
-Direct and transitive evidence rows include provenance and freshness labels.
-Related-file rows include path, relationship count, freshness, and provenance.
+Direct and transitive evidence rows include provenance, freshness labels, and
+trust scores. Related-file rows include path, relationship count, freshness,
+trust, and provenance.
 `tests_likely` contains indexed Rust test qualified names when a discovered test
 directly calls the queried symbol through resolved call evidence. When no direct
 indexed test evidence is available, the list stays empty and a note explains
@@ -343,8 +346,8 @@ Output:
 The tool parses panic/file locations, stack-frame symbols, indexed-language file
 paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
 evidence, maps failing test names to indexed Rust tests when available, keeps
-unmatched runtime test names as fallbacks, adds freshness and provenance, and
-returns source-free metadata only.
+unmatched runtime test names as fallbacks, adds freshness, trust, and
+provenance, and returns source-free metadata only.
 
 ### `symdex_index_status`
 
