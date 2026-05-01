@@ -147,7 +147,7 @@
 - [x] Source mapping API that joins runtime frames to indexed files, symbols, calls, and likely tests when available.
 - [x] Debug context pack format for reusable debugging evidence bundles.
 - [x] CLI command for building debug context packs from runtime failure input.
-- [ ] TUI debug context-pack viewer with matched frames, call paths, likely tests, provenance, and staleness.
+- [x] TUI debug context-pack viewer with matched frames, call paths, likely tests, provenance, and staleness.
 - [x] MCP tool for debug context packs with compact context-window-safe output.
 - [x] Tests for mapped frames, unmapped frames, stale frames, deleted files, and malformed stack traces.
 
