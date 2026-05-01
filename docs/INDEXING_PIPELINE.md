@@ -198,7 +198,10 @@ single suffix/name matches are `resolved_local_candidate`, multiple matches are
 `ambiguous`, and all other calls are preserved as `unresolved`. Rust resolution
 also normalizes leading `crate::`, `self::`, and `super::` prefixes and applies
 simple file-local `use` aliases such as `use crate::module::function as alias;`
-or `use crate::module as alias;` before falling back to suffix matching. Within
+or `use crate::module as alias;` before falling back to suffix matching. `self::`
+and `super::` targets in `use` declarations are interpreted from the caller
+module scope. It also handles simple one-level grouped imports such as
+`use crate::module::{function, other as alias, self as module_alias};`. Within
 Rust modules, `self::name()` and `super::name()` calls add candidates from the
 caller module and immediate parent module, so nested modules do not collapse to
 unrelated same-named root symbols. Inside Rust methods, calls through

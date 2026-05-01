@@ -65,8 +65,13 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
 
     let mut calls = Vec::new();
     for (function, symbol) in functions.iter().zip(symbols.iter()) {
-        let use_aliases =
-            collect_visible_use_aliases(file.language, function.node, tree.root_node(), source);
+        let use_aliases = collect_visible_use_aliases(
+            file.language,
+            function.node,
+            tree.root_node(),
+            source,
+            symbol,
+        );
         collect_call_edges(
             function.node,
             file.language,
@@ -717,14 +722,16 @@ fn collect_visible_use_aliases(
     function: Node<'_>,
     root: Node<'_>,
     source: &str,
+    caller: &Symbol,
 ) -> BTreeMap<String, String> {
     let mut aliases = BTreeMap::new();
     if language != Language::Rust {
         return aliases;
     }
     let scope = rust_function_module_scope(function).unwrap_or(root);
-    collect_use_aliases_from_scope(scope, source, &mut aliases);
-    collect_use_aliases_from_scope(function, source, &mut aliases);
+    let module_path = caller_module_path(caller).unwrap_or_default();
+    collect_use_aliases_from_scope(scope, source, &module_path, &mut aliases);
+    collect_use_aliases_from_scope(function, source, &module_path, &mut aliases);
     aliases
 }
 
@@ -742,12 +749,13 @@ fn rust_function_module_scope(function: Node<'_>) -> Option<Node<'_>> {
 fn collect_use_aliases_from_scope(
     node: Node<'_>,
     source: &str,
+    module_path: &str,
     aliases: &mut BTreeMap<String, String>,
 ) {
     if node.kind() == "use_declaration"
         && let Some(text) = node_text(node, source)
     {
-        for (alias, target) in parse_rust_use_declaration(text) {
+        for (alias, target) in parse_rust_use_declaration(text, module_path) {
             aliases.insert(alias, target);
         }
     }
@@ -759,17 +767,20 @@ fn collect_use_aliases_from_scope(
         {
             continue;
         }
-        collect_use_aliases_from_scope(child, source, aliases);
+        collect_use_aliases_from_scope(child, source, module_path, aliases);
     }
 }
 
-fn parse_rust_use_declaration(text: &str) -> Vec<(String, String)> {
+fn parse_rust_use_declaration(text: &str, module_path: &str) -> Vec<(String, String)> {
     let Some(path) = text.trim().strip_prefix("use ") else {
         return Vec::new();
     };
     let path = path.trim_end_matches(';').trim();
-    if path.contains('{') || path.contains('*') || path.is_empty() {
+    if path.contains('*') || path.is_empty() {
         return Vec::new();
+    }
+    if path.contains('{') || path.contains('}') {
+        return parse_grouped_rust_use_declaration(path, module_path);
     }
     let (target, alias) = if let Some((target, alias)) = path.rsplit_once(" as ") {
         (clean_expression_text(target), clean_expression_text(alias))
@@ -780,11 +791,130 @@ fn parse_rust_use_declaration(text: &str) -> Vec<(String, String)> {
         };
         (path.clone(), alias.to_owned())
     };
-    let target = normalize_rust_path(target.trim_end_matches("::"));
+    let target = normalize_rust_use_target(target.trim_end_matches("::"), module_path);
     if target.is_empty() || alias.is_empty() {
         Vec::new()
     } else {
         vec![(alias, target)]
+    }
+}
+
+fn parse_grouped_rust_use_declaration(path: &str, module_path: &str) -> Vec<(String, String)> {
+    let Some(open) = path.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = path.rfind('}') else {
+        return Vec::new();
+    };
+    if close <= open || path[open + 1..close].contains('{') || path[close + 1..].contains('}') {
+        return Vec::new();
+    }
+
+    let prefix = clean_expression_text(&path[..open])
+        .trim_end_matches("::")
+        .to_owned();
+    let entries = split_rust_use_group_entries(&path[open + 1..close]);
+    entries
+        .into_iter()
+        .filter_map(|entry| parse_rust_use_group_entry(&prefix, entry, module_path))
+        .collect()
+}
+
+fn split_rust_use_group_entries(group: &str) -> Vec<&str> {
+    group
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn parse_rust_use_group_entry(
+    prefix: &str,
+    entry: &str,
+    module_path: &str,
+) -> Option<(String, String)> {
+    if entry.contains('{') || entry.contains('}') || entry.contains('*') {
+        return None;
+    }
+    let (entry_target, alias) = if let Some((target, alias)) = entry.rsplit_once(" as ") {
+        (clean_expression_text(target), clean_expression_text(alias))
+    } else {
+        let target = clean_expression_text(entry);
+        let alias = if target == "self" {
+            prefix
+                .rsplit("::")
+                .find(|part| !part.is_empty())?
+                .to_owned()
+        } else {
+            target
+                .rsplit("::")
+                .find(|part| !part.is_empty())?
+                .to_owned()
+        };
+        (target, alias)
+    };
+    if alias.is_empty() {
+        return None;
+    }
+
+    let target = if entry_target == "self" {
+        normalize_rust_use_target(prefix, module_path)
+    } else {
+        normalize_rust_use_target(&join_rust_use_path(prefix, &entry_target), module_path)
+    };
+    if target.is_empty() {
+        None
+    } else {
+        Some((alias, target))
+    }
+}
+
+fn join_rust_use_path(prefix: &str, entry: &str) -> String {
+    let prefix = prefix.trim_end_matches("::");
+    let entry = entry.trim_start_matches("::");
+    if prefix.is_empty() {
+        entry.to_owned()
+    } else if entry.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}::{entry}")
+    }
+}
+
+fn normalize_rust_use_target(path: &str, module_path: &str) -> String {
+    let path = clean_expression_text(path);
+    if let Some(tail) = path.strip_prefix("crate::") {
+        return normalize_rust_path(tail);
+    }
+    if path == "crate" {
+        return String::new();
+    }
+
+    let mut remainder = path.as_str();
+    let mut module = module_path.to_owned();
+    loop {
+        if let Some(tail) = remainder.strip_prefix("self::") {
+            remainder = tail;
+        } else if remainder == "self" {
+            return module;
+        } else if let Some(tail) = remainder.strip_prefix("super::") {
+            let Some(parent) = module_super_path(&module) else {
+                return String::new();
+            };
+            module = parent;
+            remainder = tail;
+        } else if remainder == "super" {
+            return module_super_path(&module).unwrap_or_default();
+        } else {
+            break;
+        }
+    }
+
+    let tail = normalize_rust_path(remainder);
+    if path.starts_with("self::") || path.starts_with("super::") {
+        join_module_path(&module, &tail).unwrap_or_default()
+    } else {
+        tail
     }
 }
 
@@ -1508,6 +1638,68 @@ pub fn caller() {
         let index = index_rust_file(&file(), source).expect("index should parse");
 
         for callee_text in ["crate::inner::helper", "run_helper", "aliased_inner::other"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+        }
+    }
+
+    #[test]
+    fn resolves_rust_calls_through_grouped_use_aliases() {
+        let source = r#"mod inner {
+    pub fn helper() {}
+    pub fn other() {}
+}
+
+use crate::inner::{helper, other as renamed_other, self as inner_mod};
+
+pub fn caller() {
+    helper();
+    renamed_other();
+    inner_mod::other();
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["helper", "renamed_other", "inner_mod::other"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+        }
+    }
+
+    #[test]
+    fn resolves_rust_module_relative_use_aliases_from_caller_scope() {
+        let source = r#"mod outer {
+    mod inner {
+        pub fn helper() {}
+        pub fn other() {}
+    }
+
+    mod child {
+        use super::inner::{helper, other as renamed_other, self as inner_mod};
+
+        pub fn caller() {
+            helper();
+            renamed_other();
+            inner_mod::other();
+        }
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["helper", "renamed_other", "inner_mod::other"] {
             let call = index
                 .calls
                 .iter()
