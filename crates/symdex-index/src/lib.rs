@@ -928,6 +928,10 @@ fn resolve_cross_file_rust_callee(
         _ => return Some((None, ResolutionStatus::Ambiguous, 0.2)),
     }
 
+    if cross_file_requires_exact_rust_resolution(callee_text, caller) {
+        return Some((None, ResolutionStatus::Unresolved, 0.25));
+    }
+
     let suffix_matches = symbols
         .iter()
         .filter(|symbol| {
@@ -952,20 +956,47 @@ fn cross_file_rust_callee_candidates(
     caller: Option<&ResolutionSymbol>,
 ) -> BTreeSet<String> {
     let normalized = normalize_rust_module_path(callee_text);
-    if normalized.is_empty() || !normalized.contains("::") || normalized.ends_with('!') {
+    if normalized.is_empty() || normalized.ends_with('!') {
         return BTreeSet::new();
     }
 
-    let mut candidates = BTreeSet::from([callee_text.to_owned()]);
+    let module_scoped_candidate =
+        caller.and_then(|caller| cross_file_module_scoped_path_candidate(callee_text, caller));
+    let module_unqualified_candidate =
+        caller.and_then(|caller| cross_file_module_unqualified_path_candidate(callee_text, caller));
     let module_candidates = caller
         .into_iter()
         .flat_map(|caller| cross_file_module_relative_candidates(callee_text, caller))
         .collect::<Vec<_>>();
-    if module_candidates.is_empty() || !is_cross_file_module_relative_path(callee_text) {
+    let suppress_plain_candidate = module_scoped_candidate.is_some()
+        || module_unqualified_candidate.is_some()
+        || (!module_candidates.is_empty() && is_cross_file_module_relative_path(callee_text));
+
+    let mut candidates = BTreeSet::new();
+    if !suppress_plain_candidate && normalized.contains("::") {
+        candidates.insert(callee_text.to_owned());
         candidates.insert(normalized);
     }
     candidates.extend(module_candidates);
+    if let Some(module_scoped_candidate) = module_scoped_candidate {
+        candidates.insert(module_scoped_candidate);
+    }
+    if let Some(module_unqualified_candidate) = module_unqualified_candidate {
+        candidates.insert(module_unqualified_candidate);
+    }
     candidates
+}
+
+fn cross_file_requires_exact_rust_resolution(
+    callee_text: &str,
+    caller: Option<&ResolutionSymbol>,
+) -> bool {
+    let Some(caller) = caller else {
+        return false;
+    };
+    !cross_file_module_relative_candidates(callee_text, caller).is_empty()
+        || cross_file_module_scoped_path_candidate(callee_text, caller).is_some()
+        || cross_file_module_unqualified_path_candidate(callee_text, caller).is_some()
 }
 
 fn is_cross_file_module_relative_path(callee_text: &str) -> bool {
@@ -992,6 +1023,35 @@ fn cross_file_module_relative_candidates(
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn cross_file_module_scoped_path_candidate(
+    callee_text: &str,
+    caller: &ResolutionSymbol,
+) -> Option<String> {
+    let (head, _) = callee_text.split_once("::")?;
+    if matches!(head, "crate" | "self" | "super" | "Self") {
+        return None;
+    }
+    let module_path = caller.module_path()?;
+    if module_path.is_empty() {
+        return None;
+    }
+    join_cross_file_module_path(&module_path, callee_text)
+}
+
+fn cross_file_module_unqualified_path_candidate(
+    callee_text: &str,
+    caller: &ResolutionSymbol,
+) -> Option<String> {
+    if callee_text.contains("::") || callee_text.contains('.') || callee_text.ends_with('!') {
+        return None;
+    }
+    let module_path = caller.module_path()?;
+    if module_path.is_empty() {
+        return None;
+    }
+    join_cross_file_module_path(&module_path, callee_text)
 }
 
 fn cross_file_module_super_path(module_path: &str) -> Option<String> {
@@ -1775,6 +1835,86 @@ mod tests {
         assert_eq!(
             call.callee_symbol_id.as_deref(),
             Some(persisted_helper.id.as_str())
+        );
+        assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+    }
+
+    #[test]
+    fn resolves_cross_file_unqualified_rust_calls_from_caller_module() {
+        let mut outer_caller = sample_symbol("caller");
+        outer_caller.id = stable_id(&["symbol", "outer::caller"]);
+        outer_caller.qualified_name = "outer::caller".to_owned();
+        let mut sibling_caller = sample_symbol("caller");
+        sibling_caller.id = stable_id(&["symbol", "sibling::caller"]);
+        sibling_caller.qualified_name = "sibling::caller".to_owned();
+        let mut outer_call = sample_unresolved_call("outer::caller", "helper");
+        outer_call.caller_symbol_id = outer_caller.id.clone();
+        let mut sibling_call = sample_unresolved_call("sibling::caller", "helper");
+        sibling_call.caller_symbol_id = sibling_caller.id.clone();
+        let mut collection = collection_with_reports(vec![IndexReport {
+            file: FileFacts {
+                id: "file-callers".to_owned(),
+                relative_path: "src/callers.rs".to_owned(),
+                language: Language::Rust,
+                content_hash: content_hash(b"callers"),
+            },
+            chunks: Vec::new(),
+            symbols: vec![outer_caller, sibling_caller],
+            calls: vec![outer_call, sibling_call],
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: String::new(),
+        }]);
+        let outer_helper = sample_symbol_record("outer::helper", "file-outer-helper");
+        let root_helper = sample_symbol_record("helper", "file-root-helper");
+
+        resolve_cross_file_rust_calls(&mut collection, &[outer_helper.clone(), root_helper]);
+
+        let outer_call = &collection.reports[0].calls[0];
+        assert_eq!(
+            outer_call.callee_symbol_id.as_deref(),
+            Some(outer_helper.id.as_str())
+        );
+        assert_eq!(
+            outer_call.resolution_status,
+            ResolutionStatus::ResolvedExact
+        );
+
+        let sibling_call = &collection.reports[0].calls[1];
+        assert!(sibling_call.callee_symbol_id.is_none());
+        assert_eq!(sibling_call.resolution_status, ResolutionStatus::Unresolved);
+    }
+
+    #[test]
+    fn resolves_cross_file_scoped_rust_calls_from_caller_module() {
+        let mut caller = sample_symbol("caller");
+        caller.id = stable_id(&["symbol", "outer::caller"]);
+        caller.qualified_name = "outer::caller".to_owned();
+        let mut call = sample_unresolved_call("outer::caller", "Worker::run");
+        call.caller_symbol_id = caller.id.clone();
+        let mut collection = collection_with_reports(vec![IndexReport {
+            file: FileFacts {
+                id: "file-caller".to_owned(),
+                relative_path: "src/caller.rs".to_owned(),
+                language: Language::Rust,
+                content_hash: content_hash(b"caller"),
+            },
+            chunks: Vec::new(),
+            symbols: vec![caller],
+            calls: vec![call],
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: String::new(),
+        }]);
+        let outer_run = sample_symbol_record("outer::Worker::run", "file-outer-worker");
+        let root_run = sample_symbol_record("Worker::run", "file-root-worker");
+
+        resolve_cross_file_rust_calls(&mut collection, &[outer_run.clone(), root_run]);
+
+        let call = &collection.reports[0].calls[0];
+        assert_eq!(
+            call.callee_symbol_id.as_deref(),
+            Some(outer_run.id.as_str())
         );
         assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
     }
