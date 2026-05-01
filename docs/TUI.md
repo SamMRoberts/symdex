@@ -87,12 +87,19 @@ terminal panes.
   borders that waste terminal space.
 - Preserve compact evidence density. Styling should improve scanning, not turn
   the app into a sparse dashboard.
+- Selectable tables must render from the full result set rather than a fixed
+  row cap. Each table pane should use the available pane height and rely on
+  stateful table selection to scroll independently when the selected row moves
+  beyond the currently visible viewport.
 
 ### Interaction Feedback
 
 - Highlight the active tab and focused input/list row.
 - Use `Up` and `Down` to move the selected evidence row in completed diagnostic,
   storage, query, call graph, impact, context-pack, and debug-context tables.
+- Completed table views must allow `Up` and `Down` to reach every row returned
+  by the backing query or summary, even when the terminal cannot display all
+  rows at once.
 - In the Storage view, row selection should drive a visible detail panel for
   the selected SQLite/Qdrant metric and nearby storage health notes.
 - In the Storage view, always show a self-contained storage tab header above
@@ -175,7 +182,8 @@ represent the indexed repository.
 
 ### Evidence Freshness View
 
-- Compare indexed file content hashes with the current eligible Rust files.
+- Compare indexed file content hashes with the current eligible files for
+  implemented languages.
 - Show fresh, stale, deleted, missing, and unknown labels with selected-row
   provenance details.
 - Include content hash, index run ID, parser version, and indexed timestamp

@@ -19,6 +19,9 @@ tests/fixtures/
   rust_calls/
   rust_ignore/
   rust_secrets/
+  csharp_basic/
+  javascript_basic/
+  typescript_basic/
 ```
 
 Fixtures should be tiny and purpose-built.
@@ -43,6 +46,8 @@ Fixtures should be tiny and purpose-built.
 - TUI navigation and confirmation flows
 - TUI loading, empty, and error states
 - TUI render snapshots or buffer assertions for key screens
+- TUI selectable table panes render from full result sets and scroll selected
+  rows beyond the initially visible viewport.
 - TUI storage visualization state and render coverage for SQLite/Qdrant
   metadata, selected-row drill-down, empty stores, missing vectors, excluded
   chunks, and model/dimension drift
@@ -68,8 +73,9 @@ indexing should use mocked adapters or the existing opt-in local service test
 flags.
 
 Current continuous indexing tests cover snapshot diff coalescing, created-file
-and modified-file detection, ignored path skips, non-Rust path skips, and
-unchanged-content skips. TUI state/render tests cover continuous-indexing
+and modified-file detection, ignored path skips, unsupported-language path
+skips, and unchanged-content skips. TUI state/render tests cover
+continuous-indexing
 toggle confirmation, stopping an active watcher, pending debounce display,
 queued event count, and latest error rendering.
 
@@ -90,6 +96,11 @@ SYMDEX_TEST_QDRANT=1 cargo test -p symdex-store qdrant
 SYMDEX_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
 ```
 
+Current multi-language tests cover discovery, parser dispatch, syntax-aware
+chunking, symbol extraction, conservative call extraction, runtime path parsing,
+and continuous-indexing snapshots for C#, JavaScript, and TypeScript. Broaden
+these fixture-backed tests when adding deeper language-specific behavior.
+
 Future TUI checks:
 
 ```bash
@@ -102,7 +113,8 @@ workbench rendering and input state, symbol/call graph rendering and input
 state, impact/call-path/context-pack/debug-context rendering and input state, the storage explorer
 metric table, always-visible nested storage tab header, and detail panel,
 index coverage table and selected-file detail panel with chunk, symbol, and
-call metadata, symbol outline table and
+call metadata, query and storage table scrolling beyond the initially visible
+rows, symbol outline table and
 selected-symbol detail panel, call resolution bucket table and selected-bucket
 detail panel, embedding coverage table and selected-metric detail panel with
 exclusion-reason and health summaries, index runs timeline table and

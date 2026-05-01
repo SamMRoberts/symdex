@@ -29,6 +29,22 @@ Respect:
 
 Never follow symlinks outside the repository root.
 
+Active language targets:
+
+| Language | Extensions | Parser target | Language slug |
+|---|---|---|---|
+| Rust | `.rs` | `tree-sitter-rust` | `rust` |
+| C# | `.cs` | `tree-sitter-c-sharp` | `csharp` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | `tree-sitter-javascript` | `javascript` |
+| TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | `tree-sitter-typescript` | `typescript` |
+
+Rust, C#, JavaScript, and TypeScript are implemented language targets. C#, JS,
+and TS support starts conservatively with syntax-aware function/method chunks,
+symbols, and call-like references; it does not claim whole-language type
+inference. Future languages must be added through the same discovery, parsing,
+chunking, symbol, call, hashing, secret-detection, embedding, SQLite, Qdrant,
+manual indexing, and continuous indexing contracts.
+
 Current implementation applies built-in directory excludes and simple scoped
 `.gitignore` rules from the repository root and nested directories. Literal
 file paths, directory suffix rules, and basename rules are supported. Glob
@@ -168,10 +184,10 @@ from degrading into broad table scans as repositories grow.
 Continuous indexing is a local watch mode layered on top of incremental
 indexing. It can be toggled on or off and is off by default.
 
-Current implementation uses a polling watcher: it discovers eligible Rust files
-at a fixed interval, compares path-to-content-hash snapshots, debounces detected
-changes, and runs an incremental index batch when created, modified, or deleted
-paths are found.
+Current implementation uses a polling watcher: it discovers eligible Rust, C#,
+JavaScript, and TypeScript files at a fixed interval, compares
+path-to-content-hash snapshots, debounces detected changes, and runs an
+incremental index batch when created, modified, or deleted paths are found.
 
 When enabled:
 

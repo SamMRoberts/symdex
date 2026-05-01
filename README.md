@@ -49,9 +49,9 @@ cargo run -p symdex-cli -- serve-mcp
 ```
 
 `index --watch <repo>` runs continuous indexing for created or modified eligible
-Rust files. It uses polling, debounce, content hashes, and the same ignore and
-path-boundary rules as manual indexing. Stop the non-interactive watch process
-with `Ctrl+C`.
+Rust, C#, JavaScript, and TypeScript files. It uses polling, debounce, content
+hashes, and the same ignore and path-boundary rules as manual indexing. Stop the
+non-interactive watch process with `Ctrl+C`.
 
 ## TUI
 

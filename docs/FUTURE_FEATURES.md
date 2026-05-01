@@ -128,6 +128,19 @@ Requirements:
 - Avoid automatic destructive cleanup; stale evidence warnings should guide
   reindexing or continuous indexing.
 
+### Languages After Active Targets
+
+Languages beyond Rust, C#, JavaScript, and TypeScript should wait until the
+active target set is reliable.
+
+Requirements:
+
+- Add each future language through the same parser/chunker/symbol/call/indexing
+  contracts rather than one-off query paths.
+- Preserve local-only privacy, deterministic IDs, provenance, staleness, secret
+  filtering, and metadata-only evidence outputs.
+- Add fixture-backed tests before marking a future language supported.
+
 ## Non-Goals
 
 - No web UI.

@@ -31,11 +31,16 @@ Pure domain logic:
 - syntax-aware chunking
 - symbol extraction
 - call extraction
+- language-agnostic parser/chunker interfaces with per-language tree-sitter
+  adapters hidden behind core domain types
 - indexing plans and domain types
 - shared evidence contract schema/version constants used by CLI, TUI,
   diagnostics, and MCP
 
 This crate should not depend on Qdrant, Ollama, MCP, or CLI frameworks.
+Per-language parser details must not leak into CLI, TUI, MCP, store, Qdrant, or
+Ollama layers. Those layers should consume stable language slugs, parser
+versions, chunks, symbols, calls, and provenance metadata.
 
 ### `symdex-store`
 

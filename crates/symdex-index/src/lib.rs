@@ -1,13 +1,13 @@
 //! Indexing orchestration shared by the CLI and TUI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::thread;
 use std::time::Duration;
 
 use symdex_core::{
-    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, RUST_PARSER_VERSION, RepoRoot, Symbol,
-    discover_rust_files, index_rust_file,
+    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, Symbol, discover_indexable_files,
+    index_source_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
@@ -262,7 +262,7 @@ pub fn run_continuous_index_until(
 }
 
 pub fn watch_snapshot(root: &RepoRoot) -> Result<WatchSnapshot, String> {
-    let files = discover_rust_files(root, &DiscoveryOptions::default())
+    let files = discover_indexable_files(root, &DiscoveryOptions::default())
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|file| (file.facts.relative_path, file.facts.content_hash))
@@ -379,7 +379,7 @@ fn run_index_internal(
                 files_indexed: collection.reports.len(),
                 chunks_embedded: 0,
                 error_summary: None,
-                parser_version: RUST_PARSER_VERSION.to_owned(),
+                parser_version: parser_version_summary(&collection),
                 indexer_version: env!("CARGO_PKG_VERSION").to_owned(),
                 run_kind: run_kind.to_owned(),
             })
@@ -419,13 +419,13 @@ fn collect_index_reports(
     sqlite: Option<&SqliteStore>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<IndexCollection, String> {
-    let files = discover_rust_files(root, &DiscoveryOptions::default())
+    let files = discover_indexable_files(root, &DiscoveryOptions::default())
         .map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
         "discover",
         0,
         files.len(),
-        format!("Discovered {} Rust files", files.len()),
+        format!("Discovered {} indexable files", files.len()),
     ));
 
     let mut reports = Vec::new();
@@ -453,7 +453,7 @@ fn collect_index_reports(
         let source = fs::read_to_string(&file.absolute_path)
             .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
         let file_index =
-            index_rust_file(&file.facts, &source).map_err(|error| error.to_string())?;
+            index_source_file(&file.facts, &source).map_err(|error| error.to_string())?;
         reports.push(IndexReport {
             file: file.facts.clone(),
             chunks: file_index.chunks,
@@ -471,6 +471,10 @@ fn collect_index_reports(
     Ok(IndexCollection {
         files_seen: files.len(),
         files_skipped_unchanged,
+        parser_versions: files
+            .iter()
+            .map(|file| file.facts.language.parser_version().to_owned())
+            .collect(),
         active_paths: files
             .iter()
             .map(|file| file.facts.relative_path.clone())
@@ -519,22 +523,24 @@ fn persist_structural_index(
             language: report.file.language.as_str().to_owned(),
             content_hash: report.file.content_hash.clone(),
             index_run_id: index_run_id.to_owned(),
-            parser_version: RUST_PARSER_VERSION.to_owned(),
+            parser_version: report.file.language.parser_version().to_owned(),
         };
         let chunks = report
             .chunks
             .iter()
-            .map(|chunk| chunk_record(chunk, index_run_id))
+            .map(|chunk| chunk_record(chunk, index_run_id, report.file.language.parser_version()))
             .collect::<Result<Vec<_>, _>>()?;
         let symbols = report
             .symbols
             .iter()
-            .map(|symbol| symbol_record(symbol, index_run_id))
+            .map(|symbol| {
+                symbol_record(symbol, index_run_id, report.file.language.parser_version())
+            })
             .collect::<Vec<_>>();
         let calls = report
             .calls
             .iter()
-            .map(|call| call_record(call, index_run_id))
+            .map(|call| call_record(call, index_run_id, report.file.language.parser_version()))
             .collect::<Vec<_>>();
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
@@ -688,7 +694,7 @@ fn persist_semantic_index(
             files_indexed: collection.reports.len(),
             chunks_embedded: points.len(),
             error_summary: None,
-            parser_version: RUST_PARSER_VERSION.to_owned(),
+            parser_version: parser_version_summary(collection),
             indexer_version: env!("CARGO_PKG_VERSION").to_owned(),
             run_kind: run_kind.to_owned(),
         })
@@ -742,7 +748,7 @@ fn vector_point(
             start_line: chunk.chunk.line_range.start,
             end_line: chunk.chunk.line_range.end,
             text_hash: chunk.chunk.text_hash.clone(),
-            parser_version: Some(RUST_PARSER_VERSION.to_owned()),
+            parser_version: Some(chunk.file.language.parser_version().to_owned()),
             content_hash: Some(chunk.file.content_hash.clone()),
             index_run_id: Some(index_run_id.to_owned()),
             embedding_model: Some(embedding_model.to_owned()),
@@ -752,7 +758,11 @@ fn vector_point(
     })
 }
 
-fn chunk_record(chunk: &CodeChunk, index_run_id: &str) -> Result<ChunkRecord, String> {
+fn chunk_record(
+    chunk: &CodeChunk,
+    index_run_id: &str,
+    parser_version: &str,
+) -> Result<ChunkRecord, String> {
     Ok(ChunkRecord {
         id: chunk.id.clone(),
         file_id: chunk.file_id.clone(),
@@ -770,14 +780,14 @@ fn chunk_record(chunk: &CodeChunk, index_run_id: &str) -> Result<ChunkRecord, St
         },
         excluded_reason: chunk.excluded_reason.clone(),
         index_run_id: index_run_id.to_owned(),
-        parser_version: RUST_PARSER_VERSION.to_owned(),
+        parser_version: parser_version.to_owned(),
         embedding_model: None,
         embedding_dimension: None,
         embedded_at: None,
     })
 }
 
-fn symbol_record(symbol: &Symbol, index_run_id: &str) -> SymbolRecord {
+fn symbol_record(symbol: &Symbol, index_run_id: &str, parser_version: &str) -> SymbolRecord {
     SymbolRecord {
         id: symbol.id.clone(),
         file_id: symbol.file_id.clone(),
@@ -791,11 +801,11 @@ fn symbol_record(symbol: &Symbol, index_run_id: &str) -> SymbolRecord {
         start_byte: symbol.byte_range.start,
         end_byte: symbol.byte_range.end,
         index_run_id: index_run_id.to_owned(),
-        parser_version: RUST_PARSER_VERSION.to_owned(),
+        parser_version: parser_version.to_owned(),
     }
 }
 
-fn call_record(call: &CallEdge, index_run_id: &str) -> CallRecord {
+fn call_record(call: &CallEdge, index_run_id: &str, parser_version: &str) -> CallRecord {
     CallRecord {
         id: call.id.clone(),
         caller_symbol_id: call.caller_symbol_id.clone(),
@@ -805,13 +815,26 @@ fn call_record(call: &CallEdge, index_run_id: &str) -> CallRecord {
         confidence: call.confidence,
         resolution_status: call.resolution_status.as_str().to_owned(),
         index_run_id: index_run_id.to_owned(),
-        parser_version: RUST_PARSER_VERSION.to_owned(),
+        parser_version: parser_version.to_owned(),
     }
+}
+
+fn parser_version_summary(collection: &IndexCollection) -> String {
+    if collection.parser_versions.is_empty() {
+        return "none".to_owned();
+    }
+    collection
+        .parser_versions
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 struct IndexCollection {
     files_seen: usize,
     files_skipped_unchanged: usize,
+    parser_versions: BTreeSet<String>,
     active_paths: Vec<String>,
     reports: Vec<IndexReport>,
 }
@@ -866,8 +889,10 @@ mod tests {
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk.id, public.id);
-        let public_record = chunk_record(&public, "run").expect("public record");
-        let secret_record = chunk_record(&secret, "run").expect("secret record");
+        let public_record =
+            chunk_record(&public, "run", Language::Rust.parser_version()).expect("public record");
+        let secret_record =
+            chunk_record(&secret, "run", Language::Rust.parser_version()).expect("secret record");
         assert!(public_record.qdrant_point_id.is_some());
         assert!(secret_record.qdrant_point_id.is_none());
         assert_eq!(
@@ -906,24 +931,27 @@ mod tests {
     }
 
     #[test]
-    fn detect_watch_changes_reports_created_and_modified_rust_files() {
+    fn detect_watch_changes_reports_created_and_modified_indexable_files() {
         let repo = TestRepo::new("watch-created-modified");
         repo.write("src/lib.rs", "pub fn old() {}\n");
+        repo.write("web/app.js", "function app() {}\n");
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
         let snapshot = watch_snapshot(&root).expect("snapshot should load");
 
         repo.write("src/lib.rs", "pub fn new_name() {}\n");
-        repo.write("src/created.rs", "pub fn created() {}\n");
+        repo.write("src/created.cs", "class Created { void Run() {} }\n");
+        repo.write("web/app.js", "function changed() {}\n");
+        repo.write("web/util.ts", "export function util(): void {}\n");
         let (_next, changes) =
             detect_watch_changes(&root, &snapshot).expect("changes should detect");
 
-        assert_eq!(changes.created, vec!["src/created.rs"]);
-        assert_eq!(changes.modified, vec!["src/lib.rs"]);
+        assert_eq!(changes.created, vec!["src/created.cs", "web/util.ts"]);
+        assert_eq!(changes.modified, vec!["src/lib.rs", "web/app.js"]);
         assert!(changes.deleted.is_empty());
     }
 
     #[test]
-    fn detect_watch_changes_skips_ignored_non_rust_and_unchanged_files() {
+    fn detect_watch_changes_skips_ignored_unsupported_and_unchanged_files() {
         let repo = TestRepo::new("watch-ignored-unchanged");
         repo.write(".gitignore", "ignored.rs\nignored_dir/\n");
         repo.write("src/lib.rs", "pub fn lib() {}\n");

@@ -96,8 +96,10 @@ Current implementation status:
 - Unit test event coalescing and debounce behavior with synthetic paths.
 - Unit test that ignored paths, symlink escapes, and out-of-root paths do not
   schedule reindex work.
-- Integration test that a created Rust file is indexed in continuous mode.
-- Integration test that a modified Rust file replaces stale SQLite facts.
+- Integration test that a created eligible implemented-language file is indexed
+  in continuous mode.
+- Integration test that a modified eligible implemented-language file replaces
+  stale SQLite facts.
 - Integration test that unchanged content after a filesystem event is skipped.
 - Test offline continuous indexing without Qdrant or Ollama.
 - Test semantic continuous indexing with mocked or opt-in local Ollama/Qdrant.

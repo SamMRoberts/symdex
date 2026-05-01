@@ -72,6 +72,11 @@ CREATE TABLE files (
 );
 ```
 
+`language` stores a stable language slug such as `rust`, `csharp`,
+`javascript`, or `typescript`. The schema is intentionally language-neutral; no
+table change is required when adding C#, JavaScript, TypeScript, or future
+languages that follow the same evidence contracts.
+
 ### `symbols`
 
 ```sql
@@ -139,6 +144,8 @@ Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
 files, chunks, symbols, and calls. Semantic indexing also fills chunk embedding
 model, dimension, and embedding timestamp metadata after vector upsert.
+`parser_version` must include the per-language parser identity and symdex
+indexer/chunker version so mixed-language indexes remain auditable.
 
 ## Qdrant collection
 

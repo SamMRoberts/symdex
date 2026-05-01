@@ -301,7 +301,7 @@ impl App {
                     Span::raw(" Enable continuous semantic indexing?"),
                 ]));
                 lines.push(Line::from(
-                    "The TUI will watch changed Rust files until toggled off.",
+                    "The TUI will watch changed indexable files until toggled off.",
                 ));
                 lines.push(Line::from("Press y to start, n or Esc to cancel."));
             }
@@ -1481,7 +1481,7 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     area,
                     call_graph_table(summary),
                     app.graph.selection,
-                    summary.rows.len().min(12),
+                    summary.rows.len(),
                 );
             }
             _ => render_line_panel(frame, area, "Symbol/Call Graph", app.graph_lines()),
@@ -2909,7 +2909,7 @@ fn storage_health_tone(status: StorageHealthStatus) -> StatusTone {
 }
 
 fn coverage_table(summary: &IndexCoverageSummary) -> Table<'_> {
-    let rows = summary.files.iter().take(12).map(|file| {
+    let rows = summary.files.iter().map(|file| {
         let (label, tone) = file_coverage_status(file.status);
         Row::new(vec![
             Cell::from(file.path.as_str()),
@@ -3006,7 +3006,7 @@ fn coverage_detail_panel(summary: &IndexCoverageSummary, selection: usize) -> Pa
 }
 
 fn coverage_row_count(summary: &IndexCoverageSummary) -> usize {
-    summary.files.len().min(12)
+    summary.files.len()
 }
 
 fn selected_coverage_row(
@@ -3120,7 +3120,7 @@ fn chunk_vector_status(status: ChunkVectorStatus) -> (&'static str, StatusTone) 
 }
 
 fn outline_table(summary: &SymbolOutlineSummary) -> Table<'_> {
-    let rows = summary.symbols.iter().take(12).map(|symbol| {
+    let rows = summary.symbols.iter().map(|symbol| {
         Row::new(vec![
             Cell::from(outline_symbol_label(symbol)),
             Cell::from(symbol.kind.as_str()),
@@ -3193,7 +3193,7 @@ fn outline_detail_panel(summary: &SymbolOutlineSummary, selection: usize) -> Par
 }
 
 fn outline_row_count(summary: &SymbolOutlineSummary) -> usize {
-    summary.symbols.len().min(12)
+    summary.symbols.len()
 }
 
 fn selected_outline_row(
@@ -3211,7 +3211,7 @@ fn outline_symbol_label(symbol: &symdex_store::SymbolOutlineRow) -> String {
 }
 
 fn call_resolution_table(summary: &CallResolutionSummary) -> Table<'_> {
-    let rows = summary.buckets.iter().take(12).map(|bucket| {
+    let rows = summary.buckets.iter().map(|bucket| {
         let tone =
             call_resolution_tone(bucket.resolution_status.as_str(), bucket.confidence_bucket);
         Row::new(vec![
@@ -3305,7 +3305,7 @@ fn call_resolution_detail_panel(
 }
 
 fn call_resolution_row_count(summary: &CallResolutionSummary) -> usize {
-    summary.buckets.len().min(12)
+    summary.buckets.len()
 }
 
 fn selected_call_resolution_bucket(
@@ -3523,7 +3523,7 @@ fn embedding_health_summary(summary: &EmbeddingCoverageSummary) -> String {
 }
 
 fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
-    let rows = summary.runs.iter().take(12).map(|run| {
+    let rows = summary.runs.iter().map(|run| {
         let tone = index_run_status_tone(run.status.as_str());
         Row::new(vec![
             Cell::from(run.started_at.as_str()),
@@ -3621,11 +3621,11 @@ fn index_runs_timeline_detail_panel(
 }
 
 fn index_runs_timeline_row_count(summary: &IndexRunsTimelineSummary) -> usize {
-    summary.runs.len().min(12)
+    summary.runs.len()
 }
 
 fn freshness_table(summary: &FreshnessSummary) -> Table<'_> {
-    let rows = summary.files.iter().take(12).map(|file| {
+    let rows = summary.files.iter().map(|file| {
         let tone = freshness_tone(file.freshness);
         Row::new(vec![
             Cell::from(file.path.as_str()),
@@ -3713,7 +3713,7 @@ fn freshness_detail_panel(summary: &FreshnessSummary, selection: usize) -> Parag
 }
 
 fn freshness_row_count(summary: &FreshnessSummary) -> usize {
-    summary.files.len().min(12)
+    summary.files.len()
 }
 
 fn freshness_tone(freshness: EvidenceFreshness) -> StatusTone {
@@ -3744,7 +3744,7 @@ fn index_run_status_tone(status: &str) -> StatusTone {
 }
 
 fn semantic_neighborhood_table(summary: &SemanticNeighborhoodSummary) -> Table<'_> {
-    let rows = summary.rows.iter().take(12).map(|row| {
+    let rows = summary.rows.iter().map(|row| {
         Row::new(vec![
             Cell::from(row.path.as_str()),
             Cell::from(line_range(row.start_line, row.end_line)),
@@ -3837,7 +3837,7 @@ fn semantic_neighborhood_detail_panel(
 }
 
 fn semantic_neighborhood_row_count(summary: &SemanticNeighborhoodSummary) -> usize {
-    summary.rows.len().min(12)
+    summary.rows.len()
 }
 
 fn selected_semantic_neighborhood_row(
@@ -3870,7 +3870,7 @@ fn short_hash(text_hash: &str) -> String {
 }
 
 fn cross_store_health_table(summary: &CrossStoreHealthSummary) -> Table<'_> {
-    let rows = summary.rows.iter().take(12).map(|row| {
+    let rows = summary.rows.iter().map(|row| {
         let tone = storage_health_tone(row.status);
         Row::new(vec![
             Cell::from(status_span(row.label.as_str(), tone)),
@@ -3940,7 +3940,7 @@ fn cross_store_health_detail_panel(
 }
 
 fn cross_store_health_row_count(summary: &CrossStoreHealthSummary) -> usize {
-    summary.rows.len().min(12)
+    summary.rows.len()
 }
 
 fn selected_cross_store_health_row(
@@ -4042,7 +4042,7 @@ fn query_table(result: &QueryResult) -> Table<'_> {
 }
 
 fn symbol_table(summary: &SymbolSearchSummary) -> Table<'_> {
-    let rows = summary.symbols.iter().take(12).map(|symbol| {
+    let rows = summary.symbols.iter().map(|symbol| {
         Row::new(vec![
             Cell::from(symbol.kind.as_str()),
             Cell::from(symbol.qualified_name.as_str()),
@@ -4069,7 +4069,7 @@ fn symbol_table(summary: &SymbolSearchSummary) -> Table<'_> {
 }
 
 fn semantic_table(summary: &SemanticSearchSummary) -> Table<'_> {
-    let rows = summary.results.iter().take(12).map(|result| {
+    let rows = summary.results.iter().map(|result| {
         Row::new(vec![
             Cell::from(format!("{:.4}", result.score)).style(score_style(result.score)),
             Cell::from(result.path.as_str()),
@@ -4098,7 +4098,7 @@ fn semantic_table(summary: &SemanticSearchSummary) -> Table<'_> {
 }
 
 fn call_graph_table(summary: &CallGraphSummary) -> Table<'_> {
-    let rows = summary.rows.iter().take(12).map(call_row);
+    let rows = summary.rows.iter().map(call_row);
     Table::new(
         rows,
         [
@@ -4131,12 +4131,10 @@ fn impact_table(summary: &ImpactSummary) -> Table<'_> {
     let caller_rows = summary
         .direct_callers
         .iter()
-        .take(6)
         .map(|evidence| impact_row("caller", evidence));
     let callee_rows = summary
         .direct_callees
         .iter()
-        .take(6)
         .map(|evidence| impact_row("callee", evidence));
     Table::new(
         caller_rows.chain(callee_rows),
@@ -4175,7 +4173,6 @@ fn call_path_table(summary: &CallPathSummary) -> Table<'_> {
     let rows = summary
         .paths
         .iter()
-        .take(6)
         .enumerate()
         .flat_map(|(path_index, path)| {
             path.edges
@@ -4252,13 +4249,11 @@ fn context_pack_table(pack: &ContextPack) -> Table<'_> {
     entries.extend(
         pack.focus_symbols
             .iter()
-            .take(4)
             .map(|symbol| ("Symbol".to_owned(), symbol.qualified_name.clone())),
     );
     entries.extend(
         pack.files
             .iter()
-            .take(4)
             .map(|file| ("File".to_owned(), file.clone())),
     );
     entries.extend(
@@ -4281,7 +4276,7 @@ fn context_pack_table(pack: &ContextPack) -> Table<'_> {
 }
 
 fn debug_context_table(pack: &DebugContextPack) -> Table<'_> {
-    let frame_rows = pack.frames.iter().take(8).map(|frame| {
+    let frame_rows = pack.frames.iter().map(|frame| {
         let symbol = frame
             .matched_symbols
             .first()
@@ -4306,7 +4301,7 @@ fn debug_context_table(pack: &DebugContextPack) -> Table<'_> {
             Cell::from(provenance_label(frame.file_provenance.as_ref())),
         ])
     });
-    let path_rows = pack.call_paths_between_frames.iter().take(6).map(|path| {
+    let path_rows = pack.call_paths_between_frames.iter().map(|path| {
         let terminal_status = path
             .paths
             .first()
@@ -4326,7 +4321,7 @@ fn debug_context_table(pack: &DebugContextPack) -> Table<'_> {
             Cell::from("call graph"),
         ])
     });
-    let test_rows = pack.likely_tests.iter().take(6).map(|test| {
+    let test_rows = pack.likely_tests.iter().map(|test| {
         Row::new(vec![
             Cell::from("Test"),
             Cell::from("-"),
@@ -4480,34 +4475,27 @@ fn next_selection(selection: usize, row_count: usize) -> usize {
 
 fn query_result_count(result: &QueryResult) -> usize {
     match result {
-        QueryResult::Symbol(summary) => summary.symbols.len().min(12),
-        QueryResult::Semantic(summary) => summary.results.len().min(12),
+        QueryResult::Symbol(summary) => summary.symbols.len(),
+        QueryResult::Semantic(summary) => summary.results.len(),
     }
 }
 
 fn impact_result_count(summary: &ImpactSummary) -> usize {
-    summary.direct_callers.len().min(6) + summary.direct_callees.len().min(6)
+    summary.direct_callers.len() + summary.direct_callees.len()
 }
 
 fn call_path_result_count(summary: &CallPathSummary) -> usize {
-    summary
-        .paths
-        .iter()
-        .take(6)
-        .map(|path| path.edges.len())
-        .sum()
+    summary.paths.iter().map(|path| path.edges.len()).sum()
 }
 
 fn context_pack_row_count(pack: &ContextPack) -> usize {
-    7 + pack.focus_symbols.iter().take(4).count()
-        + pack.files.iter().take(4).count()
-        + pack.notes.len()
+    7 + pack.focus_symbols.len() + pack.files.len() + pack.notes.len()
 }
 
 fn debug_context_row_count(pack: &DebugContextPack) -> usize {
-    pack.frames.iter().take(8).count()
-        + pack.call_paths_between_frames.iter().take(6).count()
-        + pack.likely_tests.iter().take(6).count()
+    pack.frames.len()
+        + pack.call_paths_between_frames.len()
+        + pack.likely_tests.len()
         + pack.notes.len()
 }
 
@@ -4936,7 +4924,7 @@ impl Default for GraphBrowserState {
 impl GraphBrowserState {
     fn result_count(&self) -> usize {
         match &self.status {
-            GraphStatus::Completed(summary) => summary.rows.len().min(12),
+            GraphStatus::Completed(summary) => summary.rows.len(),
             _ => 0,
         }
     }
@@ -5731,6 +5719,75 @@ mod tests {
         assert!(rendered.contains("excluded"));
         assert!(rendered.contains("reason=secret_detected"));
         assert!(rendered.contains("all chunks are intentionally excluded"));
+    }
+
+    #[test]
+    fn index_coverage_scrolls_selected_rows_beyond_initial_view_capacity() {
+        let mut coverage = sample_index_coverage_summary();
+        coverage.files = (0..24)
+            .map(|index| FileCoverageRow {
+                path: format!("src/file_{index:02}.rs"),
+                language: "rust".to_owned(),
+                chunks: 1,
+                symbols: 1,
+                calls: 0,
+                embeddable_chunks: 1,
+                vector_backed_chunks: 1,
+                excluded_chunks: 0,
+                status: FileCoverageStatus::Covered,
+                detail: FileDetailSummary {
+                    chunks: vec![FileChunkDetailRow {
+                        kind: "function".to_owned(),
+                        symbol: Some(format!("crate::file_{index:02}")),
+                        start_line: index + 1,
+                        end_line: index + 2,
+                        vector_status: ChunkVectorStatus::VectorBacked,
+                        excluded_reason: None,
+                    }],
+                    symbols: vec![FileSymbolDetailRow {
+                        kind: "function".to_owned(),
+                        qualified_name: format!("crate::file_{index:02}"),
+                        parent_symbol_id: None,
+                        start_line: index + 1,
+                        end_line: index + 2,
+                    }],
+                    calls: Vec::new(),
+                },
+            })
+            .collect();
+
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            coverage,
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+        app.storage.mode = StorageMode::Coverage;
+
+        for _ in 0..18 {
+            assert!(!app.handle_key(KeyCode::Down));
+        }
+        assert_eq!(app.storage.selection, 18);
+
+        let backend = TestBackend::new(150, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("src/file_18.rs"));
+        assert!(rendered.contains("crate::file_18"));
+        assert_eq!(
+            cell_bg_for_text(buffer, "src/file_18.rs", None),
+            Some(Color::Cyan)
+        );
     }
 
     #[test]
@@ -6681,6 +6738,43 @@ mod tests {
         assert_eq!(app.query.selection, 0);
         assert!(!app.handle_query_key(KeyCode::Up));
         assert_eq!(app.query.selection, 1);
+    }
+
+    #[test]
+    fn query_workbench_scrolls_selected_rows_beyond_initial_view_capacity() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Query;
+        app.query.status = QueryStatus::Completed(QueryResult::Symbol(SymbolSearchSummary {
+            repository_id: "repo".to_owned(),
+            query: "symbol".to_owned(),
+            symbols: (0..24)
+                .map(|index| {
+                    sample_symbol(
+                        format!("symbol-{index}"),
+                        format!("crate::symbol_{index:02}"),
+                        index + 1,
+                        index + 2,
+                    )
+                })
+                .collect(),
+        }));
+
+        for _ in 0..18 {
+            assert!(!app.handle_query_key(KeyCode::Down));
+        }
+        assert_eq!(app.query.selection, 18);
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("crate::symbol_18"));
+        assert_eq!(
+            cell_bg_for_text(buffer, "crate::symbol_18", None),
+            Some(Color::Cyan)
+        );
     }
 
     #[test]

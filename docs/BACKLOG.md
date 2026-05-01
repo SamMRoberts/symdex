@@ -161,6 +161,23 @@
 - [x] Diagnostics for model, vector DB, SQLite path, index freshness, and provenance consistency.
 - [x] Tests for multiple agents reading the same index without write-capable tools.
 
+## Phase 15 — Active multi-language expansion
+
+- [x] Define language-agnostic parser/chunker interfaces in `symdex-core`.
+- [x] Add C# discovery and tree-sitter parsing for `.cs` files.
+- [x] Add JavaScript discovery and tree-sitter parsing for `.js`, `.jsx`, `.mjs`,
+  and `.cjs` files.
+- [x] Add TypeScript discovery and tree-sitter parsing for `.ts`, `.tsx`,
+  `.mts`, and `.cts` files.
+- [x] Extract chunks, symbols, and conservative call edges for each new language
+  through the same contracts used by Rust.
+- [x] Reuse existing ignore, path-boundary, hashing, secret-detection, SQLite,
+  Qdrant, manual indexing, continuous indexing, provenance, and MCP evidence
+  rules.
+- [x] Add fixture-backed tests for discovery, chunking, symbols, calls, secrets,
+  incremental indexing, continuous indexing, and MCP evidence for C#,
+  JavaScript, and TypeScript.
+
 ## Do not start yet
 
 - web UI
@@ -168,4 +185,4 @@
 - multi-repo org search
 - write tools
 - agent code editing
-- non-Rust languages
+- languages beyond Rust, C#, JavaScript, and TypeScript
