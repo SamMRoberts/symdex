@@ -111,6 +111,67 @@ Input:
 Output rows include call confidence/resolution data, `freshness`, and
 `provenance`.
 
+### `symdex_call_path`
+
+Trace compact bounded call paths between a source symbol and a target symbol.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "source": "foo::api::handler",
+  "target": "foo::db::save",
+  "max_depth": 4
+}
+```
+
+Output:
+
+```json
+{
+  "repository_id": "stable-repo-id",
+  "source": "foo::api::handler",
+  "target": "foo::db::save",
+  "max_depth": 4,
+  "paths": [
+    {
+      "hops": 2,
+      "min_confidence": 1.0,
+      "terminal_resolution_status": "resolved_exact",
+      "edges": [
+        {
+          "caller_symbol_qualified_name": "foo::api::handler",
+          "callee_symbol_qualified_name": "foo::service::run",
+          "callee_text": "run",
+          "caller_path": "src/api.rs",
+          "caller_start_line": 10,
+          "caller_end_line": 30,
+          "call_line": 18,
+          "confidence": 1.0,
+          "resolution_status": "resolved_exact",
+          "freshness": "fresh",
+          "provenance": {
+            "content_hash": "sha256:...",
+            "index_run_id": "repo-semantic-...",
+            "parser_version": "tree-sitter-rust-...",
+            "indexed_at": "2026-04-30T12:00:00Z",
+            "embedding_model": null,
+            "embedding_dimension": null,
+            "embedded_at": null
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+`max_depth` is clamped to 1-8 hops. Traversal follows resolved persisted call
+edges, avoids cycles, returns paths in deterministic index order, and keeps
+unresolved or ambiguous edges as terminal evidence when their `callee_text`
+matches the target query. The tool does not return source text.
+
 ### `symdex_impact`
 
 Return likely affected files and symbols.

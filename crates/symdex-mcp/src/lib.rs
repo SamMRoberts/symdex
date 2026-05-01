@@ -7,26 +7,28 @@ use serde_json::{Value, json};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, freshness_for_hash,
-    qdrant_collection_name,
+    EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
+    freshness_for_hash, qdrant_collection_name,
 };
 
 pub const TOOL_SEARCH: &str = "symdex_search";
 pub const TOOL_FIND_SYMBOL: &str = "symdex_find_symbol";
 pub const TOOL_CALLERS: &str = "symdex_callers";
 pub const TOOL_CALLEES: &str = "symdex_callees";
+pub const TOOL_CALL_PATH: &str = "symdex_call_path";
 pub const TOOL_IMPACT: &str = "symdex_impact";
 pub const TOOL_CONTEXT_PACK: &str = "symdex_context_pack";
 pub const TOOL_INDEX_STATUS: &str = "symdex_index_status";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub fn tool_names() -> [&'static str; 7] {
+pub fn tool_names() -> [&'static str; 8] {
     [
         TOOL_SEARCH,
         TOOL_FIND_SYMBOL,
         TOOL_CALLERS,
         TOOL_CALLEES,
+        TOOL_CALL_PATH,
         TOOL_IMPACT,
         TOOL_CONTEXT_PACK,
         TOOL_INDEX_STATUS,
@@ -136,6 +138,7 @@ fn dispatch_tool(name: &str, arguments: &Value) -> Result<Value, String> {
         TOOL_FIND_SYMBOL => tool_find_symbol(arguments),
         TOOL_CALLERS => tool_callers(arguments),
         TOOL_CALLEES => tool_callees(arguments),
+        TOOL_CALL_PATH => tool_call_path(arguments),
         TOOL_IMPACT => tool_impact(arguments),
         TOOL_CONTEXT_PACK => tool_context_pack(arguments),
         TOOL_INDEX_STATUS => tool_index_status(arguments),
@@ -233,6 +236,51 @@ fn tool_callees(arguments: &Value) -> Result<Value, String> {
         .callees(root.id(), symbol)
         .map_err(|error| error.to_string())?;
     Ok(json!({ "results": call_rows(&root, rows) }))
+}
+
+fn tool_call_path(arguments: &Value) -> Result<Value, String> {
+    let repo = required_string(arguments, "repo")?;
+    let source = required_string(arguments, "source")?;
+    let target = required_string(arguments, "target")?;
+    let max_depth = clamp_call_path_depth(optional_usize(arguments, "max_depth", 4));
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let paths = sqlite()?
+        .call_paths(root.id(), source, target, max_depth)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "repository_id": root.id(),
+        "source": source,
+        "target": target,
+        "max_depth": max_depth,
+        "paths": paths.into_iter().map(|path| json!({
+            "hops": path.hops,
+            "min_confidence": path.min_confidence,
+            "terminal_resolution_status": path.terminal_resolution_status,
+            "edges": path.edges.into_iter().map(|edge| json!({
+                "call_id": edge.call_id,
+                "caller_symbol_id": edge.caller_symbol_id,
+                "caller_symbol_name": edge.caller_symbol_name,
+                "caller_symbol_qualified_name": edge.caller_symbol_qualified_name,
+                "caller_symbol_kind": edge.caller_symbol_kind,
+                "caller_path": edge.caller_path,
+                "caller_start_line": edge.caller_start_line,
+                "caller_end_line": edge.caller_end_line,
+                "callee_text": edge.callee_text,
+                "callee_symbol_id": edge.callee_symbol_id,
+                "callee_symbol_name": edge.callee_symbol_name,
+                "callee_symbol_qualified_name": edge.callee_symbol_qualified_name,
+                "callee_symbol_kind": edge.callee_symbol_kind,
+                "callee_path": edge.callee_path,
+                "callee_start_line": edge.callee_start_line,
+                "callee_end_line": edge.callee_end_line,
+                "call_line": edge.call_line,
+                "confidence": edge.confidence,
+                "resolution_status": edge.resolution_status,
+                "freshness": freshness_label(&root, Some(&edge.caller_path), &edge.provenance),
+                "provenance": provenance_json(&edge.provenance)
+            })).collect::<Vec<_>>()
+        })).collect::<Vec<_>>()
+    }))
 }
 
 fn tool_impact(arguments: &Value) -> Result<Value, String> {
@@ -428,6 +476,30 @@ fn tool_definitions() -> Vec<Value> {
             vec![
                 ("repo", "string", "Repository root path"),
                 ("symbol", "string", "Symbol id, name, or qualified name"),
+            ],
+        ),
+        tool_definition(
+            TOOL_CALL_PATH,
+            "Call Path",
+            "Trace compact bounded call paths between source and target symbols.",
+            &["repo", "source", "target"],
+            vec![
+                ("repo", "string", "Repository root path"),
+                (
+                    "source",
+                    "string",
+                    "Source symbol id, name, or qualified name",
+                ),
+                (
+                    "target",
+                    "string",
+                    "Target symbol id, name, or qualified name",
+                ),
+                (
+                    "max_depth",
+                    "integer",
+                    "Maximum traversal depth, capped at 8",
+                ),
             ],
         ),
         tool_definition(

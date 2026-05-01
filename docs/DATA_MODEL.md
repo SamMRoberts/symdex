@@ -316,3 +316,23 @@ symbol_id = hash(file_id + kind + qualified_name + start_byte + signature_hash)
 chunk_id  = hash(file_id + kind + start_byte + end_byte + text_hash)
 call_id   = hash(caller_symbol_id + callee_text + call_line)
 ```
+
+## Call path traversal
+
+Call path tracing reads the persisted `calls` table joined to caller and callee
+`symbols` plus caller file provenance. It does not add tables or mutate index
+state.
+
+Current behavior:
+
+- source and target symbols are resolved by exact symbol ID, name, or qualified
+  name within one repository
+- traversal depth is clamped to 1-8 hops
+- edge order is deterministic by caller qualified name, file path, call line,
+  callee text, and call ID
+- resolved edges are traversed through `callee_symbol_id`
+- unresolved or ambiguous edges are preserved as terminal evidence when
+  `callee_text` matches the target query
+- cycles are skipped by tracking visited symbol IDs per candidate path
+- returned edges include caller/callee metadata, call line, confidence,
+  resolution status, and provenance; they never include source text

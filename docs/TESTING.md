@@ -35,6 +35,7 @@ Fixtures should be tiny and purpose-built.
 - deleted file cleanup
 - unresolved calls preserved
 - ambiguous calls labeled
+- bounded call path traversal order, unresolved terminal edges, cycles, and depth limits
 - repo-root path enforcement
 - ignored files not indexed
 - likely secrets excluded from embeddings
@@ -114,6 +115,11 @@ the animated continuous-indexing activity indicator.
 Current freshness tests cover hash-to-state classification, file freshness
 aggregation over indexed and current file sets, returned symbol/call provenance,
 and the TUI evidence freshness panel.
+
+Current call path tests cover deterministic path order, unresolved terminal
+edges matched by callee text, cycle avoidance, and depth limits. Ambiguous edge
+coverage remains to be added before the Phase 12 traversal test item is fully
+complete.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level Qdrant metadata for semantic

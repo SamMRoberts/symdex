@@ -43,6 +43,7 @@ cargo run -p symdex-cli -- staleness .
 cargo run -p symdex-cli -- symbol . "my_symbol"
 cargo run -p symdex-cli -- callers . "my_symbol"
 cargo run -p symdex-cli -- callees . "my_symbol"
+cargo run -p symdex-cli -- call-path . "source_symbol" "target_symbol" 4
 cargo run -p symdex-cli -- impact . "my_symbol"
 cargo run -p symdex-cli -- context-pack . "my_symbol"
 cargo run -p symdex-cli -- search . "retry logic"
@@ -77,6 +78,11 @@ Implemented CLI commands currently include:
   name and returns path, line ranges, and provenance metadata.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct
   call relationships from the local SQLite index.
+- `call-path <repo> <source> <target> [depth]`: traces deterministic bounded
+  paths over persisted call edges from a source symbol to a target symbol. The
+  depth is clamped to 1-8 hops, cycles are not followed, unresolved terminal
+  edges can match the target by callee text, and output stays metadata-only with
+  path, line, confidence, resolution, and provenance fields.
 - `impact <repo> <symbol>`: prints direct callers and direct callees as a basic
   impact view.
 - `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
@@ -99,7 +105,8 @@ Implemented CLI commands currently include:
   repository/storage status, and `q` or `Esc` to quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
-  `symdex_impact`, `symdex_context_pack`, and `symdex_index_status`.
+  `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
+  `symdex_index_status`.
 
 `doctor` checks whether Qdrant is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector

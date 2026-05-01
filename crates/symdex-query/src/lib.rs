@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use symdex_core::{DiscoveryOptions, RepoRoot, discover_rust_files};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
+    CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
     IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, SemanticNeighborhoodSummary,
     SqliteStore, StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
-    freshness_for_hash, qdrant_collection_name,
+    clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +97,15 @@ pub struct CallGraphSummary {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CallPathSummary {
+    pub repository_id: String,
+    pub source_query: String,
+    pub target_query: String,
+    pub max_depth: usize,
+    pub paths: Vec<CallPath>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImpactSummary {
     pub repository_id: String,
     pub query: String,
@@ -172,6 +181,35 @@ pub fn run_call_graph(
         query: query.to_owned(),
         direction,
         rows,
+    })
+}
+
+pub fn run_call_path(
+    repo: &str,
+    source_query: &str,
+    target_query: &str,
+    max_depth: usize,
+) -> Result<CallPathSummary, String> {
+    let source_query = source_query.trim();
+    let target_query = target_query.trim();
+    if source_query.is_empty() {
+        return Err("call path requires a source symbol query".to_owned());
+    }
+    if target_query.is_empty() {
+        return Err("call path requires a target symbol query".to_owned());
+    }
+    let max_depth = clamp_call_path_depth(max_depth);
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let paths = sqlite
+        .call_paths(root.id(), source_query, target_query, max_depth)
+        .map_err(|error| error.to_string())?;
+    Ok(CallPathSummary {
+        repository_id: root.id().to_owned(),
+        source_query: source_query.to_owned(),
+        target_query: target_query.to_owned(),
+        max_depth,
+        paths,
     })
 }
 
@@ -434,8 +472,8 @@ mod tests {
     use symdex_store::{EvidenceFreshness, FileFreshnessSnapshot};
 
     use crate::{
-        CallDirection, QueryMode, freshness_rows, run_call_graph, run_context_pack, run_impact,
-        run_semantic_search, run_symbol_search,
+        CallDirection, QueryMode, freshness_rows, run_call_graph, run_call_path, run_context_pack,
+        run_impact, run_semantic_search, run_symbol_search,
     };
 
     #[test]
@@ -467,6 +505,17 @@ mod tests {
         let error =
             run_call_graph(".", " ", CallDirection::Callers).expect_err("empty query should fail");
         assert!(error.contains("requires a symbol query"));
+    }
+
+    #[test]
+    fn call_path_rejects_empty_source_or_target_query() {
+        let source_error =
+            run_call_path(".", " ", "target", 2).expect_err("empty source should fail");
+        assert!(source_error.contains("source symbol query"));
+
+        let target_error =
+            run_call_path(".", "source", " ", 2).expect_err("empty target should fail");
+        assert!(target_error.contains("target symbol query"));
     }
 
     #[test]
