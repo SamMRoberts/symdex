@@ -274,15 +274,15 @@ fn tool_index_status(arguments: &Value) -> Result<Value, String> {
         .repository_status(root.id())
         .map_err(|error| error.to_string())?;
     Ok(json!({
-    "repository_id": status.repository_id,
-    "files_indexed": status.files_indexed,
-    "chunks_indexed": status.chunks_indexed,
-    "symbols_indexed": status.symbols_indexed,
-    "calls_indexed": status.calls_indexed,
-            "embedding_model": status.embedding_model,
-            "embedding_dimension": status.embedding_dimension,
-            "last_indexed_at": status.last_indexed_at
-        }))
+        "repository_id": status.repository_id,
+        "files_indexed": status.files_indexed,
+        "chunks_indexed": status.chunks_indexed,
+        "symbols_indexed": status.symbols_indexed,
+        "calls_indexed": status.calls_indexed,
+        "embedding_model": status.embedding_model,
+        "embedding_dimension": status.embedding_dimension,
+        "last_indexed_at": status.last_indexed_at
+    }))
 }
 
 fn provenance_json(provenance: &EvidenceProvenance) -> Value {
