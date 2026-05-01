@@ -523,7 +523,7 @@ fn collect_call_edges_from_node(
         && let Some(callee_text) = callee_text(language, node, source)
     {
         let (callee_symbol_id, resolution_status, confidence) =
-            resolve_callee(&callee_text, caller, symbols, use_aliases);
+            resolve_callee(&callee_text, language, caller, symbols, use_aliases);
         let call_line = node.start_position().row + 1;
         calls.push(CallEdge {
             id: stable_id(&[
@@ -568,11 +568,12 @@ fn collect_call_edges_from_node(
 
 fn resolve_callee(
     callee_text: &str,
+    language: Language,
     caller: &Symbol,
     symbols: &[Symbol],
     use_aliases: &BTreeMap<String, String>,
 ) -> (Option<String>, ResolutionStatus, f32) {
-    let candidates = callee_resolution_candidates(callee_text, caller, use_aliases);
+    let candidates = callee_resolution_candidates(callee_text, language, caller, use_aliases);
     let exact: Vec<&Symbol> = symbols
         .iter()
         .filter(|symbol| candidates.contains(&symbol.qualified_name))
@@ -586,6 +587,11 @@ fn resolve_callee(
     }
     if exact.len() > 1 {
         return (None, ResolutionStatus::Ambiguous, 0.2);
+    }
+    if language == Language::Rust
+        && requires_exact_rust_resolution(callee_text, caller, use_aliases)
+    {
+        return (None, ResolutionStatus::Unresolved, 0.25);
     }
 
     let suffixes = candidates
@@ -615,18 +621,31 @@ fn resolve_callee(
 
 fn callee_resolution_candidates(
     callee_text: &str,
+    language: Language,
     caller: &Symbol,
     use_aliases: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let mut candidates = BTreeSet::new();
-    let scoped_alias = rust_scoped_alias(callee_text, use_aliases);
-    let module_scoped_candidate = module_scoped_path_candidate(callee_text, caller, use_aliases);
-    let suppress_plain_scoped_candidate =
-        scoped_alias.is_some() || module_scoped_candidate.is_some();
+    let scoped_alias = (language == Language::Rust)
+        .then(|| rust_scoped_alias(callee_text, use_aliases))
+        .flatten();
+    let module_scoped_candidate = (language == Language::Rust)
+        .then(|| module_scoped_path_candidate(callee_text, caller, use_aliases))
+        .flatten();
+    let module_unqualified_candidate = (language == Language::Rust)
+        .then(|| module_unqualified_path_candidate(callee_text, caller))
+        .flatten();
+    let suppress_plain_scoped_candidate = scoped_alias.is_some()
+        || module_scoped_candidate.is_some()
+        || module_unqualified_candidate.is_some();
     if !suppress_plain_scoped_candidate {
         candidates.insert(callee_text.to_owned());
     }
-    let module_candidates = module_relative_candidates(callee_text, caller);
+    let module_candidates = if language == Language::Rust {
+        module_relative_candidates(callee_text, caller)
+    } else {
+        Vec::new()
+    };
     if !suppress_plain_scoped_candidate
         && (module_candidates.is_empty() || !is_module_relative_path(callee_text))
     {
@@ -638,6 +657,9 @@ fn callee_resolution_candidates(
     if let Some(module_scoped_candidate) = module_scoped_candidate {
         candidates.insert(module_scoped_candidate);
     }
+    if let Some(module_unqualified_candidate) = module_unqualified_candidate {
+        candidates.insert(module_unqualified_candidate);
+    }
     if let Some(method_candidate) = receiver_method_candidate(callee_text, caller) {
         candidates.insert(method_candidate);
     }
@@ -647,6 +669,18 @@ fn callee_resolution_candidates(
         candidates.insert(target.clone());
     }
     candidates.into_iter().collect()
+}
+
+fn requires_exact_rust_resolution(
+    callee_text: &str,
+    caller: &Symbol,
+    use_aliases: &BTreeMap<String, String>,
+) -> bool {
+    rust_scoped_alias(callee_text, use_aliases).is_some()
+        || use_aliases.contains_key(callee_text)
+        || !module_relative_candidates(callee_text, caller).is_empty()
+        || module_scoped_path_candidate(callee_text, caller, use_aliases).is_some()
+        || module_unqualified_path_candidate(callee_text, caller).is_some()
 }
 
 fn rust_scoped_alias<'a>(
@@ -664,6 +698,17 @@ fn module_scoped_path_candidate(
 ) -> Option<String> {
     let (head, _) = callee_text.split_once("::")?;
     if matches!(head, "crate" | "self" | "super" | "Self") || use_aliases.contains_key(head) {
+        return None;
+    }
+    let module_path = caller_module_path(caller)?;
+    if module_path.is_empty() {
+        return None;
+    }
+    join_module_path(&module_path, callee_text)
+}
+
+fn module_unqualified_path_candidate(callee_text: &str, caller: &Symbol) -> Option<String> {
+    if callee_text.contains("::") || callee_text.contains('.') || callee_text.ends_with('!') {
         return None;
     }
     let module_path = caller_module_path(caller)?;
@@ -1594,6 +1639,55 @@ mod outer {
             Some(outer_run.id.as_str())
         );
         assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+    }
+
+    #[test]
+    fn resolves_unqualified_rust_calls_from_caller_module() {
+        let source = r#"pub fn helper() {}
+
+mod outer {
+    pub fn helper() {}
+
+    pub fn caller() {
+        helper();
+    }
+}
+
+mod sibling {
+    pub fn caller() {
+        helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+        let outer_helper = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::helper")
+            .expect("outer helper should be indexed");
+
+        let outer_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "helper" && call.call_line == 7)
+            .expect("outer helper call should exist");
+        assert_eq!(
+            outer_call.callee_symbol_id.as_deref(),
+            Some(outer_helper.id.as_str())
+        );
+        assert_eq!(
+            outer_call.resolution_status,
+            ResolutionStatus::ResolvedExact
+        );
+
+        let sibling_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "helper" && call.call_line == 13)
+            .expect("sibling helper call should exist");
+        assert_eq!(sibling_call.resolution_status, ResolutionStatus::Unresolved);
+        assert!(sibling_call.callee_symbol_id.is_none());
     }
 
     #[test]

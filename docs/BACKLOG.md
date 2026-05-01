@@ -212,6 +212,7 @@
 - [x] Resolve simple grouped Rust `use` aliases.
 - [x] Resolve module-relative Rust `use` aliases from caller scope.
 - [x] Resolve caller-module Rust scoped method calls.
+- [x] Resolve caller-module unqualified Rust function calls.
 - [ ] Improve broader module, trait, and method resolution.
 - [x] Add macro-aware limitations and diagnostics.
 - [x] Add Rust type-definition, trait, and impl-summary chunks.
