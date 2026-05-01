@@ -38,7 +38,10 @@ CREATE TABLE index_runs (
   files_seen INTEGER DEFAULT 0,
   files_indexed INTEGER DEFAULT 0,
   chunks_embedded INTEGER DEFAULT 0,
-  error_summary TEXT
+  error_summary TEXT,
+  parser_version TEXT,
+  indexer_version TEXT,
+  run_kind TEXT NOT NULL DEFAULT 'manual'
 );
 ```
 
@@ -63,6 +66,8 @@ CREATE TABLE files (
   language TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   indexed_at TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
   UNIQUE(repository_id, path)
 );
 ```
@@ -81,7 +86,9 @@ CREATE TABLE symbols (
   start_line INTEGER NOT NULL,
   end_line INTEGER NOT NULL,
   start_byte INTEGER NOT NULL,
-  end_byte INTEGER NOT NULL
+  end_byte INTEGER NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT
 );
 ```
 
@@ -99,7 +106,12 @@ CREATE TABLE chunks (
   start_byte INTEGER NOT NULL,
   end_byte INTEGER NOT NULL,
   qdrant_point_id TEXT,
-  excluded_reason TEXT
+  excluded_reason TEXT,
+  index_run_id TEXT,
+  parser_version TEXT,
+  embedding_model TEXT,
+  embedding_dimension INTEGER,
+  embedded_at TEXT
 );
 ```
 
@@ -117,9 +129,16 @@ CREATE TABLE calls (
   callee_symbol_id TEXT,
   call_line INTEGER NOT NULL,
   confidence REAL NOT NULL,
-  resolution_status TEXT NOT NULL
+  resolution_status TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT
 );
 ```
+
+Provenance columns are nullable for compatibility with existing local SQLite
+databases. New indexing writes `index_run_id` and parser version metadata for
+files, chunks, symbols, and calls. Semantic indexing also fills chunk embedding
+model, dimension, and embedding timestamp metadata after vector upsert.
 
 ## Qdrant collection
 
@@ -145,6 +164,11 @@ Payload fields:
 - `start_line`
 - `end_line`
 - `text_hash`
+- `content_hash`
+- `index_run_id`
+- `embedding_model`
+- `embedding_dimension`
+- `indexed_at`
 
 Do not store source text in Qdrant payloads.
 
