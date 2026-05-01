@@ -12,8 +12,8 @@ use symdex_core::{
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
-    RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, VectorPoint, qdrant_collection_name,
-    qdrant_point_id,
+    RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, VectorPoint, current_timestamp,
+    qdrant_collection_name, qdrant_point_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -746,7 +746,7 @@ fn vector_point(
             index_run_id: Some(index_run_id.to_owned()),
             embedding_model: Some(embedding_model.to_owned()),
             embedding_dimension: Some(embedding_dimension),
-            indexed_at: Some(timestamp()),
+            indexed_at: Some(current_timestamp()),
         },
     })
 }
@@ -806,14 +806,6 @@ fn call_record(call: &CallEdge, index_run_id: &str) -> CallRecord {
         index_run_id: index_run_id.to_owned(),
         parser_version: RUST_PARSER_VERSION.to_owned(),
     }
-}
-
-fn timestamp() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    seconds.to_string()
 }
 
 struct IndexCollection {

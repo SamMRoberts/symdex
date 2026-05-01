@@ -55,41 +55,18 @@ impl SqliteStore {
     }
 
     fn ensure_provenance_columns(&self) -> Result<()> {
-        for (table, column, definition) in [
-            ("index_runs", "parser_version", "parser_version TEXT"),
-            ("index_runs", "indexer_version", "indexer_version TEXT"),
-            (
-                "index_runs",
-                "run_kind",
-                "run_kind TEXT NOT NULL DEFAULT 'manual'",
-            ),
-            ("files", "index_run_id", "index_run_id TEXT"),
-            ("files", "parser_version", "parser_version TEXT"),
-            ("symbols", "index_run_id", "index_run_id TEXT"),
-            ("symbols", "parser_version", "parser_version TEXT"),
-            ("chunks", "index_run_id", "index_run_id TEXT"),
-            ("chunks", "parser_version", "parser_version TEXT"),
-            ("chunks", "embedding_model", "embedding_model TEXT"),
-            (
-                "chunks",
-                "embedding_dimension",
-                "embedding_dimension INTEGER",
-            ),
-            ("chunks", "embedded_at", "embedded_at TEXT"),
-            ("calls", "index_run_id", "index_run_id TEXT"),
-            ("calls", "parser_version", "parser_version TEXT"),
-        ] {
-            self.ensure_column(table, column, definition)?;
+        for column in PROVENANCE_COLUMNS {
+            self.ensure_column(column)?;
         }
         Ok(())
     }
 
-    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
-        if self.column_exists(table, column)? {
+    fn ensure_column(&self, column: &ProvenanceColumn) -> Result<()> {
+        if self.column_exists(column.table, column.name)? {
             return Ok(());
         }
         self.connection
-            .execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])
+            .execute(column.alter_sql, [])
             .map_err(StoreError::Sqlite)?;
         Ok(())
     }
@@ -97,10 +74,10 @@ impl SqliteStore {
     fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
         let mut statement = self
             .connection
-            .prepare(&format!("PRAGMA table_info({table})"))
+            .prepare("SELECT name FROM pragma_table_info(?1)")
             .map_err(StoreError::Sqlite)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(1))
+            .query_map(params![table], |row| row.get::<_, String>(0))
             .map_err(StoreError::Sqlite)?;
         for row in rows {
             if row.map_err(StoreError::Sqlite)? == column {
@@ -2412,6 +2389,85 @@ fn call_resolution_buckets(rows: Vec<CallResolutionEdgeRow>) -> Vec<CallResoluti
         .collect()
 }
 
+struct ProvenanceColumn {
+    table: &'static str,
+    name: &'static str,
+    alter_sql: &'static str,
+}
+
+const PROVENANCE_COLUMNS: &[ProvenanceColumn] = &[
+    ProvenanceColumn {
+        table: "index_runs",
+        name: "parser_version",
+        alter_sql: "ALTER TABLE index_runs ADD COLUMN parser_version TEXT",
+    },
+    ProvenanceColumn {
+        table: "index_runs",
+        name: "indexer_version",
+        alter_sql: "ALTER TABLE index_runs ADD COLUMN indexer_version TEXT",
+    },
+    ProvenanceColumn {
+        table: "index_runs",
+        name: "run_kind",
+        alter_sql: "ALTER TABLE index_runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'manual'",
+    },
+    ProvenanceColumn {
+        table: "files",
+        name: "index_run_id",
+        alter_sql: "ALTER TABLE files ADD COLUMN index_run_id TEXT",
+    },
+    ProvenanceColumn {
+        table: "files",
+        name: "parser_version",
+        alter_sql: "ALTER TABLE files ADD COLUMN parser_version TEXT",
+    },
+    ProvenanceColumn {
+        table: "symbols",
+        name: "index_run_id",
+        alter_sql: "ALTER TABLE symbols ADD COLUMN index_run_id TEXT",
+    },
+    ProvenanceColumn {
+        table: "symbols",
+        name: "parser_version",
+        alter_sql: "ALTER TABLE symbols ADD COLUMN parser_version TEXT",
+    },
+    ProvenanceColumn {
+        table: "chunks",
+        name: "index_run_id",
+        alter_sql: "ALTER TABLE chunks ADD COLUMN index_run_id TEXT",
+    },
+    ProvenanceColumn {
+        table: "chunks",
+        name: "parser_version",
+        alter_sql: "ALTER TABLE chunks ADD COLUMN parser_version TEXT",
+    },
+    ProvenanceColumn {
+        table: "chunks",
+        name: "embedding_model",
+        alter_sql: "ALTER TABLE chunks ADD COLUMN embedding_model TEXT",
+    },
+    ProvenanceColumn {
+        table: "chunks",
+        name: "embedding_dimension",
+        alter_sql: "ALTER TABLE chunks ADD COLUMN embedding_dimension INTEGER",
+    },
+    ProvenanceColumn {
+        table: "chunks",
+        name: "embedded_at",
+        alter_sql: "ALTER TABLE chunks ADD COLUMN embedded_at TEXT",
+    },
+    ProvenanceColumn {
+        table: "calls",
+        name: "index_run_id",
+        alter_sql: "ALTER TABLE calls ADD COLUMN index_run_id TEXT",
+    },
+    ProvenanceColumn {
+        table: "calls",
+        name: "parser_version",
+        alter_sql: "ALTER TABLE calls ADD COLUMN parser_version TEXT",
+    },
+];
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repositories (
   id TEXT PRIMARY KEY,
@@ -2510,12 +2566,16 @@ CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(reposi
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
 "#;
 
-fn timestamp() -> String {
+pub fn current_timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     seconds.to_string()
+}
+
+fn timestamp() -> String {
+    current_timestamp()
 }
 
 fn timestamp_nanos() -> u128 {
