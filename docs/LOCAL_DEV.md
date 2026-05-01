@@ -4,6 +4,7 @@
 
 - Rust toolchain
 - SQLite available through Rust crate bindings
+- `cargo-audit` installed for local dependency audits
 - Qdrant running locally
 - Ollama running locally
 - `nomic-embed-text` pulled into Ollama
@@ -11,6 +12,7 @@
 ## Local setup commands
 
 ```bash
+cargo install cargo-audit --locked
 ollama pull nomic-embed-text
 docker pull qdrant/qdrant
 docker run -p 6333:6333 -p 6334:6334 \
@@ -31,8 +33,11 @@ SYMDEX_EMBED_MODEL=nomic-embed-text
 
 ```bash
 cargo fmt --all
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --workspace --release
+cargo audit
 cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- doctor .
@@ -128,6 +133,17 @@ Implemented CLI commands currently include:
 reachable, whether the configured embedding model is present, and whether vector
 dimension probing succeeds. These checks report diagnostic status and do not
 mutate repository data.
+
+## CI checks
+
+GitHub Actions runs the production hardening baseline on pull requests and on
+pushes to `main`:
+
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `cargo build --workspace --release`
+- `cargo audit`
 
 The TUI should surface these same diagnostics. Semantic search and semantic
 indexing views require local Ollama and Qdrant; status, structural queries, and

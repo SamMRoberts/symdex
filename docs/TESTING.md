@@ -87,7 +87,14 @@ Default local checks:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --workspace --release
+cargo audit
 ```
+
+The CI workflow runs the same production hardening baseline on pull requests and
+pushes to `main`, and installs `cargo-audit` before running the dependency
+audit. Service-dependent checks remain opt-in so ordinary CI does not require
+local Qdrant or Ollama services.
 
 Service-dependent checks:
 
