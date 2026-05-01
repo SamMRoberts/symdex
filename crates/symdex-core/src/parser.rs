@@ -619,25 +619,58 @@ fn callee_resolution_candidates(
     use_aliases: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let mut candidates = BTreeSet::new();
-    candidates.insert(callee_text.to_owned());
+    let scoped_alias = rust_scoped_alias(callee_text, use_aliases);
+    let module_scoped_candidate = module_scoped_path_candidate(callee_text, caller, use_aliases);
+    let suppress_plain_scoped_candidate =
+        scoped_alias.is_some() || module_scoped_candidate.is_some();
+    if !suppress_plain_scoped_candidate {
+        candidates.insert(callee_text.to_owned());
+    }
     let module_candidates = module_relative_candidates(callee_text, caller);
-    if module_candidates.is_empty() || !is_module_relative_path(callee_text) {
+    if !suppress_plain_scoped_candidate
+        && (module_candidates.is_empty() || !is_module_relative_path(callee_text))
+    {
         candidates.insert(normalize_rust_path(callee_text));
     }
     for module_candidate in module_candidates {
         candidates.insert(module_candidate);
     }
+    if let Some(module_scoped_candidate) = module_scoped_candidate {
+        candidates.insert(module_scoped_candidate);
+    }
     if let Some(method_candidate) = receiver_method_candidate(callee_text, caller) {
         candidates.insert(method_candidate);
     }
-    if let Some((head, tail)) = callee_text.split_once("::") {
-        if let Some(target) = use_aliases.get(head) {
-            candidates.insert(format!("{target}::{tail}"));
-        }
+    if let Some((target, tail)) = scoped_alias {
+        candidates.insert(format!("{target}::{tail}"));
     } else if let Some(target) = use_aliases.get(callee_text) {
         candidates.insert(target.clone());
     }
     candidates.into_iter().collect()
+}
+
+fn rust_scoped_alias<'a>(
+    callee_text: &'a str,
+    use_aliases: &'a BTreeMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    let (head, tail) = callee_text.split_once("::")?;
+    use_aliases.get(head).map(|target| (target.as_str(), tail))
+}
+
+fn module_scoped_path_candidate(
+    callee_text: &str,
+    caller: &Symbol,
+    use_aliases: &BTreeMap<String, String>,
+) -> Option<String> {
+    let (head, _) = callee_text.split_once("::")?;
+    if matches!(head, "crate" | "self" | "super" | "Self") || use_aliases.contains_key(head) {
+        return None;
+    }
+    let module_path = caller_module_path(caller)?;
+    if module_path.is_empty() {
+        return None;
+    }
+    join_module_path(&module_path, callee_text)
 }
 
 fn is_module_relative_path(callee_text: &str) -> bool {
@@ -1512,6 +1545,7 @@ pub fn caller() {
             assert!(call.callee_symbol_id.is_none());
             assert_eq!(call.confidence, 0.2);
         }
+
         assert_eq!(
             index
                 .parse_diagnostics
@@ -1520,6 +1554,46 @@ pub fn caller() {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn resolves_rust_scoped_method_calls_from_caller_module() {
+        let source = r#"struct Worker;
+
+impl Worker {
+    pub fn run() {}
+}
+
+mod outer {
+    pub struct Worker;
+
+    impl Worker {
+        pub fn run() {}
+    }
+
+    pub fn caller() {
+        Worker::run();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+        let outer_run = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "outer::Worker::run")
+            .expect("outer Worker::run should be indexed");
+        let call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "Worker::run")
+            .expect("Worker::run call should exist");
+
+        assert_eq!(
+            call.callee_symbol_id.as_deref(),
+            Some(outer_run.id.as_str())
+        );
+        assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
     }
 
     #[test]

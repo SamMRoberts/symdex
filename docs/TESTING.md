@@ -72,8 +72,9 @@ Fixtures should be tiny and purpose-built.
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
   module aliases used in scoped calls, simple grouped `use` aliases,
   module-relative `use` aliases from caller scope, caller-scope Rust `self::` /
-  `super::` module calls, and exact Rust `self.method()` / `Self::method()`
-  resolution to methods on the enclosing impl receiver.
+  `super::` module calls, caller-module relative `Type::method()` calls, and
+  exact Rust `self.method()` / `Self::method()` resolution to methods on the
+  enclosing impl receiver.
 - Rust cross-file call-resolution coverage for qualified module calls resolved
   from the current index batch, persisted unchanged Rust symbols used during
   incremental indexing, caller-scope `super::` calls resolved against persisted

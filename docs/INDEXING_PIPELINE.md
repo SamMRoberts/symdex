@@ -204,11 +204,13 @@ module scope. It also handles simple one-level grouped imports such as
 `use crate::module::{function, other as alias, self as module_alias};`. Within
 Rust modules, `self::name()` and `super::name()` calls add candidates from the
 caller module and immediate parent module, so nested modules do not collapse to
-unrelated same-named root symbols. Inside Rust methods, calls through
-`self.method()` and `Self::method()` also add a candidate for the enclosing impl
-receiver, so they can resolve exactly when the target method is present in the
-same file. Other receiver expressions remain conservative because symdex does
-not perform type inference. Rust macro
+unrelated same-named root symbols. Relative scoped calls such as `Type::method()`
+inside a module add a caller-module candidate such as `module::Type::method`, so
+same-named root methods are not treated as exact matches from nested modules.
+Inside Rust methods, calls through `self.method()` and `Self::method()` also add
+a candidate for the enclosing impl receiver, so they can resolve exactly when the
+target method is present in the same file. Other receiver expressions remain
+conservative because symdex does not perform type inference. Rust macro
 invocations are preserved as unresolved call edges with low confidence; macro
 expansion is not analyzed. Each macro invocation also emits a
 metadata-only diagnostic noting that the invocation was preserved without
