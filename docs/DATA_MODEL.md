@@ -444,6 +444,12 @@ paths, line numbers, and columns. Relative paths are normalized with repository
 path rules; absolute paths are accepted only when they are under the selected
 repository root.
 
+The Rust-oriented parser recognizes common `cargo test` output, panic-hook
+locations, `RUST_BACKTRACE=1` and `RUST_BACKTRACE=full` frame lines, `anyhow`
+cause lists without treating each cause as a stack frame, tracing-style
+`target=... file=... line=... column=...` metadata, and async stack-like lines
+that include a symbol followed by `at path:line:column`.
+
 The current `symdex.debug_context.v1` format joins parsed frames to existing
 SQLite `files`, `symbols`, and `calls` rows. Returned frame evidence includes
 the normalized path, matched symbols covering the runtime line, calls recorded

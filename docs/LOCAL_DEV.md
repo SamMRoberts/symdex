@@ -121,12 +121,14 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   notes. It does not include source text.
 - `debug-context <repo> <runtime-input|file|->`: parses runtime failure input
   such as stack traces, panic locations, failing test names, frame symbols, and
-  indexed-language file paths, then prints `symdex.debug_context.v1` JSON. The pack maps
-  frames to indexed files, symbols, calls at the failing line, freshness, and
-  provenance when available. Passing `-` reads from stdin; a single existing
-  path reads that file; otherwise remaining arguments are treated as inline
-  runtime text. Frame matches include trust scores and reason tags, and the pack
-  does not include source text.
+  indexed-language file paths, then prints `symdex.debug_context.v1` JSON. Rust
+  parsing covers common `cargo test`, panic-hook, `anyhow`, `tracing`, full
+  backtrace, and async stack-like output shapes. The pack maps frames to indexed
+  files, symbols, calls at the failing line, freshness, and provenance when
+  available. Passing `-` reads from stdin; a single existing path reads that
+  file; otherwise remaining arguments are treated as inline runtime text. Frame
+  matches include trust scores and reason tags, and the pack does not include
+  source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, symbol names, and provenance
   metadata. Text output also prints compact reason tags for each match.

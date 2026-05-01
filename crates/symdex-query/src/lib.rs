@@ -416,6 +416,7 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
     let mut malformed_lines = Vec::new();
     let mut pending_symbol: Option<(usize, String, String)> = None;
     let mut in_failures = false;
+    let mut in_backtrace = false;
 
     for (index, line) in input.lines().enumerate() {
         let trimmed = line.trim();
@@ -424,10 +425,36 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
         }
         if trimmed == "failures:" {
             in_failures = true;
+            in_backtrace = false;
+            continue;
+        }
+        if is_backtrace_header(trimmed) {
+            in_backtrace = true;
             continue;
         }
         if let Some(test) = parse_failing_test(trimmed, in_failures) {
             failing_tests.insert(test);
+        }
+        if let Some((symbol, path, line_number, column)) = parse_inline_symbol_location(trimmed) {
+            if let Some((_, raw, pending)) = pending_symbol.take() {
+                frames.push(RuntimeFrame {
+                    ordinal: frames.len(),
+                    raw,
+                    symbol: Some(pending),
+                    path: None,
+                    line: None,
+                    column: None,
+                });
+            }
+            frames.push(RuntimeFrame {
+                ordinal: frames.len(),
+                raw: trimmed.to_owned(),
+                symbol: Some(symbol),
+                path: Some(path),
+                line: Some(line_number),
+                column,
+            });
+            continue;
         }
         if let Some((path, line_number, column)) = parse_file_location(trimmed) {
             let (raw, symbol) = pending_symbol
@@ -444,7 +471,7 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
             });
             continue;
         }
-        if let Some(symbol) = parse_stack_symbol(trimmed) {
+        if let Some(symbol) = parse_stack_symbol(trimmed, in_backtrace) {
             if let Some((_, raw, pending)) = pending_symbol.take() {
                 frames.push(RuntimeFrame {
                     ordinal: frames.len(),
@@ -1156,14 +1183,12 @@ fn normalize_runtime_path(root: &RepoRoot, path: &str) -> Option<String> {
 }
 
 fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
+    if let Some(location) = parse_tracing_field_location(line) {
+        return Some(location);
+    }
     let (marker_start, extension_len) = runtime_path_marker(line)?;
     let path_end = marker_start + extension_len;
-    let path_start = line[..marker_start]
-        .rfind(|character: char| {
-            character.is_whitespace() || matches!(character, '\'' | '"' | '(' | ')' | '[' | ']')
-        })
-        .map(|index| index + 1)
-        .unwrap_or(0);
+    let path_start = runtime_path_start(line, marker_start);
     let path = line[path_start..path_end]
         .trim_start_matches("at ")
         .trim()
@@ -1174,6 +1199,95 @@ fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
         .strip_prefix(':')
         .and_then(|rest| parse_usize_prefix(rest).map(|(column, _)| column));
     Some((path, line_number, column))
+}
+
+fn runtime_path_start(line: &str, marker_start: usize) -> usize {
+    line[..marker_start]
+        .rfind(|character: char| {
+            character.is_whitespace() || matches!(character, '\'' | '"' | '(' | ')' | '[' | ']')
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn parse_inline_symbol_location(line: &str) -> Option<(String, String, usize, Option<usize>)> {
+    if let Some((path, line_number, column)) = parse_tracing_field_location(line)
+        && let Some(symbol) = parse_tracing_symbol(line)
+    {
+        return Some((symbol, path, line_number, column));
+    }
+
+    let (marker_start, _) = runtime_path_marker(line)?;
+    let path_start = runtime_path_start(line, marker_start);
+    let before_path = line[..path_start].trim_end();
+    let candidate = before_path
+        .strip_suffix(" at")
+        .or_else(|| before_path.strip_suffix("@"))?
+        .trim()
+        .rsplit_once(|character: char| character.is_whitespace())
+        .map(|(_, symbol)| symbol)
+        .unwrap_or_else(|| before_path.trim_end_matches(" at").trim());
+    let symbol = normalize_stack_symbol(candidate)?;
+    if !looks_like_rust_symbol(&symbol) {
+        return None;
+    }
+    let (path, line_number, column) = parse_file_location(line)?;
+    Some((symbol, path, line_number, column))
+}
+
+fn parse_tracing_field_location(line: &str) -> Option<(String, usize, Option<usize>)> {
+    let path = parse_named_field(line, "file")?;
+    if !has_supported_runtime_path_extension(&path) {
+        return None;
+    }
+    let line_number = parse_named_usize(line, "line")?;
+    let column = parse_named_usize(line, "column");
+    Some((path, line_number, column))
+}
+
+fn has_supported_runtime_path_extension(path: &str) -> bool {
+    [
+        ".tsx", ".mts", ".cts", ".jsx", ".mjs", ".cjs", ".rs", ".cs", ".ts", ".js",
+    ]
+    .iter()
+    .any(|extension| path.ends_with(extension))
+}
+
+fn parse_tracing_symbol(line: &str) -> Option<String> {
+    for key in ["target", "span", "module_path"] {
+        if let Some(symbol) =
+            parse_named_field(line, key).and_then(|value| normalize_stack_symbol(&value))
+            && looks_like_rust_symbol(&symbol)
+        {
+            return Some(symbol);
+        }
+    }
+    None
+}
+
+fn parse_named_usize(line: &str, key: &str) -> Option<usize> {
+    parse_named_field(line, key)?.parse::<usize>().ok()
+}
+
+fn parse_named_field(line: &str, key: &str) -> Option<String> {
+    let assignment = format!("{key}=");
+    let start = line.find(&assignment)? + assignment.len();
+    let rest = line[start..].trim_start();
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_owned());
+    }
+    let end = rest
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace() || matches!(character, ',' | ';'))
+        .map(|(index, _)| index)
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim_matches('"');
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }
 
 fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
@@ -1198,7 +1312,7 @@ fn runtime_path_marker(line: &str) -> Option<(usize, usize)> {
     .min_by_key(|(start, _)| *start)
 }
 
-fn parse_stack_symbol(line: &str) -> Option<String> {
+fn parse_stack_symbol(line: &str, in_backtrace: bool) -> Option<String> {
     let colon = line.find(':')?;
     if !line[..colon]
         .trim()
@@ -1211,7 +1325,41 @@ fn parse_stack_symbol(line: &str) -> Option<String> {
     if symbol.is_empty() || symbol.starts_with("at ") {
         return None;
     }
-    Some(symbol.to_owned())
+    let symbol = normalize_stack_symbol(symbol)?;
+    if !in_backtrace && !looks_like_rust_symbol(&symbol) {
+        return None;
+    }
+    Some(symbol)
+}
+
+fn normalize_stack_symbol(symbol: &str) -> Option<String> {
+    let symbol = symbol.trim();
+    let symbol = if let Some((address, symbol)) = symbol.split_once(" - ") {
+        if address.trim_start().starts_with("0x") {
+            symbol.trim()
+        } else {
+            symbol
+        }
+    } else {
+        symbol
+    };
+    let symbol = symbol.trim();
+    if symbol.is_empty() || symbol.starts_with("at ") {
+        None
+    } else {
+        Some(symbol.to_owned())
+    }
+}
+
+fn looks_like_rust_symbol(symbol: &str) -> bool {
+    symbol.contains("::") || symbol.starts_with('<')
+}
+
+fn is_backtrace_header(line: &str) -> bool {
+    line == "stack backtrace:"
+        || line == "backtrace:"
+        || line.contains("RUST_BACKTRACE=full")
+        || line.contains("RUST_BACKTRACE=1")
 }
 
 fn parse_failing_test(line: &str, in_failures: bool) -> Option<String> {
@@ -1225,19 +1373,28 @@ fn parse_failing_test(line: &str, in_failures: bool) -> Option<String> {
     {
         return Some(test.trim().to_owned());
     }
-    if in_failures
-        && !line.contains(' ')
-        && (line.starts_with("tests::") || line.contains("::tests::"))
-    {
+    if in_failures && !line.contains(' ') && is_probable_test_name(line) {
         return Some(line.to_owned());
     }
     None
+}
+
+fn is_probable_test_name(line: &str) -> bool {
+    let trimmed = line.trim_matches(':');
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | ':'))
+        && (trimmed.starts_with("tests::")
+            || trimmed.contains("::tests::")
+            || trimmed.contains("::"))
 }
 
 fn looks_like_runtime_noise(line: &str) -> bool {
     line.contains("panicked")
         || line.contains("stack backtrace")
         || line.contains("FAILED")
+        || line.contains("RUST_BACKTRACE")
         || runtime_path_marker(line).is_some()
 }
 
@@ -1898,6 +2055,65 @@ mod tests {
             parsed.frames[1].symbol.as_deref(),
             Some("crate::module::run")
         );
+    }
+
+    #[test]
+    fn runtime_parser_handles_common_rust_debug_outputs() {
+        let parsed = parse_runtime_input(
+            "running 1 test\n\
+             test tests::unit::fails ... FAILED\n\
+             ---- tests::unit::fails stdout ----\n\
+             thread 'tests::unit::fails' panicked at crates/app/src/lib.rs:18:9:\n\
+             Error: request failed\n\
+             Caused by:\n\
+                 0: while handling request\n\
+                 1: disk full\n\
+             stack backtrace:\n\
+                0:     0x0000000100000000 - std::panicking::begin_panic\n\
+                1: my_crate::service::run::{{closure}}\n\
+                   at crates/app/src/service.rs:44:13\n\
+                2: <my_crate::Worker as my_crate::Job>::poll\n\
+                   at crates/app/src/worker.rs:51:5\n\
+             tracing::event target=\"my_crate::worker\" file=\"crates/app/src/worker.rs\" line=52 column=7\n\
+             async stack: my_crate::tasks::spawned at crates/app/src/tasks.rs:9:3\n\
+             failures:\n\
+                 tests::unit::fails\n",
+        );
+
+        assert_eq!(parsed.failing_tests, vec!["tests::unit::fails"]);
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.path.as_deref() == Some("crates/app/src/lib.rs")
+                && frame.line == Some(18)
+                && frame.column == Some(9)
+        }));
+        assert!(parsed.frames.iter().all(|frame| {
+            frame.symbol.as_deref() != Some("while handling request")
+                && frame.symbol.as_deref() != Some("disk full")
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("my_crate::service::run::{{closure}}")
+                && frame.path.as_deref() == Some("crates/app/src/service.rs")
+                && frame.line == Some(44)
+                && frame.column == Some(13)
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("<my_crate::Worker as my_crate::Job>::poll")
+                && frame.path.as_deref() == Some("crates/app/src/worker.rs")
+                && frame.line == Some(51)
+                && frame.column == Some(5)
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("my_crate::worker")
+                && frame.path.as_deref() == Some("crates/app/src/worker.rs")
+                && frame.line == Some(52)
+                && frame.column == Some(7)
+        }));
+        assert!(parsed.frames.iter().any(|frame| {
+            frame.symbol.as_deref() == Some("my_crate::tasks::spawned")
+                && frame.path.as_deref() == Some("crates/app/src/tasks.rs")
+                && frame.line == Some(9)
+                && frame.column == Some(3)
+        }));
     }
 
     #[test]
