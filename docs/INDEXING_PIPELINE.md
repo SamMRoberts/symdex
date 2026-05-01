@@ -16,7 +16,8 @@ repo root
   -> embed allowed chunks with Ollama
   -> persist facts to SQLite
   -> upsert vectors to Qdrant
-  -> write index run summary
+  -> start index run summary
+  -> finish index run summary as success, skipped, partial, or failed
 ```
 
 ## File discovery
@@ -105,10 +106,14 @@ Store:
 
 If model name or vector dimension changes, require full reindex or collection migration.
 
-Current implementation records successful semantic index runs in SQLite. Before
-upserting vectors, it rejects a same-repository, same-model dimension change so
-an existing Qdrant collection is not reused with incompatible vector sizes.
-Different model names map to different Qdrant collection names.
+Current implementation records started and finished index runs in SQLite. Runs
+finish as `success`, `skipped`, `partial`, or `failed`. Offline indexing records
+successful structural runs, semantic indexing records skipped runs when there
+are no chunks to embed, and semantic failures after SQLite persistence are
+recorded as partial runs with metadata-only error summaries. Before upserting
+vectors, semantic indexing rejects a same-repository, same-model dimension
+change so an existing Qdrant collection is not reused with incompatible vector
+sizes. Different model names map to different Qdrant collection names.
 
 ## Qdrant Collections
 

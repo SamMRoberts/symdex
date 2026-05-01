@@ -186,6 +186,21 @@ struct PersistenceSummary {
     files_removed: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RunCounts {
+    files_seen: usize,
+    files_indexed: usize,
+    chunks_embedded: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunScope<'a> {
+    index_run_id: &'a str,
+    repository_id: &'a str,
+    embedding_model: &'a str,
+    run_kind: &'a str,
+}
+
 pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
     run_index_with_progress(options, |_| {})
 }
@@ -336,11 +351,46 @@ fn run_index_internal(
         "semantic"
     };
     let index_run_id = SqliteStore::new_index_run_id(root.id(), run_kind);
-    let collection = collect_index_reports(
+    let embedding_model = if options.offline {
+        "offline".to_owned()
+    } else {
+        EmbedConfig::from_env().model
+    };
+    let run_scope = RunScope {
+        index_run_id: &index_run_id,
+        repository_id: root.id(),
+        embedding_model: &embedding_model,
+        run_kind,
+    };
+    sqlite
+        .start_index_run(&index_run_record(
+            &run_scope,
+            "running",
+            None,
+            RunCounts::default(),
+            None,
+            "pending",
+        ))
+        .map_err(|error| error.to_string())?;
+
+    let collection = match collect_index_reports(
         &root,
         if skip_unchanged { Some(&sqlite) } else { None },
         &mut on_progress,
-    )?;
+    ) {
+        Ok(collection) => collection,
+        Err(error) => {
+            finish_failed_index_run(
+                &sqlite,
+                &run_scope,
+                "unknown",
+                RunCounts::default(),
+                "failed",
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
     let files = file_summaries(&collection.reports);
     let chunks_seen = collection
         .reports
@@ -353,13 +403,30 @@ fn run_index_internal(
         .flat_map(|report| report.chunks.iter())
         .filter(|chunk| chunk.excluded_reason.is_some())
         .count();
-    let persistence = persist_structural_index(
+    let persistence = match persist_structural_index(
         &mut sqlite,
         &root,
         &collection,
         &index_run_id,
         &mut on_progress,
-    )?;
+    ) {
+        Ok(persistence) => persistence,
+        Err(error) => {
+            finish_failed_index_run(
+                &sqlite,
+                &run_scope,
+                &parser_version_summary(&collection),
+                RunCounts {
+                    files_seen: collection.files_seen,
+                    files_indexed: 0,
+                    chunks_embedded: 0,
+                },
+                "failed",
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
 
     let embedding = if options.offline {
         on_progress(IndexProgress::new(
@@ -369,32 +436,71 @@ fn run_index_internal(
             "Embedding skipped for offline indexing",
         ));
         sqlite
-            .record_index_run(&IndexRunRecord {
-                id: index_run_id.clone(),
-                repository_id: root.id().to_owned(),
-                status: "success".to_owned(),
-                embedding_model: "offline".to_owned(),
-                embedding_dimension: None,
-                files_seen: collection.files_seen,
-                files_indexed: collection.reports.len(),
-                chunks_embedded: 0,
-                error_summary: None,
-                parser_version: parser_version_summary(&collection),
-                indexer_version: env!("CARGO_PKG_VERSION").to_owned(),
-                run_kind: run_kind.to_owned(),
-            })
+            .finish_index_run(&index_run_record(
+                &run_scope,
+                "success",
+                None,
+                RunCounts {
+                    files_seen: collection.files_seen,
+                    files_indexed: persistence.files_indexed,
+                    chunks_embedded: 0,
+                },
+                None,
+                &parser_version_summary(&collection),
+            ))
             .map_err(|error| error.to_string())?;
         EmbeddingSummary::SkippedOffline
     } else {
-        persist_semantic_index(
+        match persist_semantic_index(
             &sqlite,
             &root,
             &store_config,
             &collection,
             &index_run_id,
-            run_kind,
             &mut on_progress,
-        )?
+        ) {
+            Ok(embedding) => {
+                let (status, dimension, chunks_embedded) = match &embedding {
+                    EmbeddingSummary::Completed {
+                        dimension,
+                        chunks_embedded,
+                        ..
+                    } => ("success", Some(*dimension), *chunks_embedded),
+                    EmbeddingSummary::SkippedNoChunks => ("skipped", None, 0),
+                    EmbeddingSummary::SkippedOffline => ("success", None, 0),
+                };
+                sqlite
+                    .finish_index_run(&index_run_record(
+                        &run_scope,
+                        status,
+                        dimension,
+                        RunCounts {
+                            files_seen: collection.files_seen,
+                            files_indexed: persistence.files_indexed,
+                            chunks_embedded,
+                        },
+                        None,
+                        &parser_version_summary(&collection),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                embedding
+            }
+            Err(error) => {
+                finish_failed_index_run(
+                    &sqlite,
+                    &run_scope,
+                    &parser_version_summary(&collection),
+                    RunCounts {
+                        files_seen: collection.files_seen,
+                        files_indexed: persistence.files_indexed,
+                        chunks_embedded: 0,
+                    },
+                    "partial",
+                    &error,
+                )?;
+                return Err(error);
+            }
+        }
     };
 
     Ok(IndexSummary {
@@ -580,7 +686,6 @@ fn persist_semantic_index(
     store_config: &StoreConfig,
     collection: &IndexCollection,
     index_run_id: &str,
-    run_kind: &str,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
     let embed_config = EmbedConfig::from_env();
@@ -683,23 +788,6 @@ fn persist_semantic_index(
         5,
         format!("Upserted {} vector points", points.len()),
     ));
-    sqlite
-        .record_index_run(&IndexRunRecord {
-            id: index_run_id.to_owned(),
-            repository_id: root.id().to_owned(),
-            status: "success".to_owned(),
-            embedding_model: embed_config.model.clone(),
-            embedding_dimension: Some(dimension),
-            files_seen: collection.files_seen,
-            files_indexed: collection.reports.len(),
-            chunks_embedded: points.len(),
-            error_summary: None,
-            parser_version: parser_version_summary(collection),
-            indexer_version: env!("CARGO_PKG_VERSION").to_owned(),
-            run_kind: run_kind.to_owned(),
-        })
-        .map_err(|error| error.to_string())?;
-
     Ok(EmbeddingSummary::Completed {
         model: embed_config.model,
         dimension,
@@ -829,6 +917,65 @@ fn parser_version_summary(collection: &IndexCollection) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn index_run_record(
+    scope: &RunScope<'_>,
+    status: &str,
+    embedding_dimension: Option<usize>,
+    counts: RunCounts,
+    error_summary: Option<String>,
+    parser_version: &str,
+) -> IndexRunRecord {
+    IndexRunRecord {
+        id: scope.index_run_id.to_owned(),
+        repository_id: scope.repository_id.to_owned(),
+        status: status.to_owned(),
+        embedding_model: scope.embedding_model.to_owned(),
+        embedding_dimension,
+        files_seen: counts.files_seen,
+        files_indexed: counts.files_indexed,
+        chunks_embedded: counts.chunks_embedded,
+        error_summary,
+        parser_version: parser_version.to_owned(),
+        indexer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_kind: scope.run_kind.to_owned(),
+    }
+}
+
+fn finish_failed_index_run(
+    sqlite: &SqliteStore,
+    scope: &RunScope<'_>,
+    parser_version: &str,
+    counts: RunCounts,
+    status: &str,
+    error: &str,
+) -> Result<(), String> {
+    sqlite
+        .finish_index_run(&index_run_record(
+            scope,
+            status,
+            None,
+            counts,
+            Some(error_summary(error)),
+            parser_version,
+        ))
+        .map_err(|record_error| {
+            format!("{error}; additionally failed to record index run: {record_error}")
+        })
+}
+
+fn error_summary(error: &str) -> String {
+    let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_ERROR_SUMMARY_CHARS: usize = 512;
+    if normalized.chars().count() <= MAX_ERROR_SUMMARY_CHARS {
+        return normalized;
+    }
+
+    normalized
+        .chars()
+        .take(MAX_ERROR_SUMMARY_CHARS)
+        .collect::<String>()
 }
 
 struct IndexCollection {

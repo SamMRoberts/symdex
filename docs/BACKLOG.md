@@ -184,7 +184,7 @@
 
 - [x] Add CI for fmt, clippy, tests, release build, and dependency audit.
 - [ ] Add JSON CLI output mirroring MCP contracts.
-- [ ] Record failed and partial index runs, not only successful summaries.
+- [x] Record failed and partial index runs, not only successful summaries.
 - [ ] Implement Qdrant delete, verify, and repair lifecycle for changed or deleted chunks.
 - [ ] Split large store and TUI files into modules.
 

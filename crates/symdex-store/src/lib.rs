@@ -398,7 +398,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn record_index_run(&self, run: &IndexRunRecord) -> Result<()> {
+    pub fn start_index_run(&self, run: &IndexRunRecord) -> Result<()> {
         let now = timestamp();
         self.connection
             .execute(
@@ -407,7 +407,20 @@ impl SqliteStore {
                    embedding_dimension, files_seen, files_indexed, chunks_embedded,
                    error_summary, parser_version, indexer_version, run_kind
                   )
-                  VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                  ON CONFLICT(id) DO UPDATE SET
+                    started_at = excluded.started_at,
+                    finished_at = NULL,
+                    status = excluded.status,
+                    embedding_model = excluded.embedding_model,
+                    embedding_dimension = excluded.embedding_dimension,
+                    files_seen = excluded.files_seen,
+                    files_indexed = excluded.files_indexed,
+                    chunks_embedded = excluded.chunks_embedded,
+                    error_summary = excluded.error_summary,
+                    parser_version = excluded.parser_version,
+                    indexer_version = excluded.indexer_version,
+                    run_kind = excluded.run_kind",
                 params![
                     run.id,
                     run.repository_id,
@@ -426,6 +439,52 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         Ok(())
+    }
+
+    pub fn finish_index_run(&self, run: &IndexRunRecord) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO index_runs (
+                   id, repository_id, started_at, finished_at, status, embedding_model,
+                   embedding_dimension, files_seen, files_indexed, chunks_embedded,
+                   error_summary, parser_version, indexer_version, run_kind
+                  )
+                  VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                  ON CONFLICT(id) DO UPDATE SET
+                    finished_at = excluded.finished_at,
+                    status = excluded.status,
+                    embedding_model = excluded.embedding_model,
+                    embedding_dimension = excluded.embedding_dimension,
+                    files_seen = excluded.files_seen,
+                    files_indexed = excluded.files_indexed,
+                    chunks_embedded = excluded.chunks_embedded,
+                    error_summary = excluded.error_summary,
+                    parser_version = excluded.parser_version,
+                    indexer_version = excluded.indexer_version,
+                    run_kind = excluded.run_kind",
+                params![
+                    run.id,
+                    run.repository_id,
+                    now,
+                    run.status,
+                    run.embedding_model,
+                    run.embedding_dimension.map(|dimension| dimension as i64),
+                    run.files_seen as i64,
+                    run.files_indexed as i64,
+                    run.chunks_embedded as i64,
+                    run.error_summary,
+                    run.parser_version,
+                    run.indexer_version,
+                    run.run_kind,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn record_index_run(&self, run: &IndexRunRecord) -> Result<()> {
+        self.finish_index_run(run)
     }
 
     pub fn record_chunk_embedding_provenance(
@@ -4108,6 +4167,73 @@ mod tests {
         assert_eq!(summary.runs[1].id, "run-old");
         let debug = format!("{summary:?}");
         assert!(!debug.contains("source_text"));
+    }
+
+    #[test]
+    fn sqlite_tracks_started_and_finished_index_runs() {
+        let db = TestDb::new("index-run-lifecycle");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let mut run = sample_index_run("nomic-embed-text", 768);
+        run.id = "run-lifecycle".to_owned();
+        run.status = "running".to_owned();
+        run.files_seen = 0;
+        run.files_indexed = 0;
+        run.chunks_embedded = 0;
+        store
+            .start_index_run(&run)
+            .expect("started run should persist");
+
+        let started: (String, Option<String>, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT status, finished_at, files_seen, chunks_embedded
+                 FROM index_runs
+                 WHERE id = 'run-lifecycle'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("started run should load");
+        assert_eq!(started, ("running".to_owned(), None, 0, 0));
+
+        run.status = "partial".to_owned();
+        run.files_seen = 4;
+        run.files_indexed = 3;
+        run.error_summary = Some("qdrant unavailable".to_owned());
+        store
+            .finish_index_run(&run)
+            .expect("finished run should persist");
+
+        let finished: (String, Option<String>, i64, i64, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT status, finished_at, files_seen, files_indexed, error_summary
+                 FROM index_runs
+                 WHERE id = 'run-lifecycle'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("finished run should load");
+        assert_eq!(finished.0, "partial");
+        assert!(finished.1.is_some());
+        assert_eq!(finished.2, 4);
+        assert_eq!(finished.3, 3);
+        assert_eq!(finished.4.as_deref(), Some("qdrant unavailable"));
     }
 
     #[test]

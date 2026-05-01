@@ -45,16 +45,20 @@ CREATE TABLE index_runs (
 );
 ```
 
-Successful semantic indexing runs are recorded here with the embedding model,
-vector dimension, and embedded chunk count. `index-status` and
-`symdex_index_status` expose the latest successful embedding model and
-dimension when present.
+Indexing records a row when a run starts and finalizes it when the run finishes.
+Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
+Successful semantic runs include the embedding model, vector dimension, and
+embedded chunk count. Semantic runs with no changed embeddable chunks finish as
+`skipped`. Semantic failures after SQLite persistence finish as `partial` with a
+metadata-only `error_summary`; earlier recorded failures finish as `failed`.
+`index-status` and `symdex_index_status` expose the latest successful embedding
+model and dimension when present.
 
-Continuous indexing should also record compact batch summaries in `index_runs`
-or a compatible future run-history table so watch-driven updates are visible in
-storage views. At minimum, the UI should be able to distinguish manual indexing
-from continuous indexing batches, show status, timestamps, files seen/indexed,
-chunks embedded, model, dimension, and any error summary.
+Continuous indexing records compact batch summaries in `index_runs` through the
+same indexing path, so watch-driven updates are visible in storage views. The UI
+can distinguish manual/offline and semantic batches through `run_kind`, status,
+timestamps, files seen/indexed, chunks embedded, model, dimension, and any
+metadata-only error summary.
 
 ### `files`
 
