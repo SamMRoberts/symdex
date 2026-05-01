@@ -96,6 +96,10 @@ pushes to `main`, and installs `cargo-audit` before running the dependency
 audit. Service-dependent checks remain opt-in so ordinary CI does not require
 local Qdrant or Ollama services.
 
+Qdrant verifier unit tests keep the comparison logic deterministic by building
+SQLite expected-point manifests and Qdrant payload rows in memory. Live Qdrant
+scroll behavior remains part of the service-dependent adapter checks.
+
 Service-dependent checks:
 
 ```bash

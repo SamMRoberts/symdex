@@ -377,6 +377,39 @@ impl SqliteStore {
         self.qdrant_point_ids_for_paths(repository_id, &missing)
     }
 
+    pub fn qdrant_expected_points(&self, repository_id: &str) -> Result<Vec<QdrantExpectedPoint>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT chunks.qdrant_point_id, chunks.id, files.path, chunks.start_line,
+                        chunks.end_line, chunks.text_hash, chunks.embedding_model,
+                        chunks.embedding_dimension
+                 FROM chunks
+                 JOIN files ON chunks.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND chunks.qdrant_point_id IS NOT NULL
+                 ORDER BY files.path, chunks.start_line, chunks.id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                Ok(QdrantExpectedPoint {
+                    qdrant_point_id: row.get(0)?,
+                    chunk_id: row.get(1)?,
+                    path: row.get(2)?,
+                    start_line: row.get::<_, i64>(3)? as usize,
+                    end_line: row.get::<_, i64>(4)? as usize,
+                    text_hash: row.get(5)?,
+                    embedding_model: row.get(6)?,
+                    embedding_dimension: row
+                        .get::<_, Option<i64>>(7)?
+                        .map(|dimension| dimension as usize),
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn repository_status(&self, repository_id: &str) -> Result<RepositoryStatus> {
         let files_indexed: usize = self
             .connection
@@ -1898,6 +1931,18 @@ pub struct QdrantStorageProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QdrantExpectedPoint {
+    pub qdrant_point_id: String,
+    pub chunk_id: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text_hash: String,
+    pub embedding_model: Option<String>,
+    pub embedding_dimension: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageHealthRow {
     pub status: StorageHealthStatus,
     pub label: String,
@@ -2404,6 +2449,56 @@ impl QdrantClient {
         Ok(())
     }
 
+    pub fn scroll_points_for_repository(
+        &self,
+        collection_name: &str,
+        repository_id: &str,
+    ) -> Result<Vec<RetrievedPoint>> {
+        validate_collection_name(collection_name)?;
+        let mut points = Vec::new();
+        let mut offset = None;
+        loop {
+            let request = ScrollPointsRequest {
+                filter: RepositoryFilter {
+                    must: vec![RepositoryFilterCondition {
+                        key: "repository_id",
+                        value_match: MatchValue {
+                            value: repository_id,
+                        },
+                    }],
+                },
+                limit: 256,
+                with_payload: true,
+                with_vector: false,
+                offset,
+            };
+            let response: QdrantResponse<ScrollPointsResult> = self
+                .http
+                .post(self.endpoint(&format!("/collections/{collection_name}/points/scroll")))
+                .json(&request)
+                .send()
+                .map_err(StoreError::HttpRequest)?
+                .error_for_status()
+                .map_err(StoreError::HttpStatus)?
+                .json()
+                .map_err(StoreError::Decode)?;
+
+            if response.status != "ok" {
+                return Err(StoreError::UnexpectedResponse(format!(
+                    "status={} points={}",
+                    response.status,
+                    response.result.points.len()
+                )));
+            }
+            points.extend(response.result.points);
+            offset = response.result.next_page_offset;
+            if offset.is_none() {
+                break;
+            }
+        }
+        Ok(points)
+    }
+
     pub fn query_points(
         &self,
         collection_name: &str,
@@ -2577,6 +2672,39 @@ struct OperationResult {
 }
 
 #[derive(Debug, Serialize)]
+struct ScrollPointsRequest<'a> {
+    filter: RepositoryFilter<'a>,
+    limit: usize,
+    with_payload: bool,
+    with_vector: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepositoryFilter<'a> {
+    must: Vec<RepositoryFilterCondition<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepositoryFilterCondition<'a> {
+    key: &'a str,
+    #[serde(rename = "match")]
+    value_match: MatchValue<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct MatchValue<'a> {
+    value: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScrollPointsResult {
+    points: Vec<RetrievedPoint>,
+    next_page_offset: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
 struct QueryPointsRequest {
     query: Vec<f32>,
     limit: usize,
@@ -2593,6 +2721,12 @@ struct QueryPointsResult {
 pub struct ScoredPoint {
     pub id: serde_json::Value,
     pub score: f64,
+    pub payload: PointPayload,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct RetrievedPoint {
+    pub id: serde_json::Value,
     pub payload: PointPayload,
 }
 
@@ -3364,8 +3498,9 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket, CreateCollectionRequest,
-        DeletePointsRequest, Distance, FileCoverageStatus, FileRecord, PointPayload, QdrantClient,
-        QueryPointsRequest, RepositoryRecord, SqliteStore, StorageHealthStatus, StoreConfig,
+        DeletePointsRequest, Distance, FileCoverageStatus, FileRecord, MatchValue, PointPayload,
+        QdrantClient, QueryPointsRequest, RepositoryFilter, RepositoryFilterCondition,
+        RepositoryRecord, ScrollPointsRequest, SqliteStore, StorageHealthStatus, StoreConfig,
         StoreError, SymbolRecord, UpsertPointsRequest, VectorParams, VectorPoint,
         qdrant_collection_name, qdrant_point_id, validate_collection_name,
     };
@@ -3488,6 +3623,30 @@ mod tests {
         let json = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(json["points"][0], "01234567-89ab-cdef-fedc-ba9876543210");
+        assert!(json.get("source_text").is_none());
+    }
+
+    #[test]
+    fn scroll_points_request_filters_by_repository_without_source_text() {
+        let request = ScrollPointsRequest {
+            filter: RepositoryFilter {
+                must: vec![RepositoryFilterCondition {
+                    key: "repository_id",
+                    value_match: MatchValue { value: "repo" },
+                }],
+            },
+            limit: 256,
+            with_payload: true,
+            with_vector: false,
+            offset: None,
+        };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(json["filter"]["must"][0]["key"], "repository_id");
+        assert_eq!(json["filter"]["must"][0]["match"]["value"], "repo");
+        assert_eq!(json["with_payload"], true);
+        assert_eq!(json["with_vector"], false);
         assert!(json.get("source_text").is_none());
     }
 
@@ -3651,6 +3810,44 @@ mod tests {
             .qdrant_point_ids_for_missing_files("repo", &["src/lib.rs".to_owned()])
             .expect("missing point ids should load");
         assert_eq!(missing, vec!["11111111-1111-1111-1111-111111111111"]);
+    }
+
+    #[test]
+    fn sqlite_builds_qdrant_expected_point_manifest() {
+        let db = TestDb::new("qdrant-expected-points");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let mut vector = sample_chunk("chunk-vector");
+        vector.embedding_model = Some("nomic-embed-text".to_owned());
+        vector.embedding_dimension = Some(768);
+        store
+            .replace_file_facts(
+                &sample_file("hash-1"),
+                &[],
+                &[vector, missing_vector_chunk("chunk-missing")],
+                &[],
+            )
+            .expect("facts should persist");
+
+        let manifest = store
+            .qdrant_expected_points("repo")
+            .expect("expected points should load");
+
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].chunk_id, "chunk-vector");
+        assert_eq!(manifest[0].path, "src/lib.rs");
+        assert_eq!(
+            manifest[0].embedding_model.as_deref(),
+            Some("nomic-embed-text")
+        );
+        assert_eq!(manifest[0].embedding_dimension, Some(768));
     }
 
     #[test]

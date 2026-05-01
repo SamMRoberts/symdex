@@ -85,6 +85,10 @@ Implemented CLI commands currently include:
   current eligible files for implemented languages and reports fresh, stale,
   deleted, missing, and unknown evidence states. With a symbol query, the report
   is scoped to files involved in the matching symbols and compact context pack.
+- `qdrant-verify <repo>`: compares SQLite vector-backed chunk metadata against
+  live Qdrant point payloads for the configured embedding model. It reports
+  missing collections, missing points, stale payload metadata, and orphaned
+  points without printing source text or vectors.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
   name and returns path, line ranges, and provenance metadata.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct

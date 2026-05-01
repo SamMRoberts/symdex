@@ -12,8 +12,8 @@ use symdex_index::{
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, FreshnessSummary, ImpactSummary,
-    run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_freshness_report,
-    run_impact, run_semantic_search, run_symbol_search,
+    QdrantVerifySummary, run_call_graph, run_call_path, run_context_pack, run_debug_context_pack,
+    run_freshness_report, run_impact, run_qdrant_verify, run_semantic_search, run_symbol_search,
 };
 use symdex_store::{EvidenceFreshness, SqliteStore, StoreConfig, sqlite_parent};
 
@@ -45,6 +45,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let symbol_query = args.get(2).map(String::as_str);
             staleness(repo, symbol_query)
+        }
+        "qdrant-verify" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            qdrant_verify(repo)
         }
         "symbol" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -185,6 +189,12 @@ fn index_status(repo: &str) -> Result<(), String> {
 fn staleness(repo: &str, symbol_query: Option<&str>) -> Result<(), String> {
     let summary = run_freshness_report(repo, symbol_query)?;
     print_freshness_summary(&summary);
+    Ok(())
+}
+
+fn qdrant_verify(repo: &str) -> Result<(), String> {
+    let summary = run_qdrant_verify(repo)?;
+    print_qdrant_verify_summary(&summary);
     Ok(())
 }
 
@@ -356,6 +366,34 @@ fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
             edge.caller_end_line,
             edge.provenance.index_run_id.as_deref().unwrap_or("<none>")
         );
+    }
+}
+
+fn print_qdrant_verify_summary(summary: &QdrantVerifySummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!("collection: {}", summary.collection_name);
+    println!("embedding_model: {}", summary.embedding_model);
+    println!("collection_exists: {}", summary.collection_exists);
+    println!("expected_vector_points: {}", summary.expected_vector_points);
+    println!("qdrant_payload_points: {}", summary.qdrant_payload_points);
+    println!("missing_points: {}", summary.missing_points);
+    println!("stale_payload_points: {}", summary.stale_payload_points);
+    println!("orphaned_points: {}", summary.orphaned_points);
+    for row in &summary.rows {
+        println!(
+            "{} {} {}",
+            storage_health_status_label(row.status),
+            row.label,
+            row.detail
+        );
+    }
+}
+
+fn storage_health_status_label(status: symdex_store::StorageHealthStatus) -> &'static str {
+    match status {
+        symdex_store::StorageHealthStatus::Ok => "ok",
+        symdex_store::StorageHealthStatus::Warning => "warning",
+        symdex_store::StorageHealthStatus::Error => "error",
     }
 }
 
@@ -679,7 +717,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

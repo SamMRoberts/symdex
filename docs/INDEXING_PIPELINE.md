@@ -135,6 +135,13 @@ Qdrant before SQLite mutation so vector cleanup does not lose the old point IDs.
 If stale point deletion fails, semantic indexing fails before replacing SQLite
 facts and records the run failure in `index_runs`.
 
+`symdex qdrant-verify <repo>` performs a metadata-only lifecycle check for the
+configured embedding model. It derives the expected point manifest from SQLite
+chunks with `qdrant_point_id`, scrolls Qdrant payloads filtered by
+`repository_id`, and reports missing collections, missing points, stale payload
+fields, and orphaned points. The verifier requests payloads only, not vectors,
+and never returns source text.
+
 Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
 with the embedded query vector, `with_payload: true`, and `with_vector: false`.
 

@@ -203,6 +203,13 @@ repository and embedding model. If the vector dimension changed, indexing fails
 closed with a reset/reindex message instead of mixing incompatible points in the
 same Qdrant collection. Different model names use different collection names.
 
+The Qdrant verifier treats SQLite as the expected vector manifest. It compares
+each non-null `chunks.qdrant_point_id` with Qdrant payload rows filtered by
+`repository_id`, checking point ID, chunk ID, path, line range, text hash,
+embedding model, and embedding dimension. Missing collections and missing
+points are errors; stale payload fields and orphaned Qdrant points are warnings.
+The report is metadata-only and does not request vectors or source text.
+
 ## TUI visualization mapping
 
 The TUI should visualize storage metadata without showing source text by
@@ -277,6 +284,9 @@ Compare SQLite chunk metadata with Qdrant collection metadata:
 
 Surface missing collections, missing points, model drift, and dimension drift
 as warning or error rows.
+
+The CLI `qdrant-verify` command implements this live comparison against Qdrant.
+The TUI can use the same status labels when it grows live cross-store actions.
 
 The first TUI implementation uses SQLite metadata and recorded Qdrant point IDs
 to show total, embeddable, vector-backed, missing-vector, and excluded chunk

@@ -9,8 +9,9 @@ use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
-    IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, SemanticNeighborhoodSummary,
-    SqliteStore, StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
+    IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, QdrantExpectedPoint,
+    RetrievedPoint, SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary,
+    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
     clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
 
@@ -119,6 +120,20 @@ pub struct ImpactSummary {
     pub related_files: Vec<ImpactRelatedFile>,
     pub tests_likely: Vec<String>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QdrantVerifySummary {
+    pub repository_id: String,
+    pub collection_name: String,
+    pub embedding_model: String,
+    pub collection_exists: bool,
+    pub expected_vector_points: usize,
+    pub qdrant_payload_points: usize,
+    pub missing_points: usize,
+    pub stale_payload_points: usize,
+    pub orphaned_points: usize,
+    pub rows: Vec<StorageHealthRow>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -555,6 +570,197 @@ pub fn run_cross_store_health(repo: &str) -> Result<CrossStoreHealthSummary, Str
     sqlite
         .cross_store_health_summary(root.id(), &embed_config.model)
         .map_err(|error| error.to_string())
+}
+
+pub fn run_qdrant_verify(repo: &str) -> Result<QdrantVerifySummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let embed_config = EmbedConfig::from_env();
+    let expected = sqlite
+        .qdrant_expected_points(root.id())
+        .map_err(|error| error.to_string())?;
+    let store_config = StoreConfig::from_env();
+    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
+    let collection_name = qdrant_collection_name(root.id(), &embed_config.model);
+    let collection_exists = qdrant
+        .collection_exists(&collection_name)
+        .map_err(|error| error.to_string())?;
+    if !collection_exists {
+        return Ok(qdrant_verify_summary(
+            root.id(),
+            collection_name,
+            embed_config.model,
+            false,
+            expected,
+            Vec::new(),
+        ));
+    }
+    let actual = qdrant
+        .scroll_points_for_repository(&collection_name, root.id())
+        .map_err(|error| error.to_string())?;
+
+    Ok(qdrant_verify_summary(
+        root.id(),
+        collection_name,
+        embed_config.model,
+        true,
+        expected,
+        actual,
+    ))
+}
+
+fn qdrant_verify_summary(
+    repository_id: &str,
+    collection_name: String,
+    embedding_model: String,
+    collection_exists: bool,
+    expected: Vec<QdrantExpectedPoint>,
+    actual: Vec<RetrievedPoint>,
+) -> QdrantVerifySummary {
+    let expected_by_id = expected
+        .iter()
+        .map(|point| (point.qdrant_point_id.clone(), point))
+        .collect::<BTreeMap<_, _>>();
+    let actual_by_id = actual
+        .iter()
+        .map(|point| (qdrant_value_id(&point.id), point))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    let mut missing_points = 0usize;
+    let mut stale_payload_points = 0usize;
+    let mut orphaned_points = 0usize;
+
+    if !collection_exists {
+        if expected.is_empty() {
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Warning,
+                label: "collection_missing".to_owned(),
+                detail: format!(
+                    "Qdrant collection {collection_name} is missing, and SQLite has no vector-backed chunks for this model."
+                ),
+            });
+        } else {
+            missing_points = expected.len();
+            rows.push(StorageHealthRow {
+                status: StorageHealthStatus::Error,
+                label: "collection_missing".to_owned(),
+                detail: format!(
+                    "Qdrant collection {collection_name} is missing for {} SQLite vector-backed chunks.",
+                    expected.len()
+                ),
+            });
+        }
+    } else {
+        for expected_point in &expected {
+            let Some(actual_point) = actual_by_id.get(&expected_point.qdrant_point_id) else {
+                missing_points += 1;
+                rows.push(StorageHealthRow {
+                    status: StorageHealthStatus::Error,
+                    label: "missing_point".to_owned(),
+                    detail: format!(
+                        "SQLite chunk {} expects Qdrant point {} at {}:{}-{}, but the point was not returned.",
+                        expected_point.chunk_id,
+                        expected_point.qdrant_point_id,
+                        expected_point.path,
+                        expected_point.start_line,
+                        expected_point.end_line
+                    ),
+                });
+                continue;
+            };
+
+            let mismatches = qdrant_payload_mismatches(expected_point, &actual_point.payload);
+            if !mismatches.is_empty() {
+                stale_payload_points += 1;
+                rows.push(StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "stale_payload".to_owned(),
+                    detail: format!(
+                        "Qdrant point {} for chunk {} has stale payload fields: {}.",
+                        expected_point.qdrant_point_id,
+                        expected_point.chunk_id,
+                        mismatches.join(", ")
+                    ),
+                });
+            }
+        }
+
+        for point_id in actual_by_id.keys() {
+            if !expected_by_id.contains_key(point_id) {
+                orphaned_points += 1;
+                rows.push(StorageHealthRow {
+                    status: StorageHealthStatus::Warning,
+                    label: "orphaned_point".to_owned(),
+                    detail: format!(
+                        "Qdrant point {point_id} has repository payload {repository_id} but no matching SQLite chunk."
+                    ),
+                });
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        rows.push(StorageHealthRow {
+            status: StorageHealthStatus::Ok,
+            label: "qdrant_verify_ok".to_owned(),
+            detail: format!(
+                "SQLite vector-backed chunks and Qdrant payload metadata are aligned for {collection_name}."
+            ),
+        });
+    }
+
+    QdrantVerifySummary {
+        repository_id: repository_id.to_owned(),
+        collection_name,
+        embedding_model,
+        collection_exists,
+        expected_vector_points: expected.len(),
+        qdrant_payload_points: actual.len(),
+        missing_points,
+        stale_payload_points,
+        orphaned_points,
+        rows,
+    }
+}
+
+fn qdrant_payload_mismatches(
+    expected: &QdrantExpectedPoint,
+    actual: &symdex_store::PointPayload,
+) -> Vec<&'static str> {
+    let mut mismatches = Vec::new();
+    if actual.chunk_id != expected.chunk_id {
+        mismatches.push("chunk_id");
+    }
+    if actual.path != expected.path {
+        mismatches.push("path");
+    }
+    if actual.start_line != expected.start_line {
+        mismatches.push("start_line");
+    }
+    if actual.end_line != expected.end_line {
+        mismatches.push("end_line");
+    }
+    if actual.text_hash != expected.text_hash {
+        mismatches.push("text_hash");
+    }
+    if let Some(expected_model) = &expected.embedding_model
+        && actual.embedding_model.as_ref() != Some(expected_model)
+    {
+        mismatches.push("embedding_model");
+    }
+    if let Some(expected_dimension) = expected.embedding_dimension
+        && actual.embedding_dimension != Some(expected_dimension)
+    {
+        mismatches.push("embedding_dimension");
+    }
+    mismatches
+}
+
+fn qdrant_value_id(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 pub fn run_semantic_search(
@@ -1033,14 +1239,15 @@ mod tests {
 
     use symdex_core::RepoRoot;
     use symdex_store::{
-        CallRecord, EvidenceFreshness, FileFreshnessSnapshot, FileRecord, RepositoryRecord,
-        SqliteStore, StoreConfig, SymbolRecord,
+        CallRecord, EvidenceFreshness, FileFreshnessSnapshot, FileRecord, PointPayload,
+        QdrantExpectedPoint, RepositoryRecord, RetrievedPoint, SqliteStore, StorageHealthStatus,
+        StoreConfig, SymbolRecord,
     };
 
     use crate::{
         CallDirection, QueryMode, build_debug_context_pack, freshness_rows, parse_runtime_input,
-        run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_impact,
-        run_semantic_search, run_symbol_search,
+        qdrant_verify_summary, run_call_graph, run_call_path, run_context_pack,
+        run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
     };
 
     #[test]
@@ -1101,6 +1308,64 @@ mod tests {
     fn debug_context_rejects_empty_input() {
         let error = run_debug_context_pack(".", " ", 8).expect_err("empty input should fail");
         assert!(error.contains("requires runtime failure input"));
+    }
+
+    #[test]
+    fn qdrant_verify_summary_detects_missing_stale_and_orphaned_points() {
+        let aligned = expected_point("point-ok", "chunk-ok", "hash-ok");
+        let stale = expected_point("point-stale", "chunk-stale", "hash-current");
+        let missing = expected_point("point-missing", "chunk-missing", "hash-missing");
+        let summary = qdrant_verify_summary(
+            "repo",
+            "symdex_repo_model".to_owned(),
+            "nomic-embed-text".to_owned(),
+            true,
+            vec![aligned.clone(), stale.clone(), missing],
+            vec![
+                retrieved_point("point-ok", payload_for(&aligned, "hash-ok")),
+                retrieved_point("point-stale", payload_for(&stale, "old-hash")),
+                retrieved_point("point-orphan", payload_for(&aligned, "hash-ok")),
+            ],
+        );
+
+        assert_eq!(summary.expected_vector_points, 3);
+        assert_eq!(summary.qdrant_payload_points, 3);
+        assert_eq!(summary.missing_points, 1);
+        assert_eq!(summary.stale_payload_points, 1);
+        assert_eq!(summary.orphaned_points, 1);
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Error && row.label == "missing_point"
+        }));
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Warning && row.label == "stale_payload"
+        }));
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Warning && row.label == "orphaned_point"
+        }));
+        assert!(!format!("{summary:?}").contains("source_text"));
+    }
+
+    #[test]
+    fn qdrant_verify_summary_reports_ok_when_payloads_align() {
+        let expected = expected_point("point-ok", "chunk-ok", "hash-ok");
+        let summary = qdrant_verify_summary(
+            "repo",
+            "symdex_repo_model".to_owned(),
+            "nomic-embed-text".to_owned(),
+            true,
+            vec![expected.clone()],
+            vec![retrieved_point(
+                "point-ok",
+                payload_for(&expected, "hash-ok"),
+            )],
+        );
+
+        assert_eq!(summary.missing_points, 0);
+        assert_eq!(summary.stale_payload_points, 0);
+        assert_eq!(summary.orphaned_points, 0);
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Ok && row.label == "qdrant_verify_ok"
+        }));
     }
 
     #[test]
@@ -1408,6 +1673,48 @@ mod tests {
         symbol_id: &'a str,
         symbol_name: &'a str,
         qualified_name: &'a str,
+    }
+
+    fn expected_point(point_id: &str, chunk_id: &str, text_hash: &str) -> QdrantExpectedPoint {
+        QdrantExpectedPoint {
+            qdrant_point_id: point_id.to_owned(),
+            chunk_id: chunk_id.to_owned(),
+            path: "src/lib.rs".to_owned(),
+            start_line: 1,
+            end_line: 3,
+            text_hash: text_hash.to_owned(),
+            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_dimension: Some(768),
+        }
+    }
+
+    fn payload_for(expected: &QdrantExpectedPoint, text_hash: &str) -> PointPayload {
+        PointPayload {
+            repository_id: "repo".to_owned(),
+            file_id: "file".to_owned(),
+            chunk_id: expected.chunk_id.clone(),
+            symbol_id: None,
+            symbol_name: None,
+            path: expected.path.clone(),
+            language: "rust".to_owned(),
+            chunk_kind: "function".to_owned(),
+            start_line: expected.start_line,
+            end_line: expected.end_line,
+            text_hash: text_hash.to_owned(),
+            parser_version: Some("parser".to_owned()),
+            content_hash: Some("content-hash".to_owned()),
+            index_run_id: Some("run".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_dimension: Some(768),
+            indexed_at: Some("123".to_owned()),
+        }
+    }
+
+    fn retrieved_point(id: &str, payload: PointPayload) -> RetrievedPoint {
+        RetrievedPoint {
+            id: serde_json::Value::String(id.to_owned()),
+            payload,
+        }
     }
 
     fn sample_symbol(id: &str, file_id: &str, name: &str, qualified_name: &str) -> SymbolRecord {
