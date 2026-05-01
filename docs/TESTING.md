@@ -94,10 +94,10 @@ SYMDEX_TEST_QDRANT=1 cargo test -p symdex-store qdrant
 SYMDEX_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
 ```
 
-When C#, JavaScript, and TypeScript implementation work starts, add tiny
-fixture-backed tests for discovery, chunking, symbol extraction, call extraction,
-secret exclusion, incremental indexing, continuous indexing, and MCP evidence
-for each language before marking that language supported.
+Current multi-language tests cover discovery, parser dispatch, syntax-aware
+chunking, symbol extraction, conservative call extraction, runtime path parsing,
+and continuous-indexing snapshots for C#, JavaScript, and TypeScript. Broaden
+these fixture-backed tests when adding deeper language-specific behavior.
 
 Future TUI checks:
 

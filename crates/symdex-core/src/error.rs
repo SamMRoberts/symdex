@@ -63,9 +63,9 @@ impl Display for CoreError {
             ),
             Self::NonUtf8Path { path } => write!(f, "path is not valid UTF-8: {}", path.display()),
             Self::ParserLanguage { message } => {
-                write!(f, "failed to configure tree-sitter Rust parser: {message}")
+                write!(f, "failed to configure tree-sitter parser: {message}")
             }
-            Self::ParseFailed { path } => write!(f, "failed to parse Rust file {path}"),
+            Self::ParseFailed { path } => write!(f, "failed to parse source file {path}"),
         }
     }
 }

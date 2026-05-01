@@ -1,12 +1,37 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
+    CSharp,
+    JavaScript,
     Rust,
+    TypeScript,
 }
 
 impl Language {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::CSharp => "csharp",
+            Self::JavaScript => "javascript",
             Self::Rust => "rust",
+            Self::TypeScript => "typescript",
+        }
+    }
+
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        match extension {
+            "cs" => Some(Self::CSharp),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "rs" => Some(Self::Rust),
+            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            _ => None,
+        }
+    }
+
+    pub fn parser_version(self) -> &'static str {
+        match self {
+            Self::CSharp => crate::CSHARP_PARSER_VERSION,
+            Self::JavaScript => crate::JAVASCRIPT_PARSER_VERSION,
+            Self::Rust => crate::RUST_PARSER_VERSION,
+            Self::TypeScript => crate::TYPESCRIPT_PARSER_VERSION,
         }
     }
 }
@@ -139,8 +164,10 @@ pub struct CallEdge {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RustFileIndex {
+pub struct SourceFileIndex {
     pub chunks: Vec<CodeChunk>,
     pub symbols: Vec<Symbol>,
     pub calls: Vec<CallEdge>,
 }
+
+pub type RustFileIndex = SourceFileIndex;

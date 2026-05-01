@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Serialize;
-use symdex_core::{DiscoveryOptions, RepoRoot, discover_rust_files};
+use symdex_core::{DiscoveryOptions, RepoRoot, discover_indexable_files};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
@@ -448,7 +448,7 @@ pub fn run_freshness_report(
 ) -> Result<FreshnessSummary, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    let current_hashes = discover_rust_files(&root, &DiscoveryOptions::default())
+    let current_hashes = discover_indexable_files(&root, &DiscoveryOptions::default())
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|file| (file.facts.relative_path, file.facts.content_hash))
@@ -784,9 +784,8 @@ fn normalize_runtime_path(root: &RepoRoot, path: &str) -> Option<String> {
 }
 
 fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
-    let marker = ".rs:";
-    let marker_start = line.find(marker)?;
-    let path_end = marker_start + ".rs".len();
+    let (marker_start, extension_len) = runtime_path_marker(line)?;
+    let path_end = marker_start + extension_len;
     let path_start = line[..marker_start]
         .rfind(|character: char| {
             character.is_whitespace() || matches!(character, '\'' | '"' | '(' | ')' | '[' | ']')
@@ -816,6 +815,15 @@ fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
     }
     let value = input[..digits].parse::<usize>().ok()?;
     Some((value, &input[digits..]))
+}
+
+fn runtime_path_marker(line: &str) -> Option<(usize, usize)> {
+    [
+        ".tsx:", ".mts:", ".cts:", ".jsx:", ".mjs:", ".cjs:", ".rs:", ".cs:", ".ts:", ".js:",
+    ]
+    .iter()
+    .filter_map(|marker| line.find(marker).map(|start| (start, marker.len() - 1)))
+    .min_by_key(|(start, _)| *start)
 }
 
 fn parse_stack_symbol(line: &str) -> Option<String> {
@@ -858,7 +866,7 @@ fn looks_like_runtime_noise(line: &str) -> bool {
     line.contains("panicked")
         || line.contains("stack backtrace")
         || line.contains("FAILED")
-        || line.contains(".rs:")
+        || runtime_path_marker(line).is_some()
 }
 
 fn sqlite_for_read() -> Result<SqliteStore, String> {
@@ -869,7 +877,7 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
 }
 
 fn current_hashes(root: &RepoRoot) -> Result<BTreeMap<String, String>, String> {
-    discover_rust_files(root, &DiscoveryOptions::default())
+    discover_indexable_files(root, &DiscoveryOptions::default())
         .map_err(|error| error.to_string())
         .map(|files| {
             files
@@ -1114,6 +1122,30 @@ mod tests {
         assert_eq!(
             parsed.frames[1].symbol.as_deref(),
             Some("crate::module::run")
+        );
+    }
+
+    #[test]
+    fn runtime_parser_extracts_active_language_file_locations() {
+        let parsed = parse_runtime_input(
+            "at src/Program.cs:10:5\n\
+             at web/app.jsx:4:1\n\
+             at web/util.ts:8:3\n\
+             at web/component.tsx:12:7\n",
+        );
+
+        assert_eq!(
+            parsed
+                .frames
+                .iter()
+                .map(|frame| (frame.path.as_deref(), frame.line, frame.column))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("src/Program.cs"), Some(10), Some(5)),
+                (Some("web/app.jsx"), Some(4), Some(1)),
+                (Some("web/util.ts"), Some(8), Some(3)),
+                (Some("web/component.tsx"), Some(12), Some(7)),
+            ]
         );
     }
 

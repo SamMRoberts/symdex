@@ -59,20 +59,20 @@ Implemented CLI commands currently include:
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
   service checks, the active MCP evidence contract version, and repo-specific
   index freshness/provenance readiness when a repo path is provided.
-- `index <repo>`: discovers eligible files for implemented languages, currently
-  Rust, applies built-in excludes and scoped simple `.gitignore` rules, hashes
-  file contents, extracts tree-sitter function and method chunks where
-  supported, embeds chunk text with local Ollama, creates the Qdrant collection
-  if needed, and upserts semantic vectors. Use
+- `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
+  applies built-in excludes and scoped simple `.gitignore` rules, hashes file
+  contents, extracts tree-sitter function and method chunks where supported,
+  embeds chunk text with local Ollama, creates the Qdrant collection if needed,
+  and upserts semantic vectors. Use
   `index --offline <repo>` for SQLite-backed discovery and chunking without
   service calls; unchanged files are skipped by content hash. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/Qdrant embedding.
 - `index --watch <repo>`: starts continuous indexing. It polls local eligible
-  files for implemented languages, currently Rust, debounces event bursts,
-  detects created/modified/deleted paths by content-hash snapshots, and
-  reindexes changed content through the incremental indexing path until stopped
-  with `Ctrl+C`.
+  Rust, C#, JavaScript, and TypeScript files, debounces event bursts, detects
+  created/modified/deleted paths by content-hash snapshots, and reindexes
+  changed content through the incremental indexing path until stopped with
+  `Ctrl+C`.
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
   When a semantic index has completed, it also reports the latest embedding
   model and vector dimension recorded for that repository.

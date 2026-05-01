@@ -301,7 +301,7 @@ impl App {
                     Span::raw(" Enable continuous semantic indexing?"),
                 ]));
                 lines.push(Line::from(
-                    "The TUI will watch changed Rust files until toggled off.",
+                    "The TUI will watch changed indexable files until toggled off.",
                 ));
                 lines.push(Line::from("Press y to start, n or Esc to cancel."));
             }

@@ -43,9 +43,8 @@ The examples below show the `data` payload for each tool. The envelope is always
 present on successful tool calls and is also advertised by `initialize` as
 `symdexContract`. The current schema and version are defined in `symdex-core`
 so CLI, TUI, diagnostics, and MCP share the same contract identifier.
-Parser-version examples below use Rust because Rust is the current implemented
-baseline; C#, JavaScript, and TypeScript evidence must use their own parser
-version strings when implemented.
+Parser-version examples below use Rust, but C#, JavaScript, and TypeScript
+evidence uses each language's parser version string.
 
 ### `symdex_search`
 

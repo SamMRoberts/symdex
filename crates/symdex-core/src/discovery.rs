@@ -35,7 +35,7 @@ pub struct DiscoveredFile {
     pub absolute_path: PathBuf,
 }
 
-pub fn discover_rust_files(
+pub fn discover_indexable_files(
     root: &RepoRoot,
     options: &DiscoveryOptions,
 ) -> Result<Vec<DiscoveredFile>> {
@@ -48,6 +48,18 @@ pub fn discover_rust_files(
     visit_dir(root, root.path(), &ignore_rules, &mut files)?;
     files.sort_by(|left, right| left.facts.relative_path.cmp(&right.facts.relative_path));
     Ok(files)
+}
+
+pub fn discover_rust_files(
+    root: &RepoRoot,
+    options: &DiscoveryOptions,
+) -> Result<Vec<DiscoveredFile>> {
+    discover_indexable_files(root, options).map(|files| {
+        files
+            .into_iter()
+            .filter(|file| file.facts.language == Language::Rust)
+            .collect()
+    })
 }
 
 fn visit_dir(
@@ -85,7 +97,14 @@ fn visit_dir(
             continue;
         }
 
-        if !file_type.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+        let Some(language) = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(Language::from_extension)
+        else {
+            continue;
+        };
+        if !file_type.is_file() {
             continue;
         }
 
@@ -102,7 +121,7 @@ fn visit_dir(
             facts: FileFacts {
                 id: file_id,
                 relative_path,
-                language: Language::Rust,
+                language,
                 content_hash: hash,
             },
             absolute_path: path,
@@ -210,7 +229,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{DiscoveryOptions, RepoRoot, discover_rust_files};
+    use crate::{
+        DiscoveryOptions, Language, RepoRoot, discover_indexable_files, discover_rust_files,
+    };
 
     #[test]
     fn discovers_rust_files_in_stable_order() {
@@ -229,6 +250,34 @@ mod tests {
             .collect();
         assert_eq!(paths, vec!["src/lib.rs", "src/main.rs"]);
         assert_ne!(files[0].facts.id, files[1].facts.id);
+    }
+
+    #[test]
+    fn discovers_active_language_files_in_stable_order() {
+        let repo = TestRepo::new("active-languages");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        repo.write("src/Program.cs", "class Program { void Run() {} }\n");
+        repo.write("web/app.jsx", "function App() { return null; }\n");
+        repo.write("web/util.ts", "export function util(): void {}\n");
+        repo.write("README.md", "# ignored\n");
+
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let files = discover_indexable_files(&root, &DiscoveryOptions::default())
+            .expect("discovery should succeed");
+
+        let paths: Vec<_> = files
+            .iter()
+            .map(|file| (file.facts.relative_path.as_str(), file.facts.language))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("src/Program.cs", Language::CSharp),
+                ("src/lib.rs", Language::Rust),
+                ("web/app.jsx", Language::JavaScript),
+                ("web/util.ts", Language::TypeScript),
+            ]
+        );
     }
 
     #[test]

@@ -38,11 +38,12 @@ Active language targets:
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | `tree-sitter-javascript` | `javascript` |
 | TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | `tree-sitter-typescript` | `typescript` |
 
-Rust is the only currently implemented and fully validated language. C#,
-JavaScript, and TypeScript are the next active implementation targets. Future
-languages must be added through the same discovery, parsing, chunking, symbol,
-call, hashing, secret-detection, embedding, SQLite, Qdrant, manual indexing, and
-continuous indexing contracts.
+Rust, C#, JavaScript, and TypeScript are implemented language targets. C#, JS,
+and TS support starts conservatively with syntax-aware function/method chunks,
+symbols, and call-like references; it does not claim whole-language type
+inference. Future languages must be added through the same discovery, parsing,
+chunking, symbol, call, hashing, secret-detection, embedding, SQLite, Qdrant,
+manual indexing, and continuous indexing contracts.
 
 Current implementation applies built-in directory excludes and simple scoped
 `.gitignore` rules from the repository root and nested directories. Literal
@@ -183,8 +184,8 @@ from degrading into broad table scans as repositories grow.
 Continuous indexing is a local watch mode layered on top of incremental
 indexing. It can be toggled on or off and is off by default.
 
-Current implementation uses a polling watcher: it discovers eligible files for
-implemented languages, currently Rust, at a fixed interval, compares
+Current implementation uses a polling watcher: it discovers eligible Rust, C#,
+JavaScript, and TypeScript files at a fixed interval, compares
 path-to-content-hash snapshots, debounces detected changes, and runs an
 incremental index batch when created, modified, or deleted paths are found.
 

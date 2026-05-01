@@ -163,18 +163,18 @@
 
 ## Phase 15 — Active multi-language expansion
 
-- [ ] Define language-agnostic parser/chunker interfaces in `symdex-core`.
-- [ ] Add C# discovery and tree-sitter parsing for `.cs` files.
-- [ ] Add JavaScript discovery and tree-sitter parsing for `.js`, `.jsx`, `.mjs`,
+- [x] Define language-agnostic parser/chunker interfaces in `symdex-core`.
+- [x] Add C# discovery and tree-sitter parsing for `.cs` files.
+- [x] Add JavaScript discovery and tree-sitter parsing for `.js`, `.jsx`, `.mjs`,
   and `.cjs` files.
-- [ ] Add TypeScript discovery and tree-sitter parsing for `.ts`, `.tsx`,
+- [x] Add TypeScript discovery and tree-sitter parsing for `.ts`, `.tsx`,
   `.mts`, and `.cts` files.
-- [ ] Extract chunks, symbols, and conservative call edges for each new language
+- [x] Extract chunks, symbols, and conservative call edges for each new language
   through the same contracts used by Rust.
-- [ ] Reuse existing ignore, path-boundary, hashing, secret-detection, SQLite,
+- [x] Reuse existing ignore, path-boundary, hashing, secret-detection, SQLite,
   Qdrant, manual indexing, continuous indexing, provenance, and MCP evidence
   rules.
-- [ ] Add fixture-backed tests for discovery, chunking, symbols, calls, secrets,
+- [x] Add fixture-backed tests for discovery, chunking, symbols, calls, secrets,
   incremental indexing, continuous indexing, and MCP evidence for C#,
   JavaScript, and TypeScript.
 

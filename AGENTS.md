@@ -26,7 +26,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - tree-sitter extracts syntax-aware chunks and symbol boundaries.
 - The system must work offline after dependencies and models are installed.
 - Rust remains the stable baseline and first fully validated language.
-- C#, JavaScript, and TypeScript are the next active language targets.
+- C#, JavaScript, and TypeScript are supported conservative language targets.
 - Future languages must use the same parser, chunker, symbol, call, indexing,
   secret-detection, provenance, and evidence contracts.
 - Do not build a web UI in the MVP.

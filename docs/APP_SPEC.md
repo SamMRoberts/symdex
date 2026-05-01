@@ -58,9 +58,9 @@ symdex serve-mcp
 ## Success criteria
 
 - Indexing a small Rust repo completes locally without network access after setup.
-- C#, JavaScript, and TypeScript are tracked as the next active language targets
-  and must meet the same local-only indexing contracts before being marked
-  supported.
+- C#, JavaScript, and TypeScript indexing use the same local-only contracts as
+  Rust for discovery, parsing, chunking, symbols, calls, provenance, and
+  continuous indexing.
 - Continuous indexing can be toggled on and off and reindexes modified or newly created eligible files without source execution.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
@@ -90,6 +90,5 @@ feature contracts.
 - Runtime-to-source mapping from stack traces and test failures into indexed
   files, symbols, call graph edges, and tests.
 - Staleness detection for evidence that no longer matches current file hashes.
-- Multi-language indexing for C#, JavaScript, and TypeScript after the Rust
-  baseline remains stable, with future languages added only through the same
-  evidence contracts.
+- Future languages beyond Rust, C#, JavaScript, and TypeScript, added only
+  through the same evidence contracts.

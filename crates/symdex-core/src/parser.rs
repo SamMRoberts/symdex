@@ -1,22 +1,26 @@
 use tree_sitter::{Node, Parser};
 
 use crate::{
-    ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, FileFacts, LineRange, ResolutionStatus,
-    Result, RustFileIndex, Symbol, SymbolKind, content_hash, secret_exclusion_reason, stable_id,
+    ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, FileFacts, Language, LineRange,
+    ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind, content_hash,
+    secret_exclusion_reason, stable_id,
 };
 
-pub fn extract_rust_chunks(file: &FileFacts, source: &str) -> Result<Vec<CodeChunk>> {
-    Ok(index_rust_file(file, source)?.chunks)
+pub fn extract_chunks(file: &FileFacts, source: &str) -> Result<Vec<CodeChunk>> {
+    Ok(index_source_file(file, source)?.chunks)
 }
 
-pub fn index_rust_file(file: &FileFacts, source: &str) -> Result<RustFileIndex> {
+pub fn extract_rust_chunks(file: &FileFacts, source: &str) -> Result<Vec<CodeChunk>> {
+    extract_chunks(file, source)
+}
+
+pub fn index_rust_file(file: &FileFacts, source: &str) -> Result<SourceFileIndex> {
+    index_source_file(file, source)
+}
+
+pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileIndex> {
     let mut parser = Parser::new();
-    let language = tree_sitter_rust::LANGUAGE.into();
-    parser
-        .set_language(&language)
-        .map_err(|error| CoreError::ParserLanguage {
-            message: error.to_string(),
-        })?;
+    set_parser_language(&mut parser, file.language, is_tsx_path(&file.relative_path))?;
 
     let tree = parser
         .parse(source, None)
@@ -30,12 +34,12 @@ pub fn index_rust_file(file: &FileFacts, source: &str) -> Result<RustFileIndex> 
     }
 
     let mut functions = Vec::new();
-    collect_function_nodes(tree.root_node(), &mut functions);
+    collect_function_nodes(file.language, tree.root_node(), &mut functions);
 
     let mut chunks = Vec::new();
     let mut symbols = Vec::new();
     for function in &functions {
-        let (chunk, symbol) = function_facts(*function, file, source);
+        let (chunk, symbol) = function_facts(function.node, file, source, function.symbol_kind);
         chunks.push(chunk);
         symbols.push(symbol);
     }
@@ -46,47 +50,107 @@ pub fn index_rust_file(file: &FileFacts, source: &str) -> Result<RustFileIndex> 
 
     let mut calls = Vec::new();
     for (function, symbol) in functions.iter().zip(symbols.iter()) {
-        collect_call_edges(*function, symbol, &symbols, source, &mut calls);
+        collect_call_edges(
+            function.node,
+            file.language,
+            symbol,
+            &symbols,
+            source,
+            &mut calls,
+        );
     }
 
     chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
     symbols.sort_by_key(|symbol| (symbol.byte_range.start, symbol.byte_range.end));
     calls.sort_by_key(|call| (call.call_line, call.callee_text.clone()));
 
-    Ok(RustFileIndex {
+    Ok(SourceFileIndex {
         chunks,
         symbols,
         calls,
     })
 }
 
-fn collect_function_nodes<'tree>(node: Node<'tree>, functions: &mut Vec<Node<'tree>>) {
-    if node.kind() == "function_item" {
-        functions.push(node);
+fn set_parser_language(parser: &mut Parser, language: Language, tsx: bool) -> Result<()> {
+    let grammar = match language {
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::TypeScript if tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+    };
+    parser
+        .set_language(&grammar)
+        .map_err(|error| CoreError::ParserLanguage {
+            message: error.to_string(),
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FunctionNode<'tree> {
+    node: Node<'tree>,
+    symbol_kind: SymbolKind,
+}
+
+fn collect_function_nodes<'tree>(
+    language: Language,
+    node: Node<'tree>,
+    functions: &mut Vec<FunctionNode<'tree>>,
+) {
+    if let Some(symbol_kind) = function_symbol_kind(language, node) {
+        functions.push(FunctionNode { node, symbol_kind });
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_function_nodes(child, functions);
+        collect_function_nodes(language, child, functions);
     }
 }
 
-fn function_facts(node: Node<'_>, file: &FileFacts, source: &str) -> (CodeChunk, Symbol) {
-    let symbol_kind = if has_ancestor_kind(node, "impl_item") {
-        SymbolKind::Method
-    } else {
-        SymbolKind::Function
-    };
+fn function_symbol_kind(language: Language, node: Node<'_>) -> Option<SymbolKind> {
+    match language {
+        Language::Rust if node.kind() == "function_item" => {
+            if has_ancestor_kind(node, "impl_item") {
+                Some(SymbolKind::Method)
+            } else {
+                Some(SymbolKind::Function)
+            }
+        }
+        Language::CSharp => match node.kind() {
+            "method_declaration"
+            | "constructor_declaration"
+            | "destructor_declaration"
+            | "operator_declaration"
+            | "conversion_operator_declaration" => Some(SymbolKind::Method),
+            "local_function_statement" => Some(SymbolKind::Function),
+            _ => None,
+        },
+        Language::JavaScript | Language::TypeScript => match node.kind() {
+            "function_declaration" | "generator_function_declaration" => Some(SymbolKind::Function),
+            "method_definition"
+            | "method_signature"
+            | "abstract_method_signature"
+            | "generator_method" => Some(SymbolKind::Method),
+            "public_field_definition" if value_is_function_like(node) => Some(SymbolKind::Method),
+            "variable_declarator" if value_is_function_like(node) => Some(SymbolKind::Function),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn function_facts(
+    node: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    symbol_kind: SymbolKind,
+) -> (CodeChunk, Symbol) {
     let chunk_kind = if symbol_kind == SymbolKind::Method {
         ChunkKind::Method
     } else {
         ChunkKind::Function
     };
-    let symbol_name = node
-        .child_by_field_name("name")
-        .and_then(|name| name.utf8_text(source.as_bytes()).ok())
-        .unwrap_or("<anonymous>")
-        .to_owned();
+    let symbol_name = symbol_name(node, source);
     let qualified_name = qualified_name(file, node, source, &symbol_name, symbol_kind);
     let symbol = symbol_for_node(
         node,
@@ -200,6 +264,7 @@ fn symbol_for_node(
 
 fn collect_call_edges(
     function: Node<'_>,
+    language: Language,
     caller: &Symbol,
     symbols: &[Symbol],
     source: &str,
@@ -207,18 +272,19 @@ fn collect_call_edges(
 ) {
     let mut cursor = function.walk();
     for child in function.children(&mut cursor) {
-        collect_call_edges_from_node(child, caller, symbols, source, calls);
+        collect_call_edges_from_node(child, language, caller, symbols, source, calls);
     }
 }
 
 fn collect_call_edges_from_node(
     node: Node<'_>,
+    language: Language,
     caller: &Symbol,
     symbols: &[Symbol],
     source: &str,
     calls: &mut Vec<CallEdge>,
 ) {
-    if node.kind() == "call_expression"
+    if is_call_expression(language, node)
         && let Some(callee_text) = callee_text(node, source)
     {
         let (callee_symbol_id, resolution_status, confidence) =
@@ -242,7 +308,7 @@ fn collect_call_edges_from_node(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_call_edges_from_node(child, caller, symbols, source, calls);
+        collect_call_edges_from_node(child, language, caller, symbols, source, calls);
     }
 }
 
@@ -265,10 +331,14 @@ fn resolve_callee(
         return (None, ResolutionStatus::Ambiguous, 0.2);
     }
 
-    let suffix = callee_text.rsplit("::").next().unwrap_or(callee_text);
+    let suffix = symbol_suffix(callee_text);
     let candidates: Vec<&Symbol> = symbols
         .iter()
-        .filter(|symbol| symbol.name == suffix || symbol.qualified_name.ends_with(callee_text))
+        .filter(|symbol| {
+            symbol.name == suffix
+                || symbol.qualified_name.ends_with(callee_text)
+                || symbol_suffix(&symbol.qualified_name) == suffix
+        })
         .collect();
     match candidates.as_slice() {
         [symbol] => (
@@ -282,15 +352,20 @@ fn resolve_callee(
 }
 
 fn callee_text(call: Node<'_>, source: &str) -> Option<String> {
-    let function = call.child_by_field_name("function")?;
+    let function = call
+        .child_by_field_name("function")
+        .or_else(|| call.named_child(0))?;
     Some(match function.kind() {
-        "identifier" => node_text(function, source)?.to_owned(),
+        "identifier" | "property_identifier" => node_text(function, source)?.to_owned(),
         "scoped_identifier" => node_text(function, source)?.replace(' ', ""),
         "field_expression" => function
             .child_by_field_name("field")
             .and_then(|field| node_text(field, source))
             .unwrap_or_else(|| node_text(function, source).unwrap_or(""))
             .to_owned(),
+        "member_expression" | "member_access_expression" | "qualified_name" => {
+            clean_expression_text(node_text(function, source)?)
+        }
         _ => node_text(function, source)?.replace(' ', ""),
     })
 }
@@ -300,23 +375,24 @@ fn qualified_name(
     node: Node<'_>,
     source: &str,
     name: &str,
-    kind: SymbolKind,
+    _kind: SymbolKind,
 ) -> String {
     let mut parts = module_parts(&file.relative_path);
-    if kind == SymbolKind::Method
-        && let Some(impl_type) = impl_type_name(node, source)
-    {
-        parts.push(impl_type);
-    }
+    parts.extend(container_parts(file.language, node, source));
     parts.push(name.to_owned());
     parts.join("::")
 }
 
 fn module_parts(relative_path: &str) -> Vec<String> {
-    let trimmed = relative_path.strip_suffix(".rs").unwrap_or(relative_path);
+    let trimmed = strip_supported_extension(relative_path);
     let mut parts: Vec<String> = trimmed
         .split('/')
-        .filter(|part| *part != "src" && *part != "lib" && *part != "main" && *part != "mod")
+        .filter(|part| {
+            !matches!(
+                *part,
+                "src" | "lib" | "main" | "mod" | "index" | "Program" | "program"
+            )
+        })
         .map(str::to_owned)
         .collect();
     if parts.last().is_some_and(|part| part == "mod") {
@@ -325,34 +401,143 @@ fn module_parts(relative_path: &str) -> Vec<String> {
     parts
 }
 
-fn impl_type_name(node: Node<'_>, source: &str) -> Option<String> {
+fn container_parts(language: Language, node: Node<'_>, source: &str) -> Vec<String> {
+    let mut parts = Vec::new();
     let mut parent = node.parent();
     while let Some(current) = parent {
-        if current.kind() == "impl_item" {
-            if let Some(type_node) = current.child_by_field_name("type") {
-                return node_text(type_node, source).map(|text| text.replace(' ', ""));
-            }
-            let mut cursor = current.walk();
-            for child in current.children(&mut cursor) {
-                if child.kind().contains("type") {
-                    return node_text(child, source).map(|text| text.replace(' ', ""));
+        match language {
+            Language::Rust if current.kind() == "impl_item" => {
+                if let Some(type_name) = impl_type_name(current, source) {
+                    parts.push(type_name);
                 }
             }
-            return None;
+            Language::CSharp
+                if matches!(
+                    current.kind(),
+                    "namespace_declaration"
+                        | "file_scoped_namespace_declaration"
+                        | "class_declaration"
+                        | "struct_declaration"
+                        | "interface_declaration"
+                        | "record_declaration"
+                ) =>
+            {
+                if let Some(name) = named_node_text(current, source) {
+                    parts.push(clean_expression_text(name));
+                }
+            }
+            Language::JavaScript | Language::TypeScript
+                if matches!(
+                    current.kind(),
+                    "class_declaration" | "class" | "abstract_class_declaration"
+                ) =>
+            {
+                if let Some(name) = named_node_text(current, source) {
+                    parts.push(clean_expression_text(name));
+                }
+            }
+            _ => {}
         }
         parent = current.parent();
+    }
+    parts.reverse();
+    parts
+}
+
+fn impl_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some(type_node) = node.child_by_field_name("type") {
+        return node_text(type_node, source).map(clean_expression_text);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind().contains("type") {
+            return node_text(child, source).map(clean_expression_text);
+        }
     }
     None
 }
 
 fn signature_text(node: Node<'_>, source: &str) -> Option<String> {
-    let body = node.child_by_field_name("body")?;
-    let signature = &source[node.start_byte()..body.start_byte()];
-    Some(signature.trim().to_owned())
+    let end = node
+        .child_by_field_name("body")
+        .or_else(|| node.child_by_field_name("value"))
+        .map(|child| child.start_byte())
+        .unwrap_or_else(|| {
+            node.named_child(0)
+                .map(|child| child.end_byte())
+                .unwrap_or_else(|| node.end_byte())
+        });
+    let signature = &source[node.start_byte()..end.min(node.end_byte())];
+    Some(signature.trim().to_owned()).filter(|signature| !signature.is_empty())
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     node.utf8_text(source.as_bytes()).ok()
+}
+
+fn named_node_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    node.child_by_field_name("name")
+        .and_then(|name| node_text(name, source))
+}
+
+fn symbol_name(node: Node<'_>, source: &str) -> String {
+    named_node_text(node, source)
+        .or_else(|| {
+            node.parent()
+                .filter(|parent| parent.kind() == "variable_declarator")
+                .and_then(|parent| named_node_text(parent, source))
+        })
+        .or_else(|| {
+            node.child_by_field_name("property")
+                .and_then(|property| node_text(property, source))
+        })
+        .map(clean_expression_text)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "<anonymous>".to_owned())
+}
+
+fn value_is_function_like(node: Node<'_>) -> bool {
+    let Some(value) = node.child_by_field_name("value") else {
+        return false;
+    };
+    matches!(
+        value.kind(),
+        "arrow_function" | "function" | "function_expression" | "generator_function"
+    )
+}
+
+fn is_call_expression(language: Language, node: Node<'_>) -> bool {
+    match language {
+        Language::CSharp => node.kind() == "invocation_expression",
+        Language::JavaScript | Language::Rust | Language::TypeScript => {
+            node.kind() == "call_expression"
+        }
+    }
+}
+
+fn symbol_suffix(text: &str) -> &str {
+    text.rsplit([':', '.', '#'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(text)
+}
+
+fn clean_expression_text(text: &str) -> String {
+    text.split_whitespace().collect::<String>()
+}
+
+fn strip_supported_extension(relative_path: &str) -> &str {
+    for suffix in [
+        ".tsx", ".mts", ".cts", ".jsx", ".mjs", ".cjs", ".rs", ".cs", ".ts", ".js",
+    ] {
+        if let Some(stripped) = relative_path.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    relative_path
+}
+
+fn is_tsx_path(relative_path: &str) -> bool {
+    relative_path.ends_with(".tsx")
 }
 
 fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
@@ -369,15 +554,19 @@ fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ChunkKind, FileFacts, Language, ResolutionStatus, SymbolKind, extract_rust_chunks,
-        index_rust_file,
+        ChunkKind, FileFacts, Language, ResolutionStatus, SymbolKind, extract_chunks,
+        extract_rust_chunks, index_rust_file, index_source_file,
     };
 
     fn file() -> FileFacts {
+        file_with_language("src/lib.rs", Language::Rust)
+    }
+
+    fn file_with_language(relative_path: &str, language: Language) -> FileFacts {
         FileFacts {
             id: "file-1".to_owned(),
-            relative_path: "src/lib.rs".to_owned(),
-            language: Language::Rust,
+            relative_path: relative_path.to_owned(),
+            language,
             content_hash: "hash".to_owned(),
         }
     }
@@ -451,7 +640,7 @@ impl Counter {
 
         let error = extract_rust_chunks(&file(), source).expect_err("syntax errors should fail");
 
-        assert!(error.to_string().contains("failed to parse Rust file"));
+        assert!(error.to_string().contains("failed to parse source file"));
     }
 
     #[test]
@@ -514,5 +703,165 @@ pub fn caller() {
             ResolutionStatus::Unresolved
         );
         assert!(external_call.callee_symbol_id.is_none());
+    }
+
+    #[test]
+    fn indexes_csharp_methods_and_invocations() {
+        let source = r#"namespace Demo;
+
+class Runner {
+    void Helper() {}
+
+    void Run() {
+        Helper();
+        Console.WriteLine("hi");
+    }
+}
+"#;
+
+        let file = file_with_language("src/Runner.cs", Language::CSharp);
+        let index = index_source_file(&file, source).expect("C# should parse");
+
+        assert_eq!(index.symbols.len(), 2);
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified_name.ends_with("Runner::Run"))
+        );
+        let helper_call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "Helper")
+            .expect("helper invocation should be captured");
+        assert_eq!(
+            helper_call.resolution_status,
+            ResolutionStatus::ResolvedLocalCandidate
+        );
+        assert!(helper_call.callee_symbol_id.is_some());
+        assert!(
+            index
+                .calls
+                .iter()
+                .any(|call| call.callee_text == "Console.WriteLine"
+                    && call.resolution_status == ResolutionStatus::Unresolved)
+        );
+    }
+
+    #[test]
+    fn indexes_javascript_functions_methods_and_calls() {
+        let source = r#"function helper() {}
+
+class Runner {
+  run() {
+    helper();
+    service.execute();
+  }
+}
+"#;
+
+        let file = file_with_language("web/app.js", Language::JavaScript);
+        let index = index_source_file(&file, source).expect("JavaScript should parse");
+
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "helper" && symbol.kind == SymbolKind::Function)
+        );
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified_name.ends_with("Runner::run")
+                    && symbol.kind == SymbolKind::Method)
+        );
+        assert!(index.calls.iter().any(|call| call.callee_text == "helper"
+            && call.resolution_status == ResolutionStatus::ResolvedLocalCandidate));
+        assert!(
+            index
+                .calls
+                .iter()
+                .any(|call| call.callee_text == "service.execute"
+                    && call.resolution_status == ResolutionStatus::Unresolved)
+        );
+    }
+
+    #[test]
+    fn indexes_typescript_functions_and_arrow_declarators() {
+        let source = r#"export function typed(input: string): string {
+  return helper(input);
+}
+
+const helper = (value: string): string => value.trim();
+"#;
+
+        let file = file_with_language("web/util.ts", Language::TypeScript);
+        let index = index_source_file(&file, source).expect("TypeScript should parse");
+
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "typed" && symbol.kind == SymbolKind::Function)
+        );
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "helper" && symbol.kind == SymbolKind::Function)
+        );
+        assert!(index.calls.iter().any(|call| call.callee_text == "helper"
+            && call.resolution_status == ResolutionStatus::ResolvedLocalCandidate));
+
+        let chunks = extract_chunks(&file, source).expect("chunks should parse");
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn indexes_active_language_fixtures() {
+        for (fixture, relative_path, language, expected_symbols) in [
+            (
+                "csharp_basic/Program.cs",
+                "Program.cs",
+                Language::CSharp,
+                vec!["Helper", "Run"],
+            ),
+            (
+                "javascript_basic/src/app.js",
+                "src/app.js",
+                Language::JavaScript,
+                vec!["helper", "run"],
+            ),
+            (
+                "typescript_basic/src/util.ts",
+                "src/util.ts",
+                Language::TypeScript,
+                vec!["typed", "helper"],
+            ),
+        ] {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures")
+                    .join(fixture),
+            )
+            .expect("fixture should be readable");
+            let file = file_with_language(relative_path, language);
+            let index = index_source_file(&file, &source).expect("fixture should parse");
+            for expected in expected_symbols {
+                assert!(
+                    index.symbols.iter().any(|symbol| symbol.name == expected),
+                    "{fixture} should index symbol {expected}"
+                );
+            }
+            assert!(
+                !index.chunks.is_empty(),
+                "{fixture} should emit at least one chunk"
+            );
+            assert!(
+                !index.calls.is_empty(),
+                "{fixture} should emit at least one call edge"
+            );
+        }
     }
 }

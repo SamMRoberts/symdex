@@ -493,7 +493,7 @@ fn print_freshness_summary(summary: &FreshnessSummary) {
 fn print_index_summary(summary: &IndexSummary) {
     println!("repository_id: {}", summary.repository_id);
     println!("repository_root: {}", summary.repository_root);
-    println!("rust_files_seen: {}", summary.files_seen);
+    println!("files_seen: {}", summary.files_seen);
     println!(
         "files_skipped_unchanged: {}",
         summary.files_skipped_unchanged

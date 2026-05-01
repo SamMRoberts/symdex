@@ -155,7 +155,7 @@ fn index_freshness_check(summary: &FreshnessSummary) -> DiagnosticCheck {
         return DiagnosticCheck {
             label: "index_freshness".to_owned(),
             state: DiagnosticState::Missing,
-            message: format!("{} has no indexed Rust files", summary.repository_id),
+            message: format!("{} has no indexed files", summary.repository_id),
         };
     }
 
