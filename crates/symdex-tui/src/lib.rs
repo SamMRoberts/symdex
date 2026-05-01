@@ -562,7 +562,7 @@ impl App {
             Err(error) => IndexRunsTimelineStatus::Failed(error),
         };
         self.storage.freshness = match run_freshness_report(&self.repo_input, None) {
-            Ok(summary) => FreshnessStatus::Completed(summary),
+            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
             Err(error) => FreshnessStatus::Failed(error),
         };
         self.storage.neighborhood = match run_semantic_neighborhood(&self.repo_input) {
@@ -4361,7 +4361,7 @@ impl StorageExplorerState {
             calls: CallResolutionStatus::Completed(calls),
             embeddings: EmbeddingCoverageStatus::Completed(embeddings),
             runs: IndexRunsTimelineStatus::Completed(runs),
-            freshness: FreshnessStatus::Completed(freshness),
+            freshness: FreshnessStatus::Completed(Box::new(freshness)),
             neighborhood: SemanticNeighborhoodStatus::Completed(neighborhood),
             health: CrossStoreHealthStatus::Completed(health),
             selection: 0,
@@ -4477,7 +4477,7 @@ enum IndexRunsTimelineStatus {
 }
 
 enum FreshnessStatus {
-    Completed(FreshnessSummary),
+    Completed(Box<FreshnessSummary>),
     Failed(String),
 }
 
