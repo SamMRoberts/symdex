@@ -2,7 +2,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::{
     ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, FileFacts, Language, LineRange,
-    ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind, content_hash,
+    ParseDiagnostic, ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind, content_hash,
     secret_exclusion_reason, stable_id,
 };
 
@@ -27,11 +27,7 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
         .ok_or_else(|| CoreError::ParseFailed {
             path: file.relative_path.clone(),
         })?;
-    if tree.root_node().has_error() {
-        return Err(CoreError::ParseFailed {
-            path: file.relative_path.clone(),
-        });
-    }
+    let parse_diagnostics = collect_parse_diagnostics(tree.root_node());
 
     let mut functions = Vec::new();
     collect_function_nodes(file.language, tree.root_node(), &mut functions);
@@ -68,7 +64,48 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
         chunks,
         symbols,
         calls,
+        parse_diagnostics,
     })
+}
+
+fn collect_parse_diagnostics(root: Node<'_>) -> Vec<ParseDiagnostic> {
+    let mut diagnostics = Vec::new();
+    collect_parse_diagnostics_from_node(root, &mut diagnostics);
+    diagnostics.sort_by_key(|diagnostic| {
+        (
+            diagnostic.byte_range.start,
+            diagnostic.byte_range.end,
+            diagnostic.message.clone(),
+        )
+    });
+    diagnostics
+}
+
+fn collect_parse_diagnostics_from_node(node: Node<'_>, diagnostics: &mut Vec<ParseDiagnostic>) {
+    if node.is_error() || node.is_missing() {
+        diagnostics.push(ParseDiagnostic {
+            byte_range: ByteRange::new(node.start_byte(), node.end_byte()),
+            line_range: LineRange::new(node.start_position().row + 1, node.end_position().row + 1),
+            message: parse_diagnostic_message(node),
+        });
+    }
+
+    if !node.has_error() {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_parse_diagnostics_from_node(child, diagnostics);
+    }
+}
+
+fn parse_diagnostic_message(node: Node<'_>) -> String {
+    if node.is_missing() {
+        format!("tree-sitter missing `{}`", node.kind())
+    } else {
+        format!("tree-sitter parse error `{}`", node.kind())
+    }
 }
 
 fn set_parser_language(parser: &mut Parser, language: Language, tsx: bool) -> Result<()> {
@@ -635,12 +672,35 @@ impl Counter {
     }
 
     #[test]
-    fn syntax_errors_fail_closed() {
+    fn syntax_errors_emit_partial_index_with_diagnostics() {
         let source = "pub fn broken( {}\n";
 
-        let error = extract_rust_chunks(&file(), source).expect_err("syntax errors should fail");
+        let index = index_rust_file(&file(), source).expect("syntax errors should index partially");
 
-        assert!(error.to_string().contains("failed to parse source file"));
+        assert!(!index.chunks.is_empty());
+        assert!(!index.parse_diagnostics.is_empty());
+        assert!(
+            index
+                .parse_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("tree-sitter"))
+        );
+    }
+
+    #[test]
+    fn partial_parse_preserves_valid_functions_around_errors() {
+        let source = r#"pub fn before() {}
+
+pub fn broken( {}
+
+pub fn after() {}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("partial parse should succeed");
+
+        assert!(!index.parse_diagnostics.is_empty());
+        assert!(index.symbols.iter().any(|symbol| symbol.name == "before"));
+        assert!(index.symbols.iter().any(|symbol| symbol.name == "after"));
     }
 
     #[test]

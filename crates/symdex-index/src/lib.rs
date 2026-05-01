@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use symdex_core::{
-    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, RepoRoot, Symbol, discover_indexable_files,
-    index_source_file,
+    CallEdge, CodeChunk, DiscoveryOptions, FileFacts, ParseDiagnostic, RepoRoot, Symbol,
+    discover_indexable_files, index_source_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
@@ -88,6 +88,7 @@ pub struct FileIndexSummary {
     pub language: String,
     pub content_hash: String,
     pub chunks: Vec<ChunkIndexSummary>,
+    pub parse_diagnostics: Vec<ParseDiagnosticSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +98,15 @@ pub struct ChunkIndexSummary {
     pub end_line: usize,
     pub symbol: Option<String>,
     pub excluded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagnosticSummary {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -567,6 +577,7 @@ fn collect_index_reports(
                     root.id(),
                     &file.facts.relative_path,
                     &file.facts.content_hash,
+                    file.facts.language.parser_version(),
                 )
                 .map_err(|error| error.to_string())?
         {
@@ -584,19 +595,24 @@ fn collect_index_reports(
             .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
         let file_index =
             index_source_file(&file.facts, &source).map_err(|error| error.to_string())?;
+        let parse_diagnostic_count = file_index.parse_diagnostics.len();
         reports.push(IndexReport {
             file: file.facts.clone(),
             chunks: file_index.chunks,
             symbols: file_index.symbols,
             calls: file_index.calls,
+            parse_diagnostics: file_index.parse_diagnostics,
             source,
         });
-        on_progress(IndexProgress::new(
-            "parse",
-            index + 1,
-            files.len(),
-            format!("Parsed {}", file.facts.relative_path),
-        ));
+        let message = if parse_diagnostic_count == 0 {
+            format!("Parsed {}", file.facts.relative_path)
+        } else {
+            format!(
+                "Parsed {} with {parse_diagnostic_count} diagnostics",
+                file.facts.relative_path
+            )
+        };
+        on_progress(IndexProgress::new("parse", index + 1, files.len(), message));
     }
     Ok(IndexCollection {
         files_seen: files.len(),
@@ -631,8 +647,23 @@ fn file_summaries(reports: &[IndexReport]) -> Vec<FileIndexSummary> {
                     excluded_reason: chunk.excluded_reason.clone(),
                 })
                 .collect(),
+            parse_diagnostics: report
+                .parse_diagnostics
+                .iter()
+                .map(parse_diagnostic_summary)
+                .collect(),
         })
         .collect()
+}
+
+fn parse_diagnostic_summary(diagnostic: &ParseDiagnostic) -> ParseDiagnosticSummary {
+    ParseDiagnosticSummary {
+        start_line: diagnostic.line_range.start,
+        end_line: diagnostic.line_range.end,
+        start_byte: diagnostic.byte_range.start,
+        end_byte: diagnostic.byte_range.end,
+        message: diagnostic.message.clone(),
+    }
 }
 
 fn persist_structural_index(
@@ -1084,6 +1115,7 @@ struct IndexReport {
     chunks: Vec<CodeChunk>,
     symbols: Vec<Symbol>,
     calls: Vec<CallEdge>,
+    parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
 }
 
@@ -1106,8 +1138,8 @@ mod tests {
     };
 
     use crate::{
-        IndexReport, WatchSnapshot, chunk_record, chunk_texts, detect_watch_changes,
-        diff_watch_snapshots, watch_snapshot,
+        IndexReport, WatchSnapshot, chunk_record, chunk_texts, collect_index_reports,
+        detect_watch_changes, diff_watch_snapshots, watch_snapshot,
     };
 
     #[test]
@@ -1121,6 +1153,7 @@ mod tests {
             chunks: vec![public.clone(), secret.clone()],
             symbols: Vec::new(),
             calls: Vec::new(),
+            parse_diagnostics: Vec::new(),
             source,
         };
 
@@ -1206,6 +1239,21 @@ mod tests {
             detect_watch_changes(&root, &snapshot).expect("changes should detect");
 
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn index_collection_keeps_partial_parse_diagnostics() {
+        let repo = TestRepo::new("partial-parse-diagnostics");
+        repo.write("src/lib.rs", "pub fn ok() {}\npub fn broken( {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let collection = collect_index_reports(&root, None, &mut |_| {})
+            .expect("syntax errors should not abort collection");
+
+        assert_eq!(collection.reports.len(), 1);
+        assert!(!collection.reports[0].chunks.is_empty());
+        assert!(!collection.reports[0].parse_diagnostics.is_empty());
+        let summaries = super::file_summaries(&collection.reports);
+        assert!(!summaries[0].parse_diagnostics.is_empty());
     }
 
     fn sample_file() -> FileFacts {

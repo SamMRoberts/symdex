@@ -193,7 +193,7 @@
 
 ### P1 — Debugging credibility
 
-- [ ] Add partial parsing with diagnostics instead of fail-closed syntax errors.
+- [x] Add partial parsing with diagnostics instead of fail-closed syntax errors.
 - [ ] Add test discovery and failing-test mapping.
 - [ ] Add evidence trust scoring combining freshness, provenance, confidence, and parse/index completeness.
 - [ ] Add explainability metadata for why results were returned.

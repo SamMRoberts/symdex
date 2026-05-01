@@ -78,8 +78,9 @@ Every chunk must include:
 Current implementation extracts Rust `function_item` syntax nodes as function
 chunks, classifies functions under `impl_item` nodes as method chunks, and emits
 a file fallback chunk only when no function-like chunks exist. Files with
-tree-sitter syntax errors currently fail closed instead of producing partial
-chunks.
+tree-sitter syntax errors produce partial chunks where possible and return
+metadata-only parse diagnostics with line and byte ranges instead of failing the
+whole index run.
 
 Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token
@@ -200,6 +201,12 @@ removes SQLite rows for deleted files. Semantic `symdex index` currently parses
 and embeds all discovered chunks so Qdrant can be rebuilt even when SQLite
 already has matching structural facts. Same-model dimension changes fail closed;
 automated collection migration/reset remains future hardening.
+
+Files indexed from tree-sitter error trees are included in normal structural and
+semantic indexing summaries with parse diagnostics. These diagnostics are not
+source previews; they contain only the diagnostic message, line range, and byte
+range so downstream agents can account for parse completeness without receiving
+file contents.
 
 Current SQLite migrations include indexes for file cleanup, symbol lookup,
 caller/callee traversal, and index-run metadata. This keeps structural queries

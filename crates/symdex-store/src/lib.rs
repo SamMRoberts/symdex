@@ -127,17 +127,23 @@ impl SqliteStore {
         repository_id: &str,
         path: &str,
         content_hash: &str,
+        parser_version: &str,
     ) -> Result<bool> {
-        let stored_hash: Option<String> = self
+        let stored: Option<(String, Option<String>)> = self
             .connection
             .query_row(
-                "SELECT content_hash FROM files WHERE repository_id = ?1 AND path = ?2",
+                "SELECT content_hash, parser_version FROM files WHERE repository_id = ?1 AND path = ?2",
                 params![repository_id, path],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(StoreError::Sqlite)?;
-        Ok(stored_hash.as_deref() == Some(content_hash))
+        Ok(stored
+            .as_ref()
+            .is_some_and(|(stored_hash, stored_parser_version)| {
+                stored_hash == content_hash
+                    && stored_parser_version.as_deref() == Some(parser_version)
+            }))
     }
 
     pub fn replace_file_facts(
@@ -3255,8 +3261,13 @@ mod tests {
 
         assert!(
             store
-                .file_unchanged("repo", "src/lib.rs", "hash-1")
+                .file_unchanged("repo", "src/lib.rs", "hash-1", "parser")
                 .expect("unchanged check should run")
+        );
+        assert!(
+            !store
+                .file_unchanged("repo", "src/lib.rs", "hash-1", "next-parser")
+                .expect("parser-version check should run")
         );
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 1);
@@ -3349,7 +3360,7 @@ mod tests {
         assert_eq!(status.chunks_indexed, 2);
         assert!(
             !store
-                .file_unchanged("repo", "src/lib.rs", "hash-1")
+                .file_unchanged("repo", "src/lib.rs", "hash-1", "parser")
                 .expect("unchanged check should run")
         );
 

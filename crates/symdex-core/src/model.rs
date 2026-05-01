@@ -163,11 +163,19 @@ pub struct CallEdge {
     pub resolution_status: ResolutionStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagnostic {
+    pub byte_range: ByteRange,
+    pub line_range: LineRange,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceFileIndex {
     pub chunks: Vec<CodeChunk>,
     pub symbols: Vec<Symbol>,
     pub calls: Vec<CallEdge>,
+    pub parse_diagnostics: Vec<ParseDiagnostic>,
 }
 
 pub type RustFileIndex = SourceFileIndex;

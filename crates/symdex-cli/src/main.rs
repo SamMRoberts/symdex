@@ -741,6 +741,22 @@ fn print_index_summary(summary: &IndexSummary) {
                 chunk.excluded_reason.as_deref().unwrap_or("<none>")
             );
         }
+        for diagnostic in file.parse_diagnostics.iter().take(5) {
+            println!(
+                "  parse_diagnostic lines={}-{} bytes={}-{} {}",
+                diagnostic.start_line,
+                diagnostic.end_line,
+                diagnostic.start_byte,
+                diagnostic.end_byte,
+                diagnostic.message
+            );
+        }
+        if file.parse_diagnostics.len() > 5 {
+            println!(
+                "  ... {} more parse diagnostics",
+                file.parse_diagnostics.len() - 5
+            );
+        }
     }
     if summary.files.len() > 20 {
         println!("... {} more files", summary.files.len() - 20);

@@ -29,6 +29,7 @@ Fixtures should be tiny and purpose-built.
 ## Required test areas
 
 - syntax chunk line ranges
+- partial parse diagnostics for syntax-error files without aborting indexing
 - stable IDs across repeated runs
 - changed file reindex
 - continuous indexing reindexes modified files
@@ -114,6 +115,8 @@ Current multi-language tests cover discovery, parser dispatch, syntax-aware
 chunking, symbol extraction, conservative call extraction, runtime path parsing,
 and continuous-indexing snapshots for C#, JavaScript, and TypeScript. Broaden
 these fixture-backed tests when adding deeper language-specific behavior.
+Current parser tests also cover syntax-error files returning partial indexes
+with metadata-only parse diagnostics instead of failing closed.
 
 Future TUI checks:
 
