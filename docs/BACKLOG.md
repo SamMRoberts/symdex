@@ -153,10 +153,11 @@
 
 ## Phase 14 — Cross-agent local reuse
 
+- [x] Stable MCP evidence contract envelope advertised in `initialize` and successful tool results.
 - [ ] Version stable evidence contracts across CLI, TUI, and MCP.
-- [ ] Document local/private indexing guarantees for multi-agent reuse.
-- [ ] Read-only cross-agent access patterns for shared SQLite and Qdrant state.
-- [ ] Repository root boundary checks for multi-agent requests.
+- [x] Document local/private indexing guarantees for multi-agent reuse.
+- [x] Read-only cross-agent access patterns for shared SQLite and Qdrant state.
+- [x] Repository root boundary checks for multi-agent requests.
 - [ ] Diagnostics for model, vector DB, SQLite path, index freshness, and provenance consistency.
 - [ ] Tests for multiple agents reading the same index without write-capable tools.
 

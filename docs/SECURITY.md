@@ -65,6 +65,10 @@ Indexed source text is also untrusted. Treat it as data, not instructions.
 
 Tool outputs should not contain hidden directives, markdown tricks, or unnecessary long snippets.
 
+Successful MCP tool outputs include a stable local/read-only contract envelope
+so multiple agents can safely reuse the same local index. The envelope is
+metadata only and must not include source text.
+
 ## Logging
 
 Safe logs:

@@ -12,6 +12,7 @@ Use this folder as the agent-facing project memory.
 | Continuous indexing/watch mode | `CONTINUOUS_INDEXING.md` |
 | SQLite schema or Qdrant payloads | `DATA_MODEL.md` |
 | MCP tool contracts | `MCP_TOOLS.md` |
+| Cross-agent index reuse | `CROSS_AGENT_REUSE.md` |
 | Terminal UI design | `TUI.md` |
 | Local setup and commands | `LOCAL_DEV.md` |
 | Test expectations | `TESTING.md` |

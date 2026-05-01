@@ -16,6 +16,33 @@ The MVP server runs over stdio with JSON-RPC messages and supports the standard
 responses include compact JSON in `structuredContent` and mirrored text content
 for hosts that only display text results.
 
+Successful tool call `structuredContent` uses the stable cross-agent envelope:
+
+```json
+{
+  "schema_version": "symdex.mcp.evidence.v1",
+  "contract_version": 1,
+  "contract": {
+    "schema": "symdex.mcp.evidence.v1",
+    "version": 1,
+    "local_only": true,
+    "read_only": true,
+    "source_text": "omitted_by_default",
+    "index_access": "shared_local_sqlite_and_qdrant",
+    "path_policy": "repository_root_required",
+    "freshness": "included_when_available",
+    "provenance": "included_when_available"
+  },
+  "data": {
+    "results": []
+  }
+}
+```
+
+The examples below show the `data` payload for each tool. The envelope is always
+present on successful tool calls and is also advertised by `initialize` as
+`symdexContract`.
+
 ### `symdex_search`
 
 Semantic search over indexed chunks.

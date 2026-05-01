@@ -131,6 +131,7 @@ MCP server:
 - output shaping
 - path boundary enforcement
 - read-only query operations
+- stable cross-agent evidence contract envelope
 
 ## Boundary rules
 
@@ -143,5 +144,8 @@ MCP server:
   nontrivial SQLite/Qdrant aggregation; expose typed summaries from shared
   library crates instead.
 - Prefer stable serialized structs for MCP outputs.
+- MCP successful tool calls must include the current cross-agent evidence
+  contract metadata so multiple local agents can interpret the same index
+  consistently.
 - Keep all path normalization centralized.
 - Do not expose absolute paths unless user configuration allows it.
