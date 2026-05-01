@@ -556,6 +556,104 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn call_paths(
+        &self,
+        repository_id: &str,
+        source_query: &str,
+        target_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = max_depth.clamp(1, 8);
+        let sources = self.resolve_symbol_refs(repository_id, source_query)?;
+        let targets = self.resolve_symbol_refs(repository_id, target_query)?;
+        let target_ids = targets
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let edges = self.call_path_edges(repository_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            trace_call_paths(
+                &source.id,
+                target_query,
+                &target_ids,
+                max_depth,
+                &edges_by_caller,
+                &mut visited,
+                &mut stack,
+                &mut paths,
+            );
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
+    fn resolve_symbol_refs(
+        &self,
+        repository_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<SymbolRef>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id
+                  FROM symbols
+                  JOIN files ON symbols.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND (symbols.id = ?2 OR symbols.name = ?2 OR symbols.qualified_name = ?2)
+                 ORDER BY symbols.qualified_name, files.path, symbols.start_line
+                 LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, symbol_query], |row| {
+                Ok(SymbolRef { id: row.get(0)? })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn call_path_edges(&self, repository_id: &str) -> Result<Vec<CallPathEdge>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.id, calls.callee_text, calls.call_line, calls.confidence,
+                        calls.resolution_status,
+                        caller.id, caller.name, caller.qualified_name, caller.kind,
+                        caller_file.path, caller.start_line, caller.end_line,
+                        callee.id, callee.name, callee.qualified_name, callee.kind,
+                        callee_file.path, callee.start_line, callee.end_line,
+                        caller_file.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_file.indexed_at
+                   FROM calls
+                   JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                   JOIN files caller_file ON caller.file_id = caller_file.id
+                   LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                   LEFT JOIN files callee_file ON callee.file_id = callee_file.id
+                  WHERE caller_file.repository_id = ?1
+                  ORDER BY caller.qualified_name, caller_file.path, calls.call_line,
+                           calls.callee_text, calls.id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], call_path_edge)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn context_pack(
         &self,
         repository_id: &str,
@@ -1712,6 +1810,38 @@ pub struct CallSearchRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CallPath {
+    pub hops: usize,
+    pub min_confidence: f64,
+    pub terminal_resolution_status: String,
+    pub edges: Vec<CallPathEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CallPathEdge {
+    pub call_id: String,
+    pub caller_symbol_id: String,
+    pub caller_symbol_name: String,
+    pub caller_symbol_qualified_name: String,
+    pub caller_symbol_kind: String,
+    pub caller_path: String,
+    pub caller_start_line: usize,
+    pub caller_end_line: usize,
+    pub callee_text: String,
+    pub callee_symbol_id: Option<String>,
+    pub callee_symbol_name: Option<String>,
+    pub callee_symbol_qualified_name: Option<String>,
+    pub callee_symbol_kind: Option<String>,
+    pub callee_path: Option<String>,
+    pub callee_start_line: Option<usize>,
+    pub callee_end_line: Option<usize>,
+    pub call_line: usize,
+    pub confidence: f64,
+    pub resolution_status: String,
+    pub provenance: EvidenceProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContextPack {
     pub format: String,
     pub repository_id: String,
@@ -2188,6 +2318,123 @@ fn call_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSearchRow> {
             embedded_at: None,
         },
     })
+}
+
+fn call_path_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallPathEdge> {
+    Ok(CallPathEdge {
+        call_id: row.get(0)?,
+        callee_text: row.get(1)?,
+        call_line: row.get::<_, i64>(2)? as usize,
+        confidence: row.get(3)?,
+        resolution_status: row.get(4)?,
+        caller_symbol_id: row.get(5)?,
+        caller_symbol_name: row.get(6)?,
+        caller_symbol_qualified_name: row.get(7)?,
+        caller_symbol_kind: row.get(8)?,
+        caller_path: row.get(9)?,
+        caller_start_line: row.get::<_, i64>(10)? as usize,
+        caller_end_line: row.get::<_, i64>(11)? as usize,
+        callee_symbol_id: row.get(12)?,
+        callee_symbol_name: row.get(13)?,
+        callee_symbol_qualified_name: row.get(14)?,
+        callee_symbol_kind: row.get(15)?,
+        callee_path: row.get(16)?,
+        callee_start_line: row.get::<_, Option<i64>>(17)?.map(|line| line as usize),
+        callee_end_line: row.get::<_, Option<i64>>(18)?.map(|line| line as usize),
+        provenance: EvidenceProvenance {
+            content_hash: row.get(19)?,
+            index_run_id: row.get(20)?,
+            parser_version: row.get(21)?,
+            indexed_at: row.get(22)?,
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        },
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolRef {
+    id: String,
+}
+
+fn trace_call_paths(
+    current_symbol_id: &str,
+    target_query: &str,
+    target_ids: &std::collections::BTreeSet<String>,
+    remaining_depth: usize,
+    edges_by_caller: &std::collections::BTreeMap<String, Vec<CallPathEdge>>,
+    visited: &mut std::collections::BTreeSet<String>,
+    stack: &mut Vec<CallPathEdge>,
+    paths: &mut Vec<CallPath>,
+) {
+    if remaining_depth == 0 || paths.len() >= 50 {
+        return;
+    }
+    let Some(edges) = edges_by_caller.get(current_symbol_id) else {
+        return;
+    };
+    for edge in edges {
+        stack.push(edge.clone());
+        if call_edge_reaches_target(edge, target_query, target_ids) {
+            paths.push(call_path_from_edges(stack));
+            stack.pop();
+            if paths.len() >= 50 {
+                return;
+            }
+            continue;
+        }
+        if let Some(next_symbol_id) = &edge.callee_symbol_id {
+            if visited.insert(next_symbol_id.clone()) {
+                trace_call_paths(
+                    next_symbol_id,
+                    target_query,
+                    target_ids,
+                    remaining_depth.saturating_sub(1),
+                    edges_by_caller,
+                    visited,
+                    stack,
+                    paths,
+                );
+                visited.remove(next_symbol_id);
+            }
+        }
+        stack.pop();
+    }
+}
+
+fn call_edge_reaches_target(
+    edge: &CallPathEdge,
+    target_query: &str,
+    target_ids: &std::collections::BTreeSet<String>,
+) -> bool {
+    edge.callee_symbol_id
+        .as_ref()
+        .is_some_and(|symbol_id| target_ids.contains(symbol_id))
+        || edge.callee_text == target_query
+        || edge
+            .callee_symbol_name
+            .as_ref()
+            .is_some_and(|name| name == target_query)
+        || edge
+            .callee_symbol_qualified_name
+            .as_ref()
+            .is_some_and(|name| name == target_query)
+}
+
+fn call_path_from_edges(edges: &[CallPathEdge]) -> CallPath {
+    CallPath {
+        hops: edges.len(),
+        min_confidence: edges
+            .iter()
+            .map(|edge| edge.confidence)
+            .fold(1.0_f64, f64::min),
+        terminal_resolution_status: edges
+            .last()
+            .map(|edge| edge.resolution_status.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        edges: edges.to_vec(),
+    }
 }
 
 fn embedding_index_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingIndexMetadata> {
@@ -3117,6 +3364,86 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_traces_bounded_call_paths_deterministically() {
+        let db = TestDb::new("call-paths");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![
+            sample_symbol("a-symbol", "a", "crate::a"),
+            sample_symbol("b-symbol", "b", "crate::b"),
+            sample_symbol("c-symbol", "c", "crate::c"),
+        ];
+        let calls = vec![
+            sample_call("call-a-b", "a-symbol", "b", Some("b-symbol"), 10),
+            sample_call("call-b-c", "b-symbol", "c", Some("c-symbol"), 20),
+            sample_call("call-a-c", "a-symbol", "c", Some("c-symbol"), 30),
+            sample_call("call-c-a", "c-symbol", "a", Some("a-symbol"), 40),
+            unresolved_call("call-a-missing", "a-symbol", "missing", 50),
+        ];
+        store
+            .replace_file_facts(&sample_file("hash-1"), &symbols, &[], &calls)
+            .expect("calls should persist");
+
+        let shallow = store
+            .call_paths("repo", "crate::a", "crate::c", 1)
+            .expect("shallow paths should trace");
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].hops, 1);
+        assert_eq!(shallow[0].edges[0].call_id, "call-a-c");
+
+        let paths = store
+            .call_paths("repo", "crate::a", "crate::c", 2)
+            .expect("paths should trace");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].hops, 2);
+        assert_eq!(paths[0].edges[0].call_id, "call-a-b");
+        assert_eq!(paths[0].edges[1].call_id, "call-b-c");
+        assert_eq!(paths[1].hops, 1);
+        assert_eq!(paths[1].edges[0].call_id, "call-a-c");
+
+        let cyclic = store
+            .call_paths("repo", "crate::a", "crate::c", 8)
+            .expect("cycle-safe paths should trace");
+        assert_eq!(cyclic.len(), 2);
+    }
+
+    #[test]
+    fn sqlite_traces_unresolved_terminal_call_path_by_callee_text() {
+        let db = TestDb::new("call-paths-unresolved");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![sample_symbol("a-symbol", "a", "crate::a")];
+        let calls = vec![unresolved_call("call-a-missing", "a-symbol", "missing", 10)];
+        store
+            .replace_file_facts(&sample_file("hash-1"), &symbols, &[], &calls)
+            .expect("calls should persist");
+
+        let paths = store
+            .call_paths("repo", "crate::a", "missing", 2)
+            .expect("unresolved terminal path should trace");
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].hops, 1);
+        assert_eq!(paths[0].terminal_resolution_status, "unresolved");
+        assert_eq!(paths[0].edges[0].callee_symbol_id, None);
+        assert_eq!(paths[0].edges[0].callee_text, "missing");
+    }
+
+    #[test]
     fn sqlite_builds_compact_context_pack() {
         let db = TestDb::new("context-pack");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -3945,6 +4272,38 @@ mod tests {
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
         }
+    }
+
+    fn sample_call(
+        id: &str,
+        caller_symbol_id: &str,
+        callee_text: &str,
+        callee_symbol_id: Option<&str>,
+        call_line: usize,
+    ) -> CallRecord {
+        CallRecord {
+            id: id.to_owned(),
+            caller_symbol_id: caller_symbol_id.to_owned(),
+            callee_text: callee_text.to_owned(),
+            callee_symbol_id: callee_symbol_id.map(str::to_owned),
+            call_line,
+            confidence: 1.0,
+            resolution_status: "resolved_exact".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        }
+    }
+
+    fn unresolved_call(
+        id: &str,
+        caller_symbol_id: &str,
+        callee_text: &str,
+        call_line: usize,
+    ) -> CallRecord {
+        let mut call = sample_call(id, caller_symbol_id, callee_text, None, call_line);
+        call.confidence = 0.25;
+        call.resolution_status = "unresolved".to_owned();
+        call
     }
 
     fn sample_index_run(model: &str, dimension: usize) -> crate::IndexRunRecord {

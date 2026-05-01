@@ -8,8 +8,9 @@ use symdex_index::{
     WatchChangeSet, run_continuous_index, run_index,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, FreshnessSummary, ImpactSummary, run_call_graph,
-    run_context_pack, run_freshness_report, run_impact, run_semantic_search, run_symbol_search,
+    CallDirection, CallGraphSummary, CallPathSummary, FreshnessSummary, ImpactSummary,
+    run_call_graph, run_call_path, run_context_pack, run_freshness_report, run_impact,
+    run_semantic_search, run_symbol_search,
 };
 use symdex_store::{EvidenceFreshness, SqliteStore, StoreConfig, sqlite_parent};
 
@@ -56,6 +57,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
             callees(repo, query)
+        }
+        "call-path" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let source = args.get(2).map(String::as_str).unwrap_or("");
+            let target = args.get(3).map(String::as_str).unwrap_or("");
+            let max_depth = args
+                .get(4)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(4);
+            call_path(repo, source, target, max_depth)
         }
         "impact" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -211,6 +222,20 @@ fn callees(repo: &str, query: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn call_path(repo: &str, source: &str, target: &str, max_depth: usize) -> Result<(), String> {
+    let summary = run_call_path(repo, source, target, max_depth).map_err(|error| {
+        if error.contains("source symbol query") {
+            "call-path requires a source symbol query".to_owned()
+        } else if error.contains("target symbol query") {
+            "call-path requires a target symbol query".to_owned()
+        } else {
+            error
+        }
+    })?;
+    print_call_path_summary(&summary);
+    Ok(())
+}
+
 fn impact(repo: &str, query: &str) -> Result<(), String> {
     let summary = run_impact(repo, query).map_err(|error| {
         if error.contains("requires a symbol query") {
@@ -221,6 +246,39 @@ fn impact(repo: &str, query: &str) -> Result<(), String> {
     })?;
     print_impact_summary(&summary);
     Ok(())
+}
+
+fn print_call_path_summary(summary: &CallPathSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!("source: {}", summary.source_query);
+    println!("target: {}", summary.target_query);
+    println!("max_depth: {}", summary.max_depth);
+    println!("paths: {}", summary.paths.len());
+    for (index, path) in summary.paths.iter().enumerate() {
+        println!(
+            "path {} hops={} min_confidence={:.2} terminal_status={}",
+            index + 1,
+            path.hops,
+            path.min_confidence,
+            path.terminal_resolution_status
+        );
+        for edge in &path.edges {
+            println!(
+                "  {} -> {} line={} confidence={:.2} status={} {}:{}-{} run={}",
+                edge.caller_symbol_qualified_name,
+                edge.callee_symbol_qualified_name
+                    .as_deref()
+                    .unwrap_or(&edge.callee_text),
+                edge.call_line,
+                edge.confidence,
+                edge.resolution_status,
+                edge.caller_path,
+                edge.caller_start_line,
+                edge.caller_end_line,
+                edge.provenance.index_run_id.as_deref().unwrap_or("<none>")
+            );
+        }
+    }
 }
 
 fn print_impact_summary(summary: &ImpactSummary) {
@@ -529,7 +587,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct callers and callees\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }
