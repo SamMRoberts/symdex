@@ -178,6 +178,40 @@
   incremental indexing, continuous indexing, and MCP evidence for C#,
   JavaScript, and TypeScript.
 
+## Suggested next steps, prioritized
+
+### P0 — Production hardening foundation
+
+- [ ] Add CI for fmt, clippy, tests, release build, and dependency audit.
+- [ ] Add JSON CLI output mirroring MCP contracts.
+- [ ] Record failed and partial index runs, not only successful summaries.
+- [ ] Implement Qdrant delete, verify, and repair lifecycle for changed or deleted chunks.
+- [ ] Split large store and TUI files into modules.
+
+### P1 — Debugging credibility
+
+- [ ] Add partial parsing with diagnostics instead of fail-closed syntax errors.
+- [ ] Add test discovery and failing-test mapping.
+- [ ] Add evidence trust scoring combining freshness, provenance, confidence, and parse/index completeness.
+- [ ] Add explainability metadata for why results were returned.
+- [ ] Improve debug-context parsing for common Rust outputs: `cargo test`, `anyhow`, `tracing`, `RUST_BACKTRACE=full`, panic hooks, and async stack-like output.
+
+### P2 — Semantic precision
+
+- [ ] Add optional rust-analyzer enrichment.
+- [ ] Improve module, import, trait, and method resolution.
+- [ ] Add macro-aware limitations and diagnostics.
+- [ ] Add type-definition and impl/trait chunks.
+- [ ] Add cross-file and cross-module call resolution.
+
+### P3 — Operational polish
+
+- [ ] Add structured logging and metrics.
+- [ ] Add benchmarks and large-repo tests.
+- [ ] Add install and release packaging.
+- [ ] Improve the config model and CLI parser.
+- [ ] Continue TUI modularization and UX polish for warnings, stale rows, failed runs, and repair actions.
+
 ## Do not start yet
 
 - web UI
