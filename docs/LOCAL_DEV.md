@@ -145,17 +145,18 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   matches with scores, paths, line ranges, symbol names, and provenance
   metadata. Text output also prints compact reason tags for each match.
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
-  opens a repository/status dashboard backed by SQLite metadata and local
-  service configuration. Use `o` to confirm offline indexing, `s` to confirm
-  semantic indexing, `c` to toggle continuous indexing, `[` / `]` to move
-  between the Index, Storage, Doctor, Query, Calls, and Impact tabs, and
-  `Tab` / `Shift+Tab` to toggle view-local modes including impact, call-path,
-  context-pack, and debug-context evidence modes. In the Doctor tab, `Enter`
-  starts diagnostics when no result rows are available. The storage explorer
-  always shows its own nested tab header for storage overview/index
+  opens an Overview tab backed by SQLite metadata and local service
+  configuration, then uses a compact repository summary beside or above the
+  active workflow on other tabs. Use `o` to confirm offline indexing, `s` to
+  confirm semantic indexing, `c` to toggle continuous indexing, `[` / `]` to
+  move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
+  tabs, and `Tab` / `Shift+Tab` to toggle view-local modes including impact,
+  call-path, context-pack, and debug-context evidence modes. In the Doctor tab,
+  `Enter` starts diagnostics when no result rows are available. The storage
+  explorer always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs
-  timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r` to refresh
-  repository/storage status, and `q` or `Esc` to quit.
+  timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
+  to refresh repository/storage status, and `q` or `Esc` to quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and

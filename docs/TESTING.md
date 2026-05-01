@@ -162,8 +162,9 @@ cargo test -p symdex-tui
 cargo run -p symdex-cli -- tui --help
 ```
 
-Current TUI tests cover dashboard rendering, doctor diagnostics rendering, query
-workbench rendering and input state, symbol/call graph rendering and input
+Current TUI tests cover Overview/dashboard rendering, adaptive compact summary
+rendering, compact key-chip footer rendering, doctor diagnostics rendering,
+query workbench rendering and input state, symbol/call graph rendering and input
 state, impact/call-path/context-pack/debug-context rendering and input state, the storage explorer
 metric table, always-visible nested storage tab header, and detail panel,
 index coverage table and selected-file detail panel with chunk, symbol, and
