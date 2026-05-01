@@ -27,7 +27,13 @@ SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
+SYMDEX_RUST_ANALYZER=0
+SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
+
+`SYMDEX_RUST_ANALYZER=1` enables an optional `symdex doctor` readiness check for
+the configured rust-analyzer binary. The check runs `rust-analyzer --version`
+only; indexing does not run rust-analyzer project analysis by default.
 
 ## Expected commands
 
@@ -68,8 +74,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 
 - `init`: creates the local state directory for the configured SQLite path.
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
-  service checks, the active MCP evidence contract version, and repo-specific
-  index freshness/provenance readiness when a repo path is provided.
+  service checks, optional rust-analyzer enrichment readiness when explicitly
+  enabled, the active MCP evidence contract version, and repo-specific index
+  freshness/provenance readiness when a repo path is provided.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
   applies built-in excludes and scoped simple `.gitignore` rules, hashes file
   contents, extracts tree-sitter function and method chunks where supported,
@@ -184,5 +191,6 @@ The app should not require network access beyond local loopback services during 
 - embedding model is available
 - vector dimension can be determined
 - active MCP evidence contract version is local-only and read-only
+- optional rust-analyzer enrichment readiness when `SYMDEX_RUST_ANALYZER=1`
 - configured repo root exists
 - repo-specific index freshness and provenance consistency when a repo is passed

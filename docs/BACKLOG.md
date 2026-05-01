@@ -201,7 +201,8 @@
 
 ### P2 — Semantic precision
 
-- [ ] Add optional rust-analyzer enrichment.
+- [x] Add optional rust-analyzer enrichment readiness gate.
+- [ ] Add opt-in rust-analyzer symbol and call enrichment.
 - [ ] Improve module, import, trait, and method resolution.
 - [ ] Add macro-aware limitations and diagnostics.
 - [ ] Add type-definition and impl/trait chunks.

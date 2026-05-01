@@ -68,6 +68,9 @@ Fixtures should be tiny and purpose-built.
 - Rust test discovery coverage for recognized test attributes, module-qualified
   test names, SQLite test persistence/replacement, failing-test name mapping,
   and impact likely-test evidence from direct indexed test calls.
+- Optional rust-analyzer readiness coverage for default-off behavior, explicit
+  truthy opt-in flags, command override parsing, and doctor check status without
+  requiring rust-analyzer in ordinary tests.
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -162,6 +165,8 @@ Current cross-agent reuse tests cover the shared MCP evidence contract envelope,
 read-only tool annotations, underscore-only tool names, repo root validation,
 and two independent MCP readers using the same SQLite index-status path without
 write-capable tools.
+Current diagnostics tests cover optional rust-analyzer readiness configuration
+without invoking project analysis or requiring rust-analyzer to be installed.
 
 Current call path tests cover deterministic path order, unresolved terminal
 edges matched by callee text, ambiguous terminal edges matched by callee text,

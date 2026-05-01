@@ -192,6 +192,13 @@ is local and conservative: exact qualified-name matches are
 multiple matches are `ambiguous`, and all other calls are preserved as
 `unresolved`.
 
+Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
+diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is
+available when `SYMDEX_RUST_ANALYZER=1` is set, but indexing does not invoke
+project analysis by default. Future symbol and call enrichment must keep this
+opt-in boundary, preserve source-text privacy, and avoid executing indexed
+repository code.
+
 ## Incremental indexing
 
 A file can be skipped only when:

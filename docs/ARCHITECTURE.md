@@ -67,6 +67,7 @@ Local diagnostics:
 - SQLite parent path checks
 - Ollama model and embedding dimension checks
 - Qdrant health checks
+- optional rust-analyzer enrichment readiness checks when explicitly enabled
 
 Do not mutate repository data. Keep diagnostics local and reusable by CLI and
 TUI.
