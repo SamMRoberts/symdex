@@ -32,7 +32,8 @@ Successful tool call `structuredContent` uses the stable cross-agent envelope:
     "path_policy": "repository_root_required",
     "freshness": "included_when_available",
     "provenance": "included_when_available",
-    "trust": "included_when_available"
+    "trust": "included_when_available",
+    "reasons": "included_when_available"
   },
   "data": {
     "results": []
@@ -80,6 +81,18 @@ Output:
       "chunk_kind": "function",
       "text_hash": "sha256:...",
       "freshness": "fresh",
+      "trust": {
+        "score": 0.93,
+        "level": "high",
+        "factors": ["freshness:fresh", "confidence:0.82"]
+      },
+      "reasons": [
+        "semantic_vector_match",
+        "semantic_score:0.8200",
+        "path:crates/foo/src/lib.rs",
+        "chunk_kind:function",
+        "symbol_payload:foo::retry::run_with_backoff"
+      ],
       "provenance": {
         "content_hash": "sha256:...",
         "index_run_id": "repo-semantic-...",
@@ -96,8 +109,8 @@ Output:
 
 The search tool embeds the query with the configured local Ollama model and
 queries the local Qdrant collection. It returns chunk metadata, freshness state,
-trust, and provenance only; it does not return source excerpts in the current
-MVP.
+trust, reason tags, and provenance only; it does not return source excerpts in
+the current MVP.
 
 ### `symdex_find_symbol`
 
@@ -113,8 +126,8 @@ Input:
 }
 ```
 
-Output rows include `freshness`, `trust`, and `provenance` with content hash,
-index run ID, parser version, and indexed timestamp.
+Output rows include `freshness`, `trust`, `reasons`, and `provenance` with
+content hash, index run ID, parser version, and indexed timestamp.
 
 ### `symdex_callers`
 
@@ -129,8 +142,8 @@ Input:
 }
 ```
 
-Output rows include call confidence/resolution data, `freshness`, `trust`, and
-`provenance`.
+Output rows include call confidence/resolution data, `freshness`, `trust`,
+`reasons`, and `provenance`.
 
 ### `symdex_callees`
 
@@ -145,8 +158,8 @@ Input:
 }
 ```
 
-Output rows include call confidence/resolution data, `freshness`, `trust`, and
-`provenance`.
+Output rows include call confidence/resolution data, `freshness`, `trust`,
+`reasons`, and `provenance`.
 
 ### `symdex_call_path`
 
@@ -188,6 +201,19 @@ Output:
           "confidence": 1.0,
           "resolution_status": "resolved_exact",
           "freshness": "fresh",
+          "trust": {
+            "score": 1.0,
+            "level": "high",
+            "factors": ["freshness:fresh", "confidence:1.00"]
+          },
+          "reasons": [
+            "relationship:call_path_edge",
+            "persisted_path_edge",
+            "caller:foo::api::handler",
+            "callee:foo::service::run",
+            "resolution_status:resolved_exact",
+            "confidence:1.00"
+          ],
           "provenance": {
             "content_hash": "sha256:...",
             "index_run_id": "repo-semantic-...",
@@ -207,7 +233,8 @@ Output:
 `max_depth` is clamped to 1-8 hops. Traversal follows resolved persisted call
 edges, avoids cycles, returns paths in deterministic index order, and keeps
 unresolved or ambiguous edges as terminal evidence when their `callee_text`
-matches the target query. The tool does not return source text.
+matches the target query. Path and edge rows include reason tags that explain
+the relationship and traversal evidence. The tool does not return source text.
 
 ### `symdex_impact`
 

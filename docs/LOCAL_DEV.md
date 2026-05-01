@@ -111,9 +111,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `impact <repo> <symbol>`: prints direct callers, direct callees, bounded
   transitive caller/callee paths, related files, provenance, and staleness
   labels. Evidence rows include trust scores derived from freshness,
-  provenance completeness, confidence, and index metadata completeness. Likely
-  tests list indexed Rust tests that directly call the queried symbol when
-  discovered test metadata and resolved call evidence are present.
+  provenance completeness, confidence, and index metadata completeness, plus
+  compact reason tags explaining why each evidence row was returned. Likely tests
+  list indexed Rust tests that directly call the queried symbol when discovered
+  test metadata and resolved call evidence are present.
 - `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
   context. The current format is `symdex.context_pack.v1` and includes focus
   symbols, direct callers, direct callees, involved files, section limits, and
@@ -124,11 +125,11 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   frames to indexed files, symbols, calls at the failing line, freshness, and
   provenance when available. Passing `-` reads from stdin; a single existing
   path reads that file; otherwise remaining arguments are treated as inline
-  runtime text. Frame matches include trust scores and the pack does not include
-  source text.
+  runtime text. Frame matches include trust scores and reason tags, and the pack
+  does not include source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, symbol names, and provenance
-  metadata.
+  metadata. Text output also prints compact reason tags for each match.
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
   opens a repository/status dashboard backed by SQLite metadata and local
   service configuration. Use `o` to confirm offline indexing, `s` to confirm

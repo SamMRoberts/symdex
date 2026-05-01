@@ -486,12 +486,13 @@ fn print_impact_summary(summary: &ImpactSummary) {
     println!("related_files: {}", summary.related_files.len());
     for file in &summary.related_files {
         println!(
-            "{} relationships={} freshness={} trust={:.2}/{} run={}",
+            "{} relationships={} freshness={} trust={:.2}/{} reasons={} run={}",
             file.path,
             file.relationship_count,
             file.freshness.label(),
             file.trust.score,
             file.trust.level,
+            reason_list(&file.reasons),
             file.provenance
                 .as_ref()
                 .and_then(|provenance| provenance.index_run_id.as_deref())
@@ -510,31 +511,34 @@ fn print_impact_summary(summary: &ImpactSummary) {
 fn print_impact_call_evidence(evidence: &symdex_query::ImpactCallEvidence) {
     print_call_row(&evidence.row);
     println!(
-        "freshness={} trust={:.2}/{}",
+        "freshness={} trust={:.2}/{} reasons={}",
         evidence.freshness.label(),
         evidence.trust.score,
-        evidence.trust.level
+        evidence.trust.level,
+        reason_list(&evidence.reasons)
     );
 }
 
 fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
     println!(
-        "path hops={} min_confidence={:.2} terminal_status={} trust={:.2}/{}",
+        "path hops={} min_confidence={:.2} terminal_status={} trust={:.2}/{} reasons={}",
         evidence.path.hops,
         evidence.path.min_confidence,
         evidence.path.terminal_resolution_status,
         evidence.trust.score,
-        evidence.trust.level
+        evidence.trust.level,
+        reason_list(&evidence.reasons)
     );
-    for ((edge, freshness), trust) in evidence
+    for (((edge, freshness), trust), reasons) in evidence
         .path
         .edges
         .iter()
         .zip(&evidence.edge_freshness)
         .zip(&evidence.edge_trust)
+        .zip(&evidence.edge_reasons)
     {
         println!(
-            "  {} -> {} line={} confidence={:.2} status={} freshness={} trust={:.2}/{} {}:{}-{} run={}",
+            "  {} -> {} line={} confidence={:.2} status={} freshness={} trust={:.2}/{} reasons={} {}:{}-{} run={}",
             edge.caller_symbol_qualified_name,
             edge.callee_symbol_qualified_name
                 .as_deref()
@@ -545,6 +549,7 @@ fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
             freshness.label(),
             trust.score,
             trust.level,
+            reason_list(reasons),
             edge.caller_path,
             edge.caller_start_line,
             edge.caller_end_line,
@@ -676,12 +681,13 @@ fn search(repo: &str, query_parts: &[String], output: OutputMode) -> Result<(), 
     println!("results: {}", summary.results.len());
     for result in summary.results {
         println!(
-            "{:.4} {}:{}-{} {} run={}",
+            "{:.4} {}:{}-{} {} reasons={} run={}",
             result.score,
             result.path,
             result.start_line,
             result.end_line,
             result.symbol_name.as_deref().unwrap_or("<none>"),
+            reason_list(&result.reasons),
             result
                 .provenance
                 .index_run_id
@@ -690,6 +696,13 @@ fn search(repo: &str, query_parts: &[String], output: OutputMode) -> Result<(), 
         );
     }
     Ok(())
+}
+
+fn reason_list(reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        return "<none>".to_owned();
+    }
+    reasons.join(",")
 }
 
 fn print_mcp_json_tool(name: &str, arguments: serde_json::Value) -> Result<(), String> {

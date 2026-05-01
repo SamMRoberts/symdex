@@ -7419,6 +7419,7 @@ mod tests {
             row: sample_call_row(),
             freshness: EvidenceFreshness::Fresh,
             trust: sample_trust(),
+            reasons: vec!["relationship:direct_caller".to_owned()],
         }
     }
 
@@ -7530,6 +7531,7 @@ mod tests {
                     file_freshness: EvidenceFreshness::Fresh,
                     file_provenance: Some(sample_provenance()),
                     trust: sample_trust(),
+                    reasons: vec!["symbols_at_runtime_location".to_owned()],
                     matched_symbols: vec![SymbolSearchRow {
                         id: "symbol-caller".to_owned(),
                         name: "caller".to_owned(),
@@ -7561,6 +7563,7 @@ mod tests {
                     file_freshness: EvidenceFreshness::Stale,
                     file_provenance: Some(sample_provenance()),
                     trust: sample_trust(),
+                    reasons: vec!["symbols_at_runtime_location".to_owned()],
                     matched_symbols: vec![sample_symbol(
                         "symbol-add".to_owned(),
                         "crate::add".to_owned(),

@@ -196,7 +196,7 @@
 - [x] Add partial parsing with diagnostics instead of fail-closed syntax errors.
 - [x] Add test discovery and failing-test mapping.
 - [x] Add evidence trust scoring combining freshness, provenance, confidence, and parse/index completeness.
-- [ ] Add explainability metadata for why results were returned.
+- [x] Add explainability metadata for why results were returned.
 - [ ] Improve debug-context parsing for common Rust outputs: `cargo test`, `anyhow`, `tracing`, `RUST_BACKTRACE=full`, panic hooks, and async stack-like output.
 
 ### P2 — Semantic precision

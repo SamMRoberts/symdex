@@ -235,6 +235,13 @@ completeness from `index_run_id` plus `parser_version`. Trust levels are
 it is a compact ordering aid for agents deciding which metadata-only evidence is
 fresh, well-provenanced, and directly supported by indexed facts.
 
+Query-time evidence rows also include compact `reasons` tags where available.
+These tags explain why the row was returned without adding source text or new
+storage schema. Examples include `semantic_vector_match`,
+`relationship:direct_caller`, `bounded_transitive_call_path`,
+`symbols_at_runtime_location`, `symbol_name_fallback_match`, and
+`related_file_from_call_evidence`.
+
 Use cosine distance unless a selected embedding model requires otherwise.
 
 Before writing vectors, symdex checks the latest successful run for the same
@@ -406,8 +413,8 @@ Current behavior:
   `callee_text` matches the target query
 - cycles are skipped by tracking visited symbol IDs per candidate path
 - returned edges include caller/callee metadata, call line, confidence,
-  resolution status, freshness, trust, and provenance; they never include
-  source text
+  resolution status, freshness, trust, reason tags, and provenance; they never
+  include source text
 
 ## Impact traversal and related-file evidence
 
@@ -421,10 +428,13 @@ metadata-only edge shape as call path tracing.
 Impact related files are derived from direct relationships and transitive path
 edges. Each related-file row includes a deterministic relationship count,
 freshness label, trust score, and the first available provenance record for that
-file. The impact report also includes indexed Rust tests that directly call the
-queried symbol through resolved call edges. When no direct indexed test evidence
-is available, `tests_likely` remains empty and the output includes an
-explanatory note instead of guessing.
+file. Direct call rows, transitive paths, path edges, and related-file rows also
+carry reason tags that distinguish direct caller/callee evidence, bounded
+transitive paths, and file relationships derived from call evidence. The impact
+report also includes indexed Rust tests that directly call the queried symbol
+through resolved call edges. When no direct indexed test evidence is available,
+`tests_likely` remains empty and the output includes an explanatory note instead
+of guessing.
 
 ## Debug context packs
 
@@ -442,5 +452,8 @@ metadata. Failing test names found in runtime input are mapped to indexed Rust
 test facts when an exact or suffix match exists; unmatched runtime names are
 kept as fallbacks and labeled with a note. Frame matches include trust scores so
 agents can distinguish fresh, fully provenanced runtime evidence from stale,
-deleted, or weakly provenanced matches. Debug context packs do not include source
-text and do not mutate index state.
+deleted, or weakly provenanced matches. They also include reason tags that
+identify path normalization, file provenance matches, symbol-at-location
+matches, symbol-name fallback matches, calls at the runtime line, and unmatched
+frames. Debug context packs do not include source text and do not mutate index
+state.

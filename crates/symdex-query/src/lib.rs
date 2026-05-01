@@ -89,6 +89,7 @@ pub struct SemanticSearchResult {
     pub symbol_name: Option<String>,
     pub chunk_kind: String,
     pub provenance: EvidenceProvenance,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +145,7 @@ pub struct ImpactCallEvidence {
     pub row: CallSearchRow,
     pub freshness: EvidenceFreshness,
     pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,7 +153,9 @@ pub struct ImpactPathEvidence {
     pub path: CallPath,
     pub edge_freshness: Vec<EvidenceFreshness>,
     pub edge_trust: Vec<EvidenceTrust>,
+    pub edge_reasons: Vec<Vec<String>>,
     pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +165,7 @@ pub struct ImpactRelatedFile {
     pub freshness: EvidenceFreshness,
     pub provenance: Option<EvidenceProvenance>,
     pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -214,6 +219,7 @@ pub struct DebugFrameMatch {
     pub file_freshness: EvidenceFreshness,
     pub file_provenance: Option<EvidenceProvenance>,
     pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
     pub matched_symbols: Vec<SymbolSearchRow>,
     pub calls_at_line: Vec<CallPath>,
     pub matched: bool,
@@ -346,19 +352,19 @@ fn build_impact_summary(
     let max_depth = 4;
     let direct_callers = sqlite
         .callers(root.id(), query)
-        .map(|rows| impact_call_evidence(rows, &current_hashes))
+        .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_caller"))
         .map_err(|error| error.to_string())?;
     let direct_callees = sqlite
         .callees(root.id(), query)
-        .map(|rows| impact_call_evidence(rows, &current_hashes))
+        .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_callee"))
         .map_err(|error| error.to_string())?;
     let transitive_callers = sqlite
         .transitive_call_paths_to(root.id(), query, max_depth)
-        .map(|paths| impact_path_evidence(paths, &current_hashes))
+        .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_caller"))
         .map_err(|error| error.to_string())?;
     let transitive_callees = sqlite
         .transitive_call_paths_from(root.id(), query, max_depth)
-        .map(|paths| impact_path_evidence(paths, &current_hashes))
+        .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_callee"))
         .map_err(|error| error.to_string())?;
     let related_files = impact_related_files(
         &direct_callers,
@@ -803,6 +809,26 @@ fn qdrant_value_id(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+fn semantic_reasons(
+    score: f64,
+    path: &str,
+    symbol_name: Option<&str>,
+    chunk_kind: &str,
+) -> Vec<String> {
+    let mut reasons = vec![
+        "semantic_vector_match".to_owned(),
+        format!("semantic_score:{score:.4}"),
+        format!("path:{path}"),
+        format!("chunk_kind:{chunk_kind}"),
+    ];
+    if let Some(symbol_name) = symbol_name {
+        reasons.push(format!("symbol_payload:{symbol_name}"));
+    } else {
+        reasons.push("symbol_payload:missing".to_owned());
+    }
+    reasons
+}
+
 pub fn run_semantic_search(
     repo: &str,
     query: &str,
@@ -831,22 +857,29 @@ pub fn run_semantic_search(
         .query_points(&qdrant_collection, vector, limit)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .map(|point| SemanticSearchResult {
-            score: point.score,
-            path: point.payload.path,
-            start_line: point.payload.start_line,
-            end_line: point.payload.end_line,
-            symbol_name: point.payload.symbol_name,
-            chunk_kind: point.payload.chunk_kind,
-            provenance: EvidenceProvenance {
-                content_hash: point.payload.content_hash,
-                index_run_id: point.payload.index_run_id,
-                parser_version: point.payload.parser_version,
-                indexed_at: point.payload.indexed_at,
-                embedding_model: point.payload.embedding_model,
-                embedding_dimension: point.payload.embedding_dimension,
-                embedded_at: None,
-            },
+        .map(|point| {
+            let path = point.payload.path;
+            let symbol_name = point.payload.symbol_name;
+            let chunk_kind = point.payload.chunk_kind;
+            let reasons = semantic_reasons(point.score, &path, symbol_name.as_deref(), &chunk_kind);
+            SemanticSearchResult {
+                score: point.score,
+                path,
+                start_line: point.payload.start_line,
+                end_line: point.payload.end_line,
+                symbol_name,
+                chunk_kind,
+                provenance: EvidenceProvenance {
+                    content_hash: point.payload.content_hash,
+                    index_run_id: point.payload.index_run_id,
+                    parser_version: point.payload.parser_version,
+                    indexed_at: point.payload.indexed_at,
+                    embedding_model: point.payload.embedding_model,
+                    embedding_dimension: point.payload.embedding_dimension,
+                    embedded_at: None,
+                },
+                reasons,
+            }
         })
         .collect();
 
@@ -883,18 +916,25 @@ fn build_debug_context_pack(
                 .map_err(|error| error.to_string())?,
             None => None,
         };
+        let mut symbol_match_reason = None;
         let mut matched_symbols = match (normalized_path.as_deref(), frame.line) {
             (Some(path), Some(line)) => sqlite
                 .symbols_at_location(root.id(), path, line)
                 .map_err(|error| error.to_string())?,
             _ => Vec::new(),
         };
+        if !matched_symbols.is_empty() {
+            symbol_match_reason = Some("symbols_at_runtime_location");
+        }
         if matched_symbols.is_empty()
             && let Some(symbol) = frame.symbol.as_deref()
         {
             matched_symbols = sqlite
                 .find_symbols(root.id(), symbol)
                 .map_err(|error| error.to_string())?;
+            if !matched_symbols.is_empty() {
+                symbol_match_reason = Some("symbol_name_fallback_match");
+            }
         }
         matched_symbols.truncate(max_symbols);
 
@@ -929,6 +969,14 @@ fn build_debug_context_pack(
         let trust = evidence_trust(file_freshness, provenance.as_ref(), None);
         let matched =
             file_provenance.is_some() || !matched_symbols.is_empty() || !calls_at_line.is_empty();
+        let reasons = debug_frame_reasons(
+            frame,
+            normalized_path.as_deref(),
+            file_provenance.is_some(),
+            symbol_match_reason,
+            calls_at_line.len(),
+            matched,
+        );
 
         frames.push(DebugFrameMatch {
             frame: frame.clone(),
@@ -936,6 +984,7 @@ fn build_debug_context_pack(
             file_freshness,
             file_provenance: provenance,
             trust,
+            reasons,
             matched_symbols,
             calls_at_line,
             matched,
@@ -1316,19 +1365,119 @@ fn round_trust_score(score: f64) -> f64 {
     (score * 100.0).round() / 100.0
 }
 
+fn call_reasons(row: &CallSearchRow, relationship: &str) -> Vec<String> {
+    let mut reasons = vec![
+        format!("relationship:{relationship}"),
+        "persisted_call_edge".to_owned(),
+        format!("callee_text:{}", row.callee_text),
+        format!("resolution_status:{}", row.resolution_status),
+        format!("confidence:{:.2}", row.confidence),
+    ];
+    if let Some(symbol) = &row.symbol_qualified_name {
+        reasons.push(format!("symbol_match:{symbol}"));
+    } else if let Some(symbol) = &row.symbol_name {
+        reasons.push(format!("symbol_match:{symbol}"));
+    } else {
+        reasons.push("symbol_match:unresolved".to_owned());
+    }
+    if let Some(path) = &row.path {
+        reasons.push(format!("path:{path}"));
+    }
+    reasons
+}
+
+fn path_reasons(path: &CallPath, relationship: &str) -> Vec<String> {
+    vec![
+        format!("relationship:{relationship}"),
+        "bounded_transitive_call_path".to_owned(),
+        format!("hops:{}", path.hops),
+        format!("min_confidence:{:.2}", path.min_confidence),
+        format!(
+            "terminal_resolution_status:{}",
+            path.terminal_resolution_status
+        ),
+    ]
+}
+
+fn edge_reasons(edge: &symdex_store::CallPathEdge, relationship: &str) -> Vec<String> {
+    vec![
+        format!("relationship:{relationship}"),
+        "persisted_path_edge".to_owned(),
+        format!("caller:{}", edge.caller_symbol_qualified_name),
+        format!(
+            "callee:{}",
+            edge.callee_symbol_qualified_name
+                .as_deref()
+                .unwrap_or(&edge.callee_text)
+        ),
+        format!("resolution_status:{}", edge.resolution_status),
+        format!("confidence:{:.2}", edge.confidence),
+    ]
+}
+
+fn related_file_reasons(
+    relationship_count: usize,
+    provenance: Option<&EvidenceProvenance>,
+) -> Vec<String> {
+    let mut reasons = vec![
+        "related_file_from_call_evidence".to_owned(),
+        format!("relationship_count:{relationship_count}"),
+    ];
+    if provenance.is_some() {
+        reasons.push("provenance:first_related_edge".to_owned());
+    } else {
+        reasons.push("provenance:missing".to_owned());
+    }
+    reasons
+}
+
+fn debug_frame_reasons(
+    frame: &RuntimeFrame,
+    normalized_path: Option<&str>,
+    has_file_provenance: bool,
+    symbol_match_reason: Option<&'static str>,
+    calls_at_line: usize,
+    matched: bool,
+) -> Vec<String> {
+    let mut reasons = vec![format!("runtime_frame:{}", frame.ordinal)];
+    if let Some(path) = normalized_path {
+        reasons.push(format!("runtime_path_normalized:{path}"));
+    } else if frame.path.is_some() {
+        reasons.push("runtime_path_outside_or_unindexed".to_owned());
+    } else {
+        reasons.push("runtime_path:missing".to_owned());
+    }
+    if has_file_provenance {
+        reasons.push("file_provenance_match".to_owned());
+    }
+    if let Some(reason) = symbol_match_reason {
+        reasons.push(reason.to_owned());
+    }
+    if calls_at_line > 0 {
+        reasons.push(format!("calls_at_runtime_line:{calls_at_line}"));
+    }
+    if !matched {
+        reasons.push("unmatched_runtime_frame".to_owned());
+    }
+    reasons
+}
+
 fn impact_call_evidence(
     rows: Vec<CallSearchRow>,
     current_hashes: &BTreeMap<String, String>,
+    relationship: &str,
 ) -> Vec<ImpactCallEvidence> {
     rows.into_iter()
         .map(|row| {
             let freshness =
                 freshness_for_provenance(row.path.as_deref(), &row.provenance, current_hashes);
             let trust = evidence_trust(freshness, Some(&row.provenance), Some(row.confidence));
+            let reasons = call_reasons(&row, relationship);
             ImpactCallEvidence {
                 row,
                 freshness,
                 trust,
+                reasons,
             }
         })
         .collect()
@@ -1337,6 +1486,7 @@ fn impact_call_evidence(
 fn impact_path_evidence(
     paths: Vec<CallPath>,
     current_hashes: &BTreeMap<String, String>,
+    relationship: &str,
 ) -> Vec<ImpactPathEvidence> {
     paths
         .into_iter()
@@ -1352,23 +1502,31 @@ fn impact_path_evidence(
                     );
                     let trust =
                         evidence_trust(freshness, Some(&edge.provenance), Some(edge.confidence));
-                    (freshness, trust)
+                    let reasons = edge_reasons(edge, relationship);
+                    (freshness, trust, reasons)
                 })
                 .collect::<Vec<_>>();
             let edge_freshness = edge_pairs
                 .iter()
-                .map(|(freshness, _)| *freshness)
+                .map(|(freshness, _, _)| *freshness)
                 .collect::<Vec<_>>();
             let edge_trust = edge_pairs
                 .iter()
-                .map(|(_, trust)| trust.clone())
+                .map(|(_, trust, _)| trust.clone())
+                .collect::<Vec<_>>();
+            let edge_reasons = edge_pairs
+                .iter()
+                .map(|(_, _, reasons)| reasons.clone())
                 .collect::<Vec<_>>();
             let trust = aggregate_trust(&edge_trust);
+            let reasons = path_reasons(&path, relationship);
             ImpactPathEvidence {
                 path,
                 edge_freshness,
                 edge_trust,
+                edge_reasons,
                 trust,
+                reasons,
             }
         })
         .collect()
@@ -1435,12 +1593,14 @@ fn impact_related_files(
                 None => EvidenceFreshness::Unknown,
             };
             let trust = evidence_trust(freshness, provenance.as_ref(), None);
+            let reasons = related_file_reasons(relationship_count, provenance.as_ref());
             ImpactRelatedFile {
                 path,
                 relationship_count,
                 freshness,
                 provenance,
                 trust,
+                reasons,
             }
         })
         .collect()
@@ -1505,7 +1665,7 @@ mod tests {
         CallDirection, QueryMode, build_debug_context_pack, build_impact_summary, evidence_trust,
         freshness_rows, parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
         run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
-        run_symbol_search,
+        run_symbol_search, semantic_reasons,
     };
 
     #[test]
@@ -1598,6 +1758,28 @@ mod tests {
                 .factors
                 .iter()
                 .any(|factor| factor == "provenance:missing")
+        );
+    }
+
+    #[test]
+    fn semantic_reasons_explain_vector_result_metadata() {
+        let reasons = semantic_reasons(0.81234, "src/lib.rs", Some("crate::run"), "function");
+
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "semantic_vector_match")
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "semantic_score:0.8123")
+        );
+        assert!(reasons.iter().any(|reason| reason == "chunk_kind:function"));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "symbol_payload:crate::run")
         );
     }
 
@@ -1782,9 +1964,20 @@ mod tests {
         assert_eq!(pack.frames[0].calls_at_line.len(), 1);
         assert_eq!(pack.frames[0].trust.score, 1.0);
         assert_eq!(pack.frames[0].trust.level, "high");
+        assert!(pack.frames[0].reasons.iter().any(|reason| {
+            reason == "file_provenance_match"
+                || reason == "symbols_at_runtime_location"
+                || reason == "calls_at_runtime_line:1"
+        }));
         assert_eq!(pack.frames[1].trust.score, 0.84);
         assert_eq!(pack.frames[1].trust.level, "medium");
         assert!(!pack.frames[3].matched);
+        assert!(
+            pack.frames[3]
+                .reasons
+                .iter()
+                .any(|reason| reason == "unmatched_runtime_frame")
+        );
         assert!(
             pack.notes
                 .iter()
@@ -1839,10 +2032,28 @@ mod tests {
         assert_eq!(test_caller.trust.level, "medium");
         assert_eq!(test_caller.trust.score, 0.74);
         assert!(
+            test_caller
+                .reasons
+                .iter()
+                .any(|reason| reason == "relationship:direct_caller")
+        );
+        assert!(
+            test_caller
+                .reasons
+                .iter()
+                .any(|reason| { reason == "symbol_match:crate::tests::covers_callee" })
+        );
+        assert!(
             summary
                 .related_files
                 .iter()
                 .all(|file| !file.trust.factors.is_empty())
+        );
+        assert!(
+            summary
+                .related_files
+                .iter()
+                .all(|file| !file.reasons.is_empty())
         );
         assert!(
             summary
