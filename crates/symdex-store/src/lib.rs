@@ -512,6 +512,119 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn file_provenance(
+        &self,
+        repository_id: &str,
+        path: &str,
+    ) -> Result<Option<EvidenceProvenance>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT content_hash, index_run_id, parser_version, indexed_at
+                   FROM files
+                  WHERE repository_id = ?1 AND path = ?2
+                  LIMIT 1",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let mut rows = statement
+            .query_map(params![repository_id, path], |row| {
+                Ok(EvidenceProvenance {
+                    content_hash: row.get(0)?,
+                    index_run_id: row.get(1)?,
+                    parser_version: row.get(2)?,
+                    indexed_at: row.get(3)?,
+                    embedding_model: None,
+                    embedding_dimension: None,
+                    embedded_at: None,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        rows.next().transpose().map_err(StoreError::Sqlite)
+    }
+
+    pub fn symbols_at_location(
+        &self,
+        repository_id: &str,
+        path: &str,
+        line: usize,
+    ) -> Result<Vec<SymbolSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
+                   FROM symbols
+                   JOIN files ON symbols.file_id = files.id
+                  WHERE files.repository_id = ?1
+                    AND files.path = ?2
+                    AND symbols.start_line <= ?3
+                    AND symbols.end_line >= ?3
+                  ORDER BY (symbols.end_line - symbols.start_line), symbols.start_line, symbols.qualified_name
+                  LIMIT 10",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, path, line as i64], |row| {
+                Ok(SymbolSearchRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    qualified_name: row.get(2)?,
+                    kind: row.get(3)?,
+                    path: row.get(4)?,
+                    start_line: row.get::<_, i64>(5)? as usize,
+                    end_line: row.get::<_, i64>(6)? as usize,
+                    provenance: EvidenceProvenance {
+                        content_hash: row.get(7)?,
+                        index_run_id: row.get(8)?,
+                        parser_version: row.get(9)?,
+                        indexed_at: row.get(10)?,
+                        embedding_model: None,
+                        embedding_dimension: None,
+                        embedded_at: None,
+                    },
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn calls_at_location(
+        &self,
+        repository_id: &str,
+        path: &str,
+        line: usize,
+    ) -> Result<Vec<CallPathEdge>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.id, calls.callee_text, calls.call_line, calls.confidence,
+                        calls.resolution_status,
+                        caller.id, caller.name, caller.qualified_name, caller.kind,
+                        caller_files.path, caller.start_line, caller.end_line,
+                        callee.id, callee.name, callee.qualified_name, callee.kind,
+                        callee_files.path, callee.start_line, callee.end_line,
+                        caller_files.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_files.indexed_at
+                   FROM calls
+                   JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                   JOIN files caller_files ON caller.file_id = caller_files.id
+                   LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                   LEFT JOIN files callee_files ON callee.file_id = callee_files.id
+                  WHERE caller_files.repository_id = ?1
+                    AND caller_files.path = ?2
+                    AND calls.call_line = ?3
+                  ORDER BY caller.qualified_name, calls.callee_text, calls.id
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, path, line as i64], call_path_edge)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn callers(&self, repository_id: &str, symbol_query: &str) -> Result<Vec<CallSearchRow>> {
         let mut statement = self
             .connection

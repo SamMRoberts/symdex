@@ -9,6 +9,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
 symdex-core = { path = "../symdex-core" }
 symdex-embed = { path = "../symdex-embed" }
 symdex-store = { path = "../symdex-store" }

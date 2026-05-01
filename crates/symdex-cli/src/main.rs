@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 
 use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
@@ -9,8 +10,8 @@ use symdex_index::{
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, FreshnessSummary, ImpactSummary,
-    run_call_graph, run_call_path, run_context_pack, run_freshness_report, run_impact,
-    run_semantic_search, run_symbol_search,
+    run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_freshness_report,
+    run_impact, run_semantic_search, run_symbol_search,
 };
 use symdex_store::{EvidenceFreshness, SqliteStore, StoreConfig, sqlite_parent};
 
@@ -77,6 +78,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
             context_pack(repo, query)
+        }
+        "debug-context" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let input_parts = if args.len() > 2 { &args[2..] } else { &[] };
+            debug_context(repo, input_parts)
         }
         "search" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -364,6 +370,33 @@ fn context_pack(repo: &str, query: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn debug_context(repo: &str, input_parts: &[String]) -> Result<(), String> {
+    let input = runtime_input(input_parts)?;
+    let pack = run_debug_context_pack(repo, &input, 8)?;
+    let json = serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())?;
+    println!("{json}");
+    Ok(())
+}
+
+fn runtime_input(input_parts: &[String]) -> Result<String, String> {
+    let Some(first) = input_parts.first() else {
+        return Err("debug-context requires runtime failure input or `-` for stdin".to_owned());
+    };
+    if first == "-" {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("read runtime failure input from stdin: {error}"))?;
+        return Ok(input);
+    }
+    if input_parts.len() == 1
+        && let Ok(input) = fs::read_to_string(first)
+    {
+        return Ok(input);
+    }
+    Ok(input_parts.join(" "))
+}
+
 fn print_call_row(row: &symdex_store::CallSearchRow) {
     println!(
         "{} {:.2} {}:{}-{} callee={} status={}",
@@ -644,7 +677,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor                 Print local configuration and diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }
