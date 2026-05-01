@@ -742,6 +742,7 @@ fn vector_point(
             start_line: chunk.chunk.line_range.start,
             end_line: chunk.chunk.line_range.end,
             text_hash: chunk.chunk.text_hash.clone(),
+            parser_version: Some(RUST_PARSER_VERSION.to_owned()),
             content_hash: Some(chunk.file.content_hash.clone()),
             index_run_id: Some(index_run_id.to_owned()),
             embedding_model: Some(embedding_model.to_owned()),

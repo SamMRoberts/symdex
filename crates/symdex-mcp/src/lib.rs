@@ -1,11 +1,15 @@
 //! Read-only MCP tool contract boundary.
 
+use std::fs;
 use std::io::{BufRead, Write};
 
 use serde_json::{Value, json};
-use symdex_core::RepoRoot;
+use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_store::{QdrantClient, SqliteStore, StoreConfig, qdrant_collection_name};
+use symdex_store::{
+    EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, freshness_for_hash,
+    qdrant_collection_name,
+};
 
 pub const TOOL_SEARCH: &str = "symdex_search";
 pub const TOOL_FIND_SYMBOL: &str = "symdex_find_symbol";
@@ -161,14 +165,26 @@ fn tool_search(arguments: &Value) -> Result<Value, String> {
     Ok(json!({
         "results": results.into_iter().map(|result| {
             let payload = result.payload;
+            let path = payload.path;
+            let provenance = EvidenceProvenance {
+                content_hash: payload.content_hash,
+                index_run_id: payload.index_run_id,
+                parser_version: payload.parser_version,
+                indexed_at: payload.indexed_at,
+                embedding_model: payload.embedding_model,
+                embedding_dimension: payload.embedding_dimension,
+                embedded_at: None,
+            };
             json!({
-                "path": payload.path,
+                "path": path.clone(),
                 "start_line": payload.start_line,
                 "end_line": payload.end_line,
                 "symbol": payload.symbol_name,
                 "score": result.score,
                 "chunk_kind": payload.chunk_kind,
-                "text_hash": payload.text_hash
+                "text_hash": payload.text_hash,
+                "freshness": freshness_label(&root, Some(&path), &provenance),
+                "provenance": provenance_json(&provenance)
             })
         }).collect::<Vec<_>>()
     }))
@@ -192,7 +208,9 @@ fn tool_find_symbol(arguments: &Value) -> Result<Value, String> {
             "kind": symbol.kind,
             "path": symbol.path,
             "start_line": symbol.start_line,
-            "end_line": symbol.end_line
+            "end_line": symbol.end_line,
+            "freshness": freshness_label(&root, Some(&symbol.path), &symbol.provenance),
+            "provenance": provenance_json(&symbol.provenance)
         })).collect::<Vec<_>>()
     }))
 }
@@ -204,7 +222,7 @@ fn tool_callers(arguments: &Value) -> Result<Value, String> {
     let rows = sqlite()?
         .callers(root.id(), symbol)
         .map_err(|error| error.to_string())?;
-    Ok(json!({ "results": call_rows(rows) }))
+    Ok(json!({ "results": call_rows(&root, rows) }))
 }
 
 fn tool_callees(arguments: &Value) -> Result<Value, String> {
@@ -214,7 +232,7 @@ fn tool_callees(arguments: &Value) -> Result<Value, String> {
     let rows = sqlite()?
         .callees(root.id(), symbol)
         .map_err(|error| error.to_string())?;
-    Ok(json!({ "results": call_rows(rows) }))
+    Ok(json!({ "results": call_rows(&root, rows) }))
 }
 
 fn tool_impact(arguments: &Value) -> Result<Value, String> {
@@ -229,8 +247,8 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         .callees(root.id(), symbol)
         .map_err(|error| error.to_string())?;
     Ok(json!({
-        "direct_callers": call_rows(callers),
-        "direct_callees": call_rows(callees),
+        "direct_callers": call_rows(&root, callers),
+        "direct_callees": call_rows(&root, callees),
         "transitive_callers": [],
         "same_file_symbols": [],
         "tests_likely": [],
@@ -267,7 +285,41 @@ fn tool_index_status(arguments: &Value) -> Result<Value, String> {
     }))
 }
 
-fn call_rows(rows: Vec<symdex_store::CallSearchRow>) -> Vec<Value> {
+fn provenance_json(provenance: &EvidenceProvenance) -> Value {
+    json!({
+        "content_hash": provenance.content_hash,
+        "index_run_id": provenance.index_run_id,
+        "parser_version": provenance.parser_version,
+        "indexed_at": provenance.indexed_at,
+        "embedding_model": provenance.embedding_model,
+        "embedding_dimension": provenance.embedding_dimension,
+        "embedded_at": provenance.embedded_at
+    })
+}
+
+fn freshness_label(
+    root: &RepoRoot,
+    path: Option<&str>,
+    provenance: &EvidenceProvenance,
+) -> &'static str {
+    let current_hash = path.and_then(|path| current_content_hash(root, path).ok().flatten());
+    freshness_for_hash(provenance.content_hash.as_deref(), current_hash.as_deref()).label()
+}
+
+fn current_content_hash(root: &RepoRoot, path: &str) -> Result<Option<String>, String> {
+    let normalized = NormalizedRepoPath::new(path).map_err(|error| error.to_string())?;
+    let absolute = root.path().join(normalized.as_str());
+    if !absolute.exists() {
+        return Ok(None);
+    }
+    root.normalize_existing_path(&absolute)
+        .map_err(|error| error.to_string())?;
+    let bytes =
+        fs::read(&absolute).map_err(|error| format!("read {}: {error}", absolute.display()))?;
+    Ok(Some(content_hash(&bytes)))
+}
+
+fn call_rows(root: &RepoRoot, rows: Vec<symdex_store::CallSearchRow>) -> Vec<Value> {
     rows.into_iter()
         .map(|row| {
             json!({
@@ -281,7 +333,9 @@ fn call_rows(rows: Vec<symdex_store::CallSearchRow>) -> Vec<Value> {
                 "symbol_kind": row.symbol_kind,
                 "path": row.path,
                 "start_line": row.start_line,
-                "end_line": row.end_line
+                "end_line": row.end_line,
+                "freshness": freshness_label(root, row.path.as_deref(), &row.provenance),
+                "provenance": provenance_json(&row.provenance)
             })
         })
         .collect()

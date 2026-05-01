@@ -56,8 +56,8 @@ terminal panes.
   - `Tabs` for major views: Dashboard, Index, Storage, Doctor, Query, Calls,
     Impact.
   - Nested `Tabs` inside the Storage view for storage overview, index coverage,
-    symbol outline, call resolution, embedding coverage, index runs, semantic
-    neighborhood, and cross-store health.
+    symbol outline, call resolution, embedding coverage, index runs, evidence
+    freshness, semantic neighborhood, and cross-store health.
   - `Block` with styled borders and titles for each focused panel.
   - `Table` for evidence lists with columns for path, line range, score,
     confidence, kind, status, and symbol.
@@ -99,9 +99,9 @@ terminal panes.
   the active storage visualization so users can see every storage subview
   without relying on footer help.
 - In the Storage view, `Tab` and `Shift+Tab` cycle between storage overview,
-  index coverage, symbol outline, call resolution, embedding coverage, and
-  index runs timeline modes, plus semantic neighborhood payload and cross-store
-  health views.
+  index coverage, symbol outline, call resolution, embedding coverage, index
+  runs timeline, evidence freshness, semantic neighborhood payload, and
+  cross-store health views.
 - In the Doctor view, row selection must drive visible detail output for the
   selected check rather than highlight-only behavior.
 - In the Doctor view, `Enter` should toggle an expanded selected-check detail
@@ -166,11 +166,20 @@ represent the indexed repository.
   SQLite/Qdrant metric table plus a detail/health panel.
 - The Storage tab must always render a nested tab header for its storage
   visualizations. The first labels may be compact for narrow terminals, such as
-  `Store`, `Files`, `Syms`, `Calls`, `Vecs`, `Runs`, `Near`, and `Health`.
+  `Store`, `Files`, `Syms`, `Calls`, `Vecs`, `Runs`, `Fresh`, `Near`, and
+  `Health`.
 - The Storage tab also includes `Tab` / `Shift+Tab` modes for file-grouped
-  index coverage, symbol outlines, call resolution, embedding coverage, and
-  index runs timeline, plus semantic neighborhood payload metadata and
+  index coverage, symbol outlines, call resolution, embedding coverage, index
+  runs timeline, evidence freshness, semantic neighborhood payload metadata, and
   cross-store health warnings.
+
+### Evidence Freshness View
+
+- Compare indexed file content hashes with the current eligible Rust files.
+- Show fresh, stale, deleted, missing, and unknown labels with selected-row
+  provenance details.
+- Include content hash, index run ID, parser version, and indexed timestamp
+  without showing source text.
 
 ### Index Coverage View
 

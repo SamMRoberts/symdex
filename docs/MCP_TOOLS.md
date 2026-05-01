@@ -42,15 +42,25 @@ Output:
       "symbol": "foo::retry::run_with_backoff",
       "score": 0.82,
       "chunk_kind": "function",
-      "text_hash": "sha256:..."
+      "text_hash": "sha256:...",
+      "freshness": "fresh",
+      "provenance": {
+        "content_hash": "sha256:...",
+        "index_run_id": "repo-semantic-...",
+        "parser_version": "tree-sitter-rust-...",
+        "indexed_at": "2026-04-30T12:00:00Z",
+        "embedding_model": "nomic-embed-text",
+        "embedding_dimension": 768,
+        "embedded_at": null
+      }
     }
   ]
 }
 ```
 
 The search tool embeds the query with the configured local Ollama model and
-queries the local Qdrant collection. It returns chunk metadata only; it does not
-return source excerpts in the current MVP.
+queries the local Qdrant collection. It returns chunk metadata, freshness state,
+and provenance only; it does not return source excerpts in the current MVP.
 
 ### `symdex_find_symbol`
 
@@ -66,6 +76,9 @@ Input:
 }
 ```
 
+Output rows include `freshness` plus `provenance` with content hash, index run
+ID, parser version, and indexed timestamp.
+
 ### `symdex_callers`
 
 Find direct callers of a symbol.
@@ -79,6 +92,9 @@ Input:
 }
 ```
 
+Output rows include call confidence/resolution data, `freshness`, and
+`provenance`.
+
 ### `symdex_callees`
 
 Find direct callees from a symbol.
@@ -91,6 +107,9 @@ Input:
   "symbol": "foo::retry::run_with_backoff"
 }
 ```
+
+Output rows include call confidence/resolution data, `freshness`, and
+`provenance`.
 
 ### `symdex_impact`
 

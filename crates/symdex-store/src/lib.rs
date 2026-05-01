@@ -462,7 +462,9 @@ impl SqliteStore {
             .connection
             .prepare(
                 "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
-                        files.path, symbols.start_line, symbols.end_line
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
                  FROM symbols
                  JOIN files ON symbols.file_id = files.id
                  WHERE files.repository_id = ?1
@@ -489,6 +491,15 @@ impl SqliteStore {
                     path: row.get(4)?,
                     start_line: row.get::<_, i64>(5)? as usize,
                     end_line: row.get::<_, i64>(6)? as usize,
+                    provenance: EvidenceProvenance {
+                        content_hash: row.get(7)?,
+                        index_run_id: row.get(8)?,
+                        parser_version: row.get(9)?,
+                        indexed_at: row.get(10)?,
+                        embedding_model: None,
+                        embedding_dimension: None,
+                        embedded_at: None,
+                    },
                 })
             })
             .map_err(StoreError::Sqlite)?;
@@ -501,10 +512,12 @@ impl SqliteStore {
             .prepare(
                 "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
                         caller.id, caller.name, caller.qualified_name, caller.kind,
-                        files.path, caller.start_line, caller.end_line
-                 FROM calls
-                 JOIN symbols target ON calls.callee_symbol_id = target.id
-                 JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                        files.path, caller.start_line, caller.end_line,
+                        files.content_hash, calls.index_run_id, calls.parser_version,
+                        files.indexed_at
+                  FROM calls
+                  JOIN symbols target ON calls.callee_symbol_id = target.id
+                  JOIN symbols caller ON calls.caller_symbol_id = caller.id
                  JOIN files ON caller.file_id = files.id
                  WHERE files.repository_id = ?1
                    AND (target.id = ?2 OR target.name = ?2 OR target.qualified_name = ?2)
@@ -524,10 +537,12 @@ impl SqliteStore {
             .prepare(
                 "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
                         callee.id, callee.name, callee.qualified_name, callee.kind,
-                        files.path, callee.start_line, callee.end_line
-                 FROM calls
-                 JOIN symbols caller ON calls.caller_symbol_id = caller.id
-                 LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                        files.path, callee.start_line, callee.end_line,
+                        files.content_hash, calls.index_run_id, calls.parser_version,
+                        files.indexed_at
+                  FROM calls
+                  JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                  LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
                  JOIN files ON caller.file_id = files.id
                  WHERE files.repository_id = ?1
                    AND (caller.id = ?2 OR caller.name = ?2 OR caller.qualified_name = ?2)
@@ -1005,6 +1020,33 @@ impl SqliteStore {
             collection_name: qdrant_collection_name(repository_id, projected_model),
             rows,
         })
+    }
+
+    pub fn indexed_file_freshness_snapshots(
+        &self,
+        repository_id: &str,
+    ) -> Result<Vec<FileFreshnessSnapshot>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path, content_hash, indexed_at, index_run_id, parser_version
+                 FROM files
+                 WHERE repository_id = ?1
+                 ORDER BY path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                Ok(FileFreshnessSnapshot {
+                    path: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    indexed_at: row.get(2)?,
+                    index_run_id: row.get(3)?,
+                    parser_version: row.get(4)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
     }
 
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
@@ -1650,6 +1692,7 @@ pub struct SymbolSearchRow {
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
+    pub provenance: EvidenceProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1665,6 +1708,7 @@ pub struct CallSearchRow {
     pub path: Option<String>,
     pub start_line: Option<usize>,
     pub end_line: Option<usize>,
+    pub provenance: EvidenceProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1685,6 +1729,60 @@ pub struct ContextPackLimits {
     pub max_symbols: usize,
     pub max_callers: usize,
     pub max_callees: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceProvenance {
+    pub content_hash: Option<String>,
+    pub index_run_id: Option<String>,
+    pub parser_version: Option<String>,
+    pub indexed_at: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_dimension: Option<usize>,
+    pub embedded_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFreshnessSnapshot {
+    pub path: String,
+    pub content_hash: String,
+    pub indexed_at: String,
+    pub index_run_id: Option<String>,
+    pub parser_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum EvidenceFreshness {
+    Fresh,
+    Stale,
+    Deleted,
+    Missing,
+    Unknown,
+}
+
+impl EvidenceFreshness {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Deleted => "deleted",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+pub fn freshness_for_hash(
+    indexed_content_hash: Option<&str>,
+    current_content_hash: Option<&str>,
+) -> EvidenceFreshness {
+    match (indexed_content_hash, current_content_hash) {
+        (Some(indexed), Some(current)) if indexed == current => EvidenceFreshness::Fresh,
+        (Some(_), Some(_)) => EvidenceFreshness::Stale,
+        (Some(_), None) => EvidenceFreshness::Deleted,
+        (None, Some(_)) => EvidenceFreshness::Missing,
+        (None, None) => EvidenceFreshness::Unknown,
+    }
 }
 
 fn env_path(upper: &str, legacy: &str) -> Option<PathBuf> {
@@ -1956,6 +2054,8 @@ pub struct PointPayload {
     pub end_line: usize,
     pub text_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_run_id: Option<String>,
@@ -2078,6 +2178,15 @@ fn call_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSearchRow> {
         path: row.get(8)?,
         start_line: row.get::<_, Option<i64>>(9)?.map(|line| line as usize),
         end_line: row.get::<_, Option<i64>>(10)?.map(|line| line as usize),
+        provenance: EvidenceProvenance {
+            content_hash: row.get(11)?,
+            index_run_id: row.get(12)?,
+            parser_version: row.get(13)?,
+            indexed_at: row.get(14)?,
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        },
     })
 }
 
@@ -2640,6 +2749,30 @@ mod tests {
     }
 
     #[test]
+    fn freshness_for_hash_labels_evidence_states() {
+        assert_eq!(
+            crate::freshness_for_hash(Some("same"), Some("same")),
+            crate::EvidenceFreshness::Fresh
+        );
+        assert_eq!(
+            crate::freshness_for_hash(Some("old"), Some("new")),
+            crate::EvidenceFreshness::Stale
+        );
+        assert_eq!(
+            crate::freshness_for_hash(Some("old"), None),
+            crate::EvidenceFreshness::Deleted
+        );
+        assert_eq!(
+            crate::freshness_for_hash(None, Some("new")),
+            crate::EvidenceFreshness::Missing
+        );
+        assert_eq!(
+            crate::freshness_for_hash(None, None),
+            crate::EvidenceFreshness::Unknown
+        );
+    }
+
+    #[test]
     fn upsert_points_request_uses_payload_without_source_text() {
         let point = VectorPoint {
             id: "01234567-89ab-cdef-fedc-ba9876543210".to_owned(),
@@ -2967,10 +3100,16 @@ mod tests {
         let found = store.find_symbols("repo", "helper").expect("symbol search");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].qualified_name, "helper");
+        assert_eq!(found[0].provenance.content_hash.as_deref(), Some("hash-1"));
+        assert_eq!(found[0].provenance.index_run_id.as_deref(), Some("run"));
 
         let callers = store.callers("repo", "helper").expect("callers query");
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0].symbol_qualified_name.as_deref(), Some("caller"));
+        assert_eq!(
+            callers[0].provenance.parser_version.as_deref(),
+            Some("parser")
+        );
 
         let callees = store.callees("repo", "caller").expect("callees query");
         assert_eq!(callees.len(), 1);
@@ -3721,6 +3860,7 @@ mod tests {
             start_line: 1,
             end_line: 3,
             text_hash: "hash".to_owned(),
+            parser_version: Some("parser".to_owned()),
             content_hash: Some("content-hash".to_owned()),
             index_run_id: Some("run".to_owned()),
             embedding_model: Some("nomic-embed-text".to_owned()),

@@ -1,12 +1,15 @@
 //! Query orchestration shared by the CLI and TUI.
 
-use symdex_core::RepoRoot;
+use std::collections::{BTreeMap, BTreeSet};
+
+use symdex_core::{DiscoveryOptions, RepoRoot, discover_rust_files};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
-    EmbeddingCoverageSummary, IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient,
-    SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary, StoreConfig,
-    SymbolOutlineSummary, SymbolSearchRow, qdrant_collection_name,
+    EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
+    IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, SemanticNeighborhoodSummary,
+    SqliteStore, StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
+    freshness_for_hash, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,7 @@ pub struct SemanticSearchResult {
     pub end_line: usize,
     pub symbol_name: Option<String>,
     pub chunk_kind: String,
+    pub provenance: EvidenceProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +102,35 @@ pub struct ImpactSummary {
     pub query: String,
     pub direct_callers: Vec<CallSearchRow>,
     pub direct_callees: Vec<CallSearchRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshnessSummary {
+    pub repository_id: String,
+    pub symbol_query: Option<String>,
+    pub files: Vec<FileFreshnessRow>,
+    pub focus_symbols: Vec<SymbolSearchRow>,
+    pub context_pack: Option<ContextPack>,
+}
+
+impl FreshnessSummary {
+    pub fn count(&self, freshness: EvidenceFreshness) -> usize {
+        self.files
+            .iter()
+            .filter(|row| row.freshness == freshness)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFreshnessRow {
+    pub path: String,
+    pub freshness: EvidenceFreshness,
+    pub indexed_content_hash: Option<String>,
+    pub current_content_hash: Option<String>,
+    pub indexed_at: Option<String>,
+    pub index_run_id: Option<String>,
+    pub parser_version: Option<String>,
 }
 
 pub fn run_symbol_search(repo: &str, query: &str) -> Result<SymbolSearchSummary, String> {
@@ -174,6 +207,53 @@ pub fn run_context_pack(repo: &str, query: &str, limit: usize) -> Result<Context
     sqlite
         .context_pack(root.id(), query, limit)
         .map_err(|error| error.to_string())
+}
+
+pub fn run_freshness_report(
+    repo: &str,
+    symbol_query: Option<&str>,
+) -> Result<FreshnessSummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let current_hashes = discover_rust_files(&root, &DiscoveryOptions::default())
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|file| (file.facts.relative_path, file.facts.content_hash))
+        .collect::<BTreeMap<_, _>>();
+    let indexed = sqlite
+        .indexed_file_freshness_snapshots(root.id())
+        .map_err(|error| error.to_string())?;
+
+    let mut focus_symbols = Vec::new();
+    let mut context_pack = None;
+    let mut scoped_paths = BTreeSet::new();
+    let query = symbol_query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_owned);
+    if let Some(query) = &query {
+        focus_symbols = sqlite
+            .find_symbols(root.id(), query)
+            .map_err(|error| error.to_string())?;
+        for symbol in &focus_symbols {
+            scoped_paths.insert(symbol.path.clone());
+        }
+        let pack = sqlite
+            .context_pack(root.id(), query, 8)
+            .map_err(|error| error.to_string())?;
+        for path in &pack.files {
+            scoped_paths.insert(path.clone());
+        }
+        context_pack = Some(pack);
+    }
+
+    Ok(FreshnessSummary {
+        repository_id: root.id().to_owned(),
+        symbol_query: query,
+        files: freshness_rows(&indexed, &current_hashes, &scoped_paths),
+        focus_symbols,
+        context_pack,
+    })
 }
 
 pub fn run_storage_explorer(repo: &str) -> Result<StorageExplorerSummary, String> {
@@ -279,6 +359,15 @@ pub fn run_semantic_search(
             end_line: point.payload.end_line,
             symbol_name: point.payload.symbol_name,
             chunk_kind: point.payload.chunk_kind,
+            provenance: EvidenceProvenance {
+                content_hash: point.payload.content_hash,
+                index_run_id: point.payload.index_run_id,
+                parser_version: point.payload.parser_version,
+                indexed_at: point.payload.indexed_at,
+                embedding_model: point.payload.embedding_model,
+                embedding_dimension: point.payload.embedding_dimension,
+                embedded_at: None,
+            },
         })
         .collect();
 
@@ -297,10 +386,55 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
     Ok(sqlite)
 }
 
+fn freshness_rows(
+    indexed: &[FileFreshnessSnapshot],
+    current_hashes: &BTreeMap<String, String>,
+    scoped_paths: &BTreeSet<String>,
+) -> Vec<FileFreshnessRow> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for file in indexed {
+        if !scoped_paths.is_empty() && !scoped_paths.contains(&file.path) {
+            continue;
+        }
+        let current = current_hashes.get(&file.path);
+        rows.push(FileFreshnessRow {
+            path: file.path.clone(),
+            freshness: freshness_for_hash(Some(&file.content_hash), current.map(String::as_str)),
+            indexed_content_hash: Some(file.content_hash.clone()),
+            current_content_hash: current.cloned(),
+            indexed_at: Some(file.indexed_at.clone()),
+            index_run_id: file.index_run_id.clone(),
+            parser_version: file.parser_version.clone(),
+        });
+        seen.insert(file.path.clone());
+    }
+    for (path, hash) in current_hashes {
+        if seen.contains(path) || (!scoped_paths.is_empty() && !scoped_paths.contains(path)) {
+            continue;
+        }
+        rows.push(FileFreshnessRow {
+            path: path.clone(),
+            freshness: freshness_for_hash(None, Some(hash)),
+            indexed_content_hash: None,
+            current_content_hash: Some(hash.clone()),
+            indexed_at: None,
+            index_run_id: None,
+            parser_version: None,
+        });
+    }
+    rows.sort_by(|left, right| left.path.cmp(&right.path));
+    rows
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use symdex_store::{EvidenceFreshness, FileFreshnessSnapshot};
+
     use crate::{
-        CallDirection, QueryMode, run_call_graph, run_context_pack, run_impact,
+        CallDirection, QueryMode, freshness_rows, run_call_graph, run_context_pack, run_impact,
         run_semantic_search, run_symbol_search,
     };
 
@@ -345,5 +479,43 @@ mod tests {
     fn context_pack_rejects_empty_query() {
         let error = run_context_pack(".", " ", 8).expect_err("empty query should fail");
         assert!(error.contains("requires a symbol query"));
+    }
+
+    #[test]
+    fn freshness_rows_compare_indexed_and_current_hashes() {
+        let indexed = vec![
+            snapshot("src/deleted.rs", "old"),
+            snapshot("src/fresh.rs", "same"),
+            snapshot("src/stale.rs", "old"),
+        ];
+        let current = BTreeMap::from([
+            ("src/fresh.rs".to_owned(), "same".to_owned()),
+            ("src/missing.rs".to_owned(), "new".to_owned()),
+            ("src/stale.rs".to_owned(), "new".to_owned()),
+        ]);
+
+        let rows = freshness_rows(&indexed, &current, &BTreeSet::new());
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.path.as_str(), row.freshness))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/deleted.rs", EvidenceFreshness::Deleted),
+                ("src/fresh.rs", EvidenceFreshness::Fresh),
+                ("src/missing.rs", EvidenceFreshness::Missing),
+                ("src/stale.rs", EvidenceFreshness::Stale),
+            ]
+        );
+    }
+
+    fn snapshot(path: &str, content_hash: &str) -> FileFreshnessSnapshot {
+        FileFreshnessSnapshot {
+            path: path.to_owned(),
+            content_hash: content_hash.to_owned(),
+            indexed_at: "now".to_owned(),
+            index_run_id: Some("run".to_owned()),
+            parser_version: Some("parser".to_owned()),
+        }
     }
 }

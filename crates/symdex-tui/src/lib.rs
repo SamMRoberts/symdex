@@ -27,19 +27,20 @@ use symdex_index::{
     IndexSummary, run_continuous_index_until, run_index_with_progress,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary,
-    SymbolSearchSummary, run_call_graph, run_call_resolution, run_context_pack,
-    run_cross_store_health, run_embedding_coverage, run_impact, run_index_coverage,
-    run_index_runs_timeline, run_semantic_neighborhood, run_semantic_search, run_storage_explorer,
-    run_symbol_outline, run_symbol_search,
+    CallDirection, CallGraphSummary, FreshnessSummary, ImpactSummary, QueryMode, QueryResult,
+    SemanticSearchSummary, SymbolSearchSummary, run_call_graph, run_call_resolution,
+    run_context_pack, run_cross_store_health, run_embedding_coverage, run_freshness_report,
+    run_impact, run_index_coverage, run_index_runs_timeline, run_semantic_neighborhood,
+    run_semantic_search, run_storage_explorer, run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
-    CrossStoreHealthSummary, EmbeddingCoverageSummary, FileCoverageStatus, FileDetailSummary,
-    IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary, QdrantStorageProjection,
-    RepositoryStatus, SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
-    SqliteStore, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
-    SymbolOutlineSummary, qdrant_collection_name,
+    CrossStoreHealthSummary, EmbeddingCoverageSummary, EvidenceFreshness, FileCoverageStatus,
+    FileDetailSummary, IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
+    QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
+    SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore, StorageExplorerSummary,
+    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
+    qdrant_collection_name,
 };
 
 pub struct TuiOptions {
@@ -119,6 +120,7 @@ impl App {
         let index_runs = sqlite
             .index_runs_timeline_summary(root.id())
             .map_err(|error| error.to_string())?;
+        let freshness = run_freshness_report(repo, None)?;
         let semantic_neighborhood = sqlite
             .semantic_neighborhood_summary(root.id(), &embed_config.model)
             .map_err(|error| error.to_string())?;
@@ -152,6 +154,7 @@ impl App {
                 call_resolution,
                 embedding_coverage,
                 index_runs,
+                freshness,
                 semantic_neighborhood,
                 cross_store_health,
             ),
@@ -182,6 +185,7 @@ impl App {
         let call_resolution = call_resolution_summary_from_status(&repository_id);
         let embedding_coverage = embedding_coverage_summary_from_status(&repository_id, &status);
         let index_runs = index_runs_timeline_summary_from_status(&repository_id, &status);
+        let freshness = freshness_summary_from_status(&repository_id);
         let semantic_neighborhood =
             semantic_neighborhood_summary_from_status(&repository_id, &status);
         let cross_store_health = cross_store_health_summary_from_status(&repository_id, &status);
@@ -211,6 +215,7 @@ impl App {
                 call_resolution,
                 embedding_coverage,
                 index_runs,
+                freshness,
                 semantic_neighborhood,
                 cross_store_health,
             ),
@@ -556,6 +561,10 @@ impl App {
             Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
             Err(error) => IndexRunsTimelineStatus::Failed(error),
         };
+        self.storage.freshness = match run_freshness_report(&self.repo_input, None) {
+            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
+            Err(error) => FreshnessStatus::Failed(error),
+        };
         self.storage.neighborhood = match run_semantic_neighborhood(&self.repo_input) {
             Ok(summary) => SemanticNeighborhoodStatus::Completed(summary),
             Err(error) => SemanticNeighborhoodStatus::Failed(error),
@@ -605,6 +614,10 @@ impl App {
                     index_runs_timeline_row_count(summary)
                 }
                 IndexRunsTimelineStatus::Failed(_) => 1,
+            },
+            StorageMode::Freshness => match &self.storage.freshness {
+                FreshnessStatus::Completed(summary) => freshness_row_count(summary),
+                FreshnessStatus::Failed(_) => 1,
             },
             StorageMode::Neighborhood => match &self.storage.neighborhood {
                 SemanticNeighborhoodStatus::Completed(summary) => {
@@ -1673,6 +1686,26 @@ fn render_storage_mode_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
             }
             IndexRunsTimelineStatus::Failed(error) => render_storage_error(frame, area, error),
         },
+        StorageMode::Freshness => match &app.storage.freshness {
+            FreshnessStatus::Completed(summary) => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(7), Constraint::Length(9)])
+                    .split(area);
+                render_selectable_table(
+                    frame,
+                    chunks[0],
+                    freshness_table(summary),
+                    app.storage.selection,
+                    freshness_row_count(summary),
+                );
+                frame.render_widget(
+                    freshness_detail_panel(summary, app.storage.selection),
+                    chunks[1],
+                );
+            }
+            FreshnessStatus::Failed(error) => render_storage_error(frame, area, error),
+        },
         StorageMode::Neighborhood => match &app.storage.neighborhood {
             SemanticNeighborhoodStatus::Completed(summary) => {
                 let chunks = Layout::default()
@@ -2075,6 +2108,16 @@ fn index_runs_timeline_summary_from_status(
     IndexRunsTimelineSummary {
         repository_id: repository_id.to_owned(),
         runs,
+    }
+}
+
+fn freshness_summary_from_status(repository_id: &str) -> FreshnessSummary {
+    FreshnessSummary {
+        repository_id: repository_id.to_owned(),
+        symbol_query: None,
+        files: Vec::new(),
+        focus_symbols: Vec::new(),
+        context_pack: None,
     }
 }
 
@@ -3421,6 +3464,107 @@ fn index_runs_timeline_row_count(summary: &IndexRunsTimelineSummary) -> usize {
     summary.runs.len().min(12)
 }
 
+fn freshness_table(summary: &FreshnessSummary) -> Table<'_> {
+    let rows = summary.files.iter().take(12).map(|file| {
+        let tone = freshness_tone(file.freshness);
+        Row::new(vec![
+            Cell::from(file.path.as_str()),
+            Cell::from(status_span(file.freshness.label(), tone)),
+            Cell::from(file.indexed_content_hash.as_deref().unwrap_or("<none>")),
+            Cell::from(file.current_content_hash.as_deref().unwrap_or("<none>")),
+            Cell::from(file.index_run_id.as_deref().unwrap_or("<none>")),
+        ])
+    });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(34),
+            Constraint::Length(9),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(17),
+        ],
+    )
+    .header(table_header([
+        "Path",
+        "Fresh",
+        "Indexed hash",
+        "Current hash",
+        "Run",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Evidence Freshness | fresh={} stale={} deleted={} missing={}",
+        summary.count(EvidenceFreshness::Fresh),
+        summary.count(EvidenceFreshness::Stale),
+        summary.count(EvidenceFreshness::Deleted),
+        summary.count(EvidenceFreshness::Missing)
+    )))
+    .column_spacing(1)
+}
+
+fn freshness_detail_panel(summary: &FreshnessSummary, selection: usize) -> Paragraph<'_> {
+    let Some(file) = summary
+        .files
+        .get(selection.min(summary.files.len().saturating_sub(1)))
+    else {
+        return Paragraph::new(vec![Line::from(
+            "No freshness rows. Run indexing or refresh the repository.",
+        )])
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Freshness Detail"),
+        );
+    };
+    let tone = freshness_tone(file.freshness);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("File: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(file.path.as_str()),
+            Span::raw(" "),
+            status_span(file.freshness.label(), tone),
+        ]),
+        Line::from(vec![
+            Span::styled("Hashes: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "indexed={} current={}",
+                file.indexed_content_hash.as_deref().unwrap_or("<none>"),
+                file.current_content_hash.as_deref().unwrap_or("<none>")
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Provenance: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "run={} parser={} indexed_at={}",
+                file.index_run_id.as_deref().unwrap_or("<none>"),
+                file.parser_version.as_deref().unwrap_or("<none>"),
+                file.indexed_at.as_deref().unwrap_or("<never>")
+            )),
+        ]),
+    ];
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(tone_style(tone))
+            .title("Freshness Detail"),
+    )
+}
+
+fn freshness_row_count(summary: &FreshnessSummary) -> usize {
+    summary.files.len().min(12)
+}
+
+fn freshness_tone(freshness: EvidenceFreshness) -> StatusTone {
+    match freshness {
+        EvidenceFreshness::Fresh => StatusTone::Success,
+        EvidenceFreshness::Stale | EvidenceFreshness::Missing => StatusTone::Warning,
+        EvidenceFreshness::Deleted => StatusTone::Error,
+        EvidenceFreshness::Unknown => StatusTone::Info,
+    }
+}
+
 fn selected_index_run(
     summary: &IndexRunsTimelineSummary,
     selection: usize,
@@ -4190,6 +4334,7 @@ struct StorageExplorerState {
     calls: CallResolutionStatus,
     embeddings: EmbeddingCoverageStatus,
     runs: IndexRunsTimelineStatus,
+    freshness: FreshnessStatus,
     neighborhood: SemanticNeighborhoodStatus,
     health: CrossStoreHealthStatus,
     selection: usize,
@@ -4204,6 +4349,7 @@ impl StorageExplorerState {
         calls: CallResolutionSummary,
         embeddings: EmbeddingCoverageSummary,
         runs: IndexRunsTimelineSummary,
+        freshness: FreshnessSummary,
         neighborhood: SemanticNeighborhoodSummary,
         health: CrossStoreHealthSummary,
     ) -> Self {
@@ -4215,6 +4361,7 @@ impl StorageExplorerState {
             calls: CallResolutionStatus::Completed(calls),
             embeddings: EmbeddingCoverageStatus::Completed(embeddings),
             runs: IndexRunsTimelineStatus::Completed(runs),
+            freshness: FreshnessStatus::Completed(Box::new(freshness)),
             neighborhood: SemanticNeighborhoodStatus::Completed(neighborhood),
             health: CrossStoreHealthStatus::Completed(health),
             selection: 0,
@@ -4230,14 +4377,15 @@ enum StorageMode {
     Calls,
     Embeddings,
     Runs,
+    Freshness,
     Neighborhood,
     Health,
 }
 
 impl StorageMode {
-    fn tabs() -> [&'static str; 8] {
+    fn tabs() -> [&'static str; 9] {
         [
-            "Store", "Files", "Syms", "Calls", "Vecs", "Runs", "Near", "Health",
+            "Store", "Files", "Syms", "Calls", "Vecs", "Runs", "Fresh", "Near", "Health",
         ]
     }
 
@@ -4249,8 +4397,9 @@ impl StorageMode {
             Self::Calls => 3,
             Self::Embeddings => 4,
             Self::Runs => 5,
-            Self::Neighborhood => 6,
-            Self::Health => 7,
+            Self::Freshness => 6,
+            Self::Neighborhood => 7,
+            Self::Health => 8,
         }
     }
 
@@ -4262,6 +4411,7 @@ impl StorageMode {
             Self::Calls => "call resolution",
             Self::Embeddings => "embedding coverage",
             Self::Runs => "index runs timeline",
+            Self::Freshness => "evidence freshness",
             Self::Neighborhood => "semantic neighborhood",
             Self::Health => "cross-store health",
         }
@@ -4274,7 +4424,8 @@ impl StorageMode {
             Self::Outline => Self::Calls,
             Self::Calls => Self::Embeddings,
             Self::Embeddings => Self::Runs,
-            Self::Runs => Self::Neighborhood,
+            Self::Runs => Self::Freshness,
+            Self::Freshness => Self::Neighborhood,
             Self::Neighborhood => Self::Health,
             Self::Health => Self::Explorer,
         }
@@ -4288,7 +4439,8 @@ impl StorageMode {
             Self::Calls => Self::Outline,
             Self::Embeddings => Self::Calls,
             Self::Runs => Self::Embeddings,
-            Self::Neighborhood => Self::Runs,
+            Self::Freshness => Self::Runs,
+            Self::Neighborhood => Self::Freshness,
             Self::Health => Self::Neighborhood,
         }
     }
@@ -4321,6 +4473,11 @@ enum EmbeddingCoverageStatus {
 
 enum IndexRunsTimelineStatus {
     Completed(IndexRunsTimelineSummary),
+    Failed(String),
+}
+
+enum FreshnessStatus {
+    Completed(Box<FreshnessSummary>),
     Failed(String),
 }
 
@@ -4662,18 +4819,20 @@ mod tests {
     use ratatui::style::Color;
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
-        CallDirection, CallGraphSummary, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
+        CallDirection, CallGraphSummary, FileFreshnessRow, FreshnessSummary, ImpactSummary,
+        QueryMode, QueryResult, SymbolSearchSummary,
     };
     use symdex_store::{
         CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary, CallSearchRow,
         ChunkVectorStatus, ConfidenceBucket, ContextPack, ContextPackLimits,
         CrossStoreHealthSummary, EmbeddingCoverageSummary, EmbeddingExclusionRow,
-        FileCallDetailRow, FileChunkDetailRow, FileCoverageRow, FileCoverageStatus,
-        FileDetailSummary, FileSymbolDetailRow, IndexCoverageSummary, IndexRunTimelineRow,
-        IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus,
-        SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
-        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
-        SymbolOutlineSummary, SymbolSearchRow,
+        EvidenceFreshness, EvidenceProvenance, FileCallDetailRow, FileChunkDetailRow,
+        FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
+        IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
+        QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
+        SemanticNeighborhoodSummary, SqliteStorageSummary, StorageExplorerSummary,
+        StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
+        SymbolSearchRow,
     };
 
     use crate::{
@@ -4841,6 +5000,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -4882,6 +5042,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -4912,6 +5073,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -4939,6 +5101,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -4963,6 +5126,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -4986,6 +5150,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5010,6 +5175,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5035,6 +5201,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5061,11 +5228,12 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
 
-        for _ in 0..6 {
+        for _ in 0..7 {
             assert!(!app.handle_key(KeyCode::Tab));
         }
 
@@ -5084,11 +5252,12 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
 
-        for _ in 0..7 {
+        for _ in 0..8 {
             assert!(!app.handle_key(KeyCode::Tab));
         }
 
@@ -5107,6 +5276,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5145,6 +5315,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5176,6 +5347,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5204,6 +5376,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5233,6 +5406,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5264,6 +5438,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5292,6 +5467,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5327,6 +5503,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5358,6 +5535,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5386,6 +5564,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5421,6 +5600,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5453,6 +5633,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5481,6 +5662,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5512,6 +5694,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5543,6 +5726,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5561,6 +5745,36 @@ mod tests {
     }
 
     #[test]
+    fn renders_freshness_provenance_panel() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+        app.storage.mode = StorageMode::Freshness;
+        app.storage.selection = 1;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Evidence Freshness"));
+        assert!(rendered.contains("src/stale.rs"));
+        assert!(rendered.contains("Provenance"));
+        assert!(rendered.contains("run-success"));
+        assert!(!rendered.contains("source_text"));
+    }
+
+    #[test]
     fn renders_semantic_neighborhood_without_source_text() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Storage;
@@ -5571,6 +5785,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5601,6 +5816,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5632,6 +5848,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5659,6 +5876,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5694,6 +5912,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -5723,6 +5942,7 @@ mod tests {
             sample_call_resolution_summary(),
             sample_embedding_coverage_summary(),
             sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
             sample_semantic_neighborhood_summary(),
             sample_cross_store_health_summary(),
         );
@@ -6000,6 +6220,7 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 start_line: 1,
                 end_line: 3,
+                provenance: sample_provenance(),
             }],
         }));
         let backend = TestBackend::new(100, 24);
@@ -6576,6 +6797,35 @@ mod tests {
         }
     }
 
+    fn sample_freshness_summary() -> FreshnessSummary {
+        FreshnessSummary {
+            repository_id: "repo".to_owned(),
+            symbol_query: None,
+            files: vec![
+                FileFreshnessRow {
+                    path: "src/lib.rs".to_owned(),
+                    freshness: EvidenceFreshness::Fresh,
+                    indexed_content_hash: Some("hash-1".to_owned()),
+                    current_content_hash: Some("hash-1".to_owned()),
+                    indexed_at: Some("2026-01-01T00:00:00Z".to_owned()),
+                    index_run_id: Some("run-success".to_owned()),
+                    parser_version: Some("tree-sitter-rust".to_owned()),
+                },
+                FileFreshnessRow {
+                    path: "src/stale.rs".to_owned(),
+                    freshness: EvidenceFreshness::Stale,
+                    indexed_content_hash: Some("old".to_owned()),
+                    current_content_hash: Some("new".to_owned()),
+                    indexed_at: Some("2026-01-01T00:00:00Z".to_owned()),
+                    index_run_id: Some("run-success".to_owned()),
+                    parser_version: Some("tree-sitter-rust".to_owned()),
+                },
+            ],
+            focus_symbols: Vec::new(),
+            context_pack: None,
+        }
+    }
+
     fn sample_semantic_neighborhood_summary() -> SemanticNeighborhoodSummary {
         SemanticNeighborhoodSummary {
             repository_id: "repo".to_owned(),
@@ -6679,6 +6929,7 @@ mod tests {
             path: Some("src/lib.rs".to_owned()),
             start_line: Some(5),
             end_line: Some(8),
+            provenance: sample_provenance(),
         }
     }
 
@@ -6701,6 +6952,7 @@ mod tests {
             path: "src/lib.rs".to_owned(),
             start_line,
             end_line,
+            provenance: sample_provenance(),
         }
     }
 
@@ -6717,6 +6969,7 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 start_line: 1,
                 end_line: 3,
+                provenance: sample_provenance(),
             }],
             direct_callers: vec![sample_call_row()],
             direct_callees: Vec::new(),
@@ -6727,6 +6980,18 @@ mod tests {
                 max_callees: 8,
             },
             notes: vec!["metadata_only_no_source_text".to_owned()],
+        }
+    }
+
+    fn sample_provenance() -> EvidenceProvenance {
+        EvidenceProvenance {
+            content_hash: Some("content-hash".to_owned()),
+            index_run_id: Some("run".to_owned()),
+            parser_version: Some("parser".to_owned()),
+            indexed_at: Some("2026-04-30T00:00:00Z".to_owned()),
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
         }
     }
 
