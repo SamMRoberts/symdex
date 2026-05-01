@@ -46,6 +46,7 @@ cargo run -p symdex-cli -- callees . "my_symbol"
 cargo run -p symdex-cli -- call-path . "source_symbol" "target_symbol" 4
 cargo run -p symdex-cli -- impact . "my_symbol"
 cargo run -p symdex-cli -- context-pack . "my_symbol"
+cargo run -p symdex-cli -- debug-context . panic.log
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- tui .
 cargo run -p symdex-cli -- serve-mcp
@@ -91,6 +92,13 @@ Implemented CLI commands currently include:
   context. The current format is `symdex.context_pack.v1` and includes focus
   symbols, direct callers, direct callees, involved files, section limits, and
   notes. It does not include source text.
+- `debug-context <repo> <runtime-input|file|->`: parses runtime failure input
+  such as stack traces, panic locations, failing test names, frame symbols, and
+  Rust file paths, then prints `symdex.debug_context.v1` JSON. The pack maps
+  frames to indexed files, symbols, calls at the failing line, freshness, and
+  provenance when available. Passing `-` reads from stdin; a single existing
+  path reads that file; otherwise remaining arguments are treated as inline
+  runtime text. It does not include source text.
 - `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
   matches with scores, paths, line ranges, symbol names, and provenance
   metadata.
@@ -109,7 +117,7 @@ Implemented CLI commands currently include:
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
-  `symdex_index_status`.
+  `symdex_debug_context`, and `symdex_index_status`.
 
 `doctor` checks whether Qdrant is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector

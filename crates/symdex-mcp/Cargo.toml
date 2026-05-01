@@ -12,4 +12,5 @@ workspace = true
 serde_json = "1.0.149"
 symdex-core = { path = "../symdex-core" }
 symdex-embed = { path = "../symdex-embed" }
+symdex-query = { path = "../symdex-query" }
 symdex-store = { path = "../symdex-store" }

@@ -243,6 +243,70 @@ The context pack is intentionally compact and does not return source text. It is
 currently structural only; semantic hits can be combined by calling
 `symdex_search` separately.
 
+### `symdex_debug_context`
+
+Build a compact debugging evidence pack from runtime failure input.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "input": "thread 'main' panicked at src/lib.rs:42:5:\\nstack backtrace:\\n0: crate::run\\n   at src/lib.rs:42:5",
+  "limit": 8
+}
+```
+
+Output:
+
+```json
+{
+  "format": "symdex.debug_context.v1",
+  "repository_id": "stable-repo-id",
+  "frames": [
+    {
+      "frame": {
+        "ordinal": 0,
+        "symbol": "crate::run",
+        "path": "src/lib.rs",
+        "line": 42,
+        "column": 5
+      },
+      "normalized_path": "src/lib.rs",
+      "file_freshness": "fresh",
+      "file_provenance": {
+        "content_hash": "sha256:...",
+        "index_run_id": "repo-...",
+        "parser_version": "tree-sitter-rust-...",
+        "indexed_at": "2026-04-30T12:00:00Z",
+        "embedding_model": null,
+        "embedding_dimension": null,
+        "embedded_at": null
+      },
+      "matched_symbols": [],
+      "calls_at_line": [],
+      "matched": true
+    }
+  ],
+  "call_paths_between_frames": [],
+  "likely_tests": [],
+  "limits": {
+    "max_frames": 8,
+    "max_symbols_per_frame": 8,
+    "max_calls_per_frame": 8,
+    "max_call_paths_between_frames": 8
+  },
+  "notes": [
+    "metadata_only_no_source_text",
+    "likely_tests_limited_to_runtime_failure_names_until_test_mapping_is_indexed"
+  ]
+}
+```
+
+The tool parses panic/file locations, stack-frame symbols, Rust file paths, and
+failing test names. It maps frames to indexed SQLite file/symbol/call evidence,
+adds freshness and provenance, and returns source-free metadata only.
+
 ### `symdex_index_status`
 
 Return local SQLite index counts.

@@ -352,3 +352,19 @@ freshness label, and the first available provenance record for that file. The
 impact report does not claim likely affected tests yet; `tests_likely` remains
 empty and output includes a note until test discovery and test-to-symbol mapping
 are indexed.
+
+## Debug context packs
+
+Debug context packs are query-time metadata bundles and do not add new tables.
+Runtime input is parsed into frames containing optional frame symbols, file
+paths, line numbers, and columns. Relative paths are normalized with repository
+path rules; absolute paths are accepted only when they are under the selected
+repository root.
+
+The current `symdex.debug_context.v1` format joins parsed frames to existing
+SQLite `files`, `symbols`, and `calls` rows. Returned frame evidence includes
+the normalized path, matched symbols covering the runtime line, calls recorded
+at that line, freshness labels from current file hashes, and provenance
+metadata. Likely tests are limited to failing test names found in runtime input
+until indexed test discovery and mapping are available. Debug context packs do
+not include source text and do not mutate index state.

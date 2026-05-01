@@ -6,6 +6,7 @@ use std::io::{BufRead, Write};
 use serde_json::{Value, json};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
+use symdex_query::run_debug_context_pack;
 use symdex_store::{
     EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
     freshness_for_hash, qdrant_collection_name,
@@ -18,11 +19,12 @@ pub const TOOL_CALLEES: &str = "symdex_callees";
 pub const TOOL_CALL_PATH: &str = "symdex_call_path";
 pub const TOOL_IMPACT: &str = "symdex_impact";
 pub const TOOL_CONTEXT_PACK: &str = "symdex_context_pack";
+pub const TOOL_DEBUG_CONTEXT: &str = "symdex_debug_context";
 pub const TOOL_INDEX_STATUS: &str = "symdex_index_status";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub fn tool_names() -> [&'static str; 8] {
+pub fn tool_names() -> [&'static str; 9] {
     [
         TOOL_SEARCH,
         TOOL_FIND_SYMBOL,
@@ -31,6 +33,7 @@ pub fn tool_names() -> [&'static str; 8] {
         TOOL_CALL_PATH,
         TOOL_IMPACT,
         TOOL_CONTEXT_PACK,
+        TOOL_DEBUG_CONTEXT,
         TOOL_INDEX_STATUS,
     ]
 }
@@ -141,6 +144,7 @@ fn dispatch_tool(name: &str, arguments: &Value) -> Result<Value, String> {
         TOOL_CALL_PATH => tool_call_path(arguments),
         TOOL_IMPACT => tool_impact(arguments),
         TOOL_CONTEXT_PACK => tool_context_pack(arguments),
+        TOOL_DEBUG_CONTEXT => tool_debug_context(arguments),
         TOOL_INDEX_STATUS => tool_index_status(arguments),
         _ => Err(format!("Unknown tool: {name}")),
     }
@@ -333,6 +337,14 @@ fn tool_context_pack(arguments: &Value) -> Result<Value, String> {
     let pack = sqlite()?
         .context_pack(root.id(), symbol, limit)
         .map_err(|error| error.to_string())?;
+    serde_json::to_value(pack).map_err(|error| error.to_string())
+}
+
+fn tool_debug_context(arguments: &Value) -> Result<Value, String> {
+    let repo = required_string(arguments, "repo")?;
+    let input = required_string(arguments, "input")?;
+    let limit = optional_usize(arguments, "limit", 8).min(25);
+    let pack = run_debug_context_pack(repo, input, limit)?;
     serde_json::to_value(pack).map_err(|error| error.to_string())
 }
 
@@ -627,6 +639,25 @@ fn tool_definitions() -> Vec<Value> {
             ],
         ),
         tool_definition(
+            TOOL_DEBUG_CONTEXT,
+            "Debug Context",
+            "Return compact metadata-only debugging evidence from runtime failure input.",
+            &["repo", "input"],
+            vec![
+                ("repo", "string", "Repository root path"),
+                (
+                    "input",
+                    "string",
+                    "Stack trace, panic output, failing test names, or file locations",
+                ),
+                (
+                    "limit",
+                    "integer",
+                    "Maximum rows per evidence section, capped at 25",
+                ),
+            ],
+        ),
+        tool_definition(
             TOOL_INDEX_STATUS,
             "Index Status",
             "Return local SQLite index counts for a repository.",
@@ -677,7 +708,9 @@ fn tool_definition(
 mod tests {
     use serde_json::json;
 
-    use crate::{TOOL_CONTEXT_PACK, TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve};
+    use crate::{
+        TOOL_CONTEXT_PACK, TOOL_DEBUG_CONTEXT, TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve,
+    };
 
     #[test]
     fn lists_tools_after_initialize() {
@@ -723,6 +756,7 @@ mod tests {
         }));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_FIND_SYMBOL));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_CONTEXT_PACK));
+        assert!(tools.iter().any(|tool| tool["name"] == TOOL_DEBUG_CONTEXT));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_INDEX_STATUS));
     }
 
