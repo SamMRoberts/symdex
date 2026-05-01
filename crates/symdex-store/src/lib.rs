@@ -585,10 +585,12 @@ impl SqliteStore {
             let mut stack = Vec::new();
             trace_call_paths(
                 &source.id,
-                target_query,
-                &target_ids,
                 max_depth,
-                &edges_by_caller,
+                &TraceContext {
+                    target_query,
+                    target_ids: &target_ids,
+                    edges_by_caller: &edges_by_caller,
+                },
                 &mut visited,
                 &mut stack,
                 &mut paths,
@@ -2358,12 +2360,16 @@ struct SymbolRef {
     id: String,
 }
 
+struct TraceContext<'a> {
+    target_query: &'a str,
+    target_ids: &'a std::collections::BTreeSet<String>,
+    edges_by_caller: &'a std::collections::BTreeMap<String, Vec<CallPathEdge>>,
+}
+
 fn trace_call_paths(
     current_symbol_id: &str,
-    target_query: &str,
-    target_ids: &std::collections::BTreeSet<String>,
     remaining_depth: usize,
-    edges_by_caller: &std::collections::BTreeMap<String, Vec<CallPathEdge>>,
+    context: &TraceContext<'_>,
     visited: &mut std::collections::BTreeSet<String>,
     stack: &mut Vec<CallPathEdge>,
     paths: &mut Vec<CallPath>,
@@ -2371,12 +2377,12 @@ fn trace_call_paths(
     if remaining_depth == 0 || paths.len() >= 50 {
         return;
     }
-    let Some(edges) = edges_by_caller.get(current_symbol_id) else {
+    let Some(edges) = context.edges_by_caller.get(current_symbol_id) else {
         return;
     };
     for edge in edges {
         stack.push(edge.clone());
-        if call_edge_reaches_target(edge, target_query, target_ids) {
+        if call_edge_reaches_target(edge, context.target_query, context.target_ids) {
             paths.push(call_path_from_edges(stack));
             stack.pop();
             if paths.len() >= 50 {
@@ -2384,20 +2390,18 @@ fn trace_call_paths(
             }
             continue;
         }
-        if let Some(next_symbol_id) = &edge.callee_symbol_id {
-            if visited.insert(next_symbol_id.clone()) {
-                trace_call_paths(
-                    next_symbol_id,
-                    target_query,
-                    target_ids,
-                    remaining_depth.saturating_sub(1),
-                    edges_by_caller,
-                    visited,
-                    stack,
-                    paths,
-                );
-                visited.remove(next_symbol_id);
-            }
+        if let Some(next_symbol_id) = &edge.callee_symbol_id
+            && visited.insert(next_symbol_id.clone())
+        {
+            trace_call_paths(
+                next_symbol_id,
+                remaining_depth.saturating_sub(1),
+                context,
+                visited,
+                stack,
+                paths,
+            );
+            visited.remove(next_symbol_id);
         }
         stack.pop();
     }

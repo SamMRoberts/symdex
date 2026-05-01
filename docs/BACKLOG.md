@@ -132,10 +132,10 @@
 
 ## Phase 12 — Explicit graph traversal and repeatable impact
 
-- [ ] Call path tracing API over persisted call edges with bounded traversal depth.
-- [ ] CLI command for call path tracing between source and target symbols.
+- [x] Call path tracing API over persisted call edges with bounded traversal depth.
+- [x] CLI command for call path tracing between source and target symbols.
 - [ ] TUI call path view with paths, hops, confidence, resolution status, and file/line evidence.
-- [ ] MCP tool for compact call path tracing.
+- [x] MCP tool for compact call path tracing.
 - [ ] Expand impact analysis to include bounded transitive paths and related files.
 - [ ] Add test discovery and mapping design before claiming likely affected tests.
 - [ ] Impact output includes provenance and staleness labels for every evidence row.
