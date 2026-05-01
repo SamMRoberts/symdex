@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use tree_sitter::{Node, Parser};
 
 use crate::{
@@ -50,11 +52,14 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
 
     let mut calls = Vec::new();
     for (function, symbol) in functions.iter().zip(symbols.iter()) {
+        let use_aliases =
+            collect_visible_use_aliases(file.language, function.node, tree.root_node(), source);
         collect_call_edges(
             function.node,
             file.language,
             symbol,
             &symbols,
+            &use_aliases,
             source,
             &mut calls,
         );
@@ -387,12 +392,13 @@ fn collect_call_edges(
     language: Language,
     caller: &Symbol,
     symbols: &[Symbol],
+    use_aliases: &BTreeMap<String, String>,
     source: &str,
     calls: &mut Vec<CallEdge>,
 ) {
     let mut cursor = function.walk();
     for child in function.children(&mut cursor) {
-        collect_call_edges_from_node(child, language, caller, symbols, source, calls);
+        collect_call_edges_from_node(child, language, caller, symbols, use_aliases, source, calls);
     }
 }
 
@@ -401,6 +407,7 @@ fn collect_call_edges_from_node(
     language: Language,
     caller: &Symbol,
     symbols: &[Symbol],
+    use_aliases: &BTreeMap<String, String>,
     source: &str,
     calls: &mut Vec<CallEdge>,
 ) {
@@ -408,7 +415,7 @@ fn collect_call_edges_from_node(
         && let Some(callee_text) = callee_text(node, source)
     {
         let (callee_symbol_id, resolution_status, confidence) =
-            resolve_callee(&callee_text, symbols);
+            resolve_callee(&callee_text, symbols, use_aliases);
         let call_line = node.start_position().row + 1;
         calls.push(CallEdge {
             id: stable_id(&[
@@ -428,17 +435,19 @@ fn collect_call_edges_from_node(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_call_edges_from_node(child, language, caller, symbols, source, calls);
+        collect_call_edges_from_node(child, language, caller, symbols, use_aliases, source, calls);
     }
 }
 
 fn resolve_callee(
     callee_text: &str,
     symbols: &[Symbol],
+    use_aliases: &BTreeMap<String, String>,
 ) -> (Option<String>, ResolutionStatus, f32) {
+    let candidates = callee_resolution_candidates(callee_text, use_aliases);
     let exact: Vec<&Symbol> = symbols
         .iter()
-        .filter(|symbol| symbol.qualified_name == callee_text)
+        .filter(|symbol| candidates.contains(&symbol.qualified_name))
         .collect();
     if exact.len() == 1 {
         return (
@@ -451,13 +460,18 @@ fn resolve_callee(
         return (None, ResolutionStatus::Ambiguous, 0.2);
     }
 
-    let suffix = symbol_suffix(callee_text);
+    let suffixes = candidates
+        .iter()
+        .map(|candidate| symbol_suffix(candidate).to_owned())
+        .collect::<BTreeSet<_>>();
     let candidates: Vec<&Symbol> = symbols
         .iter()
         .filter(|symbol| {
-            symbol.name == suffix
-                || symbol.qualified_name.ends_with(callee_text)
-                || symbol_suffix(&symbol.qualified_name) == suffix
+            suffixes.contains(&symbol.name)
+                || candidates
+                    .iter()
+                    .any(|candidate| symbol.qualified_name.ends_with(candidate))
+                || suffixes.contains(symbol_suffix(&symbol.qualified_name))
         })
         .collect();
     match candidates.as_slice() {
@@ -469,6 +483,110 @@ fn resolve_callee(
         [] => (None, ResolutionStatus::Unresolved, 0.25),
         _ => (None, ResolutionStatus::Ambiguous, 0.2),
     }
+}
+
+fn callee_resolution_candidates(
+    callee_text: &str,
+    use_aliases: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    candidates.insert(callee_text.to_owned());
+    candidates.insert(normalize_rust_path(callee_text));
+    if let Some((head, tail)) = callee_text.split_once("::") {
+        if let Some(target) = use_aliases.get(head) {
+            candidates.insert(format!("{target}::{tail}"));
+        }
+    } else if let Some(target) = use_aliases.get(callee_text) {
+        candidates.insert(target.clone());
+    }
+    candidates.into_iter().collect()
+}
+
+fn collect_visible_use_aliases(
+    language: Language,
+    function: Node<'_>,
+    root: Node<'_>,
+    source: &str,
+) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+    if language != Language::Rust {
+        return aliases;
+    }
+    let scope = rust_function_module_scope(function).unwrap_or(root);
+    collect_use_aliases_from_scope(scope, source, &mut aliases);
+    collect_use_aliases_from_scope(function, source, &mut aliases);
+    aliases
+}
+
+fn rust_function_module_scope(function: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = function.parent();
+    while let Some(current) = parent {
+        if current.kind() == "mod_item" {
+            return Some(current);
+        }
+        parent = current.parent();
+    }
+    None
+}
+
+fn collect_use_aliases_from_scope(
+    node: Node<'_>,
+    source: &str,
+    aliases: &mut BTreeMap<String, String>,
+) {
+    if node.kind() == "use_declaration"
+        && let Some(text) = node_text(node, source)
+    {
+        for (alias, target) in parse_rust_use_declaration(text) {
+            aliases.insert(alias, target);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.id() != node.id()
+            && matches!(child.kind(), "function_item" | "impl_item" | "mod_item")
+        {
+            continue;
+        }
+        collect_use_aliases_from_scope(child, source, aliases);
+    }
+}
+
+fn parse_rust_use_declaration(text: &str) -> Vec<(String, String)> {
+    let Some(path) = text.trim().strip_prefix("use ") else {
+        return Vec::new();
+    };
+    let path = path.trim_end_matches(';').trim();
+    if path.contains('{') || path.contains('*') || path.is_empty() {
+        return Vec::new();
+    }
+    let (target, alias) = if let Some((target, alias)) = path.rsplit_once(" as ") {
+        (clean_expression_text(target), clean_expression_text(alias))
+    } else {
+        let path = clean_expression_text(path);
+        let Some(alias) = path.rsplit("::").find(|part| !part.is_empty()) else {
+            return Vec::new();
+        };
+        (path.clone(), alias.to_owned())
+    };
+    let target = normalize_rust_path(target.trim_end_matches("::"));
+    if target.is_empty() || alias.is_empty() {
+        Vec::new()
+    } else {
+        vec![(alias, target)]
+    }
+}
+
+fn normalize_rust_path(path: &str) -> String {
+    let mut parts = path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    while matches!(parts.first(), Some(&"crate" | &"self" | &"super")) {
+        parts.remove(0);
+    }
+    parts.join("::")
 }
 
 fn callee_text(call: Node<'_>, source: &str) -> Option<String> {
@@ -887,6 +1005,80 @@ pub fn caller() {
             ResolutionStatus::Unresolved
         );
         assert!(external_call.callee_symbol_id.is_none());
+    }
+
+    #[test]
+    fn resolves_rust_calls_through_crate_prefixes_and_use_aliases() {
+        let source = r#"mod inner {
+    pub fn helper() {}
+    pub fn other() {}
+}
+
+use crate::inner::helper as run_helper;
+use crate::inner as aliased_inner;
+
+pub fn caller() {
+    crate::inner::helper();
+    run_helper();
+    aliased_inner::other();
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        for callee_text in ["crate::inner::helper", "run_helper", "aliased_inner::other"] {
+            let call = index
+                .calls
+                .iter()
+                .find(|call| call.callee_text == callee_text)
+                .unwrap_or_else(|| panic!("{callee_text} call should exist"));
+            assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+            assert!(call.callee_symbol_id.is_some());
+        }
+    }
+
+    #[test]
+    fn keeps_rust_use_alias_resolution_scoped_to_visible_modules() {
+        let source = r#"mod inner {
+    pub fn helper() {}
+}
+
+mod first {
+    use crate::inner::helper as local_helper;
+
+    pub fn caller() {
+        local_helper();
+    }
+}
+
+mod second {
+    pub fn caller() {
+        local_helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        let resolved_alias_calls = index
+            .calls
+            .iter()
+            .filter(|call| {
+                call.callee_text == "local_helper"
+                    && call.resolution_status == ResolutionStatus::ResolvedExact
+            })
+            .count();
+        let unresolved_alias_calls = index
+            .calls
+            .iter()
+            .filter(|call| {
+                call.callee_text == "local_helper"
+                    && call.resolution_status == ResolutionStatus::Unresolved
+            })
+            .count();
+
+        assert_eq!(resolved_alias_calls, 1);
+        assert_eq!(unresolved_alias_calls, 1);
     }
 
     #[test]

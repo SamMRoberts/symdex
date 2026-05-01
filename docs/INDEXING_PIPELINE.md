@@ -187,10 +187,12 @@ Current implementation extracts Rust function and method symbols from
 `function_item` nodes. Free functions use module-derived qualified names, while
 methods include the enclosing `impl` type when tree-sitter exposes it. Call
 extraction records `call_expression` nodes inside indexed functions. Resolution
-is local and conservative: exact qualified-name matches are
-`resolved_exact`, single suffix/name matches are `resolved_local_candidate`,
-multiple matches are `ambiguous`, and all other calls are preserved as
-`unresolved`.
+is local and conservative: exact qualified-name matches are `resolved_exact`,
+single suffix/name matches are `resolved_local_candidate`, multiple matches are
+`ambiguous`, and all other calls are preserved as `unresolved`. Rust resolution
+also normalizes leading `crate::`, `self::`, and `super::` prefixes and applies
+simple file-local `use` aliases such as `use crate::module::function as alias;`
+or `use crate::module as alias;` before falling back to suffix matching.
 
 Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
 diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is

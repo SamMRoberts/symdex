@@ -68,6 +68,9 @@ Fixtures should be tiny and purpose-built.
 - Rust test discovery coverage for recognized test attributes, module-qualified
   test names, SQLite test persistence/replacement, failing-test name mapping,
   and impact likely-test evidence from direct indexed test calls.
+- Rust call-resolution coverage for exact local calls, unresolved calls,
+  normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
+  and module aliases used in scoped calls.
 - Optional rust-analyzer readiness coverage for default-off behavior, explicit
   truthy opt-in flags, command override parsing, and doctor check status without
   requiring rust-analyzer in ordinary tests.
