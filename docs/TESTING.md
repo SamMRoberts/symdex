@@ -50,7 +50,7 @@ Fixtures should be tiny and purpose-built.
   states, including metadata-only TUI rendering.
 - Debug context coverage for parsed panic/file locations, stack-frame symbols,
   failing test names, mapped frames, unmapped frames, stale frames, deleted
-  files, and malformed runtime input.
+  files, malformed runtime input, and TUI debug context pack rendering.
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and
@@ -99,7 +99,7 @@ cargo run -p symdex-cli -- tui --help
 
 Current TUI tests cover dashboard rendering, doctor diagnostics rendering, query
 workbench rendering and input state, symbol/call graph rendering and input
-state, impact/call-path/context-pack rendering and input state, the storage explorer
+state, impact/call-path/context-pack/debug-context rendering and input state, the storage explorer
 metric table, always-visible nested storage tab header, and detail panel,
 index coverage table and selected-file detail panel with chunk, symbol, and
 call metadata, symbol outline table and

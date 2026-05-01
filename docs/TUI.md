@@ -5,7 +5,7 @@
 Build a native terminal UI for symdex as a local-first full control panel.
 
 The TUI should make existing indexing, diagnostics, semantic search, structural
-queries, impact analysis, and context packs easier to inspect without changing
+queries, impact analysis, context packs, and debug context packs easier to inspect without changing
 the privacy or safety model.
 
 ## Command
@@ -92,7 +92,7 @@ terminal panes.
 
 - Highlight the active tab and focused input/list row.
 - Use `Up` and `Down` to move the selected evidence row in completed diagnostic,
-  storage, query, call graph, impact, and context-pack tables.
+  storage, query, call graph, impact, context-pack, and debug-context tables.
 - In the Storage view, row selection should drive a visible detail panel for
   the selected SQLite/Qdrant metric and nearby storage health notes.
 - In the Storage view, always show a self-contained storage tab header above
@@ -112,7 +112,7 @@ terminal panes.
 - Style loading/running states distinctly from idle states.
 - Style empty states as deliberate placeholders, not blank panels.
 - Style failed states with a short red status line plus the error text.
-- Show selected query mode, graph direction, and impact/call-path/context mode as tabs or
+- Show selected query mode, graph direction, and impact/call-path/context/debug mode as tabs or
   segmented controls rather than only inline prose.
 
 ### Accessibility and Terminal Compatibility
@@ -361,7 +361,7 @@ represent the indexed repository.
 - Use a table for symbol, path, line range, confidence, callee text, and
   resolution status.
 
-### Impact, Call Path, and Context Pack Viewer
+### Impact, Call Path, Context Pack, and Debug Context Viewer
 
 - Show impact using direct callers/callees, bounded transitive path counts,
   freshness labels, and related-file metadata from the Impact tab with typed
@@ -370,6 +370,9 @@ represent the indexed repository.
   Render paths as rows with path number, hop number, edge, confidence, file,
   call line, and resolution status.
 - Show `symdex.context_pack.v1` metadata with the same viewer controls.
+- Show `symdex.debug_context.v1` metadata from runtime failure input with
+  matched frames, call paths between frames, likely tests, freshness, and
+  provenance labels.
 - Do not include source text by default.
 - Render impact sections as separate panels or tables for direct callers and
   direct callees.
@@ -384,7 +387,7 @@ represent the indexed repository.
 - Primary views are selected with bracket navigation instead of letter keys:
   `[` moves to the previous major tab and `]` moves to the next major tab.
 - Letter keys must remain available to text-entry views for query, call graph,
-  impact, and context-pack inputs.
+  impact, context-pack, and debug-context inputs.
 - Keep visible focus state.
 - Keep views compact enough for agent-facing evidence review.
 - Never hide long-running work; show loading/running/completed/failed states.
@@ -404,19 +407,19 @@ Current dashboard keys:
   neighborhood, and cross-store health in the storage explorer
 - `Tab` / `Shift+Tab`: toggle symbol and semantic query modes in the query workbench
 - `Tab` / `Shift+Tab`: toggle callers and callees in the symbol/call graph browser
-- `Tab` / `Shift+Tab`: toggle impact, call-path, and context-pack modes in the impact/call-path/context-pack viewer
+- `Tab` / `Shift+Tab`: toggle impact, call-path, context-pack, and debug-context modes in the impact/call-path/context-pack/debug-context viewer
 - `Up` / `Down`: move the selected row in completed result and storage tables
 - `Enter`: start Doctor diagnostics when the Doctor tab has no result rows
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
-- typed text: edit the impact/call-path/context-pack viewer input
+- typed text: edit the impact/call-path/context-pack/debug-context viewer input
 - `Backspace`: edit the query workbench input
 - `Backspace`: edit the symbol/call graph browser input
-- `Backspace`: edit the impact/call-path/context-pack viewer input
+- `Backspace`: edit the impact/call-path/context-pack/debug-context viewer input
 - `Enter`: run the current query workbench query
 - `Enter`: run the current symbol/call graph lookup
-- `Enter`: run the current impact/call-path/context-pack lookup
+- `Enter`: run the current impact/call-path/context-pack/debug-context lookup
 - `r`: refresh repository and storage status
 - `y`: confirm a pending indexing job
 - `n` or `Esc`: cancel a pending indexing job or continuous-indexing toggle

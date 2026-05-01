@@ -108,7 +108,7 @@ Implemented CLI commands currently include:
   semantic indexing, `c` to toggle continuous indexing, `[` / `]` to move
   between the Index, Storage, Doctor, Query, Calls, and Impact tabs, and
   `Tab` / `Shift+Tab` to toggle view-local modes including impact, call-path,
-  and context-pack evidence modes. In the Doctor tab, `Enter`
+  context-pack, and debug-context evidence modes. In the Doctor tab, `Enter`
   starts diagnostics when no result rows are available. The storage explorer
   always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs

@@ -27,18 +27,18 @@ use symdex_index::{
     IndexSummary, run_continuous_index_until, run_index_with_progress,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, CallPathSummary, FreshnessSummary, ImpactSummary, QueryMode,
-    QueryResult, SemanticSearchSummary, SymbolSearchSummary, run_call_graph, run_call_path,
-    run_call_resolution, run_context_pack, run_cross_store_health, run_embedding_coverage,
-    run_freshness_report, run_impact, run_index_coverage, run_index_runs_timeline,
-    run_semantic_neighborhood, run_semantic_search, run_storage_explorer, run_symbol_outline,
-    run_symbol_search,
+    CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
+    ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary, SymbolSearchSummary,
+    run_call_graph, run_call_path, run_call_resolution, run_context_pack, run_cross_store_health,
+    run_debug_context_pack, run_embedding_coverage, run_freshness_report, run_impact,
+    run_index_coverage, run_index_runs_timeline, run_semantic_neighborhood, run_semantic_search,
+    run_storage_explorer, run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
-    CrossStoreHealthSummary, EmbeddingCoverageSummary, EvidenceFreshness, FileCoverageStatus,
-    FileDetailSummary, IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
-    QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
+    CrossStoreHealthSummary, EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance,
+    FileCoverageStatus, FileDetailSummary, IndexCoverageSummary, IndexRunTimelineRow,
+    IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
     SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore, StorageExplorerSummary,
     StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
     qdrant_collection_name,
@@ -488,7 +488,7 @@ impl App {
             Line::from(vec![
                 Span::styled("Input: ", Style::new().add_modifier(Modifier::BOLD)),
                 Span::raw(if self.evidence.input.is_empty() {
-                    "<type symbol or source -> target>".to_owned()
+                    "<symbol, source -> target, or runtime failure>".to_owned()
                 } else {
                     self.evidence.input.clone()
                 }),
@@ -503,7 +503,9 @@ impl App {
             EvidenceStatus::Idle => {
                 lines.push(Line::from(vec![
                     status_span("idle", StatusTone::Dim),
-                    Span::raw(" No impact, call-path, or context-pack lookup has run."),
+                    Span::raw(
+                        " No impact, call-path, context-pack, or debug-context lookup has run.",
+                    ),
                 ]));
             }
             EvidenceStatus::Running => {
@@ -1104,6 +1106,9 @@ impl App {
                 EvidenceMode::ContextPack => {
                     run_context_pack(&repo, &query, 8).map(EvidenceResult::ContextPack)
                 }
+                EvidenceMode::DebugContext => {
+                    run_debug_context_pack(&repo, &query, 8).map(EvidenceResult::DebugContext)
+                }
             };
             let _ = sender.send(result);
         });
@@ -1509,10 +1514,19 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     context_pack_row_count(pack),
                 );
             }
+            EvidenceStatus::Completed(EvidenceResult::DebugContext(pack)) => {
+                render_selectable_table(
+                    frame,
+                    area,
+                    debug_context_table(pack),
+                    app.evidence.selection,
+                    debug_context_row_count(pack),
+                );
+            }
             _ => render_line_panel(
                 frame,
                 area,
-                "Impact/Call Path/Context Pack",
+                "Impact/Call Path/Context Pack/Debug",
                 app.evidence_lines(),
             ),
         },
@@ -2391,6 +2405,7 @@ fn evidence_result_lines(result: &EvidenceResult) -> Vec<Line<'_>> {
         EvidenceResult::Impact(summary) => impact_lines(summary),
         EvidenceResult::CallPath(summary) => call_path_lines(summary),
         EvidenceResult::ContextPack(pack) => context_pack_lines(pack),
+        EvidenceResult::DebugContext(pack) => debug_context_lines(pack),
     }
 }
 
@@ -2499,6 +2514,71 @@ fn context_pack_lines(pack: &ContextPack) -> Vec<Line<'_>> {
     lines.push(Line::from(format!(
         "Limits: symbols={} callers={} callees={}",
         pack.limits.max_symbols, pack.limits.max_callers, pack.limits.max_callees
+    )));
+    lines.extend(
+        pack.notes
+            .iter()
+            .map(|note| Line::from(format!("Note: {note}"))),
+    );
+    lines
+}
+
+fn debug_context_lines(pack: &DebugContextPack) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(format!("Format: {}", pack.format)),
+        Line::from(format!("Frames: {}", pack.frames.len())),
+        Line::from(format!(
+            "Call paths between frames: {}",
+            pack.call_paths_between_frames.len()
+        )),
+        Line::from(format!("Likely tests: {}", pack.likely_tests.len())),
+    ];
+    lines.extend(pack.frames.iter().take(5).map(|frame| {
+        let symbol = frame
+            .matched_symbols
+            .first()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .or(frame.frame.symbol.as_deref())
+            .unwrap_or("<unmapped>");
+        Line::from(format!(
+            "Frame #{} {} {} freshness={} path={}",
+            frame.frame.ordinal,
+            if frame.matched {
+                "matched"
+            } else {
+                "unmatched"
+            },
+            symbol,
+            frame.file_freshness.label(),
+            frame
+                .normalized_path
+                .as_deref()
+                .or(frame.frame.path.as_deref())
+                .unwrap_or("<unknown>")
+        ))
+    }));
+    lines.extend(pack.call_paths_between_frames.iter().take(4).map(|path| {
+        Line::from(format!(
+            "Path frames {}->{} {} -> {} paths={}",
+            path.from_frame,
+            path.to_frame,
+            path.from_symbol,
+            path.to_symbol,
+            path.paths.len()
+        ))
+    }));
+    lines.extend(
+        pack.likely_tests
+            .iter()
+            .take(5)
+            .map(|test| Line::from(format!("Likely test: {test}"))),
+    );
+    lines.push(Line::from(format!(
+        "Limits: frames={} symbols/frame={} calls/frame={} paths={}",
+        pack.limits.max_frames,
+        pack.limits.max_symbols_per_frame,
+        pack.limits.max_calls_per_frame,
+        pack.limits.max_call_paths_between_frames
     )));
     lines.extend(
         pack.notes
@@ -4200,6 +4280,105 @@ fn context_pack_table(pack: &ContextPack) -> Table<'_> {
         .column_spacing(1)
 }
 
+fn debug_context_table(pack: &DebugContextPack) -> Table<'_> {
+    let frame_rows = pack.frames.iter().take(8).map(|frame| {
+        let symbol = frame
+            .matched_symbols
+            .first()
+            .map(|symbol| symbol.qualified_name.clone())
+            .or_else(|| frame.frame.symbol.clone())
+            .unwrap_or_else(|| "<unmapped>".to_owned());
+        Row::new(vec![
+            Cell::from("Frame"),
+            Cell::from(format!("#{}", frame.frame.ordinal)),
+            Cell::from(format!(
+                "{} {} {}",
+                frame
+                    .normalized_path
+                    .as_deref()
+                    .or(frame.frame.path.as_deref())
+                    .unwrap_or("<unknown>"),
+                runtime_line_label(frame.frame.line, frame.frame.column),
+                symbol
+            )),
+            freshness_cell(frame.file_freshness),
+            matched_cell(frame.matched),
+            Cell::from(provenance_label(frame.file_provenance.as_ref())),
+        ])
+    });
+    let path_rows = pack.call_paths_between_frames.iter().take(6).map(|path| {
+        let terminal_status = path
+            .paths
+            .first()
+            .map(|path| path.terminal_resolution_status.as_str())
+            .unwrap_or("unresolved");
+        Row::new(vec![
+            Cell::from("Path"),
+            Cell::from(format!("{}->{}", path.from_frame, path.to_frame)),
+            Cell::from(format!(
+                "{} -> {} ({} paths)",
+                path.from_symbol,
+                path.to_symbol,
+                path.paths.len()
+            )),
+            Cell::from("n/a"),
+            resolution_cell(terminal_status),
+            Cell::from("call graph"),
+        ])
+    });
+    let test_rows = pack.likely_tests.iter().take(6).map(|test| {
+        Row::new(vec![
+            Cell::from("Test"),
+            Cell::from("-"),
+            Cell::from(test.clone()),
+            Cell::from("unknown"),
+            Cell::from("runtime"),
+            Cell::from("failure input"),
+        ])
+    });
+    let note_rows = pack.notes.iter().map(|note| {
+        Row::new(vec![
+            Cell::from("Note"),
+            Cell::from("-"),
+            Cell::from(note.clone()),
+            Cell::from("n/a"),
+            Cell::from("metadata"),
+            Cell::from(pack.format.clone()),
+        ])
+    });
+    let rows = frame_rows
+        .chain(path_rows)
+        .chain(test_rows)
+        .chain(note_rows);
+
+    Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Percentage(42),
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Percentage(22),
+        ],
+    )
+    .header(table_header([
+        "Kind",
+        "Ref",
+        "Evidence",
+        "Fresh",
+        "Status",
+        "Provenance",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Impact/Call Path/Context Pack/Debug | Debug Context | Frames: {} | Paths: {} | Tests: {}",
+        pack.frames.len(),
+        pack.call_paths_between_frames.len(),
+        pack.likely_tests.len()
+    )))
+    .column_spacing(1)
+}
+
 fn call_row(row: &symdex_store::CallSearchRow) -> Row<'_> {
     Row::new(vec![
         Cell::from(
@@ -4325,6 +4504,13 @@ fn context_pack_row_count(pack: &ContextPack) -> usize {
         + pack.notes.len()
 }
 
+fn debug_context_row_count(pack: &DebugContextPack) -> usize {
+    pack.frames.iter().take(8).count()
+        + pack.call_paths_between_frames.iter().take(6).count()
+        + pack.likely_tests.iter().take(6).count()
+        + pack.notes.len()
+}
+
 fn progress_percent(progress: Option<&IndexProgress>) -> u16 {
     let Some(progress) = progress else {
         return 0;
@@ -4351,6 +4537,47 @@ fn optional_line_range(start: Option<usize>, end: Option<usize>) -> String {
     match (start, end) {
         (Some(start), Some(end)) => line_range(start, end),
         _ => "<unknown>".to_owned(),
+    }
+}
+
+fn runtime_line_label(line: Option<usize>, column: Option<usize>) -> String {
+    match (line, column) {
+        (Some(line), Some(column)) => format!("{line}:{column}"),
+        (Some(line), None) => line.to_string(),
+        _ => "-".to_owned(),
+    }
+}
+
+fn provenance_label(provenance: Option<&EvidenceProvenance>) -> String {
+    let Some(provenance) = provenance else {
+        return "none".to_owned();
+    };
+    let run = provenance.index_run_id.as_deref().unwrap_or("run?");
+    let parser = provenance.parser_version.as_deref().unwrap_or("parser?");
+    let hash = provenance
+        .content_hash
+        .as_deref()
+        .map(short_hash)
+        .unwrap_or("hash?".to_owned());
+    format!("{run} {parser} {hash}")
+}
+
+fn freshness_cell(freshness: EvidenceFreshness) -> Cell<'static> {
+    let tone = match freshness {
+        EvidenceFreshness::Fresh => StatusTone::Success,
+        EvidenceFreshness::Stale | EvidenceFreshness::Deleted | EvidenceFreshness::Missing => {
+            StatusTone::Warning
+        }
+        EvidenceFreshness::Unknown => StatusTone::Dim,
+    };
+    Cell::from(status_span(freshness.label(), tone))
+}
+
+fn matched_cell(matched: bool) -> Cell<'static> {
+    if matched {
+        Cell::from(status_span("matched", StatusTone::Success))
+    } else {
+        Cell::from(status_span("unmapped", StatusTone::Warning))
     }
 }
 
@@ -4409,7 +4636,7 @@ impl View {
                 "[ or ] tabs | Tab/Shift+Tab callers/callees | type symbol | Up/Down select | Enter run | Esc clear/back | q quit"
             }
             Self::Evidence => {
-                "[ or ] tabs | Tab/Shift+Tab impact/call-path/context | type symbol or source -> target | Up/Down select | Enter run | Esc clear/back | q quit"
+                "[ or ] tabs | Tab/Shift+Tab impact/call-path/context/debug | type symbol, source -> target, or runtime failure | Up/Down select | Enter run | Esc clear/back | q quit"
             }
         }
     }
@@ -4727,6 +4954,7 @@ enum EvidenceMode {
     Impact,
     CallPath,
     ContextPack,
+    DebugContext,
 }
 
 impl EvidenceMode {
@@ -4735,6 +4963,7 @@ impl EvidenceMode {
             Self::Impact => "impact",
             Self::CallPath => "call path",
             Self::ContextPack => "context pack",
+            Self::DebugContext => "debug context",
         }
     }
 
@@ -4742,7 +4971,8 @@ impl EvidenceMode {
         match self {
             Self::Impact => Self::CallPath,
             Self::CallPath => Self::ContextPack,
-            Self::ContextPack => Self::Impact,
+            Self::ContextPack => Self::DebugContext,
+            Self::DebugContext => Self::Impact,
         }
     }
 }
@@ -4777,6 +5007,9 @@ impl EvidenceViewerState {
             EvidenceStatus::Completed(EvidenceResult::ContextPack(pack)) => {
                 context_pack_row_count(pack)
             }
+            EvidenceStatus::Completed(EvidenceResult::DebugContext(pack)) => {
+                debug_context_row_count(pack)
+            }
             _ => 0,
         }
     }
@@ -4793,6 +5026,7 @@ enum EvidenceResult {
     Impact(ImpactSummary),
     CallPath(CallPathSummary),
     ContextPack(ContextPack),
+    DebugContext(DebugContextPack),
 }
 
 enum IndexJobMessage {
@@ -4979,8 +5213,10 @@ mod tests {
     use ratatui::style::Color;
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
-        CallDirection, CallGraphSummary, CallPathSummary, FileFreshnessRow, FreshnessSummary,
-        ImpactCallEvidence, ImpactSummary, QueryMode, QueryResult, SymbolSearchSummary,
+        CallDirection, CallGraphSummary, CallPathSummary, DebugContextLimits, DebugContextPack,
+        DebugFrameCallPath, DebugFrameMatch, FileFreshnessRow, FreshnessSummary,
+        ImpactCallEvidence, ImpactSummary, QueryMode, QueryResult, RuntimeFrame,
+        SymbolSearchSummary,
     };
     use symdex_store::{
         CallPath, CallPathEdge, CallResolutionBucket, CallResolutionEdgeRow, CallResolutionSummary,
@@ -6674,6 +6910,51 @@ mod tests {
     }
 
     #[test]
+    fn renders_debug_context_pack_metadata() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Evidence;
+        app.evidence.mode = EvidenceMode::DebugContext;
+        app.evidence.input = "thread 'main' panicked at src/lib.rs:7:5".to_owned();
+        app.evidence.status =
+            EvidenceStatus::Completed(EvidenceResult::DebugContext(sample_debug_context_pack()));
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Debug Context"));
+        assert!(rendered.contains("Frame"));
+        assert!(rendered.contains("Path"));
+        assert!(rendered.contains("Test"));
+        assert!(rendered.contains("fresh"));
+        assert!(rendered.contains("matched"));
+        assert!(rendered.contains("crate::caller"));
+        assert!(rendered.contains("test_add"));
+        assert!(rendered.contains("run"));
+    }
+
+    #[test]
+    fn renders_debug_context_pack_at_80x24() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Evidence;
+        app.evidence.mode = EvidenceMode::DebugContext;
+        app.evidence.status =
+            EvidenceStatus::Completed(EvidenceResult::DebugContext(sample_debug_context_pack()));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("symdex TUI"));
+        assert!(rendered.contains("Debug"));
+        assert!(rendered.contains("Kind"));
+        assert!(rendered.contains("Fresh"));
+        assert!(rendered.contains("Status"));
+    }
+
+    #[test]
     fn evidence_viewer_accepts_input_and_toggles_modes() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Evidence;
@@ -6691,6 +6972,10 @@ mod tests {
         assert!(!app.handle_key(KeyCode::Tab));
         assert_eq!(app.view, View::Evidence);
         assert_eq!(app.evidence.mode, EvidenceMode::ContextPack);
+
+        assert!(!app.handle_key(KeyCode::Tab));
+        assert_eq!(app.view, View::Evidence);
+        assert_eq!(app.evidence.mode, EvidenceMode::DebugContext);
 
         assert!(!app.handle_evidence_key(KeyCode::Backspace));
         assert_eq!(app.evidence.input, "ad");
@@ -7228,6 +7513,81 @@ mod tests {
                 max_symbols: 8,
                 max_callers: 8,
                 max_callees: 8,
+            },
+            notes: vec!["metadata_only_no_source_text".to_owned()],
+        }
+    }
+
+    fn sample_debug_context_pack() -> DebugContextPack {
+        DebugContextPack {
+            format: "symdex.debug_context.v1".to_owned(),
+            repository_id: "repo".to_owned(),
+            frames: vec![
+                DebugFrameMatch {
+                    frame: RuntimeFrame {
+                        ordinal: 0,
+                        raw: "thread 'main' panicked at src/lib.rs:7:5".to_owned(),
+                        symbol: Some("caller".to_owned()),
+                        path: Some("src/lib.rs".to_owned()),
+                        line: Some(7),
+                        column: Some(5),
+                    },
+                    normalized_path: Some("src/lib.rs".to_owned()),
+                    file_freshness: EvidenceFreshness::Fresh,
+                    file_provenance: Some(sample_provenance()),
+                    matched_symbols: vec![SymbolSearchRow {
+                        id: "symbol-caller".to_owned(),
+                        name: "caller".to_owned(),
+                        qualified_name: "crate::caller".to_owned(),
+                        kind: "function".to_owned(),
+                        path: "src/lib.rs".to_owned(),
+                        start_line: 5,
+                        end_line: 8,
+                        provenance: sample_provenance(),
+                    }],
+                    calls_at_line: vec![CallPath {
+                        hops: 1,
+                        min_confidence: 1.0,
+                        terminal_resolution_status: "resolved_exact".to_owned(),
+                        edges: vec![sample_call_path_edge()],
+                    }],
+                    matched: true,
+                },
+                DebugFrameMatch {
+                    frame: RuntimeFrame {
+                        ordinal: 1,
+                        raw: "at src/lib.rs:1:1".to_owned(),
+                        symbol: Some("add".to_owned()),
+                        path: Some("src/lib.rs".to_owned()),
+                        line: Some(1),
+                        column: Some(1),
+                    },
+                    normalized_path: Some("src/lib.rs".to_owned()),
+                    file_freshness: EvidenceFreshness::Stale,
+                    file_provenance: Some(sample_provenance()),
+                    matched_symbols: vec![sample_symbol(
+                        "symbol-add".to_owned(),
+                        "crate::add".to_owned(),
+                        1,
+                        3,
+                    )],
+                    calls_at_line: Vec::new(),
+                    matched: true,
+                },
+            ],
+            call_paths_between_frames: vec![DebugFrameCallPath {
+                from_frame: 0,
+                to_frame: 1,
+                from_symbol: "crate::caller".to_owned(),
+                to_symbol: "crate::add".to_owned(),
+                paths: sample_call_path_summary().paths,
+            }],
+            likely_tests: vec!["test_add".to_owned()],
+            limits: DebugContextLimits {
+                max_frames: 8,
+                max_symbols_per_frame: 8,
+                max_calls_per_frame: 8,
+                max_call_paths_between_frames: 8,
             },
             notes: vec!["metadata_only_no_source_text".to_owned()],
         }
