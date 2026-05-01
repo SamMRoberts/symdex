@@ -19,4 +19,6 @@ pub use parser::{extract_rust_chunks, index_rust_file};
 pub use path::{NormalizedRepoPath, RepoRoot};
 pub use secrets::secret_exclusion_reason;
 
+pub const EVIDENCE_CONTRACT_SCHEMA: &str = "symdex.mcp.evidence.v1";
+pub const EVIDENCE_CONTRACT_VERSION: u64 = 1;
 pub const RUST_PARSER_VERSION: &str = "tree-sitter-rust:0.24.2;symdex-core:0.1.0";

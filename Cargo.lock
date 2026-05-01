@@ -1535,7 +1535,9 @@ dependencies = [
 name = "symdex-diagnostics"
 version = "0.1.0"
 dependencies = [
+ "symdex-core",
  "symdex-embed",
+ "symdex-query",
  "symdex-store",
 ]
 

@@ -35,6 +35,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
+cargo run -p symdex-cli -- doctor .
 cargo run -p symdex-cli -- index .
 cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- index --watch .
@@ -55,7 +56,9 @@ cargo run -p symdex-cli -- serve-mcp
 Implemented CLI commands currently include:
 
 - `init`: creates the local state directory for the configured SQLite path.
-- `doctor`: prints local configuration and basic filesystem diagnostics.
+- `doctor [repo]`: prints local configuration, filesystem diagnostics, local
+  service checks, the active MCP evidence contract version, and repo-specific
+  index freshness/provenance readiness when a repo path is provided.
 - `index <repo>`: discovers Rust files, applies built-in excludes and scoped
   simple `.gitignore` rules, hashes file contents, extracts tree-sitter
   function and method chunks, embeds chunk text with local Ollama, creates the
@@ -137,8 +140,11 @@ The app should not require network access beyond local loopback services during 
 `symdex doctor` should check:
 
 - SQLite database path is writable
+- SQLite database file exists after `symdex init`
 - Qdrant is reachable
 - Ollama is reachable
 - embedding model is available
 - vector dimension can be determined
+- active MCP evidence contract version is local-only and read-only
 - configured repo root exists
+- repo-specific index freshness and provenance consistency when a repo is passed

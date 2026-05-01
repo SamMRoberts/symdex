@@ -32,6 +32,8 @@ Pure domain logic:
 - symbol extraction
 - call extraction
 - indexing plans and domain types
+- shared evidence contract schema/version constants used by CLI, TUI,
+  diagnostics, and MCP
 
 This crate should not depend on Qdrant, Ollama, MCP, or CLI frameworks.
 
@@ -131,7 +133,8 @@ MCP server:
 - output shaping
 - path boundary enforcement
 - read-only query operations
-- stable cross-agent evidence contract envelope
+- stable cross-agent evidence contract envelope using the shared `symdex-core`
+  contract constants
 
 ## Boundary rules
 

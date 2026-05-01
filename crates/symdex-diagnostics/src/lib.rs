@@ -4,8 +4,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_store::{QdrantClient, StoreConfig, sqlite_parent};
+use symdex_query::FreshnessSummary;
+use symdex_store::{EvidenceFreshness, QdrantClient, StoreConfig, sqlite_parent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticReport {
@@ -46,6 +48,10 @@ impl DiagnosticState {
 }
 
 pub fn run_diagnostics() -> Result<DiagnosticReport, String> {
+    run_diagnostics_for_repo(None)
+}
+
+pub fn run_diagnostics_for_repo(repo: Option<&str>) -> Result<DiagnosticReport, String> {
     let store = StoreConfig::from_env();
     let embed = EmbedConfig::from_env();
     let cwd = env::current_dir().map_err(|error| format!("read current directory: {error}"))?;
@@ -59,8 +65,11 @@ pub fn run_diagnostics() -> Result<DiagnosticReport, String> {
             message: "database path has no parent".to_owned(),
         },
     });
+    checks.push(sqlite_database_check(&store.sqlite_path));
     checks.extend(ollama_checks(&embed));
     checks.push(qdrant_check(&store));
+    checks.push(mcp_contract_check());
+    checks.extend(cross_agent_repo_checks(repo));
 
     Ok(DiagnosticReport {
         workspace: cwd.display().to_string(),
@@ -70,6 +79,143 @@ pub fn run_diagnostics() -> Result<DiagnosticReport, String> {
         embed_model: embed.model,
         checks,
     })
+}
+
+fn sqlite_database_check(path: &Path) -> DiagnosticCheck {
+    if path.exists() {
+        if path.is_file() {
+            return DiagnosticCheck {
+                label: "sqlite_database".to_owned(),
+                state: DiagnosticState::Ok,
+                message: path.display().to_string(),
+            };
+        }
+        return DiagnosticCheck {
+            label: "sqlite_database".to_owned(),
+            state: DiagnosticState::Error,
+            message: format!("not a file ({})", path.display()),
+        };
+    }
+
+    DiagnosticCheck {
+        label: "sqlite_database".to_owned(),
+        state: DiagnosticState::Missing,
+        message: format!("{} - run `symdex init`", path.display()),
+    }
+}
+
+fn mcp_contract_check() -> DiagnosticCheck {
+    DiagnosticCheck {
+        label: "mcp_evidence_contract".to_owned(),
+        state: DiagnosticState::Ok,
+        message: format!(
+            "{EVIDENCE_CONTRACT_SCHEMA} version={EVIDENCE_CONTRACT_VERSION} read_only local_only"
+        ),
+    }
+}
+
+fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
+    let Some(repo) = repo.map(str::trim).filter(|repo| !repo.is_empty()) else {
+        return vec![
+            DiagnosticCheck {
+                label: "index_freshness".to_owned(),
+                state: DiagnosticState::Skipped,
+                message: "pass a repository path to check indexed evidence freshness".to_owned(),
+            },
+            DiagnosticCheck {
+                label: "provenance_consistency".to_owned(),
+                state: DiagnosticState::Skipped,
+                message: "pass a repository path to check indexed evidence provenance".to_owned(),
+            },
+        ];
+    };
+
+    match symdex_query::run_freshness_report(repo, None) {
+        Ok(summary) => vec![
+            index_freshness_check(&summary),
+            provenance_consistency_check(&summary),
+        ],
+        Err(error) => vec![
+            DiagnosticCheck {
+                label: "index_freshness".to_owned(),
+                state: DiagnosticState::Error,
+                message: error.clone(),
+            },
+            DiagnosticCheck {
+                label: "provenance_consistency".to_owned(),
+                state: DiagnosticState::Error,
+                message: error,
+            },
+        ],
+    }
+}
+
+fn index_freshness_check(summary: &FreshnessSummary) -> DiagnosticCheck {
+    if summary.files.is_empty() {
+        return DiagnosticCheck {
+            label: "index_freshness".to_owned(),
+            state: DiagnosticState::Missing,
+            message: format!("{} has no indexed Rust files", summary.repository_id),
+        };
+    }
+
+    let fresh = summary.count(EvidenceFreshness::Fresh);
+    let stale = summary.count(EvidenceFreshness::Stale);
+    let deleted = summary.count(EvidenceFreshness::Deleted);
+    let missing = summary.count(EvidenceFreshness::Missing);
+    let unknown = summary.count(EvidenceFreshness::Unknown);
+    let message = format!(
+        "fresh={fresh} stale={stale} deleted={deleted} missing={missing} unknown={unknown}"
+    );
+    let state = if stale == 0 && deleted == 0 && missing == 0 && unknown == 0 {
+        DiagnosticState::Ok
+    } else {
+        DiagnosticState::Error
+    };
+
+    DiagnosticCheck {
+        label: "index_freshness".to_owned(),
+        state,
+        message,
+    }
+}
+
+fn provenance_consistency_check(summary: &FreshnessSummary) -> DiagnosticCheck {
+    let indexed_rows = summary
+        .files
+        .iter()
+        .filter(|row| row.indexed_content_hash.is_some())
+        .collect::<Vec<_>>();
+    if indexed_rows.is_empty() {
+        return DiagnosticCheck {
+            label: "provenance_consistency".to_owned(),
+            state: DiagnosticState::Missing,
+            message: format!("{} has no indexed provenance rows", summary.repository_id),
+        };
+    }
+
+    let incomplete = indexed_rows
+        .iter()
+        .filter(|row| {
+            row.indexed_at.as_deref().unwrap_or_default().is_empty()
+                || row.index_run_id.as_deref().unwrap_or_default().is_empty()
+                || row.parser_version.as_deref().unwrap_or_default().is_empty()
+        })
+        .count();
+    let state = if incomplete == 0 {
+        DiagnosticState::Ok
+    } else {
+        DiagnosticState::Error
+    };
+
+    DiagnosticCheck {
+        label: "provenance_consistency".to_owned(),
+        state,
+        message: format!(
+            "indexed_rows={} incomplete_provenance={incomplete}",
+            indexed_rows.len()
+        ),
+    }
 }
 
 fn writable_dir_check(label: &str, path: &Path) -> DiagnosticCheck {
@@ -173,7 +319,13 @@ fn qdrant_check(config: &StoreConfig) -> DiagnosticCheck {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticState, writable_dir_check};
+    use symdex_query::{FileFreshnessRow, FreshnessSummary};
+    use symdex_store::EvidenceFreshness;
+
+    use crate::{
+        DiagnosticState, index_freshness_check, provenance_consistency_check,
+        sqlite_database_check, writable_dir_check,
+    };
 
     #[test]
     fn writable_dir_check_reports_existing_directory() {
@@ -192,5 +344,66 @@ mod tests {
 
         assert_eq!(check.state, DiagnosticState::Missing);
         assert!(check.message.contains("symdex init"));
+    }
+
+    #[test]
+    fn sqlite_database_check_reports_missing_file() {
+        let check = sqlite_database_check(std::path::Path::new(
+            "target/definitely-not-created-by-this-test/symdex.sqlite",
+        ));
+
+        assert_eq!(check.label, "sqlite_database");
+        assert_eq!(check.state, DiagnosticState::Missing);
+        assert!(check.message.contains("symdex init"));
+    }
+
+    #[test]
+    fn index_freshness_check_flags_stale_or_missing_evidence() {
+        let summary = freshness_summary(vec![
+            freshness_row("src/fresh.rs", EvidenceFreshness::Fresh, true),
+            freshness_row("src/stale.rs", EvidenceFreshness::Stale, true),
+            freshness_row("src/new.rs", EvidenceFreshness::Missing, false),
+        ]);
+
+        let check = index_freshness_check(&summary);
+
+        assert_eq!(check.state, DiagnosticState::Error);
+        assert!(check.message.contains("fresh=1"));
+        assert!(check.message.contains("stale=1"));
+        assert!(check.message.contains("missing=1"));
+    }
+
+    #[test]
+    fn provenance_consistency_check_flags_incomplete_indexed_rows() {
+        let mut row = freshness_row("src/lib.rs", EvidenceFreshness::Fresh, true);
+        row.parser_version = None;
+        let summary = freshness_summary(vec![row]);
+
+        let check = provenance_consistency_check(&summary);
+
+        assert_eq!(check.state, DiagnosticState::Error);
+        assert!(check.message.contains("incomplete_provenance=1"));
+    }
+
+    fn freshness_summary(files: Vec<FileFreshnessRow>) -> FreshnessSummary {
+        FreshnessSummary {
+            repository_id: "repo".to_owned(),
+            symbol_query: None,
+            files,
+            focus_symbols: Vec::new(),
+            context_pack: None,
+        }
+    }
+
+    fn freshness_row(path: &str, freshness: EvidenceFreshness, indexed: bool) -> FileFreshnessRow {
+        FileFreshnessRow {
+            path: path.to_owned(),
+            freshness,
+            indexed_content_hash: indexed.then(|| "indexed-hash".to_owned()),
+            current_content_hash: Some("current-hash".to_owned()),
+            indexed_at: indexed.then(|| "2026-05-01T00:00:00Z".to_owned()),
+            index_run_id: indexed.then(|| "run-1".to_owned()),
+            parser_version: indexed.then(|| "parser".to_owned()),
+        }
     }
 }

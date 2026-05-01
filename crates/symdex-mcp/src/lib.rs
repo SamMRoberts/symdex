@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, Write};
 
 use serde_json::{Value, json};
+pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_query::run_debug_context_pack;
@@ -23,8 +24,6 @@ pub const TOOL_DEBUG_CONTEXT: &str = "symdex_debug_context";
 pub const TOOL_INDEX_STATUS: &str = "symdex_index_status";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-pub const EVIDENCE_CONTRACT_SCHEMA: &str = "symdex.mcp.evidence.v1";
-pub const EVIDENCE_CONTRACT_VERSION: u64 = 1;
 
 pub fn tool_names() -> [&'static str; 9] {
     [
@@ -352,9 +351,16 @@ fn tool_debug_context(arguments: &Value) -> Result<Value, String> {
 }
 
 fn tool_index_status(arguments: &Value) -> Result<Value, String> {
+    tool_index_status_with_store(arguments, &StoreConfig::from_env())
+}
+
+fn tool_index_status_with_store(
+    arguments: &Value,
+    store_config: &StoreConfig,
+) -> Result<Value, String> {
     let repo = required_string(arguments, "repo")?;
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let status = sqlite()?
+    let status = sqlite_with_config(store_config)?
         .repository_status(root.id())
         .map_err(|error| error.to_string())?;
     Ok(json!({
@@ -503,7 +509,11 @@ fn impact_related_files_json<'a>(
 }
 
 fn sqlite() -> Result<SqliteStore, String> {
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    sqlite_with_config(&StoreConfig::from_env())
+}
+
+fn sqlite_with_config(config: &StoreConfig) -> Result<SqliteStore, String> {
+    let store = SqliteStore::open(config).map_err(|error| error.to_string())?;
     store.migrate().map_err(|error| error.to_string())?;
     Ok(store)
 }
@@ -733,11 +743,16 @@ fn tool_definition(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use serde_json::json;
+    use symdex_store::StoreConfig;
 
     use crate::{
         EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, TOOL_CONTEXT_PACK, TOOL_DEBUG_CONTEXT,
-        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve, tool_success,
+        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve, tool_index_status_with_store, tool_names,
+        tool_success,
     };
 
     #[test]
@@ -889,5 +904,53 @@ mod tests {
                 .expect("error text")
                 .contains("repository root is not a directory")
         );
+    }
+
+    #[test]
+    fn multiple_agents_can_read_same_index_without_write_tools() {
+        let store_config = temp_store_config();
+        let arguments = json!({ "repo": "." });
+
+        let agent_one = tool_index_status_with_store(&arguments, &store_config)
+            .expect("first agent should read index status");
+        let agent_two = tool_index_status_with_store(&arguments, &store_config)
+            .expect("second agent should read index status");
+
+        assert_eq!(agent_one["repository_id"], agent_two["repository_id"]);
+        assert_eq!(agent_one["files_indexed"], agent_two["files_indexed"]);
+        assert!(
+            tool_names()
+                .iter()
+                .all(|name| !name.contains("index") || *name == TOOL_INDEX_STATUS)
+        );
+        for forbidden in ["reset", "delete", "write", "mutate", "reindex"] {
+            assert!(
+                tool_names().iter().all(|name| !name.contains(forbidden)),
+                "tool list should not expose write-capable action `{forbidden}`"
+            );
+        }
+
+        let wrapped = tool_success(agent_one);
+        assert_eq!(
+            wrapped["structuredContent"]["schema_version"],
+            EVIDENCE_CONTRACT_SCHEMA
+        );
+        assert_eq!(wrapped["structuredContent"]["contract"]["read_only"], true);
+    }
+
+    fn temp_store_config() -> StoreConfig {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be available")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "symdex-mcp-multi-agent-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp store directory should be created");
+        StoreConfig {
+            sqlite_path: dir.join("symdex.sqlite"),
+            qdrant_url: "http://localhost:6333".to_owned(),
+        }
     }
 }

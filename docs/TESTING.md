@@ -118,6 +118,10 @@ the animated continuous-indexing activity indicator.
 Current freshness tests cover hash-to-state classification, file freshness
 aggregation over indexed and current file sets, returned symbol/call provenance,
 and the TUI evidence freshness panel.
+Current cross-agent reuse tests cover the shared MCP evidence contract envelope,
+read-only tool annotations, underscore-only tool names, repo root validation,
+and two independent MCP readers using the same SQLite index-status path without
+write-capable tools.
 
 Current call path tests cover deterministic path order, unresolved terminal
 edges matched by callee text, ambiguous terminal edges matched by callee text,

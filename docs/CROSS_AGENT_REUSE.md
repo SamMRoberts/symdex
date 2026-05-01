@@ -17,6 +17,8 @@ index without each agent rebuilding or inventing its own evidence model.
   - the actual tool payload under `data`
 - Tool names use underscores and must remain stable unless a new contract
   version is introduced.
+- The evidence contract schema and version live in `symdex-core` so CLI, TUI,
+  MCP, and diagnostics can report the same current contract.
 
 ## Privacy Guarantees
 
@@ -44,7 +46,7 @@ execute indexed repository code or expose source text by default.
 
 ## Diagnostics Expectations
 
-Cross-agent diagnostics should make these facts visible:
+`symdex doctor [repo]` makes these facts visible:
 
 - SQLite database path and parent directory health.
 - Qdrant endpoint health.
@@ -52,10 +54,12 @@ Cross-agent diagnostics should make these facts visible:
 - Index freshness and provenance consistency.
 - Whether an agent is receiving stale, missing, deleted, unknown, or fresh
   evidence.
+- The active MCP evidence contract schema/version and local-only/read-only
+  policy.
 
 ## Future Work
 
-- Add a CLI/TUI cross-agent readiness report that combines local diagnostics,
-  index freshness, provenance coverage, and MCP contract version.
-- Add tests that simulate multiple MCP clients reading the same indexed
-  repository without write-capable tools.
+- Surface the full repo-aware cross-agent readiness report in the TUI Doctor
+  tab.
+- Add fixture-backed multi-agent tests with populated files, symbols, calls, and
+  provenance rows.

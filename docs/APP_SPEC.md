@@ -50,7 +50,7 @@ symdex callees <repo> <symbol>
 symdex impact <repo> <symbol>
 symdex context-pack <repo> <symbol>
 symdex tui [repo]
-symdex doctor
+symdex doctor [repo]
 symdex serve-mcp
 ```
 

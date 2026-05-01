@@ -41,7 +41,8 @@ Successful tool call `structuredContent` uses the stable cross-agent envelope:
 
 The examples below show the `data` payload for each tool. The envelope is always
 present on successful tool calls and is also advertised by `initialize` as
-`symdexContract`.
+`symdexContract`. The current schema and version are defined in `symdex-core`
+so CLI, TUI, diagnostics, and MCP share the same contract identifier.
 
 ### `symdex_search`
 
