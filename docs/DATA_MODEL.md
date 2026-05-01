@@ -210,6 +210,11 @@ embedding model, and embedding dimension. Missing collections and missing
 points are errors; stale payload fields and orphaned Qdrant points are warnings.
 The report is metadata-only and does not request vectors or source text.
 
+The Qdrant repair command uses verifier metadata as its repair plan. Orphaned
+point IDs are deleted from Qdrant. Missing or stale expected points, including
+payload model or dimension drift, are rebuilt through semantic indexing rather
+than by a separate write path so SQLite remains the structural source of truth.
+
 ## TUI visualization mapping
 
 The TUI should visualize storage metadata without showing source text by

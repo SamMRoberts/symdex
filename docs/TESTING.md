@@ -98,7 +98,10 @@ local Qdrant or Ollama services.
 
 Qdrant verifier unit tests keep the comparison logic deterministic by building
 SQLite expected-point manifests and Qdrant payload rows in memory. Live Qdrant
-scroll behavior remains part of the service-dependent adapter checks.
+scroll behavior remains part of the service-dependent adapter checks. Repair
+uses the verifier's captured point IDs for orphan deletion and the existing
+semantic index path for vector rebuilds, so focused tests cover the repair plan
+classification while live end-to-end repair remains service-dependent.
 
 Service-dependent checks:
 

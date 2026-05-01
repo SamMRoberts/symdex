@@ -15,7 +15,7 @@ use symdex_query::{
     QdrantVerifySummary, run_call_graph, run_call_path, run_context_pack, run_debug_context_pack,
     run_freshness_report, run_impact, run_qdrant_verify, run_semantic_search, run_symbol_search,
 };
-use symdex_store::{EvidenceFreshness, SqliteStore, StoreConfig, sqlite_parent};
+use symdex_store::{EvidenceFreshness, QdrantClient, SqliteStore, StoreConfig, sqlite_parent};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -49,6 +49,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "qdrant-verify" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             qdrant_verify(repo)
+        }
+        "qdrant-repair" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            qdrant_repair(repo)
         }
         "symbol" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -196,6 +200,44 @@ fn qdrant_verify(repo: &str) -> Result<(), String> {
     let summary = run_qdrant_verify(repo)?;
     print_qdrant_verify_summary(&summary);
     Ok(())
+}
+
+fn qdrant_repair(repo: &str) -> Result<(), String> {
+    let before = run_qdrant_verify(repo)?;
+    println!("pre_repair_verify:");
+    print_qdrant_verify_summary(&before);
+
+    let orphaned_points_deleted = delete_orphaned_qdrant_points(&before)?;
+    println!("orphaned_points_deleted: {orphaned_points_deleted}");
+
+    let reindex_required = before.missing_points > 0 || before.stale_payload_points > 0;
+    if reindex_required {
+        println!("semantic_reindex: started");
+        let index_summary = run_index(&IndexOptions {
+            repo: repo.to_owned(),
+            offline: false,
+        })?;
+        print_index_summary(&index_summary);
+    } else {
+        println!("semantic_reindex: skipped");
+    }
+
+    let after = run_qdrant_verify(repo)?;
+    println!("post_repair_verify:");
+    print_qdrant_verify_summary(&after);
+    Ok(())
+}
+
+fn delete_orphaned_qdrant_points(summary: &QdrantVerifySummary) -> Result<usize, String> {
+    if !summary.collection_exists || summary.orphaned_point_ids.is_empty() {
+        return Ok(0);
+    }
+    let store_config = StoreConfig::from_env();
+    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
+    qdrant
+        .delete_points(&summary.collection_name, &summary.orphaned_point_ids)
+        .map_err(|error| error.to_string())?;
+    Ok(summary.orphaned_point_ids.len())
 }
 
 fn symbol(repo: &str, query: &str) -> Result<(), String> {
@@ -717,7 +759,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
+        "symdex {}\n\nUSAGE:\n    symdex <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help",
         env!("CARGO_PKG_VERSION")
     );
 }

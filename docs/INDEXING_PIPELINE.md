@@ -142,6 +142,13 @@ chunks with `qdrant_point_id`, scrolls Qdrant payloads filtered by
 fields, and orphaned points. The verifier requests payloads only, not vectors,
 and never returns source text.
 
+`symdex qdrant-repair <repo>` starts from that verification report. Orphaned
+Qdrant points are deleted directly because SQLite has no matching chunk for
+them. Missing collections, missing points, stale payload fields, and payload
+model or dimension drift are repaired by running the normal semantic indexing
+path, preserving the same parser, hashing, secret-detection, embedding,
+provenance, and index-run lifecycle behavior as `symdex index <repo>`.
+
 Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
 with the embedded query vector, `with_payload: true`, and `with_vector: false`.
 

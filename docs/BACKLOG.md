@@ -185,10 +185,10 @@
 - [x] Add CI for fmt, clippy, tests, release build, and dependency audit.
 - [ ] Add JSON CLI output mirroring MCP contracts.
 - [x] Record failed and partial index runs, not only successful summaries.
-- [ ] Implement Qdrant delete, verify, and repair lifecycle for changed or deleted chunks.
+- [x] Implement Qdrant delete, verify, and repair lifecycle for changed or deleted chunks.
   - [x] Delete stale Qdrant points for changed and deleted chunks before SQLite cleanup.
   - [x] Verify SQLite/Qdrant vector lifecycle state.
-  - [ ] Repair missing, stale, orphaned, or drifted vectors.
+  - [x] Repair missing, stale, orphaned, or drifted vectors.
 - [ ] Split large store and TUI files into modules.
 
 ### P1 — Debugging credibility

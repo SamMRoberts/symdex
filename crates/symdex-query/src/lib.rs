@@ -133,6 +133,9 @@ pub struct QdrantVerifySummary {
     pub missing_points: usize,
     pub stale_payload_points: usize,
     pub orphaned_points: usize,
+    pub missing_point_ids: Vec<String>,
+    pub stale_payload_point_ids: Vec<String>,
+    pub orphaned_point_ids: Vec<String>,
     pub rows: Vec<StorageHealthRow>,
 }
 
@@ -629,6 +632,9 @@ fn qdrant_verify_summary(
     let mut missing_points = 0usize;
     let mut stale_payload_points = 0usize;
     let mut orphaned_points = 0usize;
+    let mut missing_point_ids = Vec::new();
+    let mut stale_payload_point_ids = Vec::new();
+    let mut orphaned_point_ids = Vec::new();
 
     if !collection_exists {
         if expected.is_empty() {
@@ -641,6 +647,7 @@ fn qdrant_verify_summary(
             });
         } else {
             missing_points = expected.len();
+            missing_point_ids.extend(expected.iter().map(|point| point.qdrant_point_id.clone()));
             rows.push(StorageHealthRow {
                 status: StorageHealthStatus::Error,
                 label: "collection_missing".to_owned(),
@@ -654,6 +661,7 @@ fn qdrant_verify_summary(
         for expected_point in &expected {
             let Some(actual_point) = actual_by_id.get(&expected_point.qdrant_point_id) else {
                 missing_points += 1;
+                missing_point_ids.push(expected_point.qdrant_point_id.clone());
                 rows.push(StorageHealthRow {
                     status: StorageHealthStatus::Error,
                     label: "missing_point".to_owned(),
@@ -672,6 +680,7 @@ fn qdrant_verify_summary(
             let mismatches = qdrant_payload_mismatches(expected_point, &actual_point.payload);
             if !mismatches.is_empty() {
                 stale_payload_points += 1;
+                stale_payload_point_ids.push(expected_point.qdrant_point_id.clone());
                 rows.push(StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "stale_payload".to_owned(),
@@ -688,6 +697,7 @@ fn qdrant_verify_summary(
         for point_id in actual_by_id.keys() {
             if !expected_by_id.contains_key(point_id) {
                 orphaned_points += 1;
+                orphaned_point_ids.push(point_id.clone());
                 rows.push(StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "orphaned_point".to_owned(),
@@ -719,6 +729,9 @@ fn qdrant_verify_summary(
         missing_points,
         stale_payload_points,
         orphaned_points,
+        missing_point_ids,
+        stale_payload_point_ids,
+        orphaned_point_ids,
         rows,
     }
 }
@@ -1333,6 +1346,9 @@ mod tests {
         assert_eq!(summary.missing_points, 1);
         assert_eq!(summary.stale_payload_points, 1);
         assert_eq!(summary.orphaned_points, 1);
+        assert_eq!(summary.missing_point_ids, vec!["point-missing"]);
+        assert_eq!(summary.stale_payload_point_ids, vec!["point-stale"]);
+        assert_eq!(summary.orphaned_point_ids, vec!["point-orphan"]);
         assert!(summary.rows.iter().any(|row| {
             row.status == StorageHealthStatus::Error && row.label == "missing_point"
         }));
@@ -1363,8 +1379,30 @@ mod tests {
         assert_eq!(summary.missing_points, 0);
         assert_eq!(summary.stale_payload_points, 0);
         assert_eq!(summary.orphaned_points, 0);
+        assert!(summary.missing_point_ids.is_empty());
+        assert!(summary.stale_payload_point_ids.is_empty());
+        assert!(summary.orphaned_point_ids.is_empty());
         assert!(summary.rows.iter().any(|row| {
             row.status == StorageHealthStatus::Ok && row.label == "qdrant_verify_ok"
+        }));
+    }
+
+    #[test]
+    fn qdrant_verify_summary_marks_missing_collection_points_repairable() {
+        let expected = expected_point("point-missing", "chunk-missing", "hash-missing");
+        let summary = qdrant_verify_summary(
+            "repo",
+            "symdex_repo_model".to_owned(),
+            "nomic-embed-text".to_owned(),
+            false,
+            vec![expected],
+            Vec::new(),
+        );
+
+        assert_eq!(summary.missing_points, 1);
+        assert_eq!(summary.missing_point_ids, vec!["point-missing"]);
+        assert!(summary.rows.iter().any(|row| {
+            row.status == StorageHealthStatus::Error && row.label == "collection_missing"
         }));
     }
 

@@ -89,6 +89,10 @@ Implemented CLI commands currently include:
   live Qdrant point payloads for the configured embedding model. It reports
   missing collections, missing points, stale payload metadata, and orphaned
   points without printing source text or vectors.
+- `qdrant-repair <repo>`: runs the same verification first, deletes orphaned
+  Qdrant points, then runs semantic indexing when missing collections, missing
+  points, stale payload fields, model drift, or dimension drift require vectors
+  to be rebuilt. It finishes with a second verification report.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
   name and returns path, line ranges, and provenance metadata.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct
