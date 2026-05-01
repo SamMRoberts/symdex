@@ -72,6 +72,10 @@ Fixtures should be tiny and purpose-built.
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
   module aliases used in scoped calls, and exact Rust `self.method()` /
   `Self::method()` resolution to methods on the enclosing impl receiver.
+- Rust cross-file call-resolution coverage for qualified module calls resolved
+  from the current index batch, persisted unchanged Rust symbols used during
+  incremental indexing, and stale persisted symbols ignored for files being
+  replaced.
 - Rust macro coverage for unresolved macro call edges and metadata-only
   diagnostics that macro invocations are preserved without expansion.
 - Rust chunking coverage for function, method, type-definition, trait,

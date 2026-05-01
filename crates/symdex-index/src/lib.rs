@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, ParseDiagnostic,
-    RepoRoot, Symbol, discover_indexable_files, index_source_file,
+    RepoRoot, ResolutionStatus, Symbol, discover_indexable_files, index_source_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
@@ -415,7 +415,7 @@ fn run_index_internal(
         ))
         .map_err(|error| error.to_string())?;
 
-    let collection = match collect_index_reports(
+    let mut collection = match collect_index_reports(
         &root,
         if skip_unchanged { Some(&sqlite) } else { None },
         &mut on_progress,
@@ -433,6 +433,26 @@ fn run_index_internal(
             return Err(error);
         }
     };
+    let persisted_rust_symbols = match sqlite.rust_symbols_for_repository(root.id()) {
+        Ok(symbols) => symbols,
+        Err(error) => {
+            let error = error.to_string();
+            finish_failed_index_run(
+                &sqlite,
+                &run_scope,
+                &parser_version_summary(&collection),
+                RunCounts {
+                    files_seen: collection.files_seen,
+                    files_indexed: 0,
+                    chunks_embedded: 0,
+                },
+                "failed",
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
+    resolve_cross_file_rust_calls(&mut collection, &persisted_rust_symbols);
     let files = file_summaries(&collection.reports);
     let rust_analyzer =
         rust_analyzer_enrichment_summary(&collection, &RustAnalyzerEnrichmentConfig::from_env());
@@ -829,6 +849,142 @@ fn plan_rust_analyzer_enrichment(
                 eligible_symbols: rust_reports.iter().map(|report| report.symbols.len()).sum(),
                 eligible_calls: rust_reports.iter().map(|report| report.calls.len()).sum(),
             }
+        }
+    }
+}
+
+fn resolve_cross_file_rust_calls(
+    collection: &mut IndexCollection,
+    persisted_rust_symbols: &[SymbolRecord],
+) {
+    let replaced_file_ids = collection
+        .reports
+        .iter()
+        .map(|report| report.file.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut symbols = collection
+        .reports
+        .iter()
+        .filter(|report| report.file.language == Language::Rust)
+        .flat_map(|report| report.symbols.iter().map(ResolutionSymbol::from_symbol))
+        .collect::<Vec<_>>();
+    symbols.extend(
+        persisted_rust_symbols
+            .iter()
+            .filter(|symbol| !replaced_file_ids.contains(symbol.file_id.as_str()))
+            .map(ResolutionSymbol::from_record),
+    );
+
+    if symbols.is_empty() {
+        return;
+    }
+
+    for report in collection
+        .reports
+        .iter_mut()
+        .filter(|report| report.file.language == Language::Rust)
+    {
+        for call in &mut report.calls {
+            if call.resolution_status != ResolutionStatus::Unresolved {
+                continue;
+            }
+            if let Some((callee_symbol_id, resolution_status, confidence)) =
+                resolve_cross_file_rust_callee(&call.callee_text, &symbols)
+            {
+                call.callee_symbol_id = callee_symbol_id;
+                call.resolution_status = resolution_status;
+                call.confidence = confidence;
+            }
+        }
+    }
+}
+
+fn resolve_cross_file_rust_callee(
+    callee_text: &str,
+    symbols: &[ResolutionSymbol],
+) -> Option<(Option<String>, ResolutionStatus, f32)> {
+    let candidates = cross_file_rust_callee_candidates(callee_text);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let exact = symbols
+        .iter()
+        .filter(|symbol| candidates.contains(&symbol.qualified_name))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [symbol] => {
+            return Some((
+                Some(symbol.id.clone()),
+                ResolutionStatus::ResolvedExact,
+                1.0,
+            ));
+        }
+        [] => {}
+        _ => return Some((None, ResolutionStatus::Ambiguous, 0.2)),
+    }
+
+    let suffix_matches = symbols
+        .iter()
+        .filter(|symbol| {
+            candidates
+                .iter()
+                .any(|candidate| symbol.qualified_name.ends_with(candidate))
+        })
+        .collect::<Vec<_>>();
+    match suffix_matches.as_slice() {
+        [symbol] => Some((
+            Some(symbol.id.clone()),
+            ResolutionStatus::ResolvedLocalCandidate,
+            0.65,
+        )),
+        [] => None,
+        _ => Some((None, ResolutionStatus::Ambiguous, 0.2)),
+    }
+}
+
+fn cross_file_rust_callee_candidates(callee_text: &str) -> BTreeSet<String> {
+    let normalized = normalize_rust_module_path(callee_text);
+    if normalized.is_empty() || !normalized.contains("::") || normalized.ends_with('!') {
+        return BTreeSet::new();
+    }
+
+    BTreeSet::from([callee_text.to_owned(), normalized])
+}
+
+fn normalize_rust_module_path(path: &str) -> String {
+    let mut parts = path
+        .split("::")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    while matches!(parts.first(), Some(&"crate" | &"self" | &"super")) {
+        parts.remove(0);
+    }
+    parts.join("::")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolutionSymbol {
+    id: String,
+    file_id: String,
+    qualified_name: String,
+}
+
+impl ResolutionSymbol {
+    fn from_symbol(symbol: &Symbol) -> Self {
+        Self {
+            id: symbol.id.clone(),
+            file_id: symbol.file_id.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+        }
+    }
+
+    fn from_record(symbol: &SymbolRecord) -> Self {
+        Self {
+            id: symbol.id.clone(),
+            file_id: symbol.file_id.clone(),
+            qualified_name: symbol.qualified_name.clone(),
         }
     }
 }
@@ -1341,11 +1497,13 @@ mod tests {
         ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
         ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
+    use symdex_store::SymbolRecord;
 
     use crate::{
         IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
         RustAnalyzerReadiness, WatchSnapshot, chunk_record, chunk_texts, collect_index_reports,
-        detect_watch_changes, diff_watch_snapshots, plan_rust_analyzer_enrichment, watch_snapshot,
+        detect_watch_changes, diff_watch_snapshots, plan_rust_analyzer_enrichment,
+        resolve_cross_file_rust_calls, watch_snapshot,
     };
 
     #[test]
@@ -1461,6 +1619,102 @@ mod tests {
         assert!(!collection.reports[0].parse_diagnostics.is_empty());
         let summaries = super::file_summaries(&collection.reports);
         assert!(!summaries[0].parse_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn resolves_cross_file_rust_module_calls_from_current_reports() {
+        let repo = TestRepo::new("cross-file-rust-current-reports");
+        repo.write(
+            "src/lib.rs",
+            "mod worker;\npub fn run() { crate::worker::helper(); }\n",
+        );
+        repo.write("src/worker.rs", "pub fn helper() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let mut collection = collect_index_reports(&root, None, &mut |_| {})
+            .expect("collection should parse both files");
+
+        resolve_cross_file_rust_calls(&mut collection, &[]);
+
+        let helper_symbol_id = collection
+            .reports
+            .iter()
+            .flat_map(|report| &report.symbols)
+            .find(|symbol| symbol.qualified_name == "worker::helper")
+            .expect("helper symbol should be indexed")
+            .id
+            .clone();
+        let call = collection
+            .reports
+            .iter()
+            .flat_map(|report| &report.calls)
+            .find(|call| call.callee_text == "crate::worker::helper")
+            .expect("qualified module call should be captured");
+
+        assert_eq!(
+            call.callee_symbol_id.as_deref(),
+            Some(helper_symbol_id.as_str())
+        );
+        assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+        assert_eq!(call.confidence, 1.0);
+    }
+
+    #[test]
+    fn resolves_cross_file_rust_calls_against_persisted_unchanged_symbols() {
+        let mut caller = sample_symbol("run");
+        caller.id = stable_id(&["symbol", "run"]);
+        let mut call = sample_unresolved_call("run", "crate::worker::helper");
+        call.caller_symbol_id = caller.id.clone();
+        let mut collection = collection_with_reports(vec![IndexReport {
+            file: FileFacts {
+                id: "file-lib".to_owned(),
+                relative_path: "src/lib.rs".to_owned(),
+                language: Language::Rust,
+                content_hash: content_hash(b"lib"),
+            },
+            chunks: Vec::new(),
+            symbols: vec![caller],
+            calls: vec![call],
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: String::new(),
+        }]);
+        let persisted_helper = sample_symbol_record("worker::helper", "file-worker");
+
+        resolve_cross_file_rust_calls(&mut collection, std::slice::from_ref(&persisted_helper));
+
+        let call = &collection.reports[0].calls[0];
+        assert_eq!(
+            call.callee_symbol_id.as_deref(),
+            Some(persisted_helper.id.as_str())
+        );
+        assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+    }
+
+    #[test]
+    fn ignores_persisted_symbols_from_replaced_files_during_cross_file_resolution() {
+        let caller = sample_symbol("run");
+        let collection_file_id = caller.file_id.clone();
+        let mut collection = collection_with_reports(vec![IndexReport {
+            file: FileFacts {
+                id: collection_file_id.clone(),
+                relative_path: "src/lib.rs".to_owned(),
+                language: Language::Rust,
+                content_hash: content_hash(b"lib"),
+            },
+            chunks: Vec::new(),
+            symbols: vec![caller],
+            calls: vec![sample_unresolved_call("run", "crate::worker::helper")],
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: String::new(),
+        }]);
+        let stale_symbol = sample_symbol_record("worker::helper", &collection_file_id);
+
+        resolve_cross_file_rust_calls(&mut collection, &[stale_symbol]);
+
+        let call = &collection.reports[0].calls[0];
+        assert!(call.callee_symbol_id.is_none());
+        assert_eq!(call.resolution_status, ResolutionStatus::Unresolved);
     }
 
     #[test]
@@ -1633,6 +1887,37 @@ mod tests {
             call_line: 1,
             confidence: 1.0,
             resolution_status: ResolutionStatus::ResolvedExact,
+        }
+    }
+
+    fn sample_unresolved_call(caller: &str, callee: &str) -> CallEdge {
+        CallEdge {
+            id: stable_id(&["call", caller, callee]),
+            caller_symbol_id: stable_id(&["symbol", caller]),
+            callee_text: callee.to_owned(),
+            callee_symbol_id: None,
+            call_line: 1,
+            confidence: 0.25,
+            resolution_status: ResolutionStatus::Unresolved,
+        }
+    }
+
+    fn sample_symbol_record(qualified_name: &str, file_id: &str) -> SymbolRecord {
+        let name = qualified_name.rsplit("::").next().unwrap_or(qualified_name);
+        SymbolRecord {
+            id: stable_id(&["persisted-symbol", qualified_name, file_id]),
+            file_id: file_id.to_owned(),
+            parent_symbol_id: None,
+            name: name.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            kind: "function".to_owned(),
+            signature: Some(format!("fn {name}()")),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 1,
+            index_run_id: "run".to_owned(),
+            parser_version: Language::Rust.parser_version().to_owned(),
         }
     }
 

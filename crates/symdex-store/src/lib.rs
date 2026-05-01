@@ -1647,6 +1647,43 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn rust_symbols_for_repository(&self, repository_id: &str) -> Result<Vec<SymbolRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.file_id, symbols.parent_symbol_id, symbols.name,
+                        symbols.qualified_name, symbols.kind, symbols.signature,
+                        symbols.start_line, symbols.end_line, symbols.start_byte,
+                        symbols.end_byte, symbols.index_run_id, symbols.parser_version
+                 FROM symbols
+                 JOIN files ON symbols.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND files.language = 'rust'
+                 ORDER BY symbols.qualified_name, files.path, symbols.start_line, symbols.id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], |row| {
+                Ok(SymbolRecord {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    parent_symbol_id: row.get(2)?,
+                    name: row.get(3)?,
+                    qualified_name: row.get(4)?,
+                    kind: row.get(5)?,
+                    signature: row.get(6)?,
+                    start_line: row.get::<_, i64>(7)? as usize,
+                    end_line: row.get::<_, i64>(8)? as usize,
+                    start_byte: row.get::<_, i64>(9)? as usize,
+                    end_byte: row.get::<_, i64>(10)? as usize,
+                    index_run_id: row.get(11)?,
+                    parser_version: row.get(12)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection

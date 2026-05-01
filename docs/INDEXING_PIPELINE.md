@@ -204,6 +204,15 @@ expansion is not analyzed. Each macro invocation also emits a
 metadata-only diagnostic noting that the invocation was preserved without
 expansion.
 
+After per-file parsing, the indexer performs a conservative Rust cross-file
+resolution pass before persisting SQLite facts. Qualified module calls such as
+`crate::module::function()` are normalized and matched against Rust symbols from
+the current index batch plus already persisted unchanged Rust files. A single
+qualified match is upgraded to `resolved_exact`; multiple matches are preserved
+as `ambiguous`; unresolved calls without qualified module paths are left
+unchanged. Symbols from files being replaced are ignored so incremental indexing
+does not resolve against stale facts.
+
 Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
 diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is
 available when `SYMDEX_RUST_ANALYZER=1` is set, but indexing does not invoke

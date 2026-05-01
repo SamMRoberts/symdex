@@ -209,7 +209,7 @@
 - [ ] Improve broader module, trait, and method resolution.
 - [x] Add macro-aware limitations and diagnostics.
 - [x] Add Rust type-definition, trait, and impl-summary chunks.
-- [ ] Add cross-file and cross-module call resolution.
+- [x] Add cross-file and cross-module call resolution.
 
 ### P3 — Operational polish
 
