@@ -23,7 +23,8 @@ use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run
 use symdex_embed::EmbedConfig;
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexProgress,
-    IndexSummary, run_continuous_index_until, run_index_with_progress,
+    IndexSummary, RustAnalyzerEnrichmentSummary, run_continuous_index_until,
+    run_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
@@ -962,7 +963,7 @@ impl App {
                     let _ = progress_sender.send(IndexJobMessage::Progress(progress));
                 },
             );
-            let _ = sender.send(IndexJobMessage::Finished(result));
+            let _ = sender.send(IndexJobMessage::Finished(result.map(Box::new)));
         });
         self.index_receiver = Some(receiver);
         self.last_index_summary = None;
@@ -1132,7 +1133,7 @@ impl App {
                     summary.sqlite_chunks_indexed
                 );
                 let completed_message = self.message.clone();
-                self.last_index_summary = Some(summary);
+                self.last_index_summary = Some(*summary);
                 self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
                 if let Err(error) = self.refresh_status() {
@@ -1245,7 +1246,7 @@ impl App {
                 self.continuous.last_reindexed_file =
                     changes.paths().first().map(|path| (*path).to_owned());
                 self.continuous.latest_error = None;
-                self.last_index_summary = Some(summary);
+                self.last_index_summary = Some(*summary);
                 if let Err(error) = self.refresh_status() {
                     self.message =
                         format!("Continuous indexing completed, but refresh failed: {error}");
@@ -2230,6 +2231,31 @@ fn summary_lines(summary: &IndexSummary) -> Vec<Line<'static>> {
             summary.chunks_excluded_from_embedding
         )),
     ];
+    match &summary.rust_analyzer {
+        RustAnalyzerEnrichmentSummary::Disabled { .. } => {
+            lines.push(Line::from("Rust-analyzer enrichment: disabled"));
+        }
+        RustAnalyzerEnrichmentSummary::NotReady { reason, .. } => {
+            lines.push(Line::from(format!(
+                "Rust-analyzer enrichment: not ready ({reason})"
+            )));
+        }
+        RustAnalyzerEnrichmentSummary::SkippedNoRustFiles { .. } => {
+            lines.push(Line::from(
+                "Rust-analyzer enrichment: skipped (no Rust files)",
+            ));
+        }
+        RustAnalyzerEnrichmentSummary::Planned {
+            eligible_files,
+            eligible_symbols,
+            eligible_calls,
+            ..
+        } => {
+            lines.push(Line::from(format!(
+                "Rust-analyzer enrichment: planned files={eligible_files} symbols={eligible_symbols} calls={eligible_calls}"
+            )));
+        }
+    }
     match &summary.embedding {
         EmbeddingSummary::SkippedOffline => {
             lines.push(Line::from("Embedding: skipped (--offline)"));
@@ -4997,7 +5023,7 @@ enum EvidenceResult {
 
 enum IndexJobMessage {
     Progress(IndexProgress),
-    Finished(Result<IndexSummary, String>),
+    Finished(Result<Box<IndexSummary>, String>),
 }
 
 enum ContinuousIndexMessage {

@@ -202,7 +202,8 @@
 ### P2 — Semantic precision
 
 - [x] Add optional rust-analyzer enrichment readiness gate.
-- [ ] Add opt-in rust-analyzer symbol and call enrichment.
+- [x] Add opt-in rust-analyzer enrichment planning and reporting.
+- [ ] Add opt-in rust-analyzer symbol and call fact application.
 - [x] Improve Rust crate-prefix and simple `use` alias call resolution.
 - [ ] Improve broader module, trait, and method resolution.
 - [ ] Add macro-aware limitations and diagnostics.

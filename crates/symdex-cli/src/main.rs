@@ -9,7 +9,7 @@ use symdex_diagnostics::{
 };
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexSummary,
-    WatchChangeSet, run_continuous_index, run_index,
+    RustAnalyzerEnrichmentSummary, WatchChangeSet, run_continuous_index, run_index,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, FreshnessSummary, ImpactSummary,
@@ -806,6 +806,30 @@ fn print_index_summary(summary: &IndexSummary) {
     println!("sqlite_symbols_indexed: {}", summary.sqlite_symbols_indexed);
     println!("sqlite_calls_indexed: {}", summary.sqlite_calls_indexed);
     println!("sqlite_files_removed: {}", summary.sqlite_files_removed);
+    match &summary.rust_analyzer {
+        RustAnalyzerEnrichmentSummary::Disabled { enable_env } => {
+            println!("rust_analyzer_enrichment: disabled (set {enable_env}=1)");
+        }
+        RustAnalyzerEnrichmentSummary::NotReady { command, reason } => {
+            println!("rust_analyzer_enrichment: not_ready command={command} reason={reason}");
+        }
+        RustAnalyzerEnrichmentSummary::SkippedNoRustFiles { command, version } => {
+            println!(
+                "rust_analyzer_enrichment: skipped_no_rust_files command={command} version={version}"
+            );
+        }
+        RustAnalyzerEnrichmentSummary::Planned {
+            command,
+            version,
+            eligible_files,
+            eligible_symbols,
+            eligible_calls,
+        } => {
+            println!(
+                "rust_analyzer_enrichment: planned command={command} version={version} files={eligible_files} symbols={eligible_symbols} calls={eligible_calls}"
+            );
+        }
+    }
     match &summary.embedding {
         EmbeddingSummary::SkippedOffline => {
             println!("embedding: skipped (--offline)");

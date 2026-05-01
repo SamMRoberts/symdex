@@ -74,6 +74,9 @@ Fixtures should be tiny and purpose-built.
 - Optional rust-analyzer readiness coverage for default-off behavior, explicit
   truthy opt-in flags, command override parsing, and doctor check status without
   requiring rust-analyzer in ordinary tests.
+- Optional rust-analyzer enrichment planning coverage for disabled, not-ready,
+  no-Rust-file, and planned eligible Rust file/symbol/call count states without
+  requiring rust-analyzer in ordinary tests.
 
 Current path-boundary tests cover file paths rejected as repository roots,
 canonical symlink escapes rejected by normalization, symlinked files and

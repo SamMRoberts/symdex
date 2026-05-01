@@ -1,13 +1,16 @@
 //! Indexing orchestration shared by the CLI and TUI.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
+use std::io;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use symdex_core::{
-    CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, ParseDiagnostic, RepoRoot,
-    Symbol, discover_indexable_files, index_source_file,
+    CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, ParseDiagnostic,
+    RepoRoot, Symbol, discover_indexable_files, index_source_file,
 };
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
@@ -79,6 +82,7 @@ pub struct IndexSummary {
     pub sqlite_symbols_indexed: usize,
     pub sqlite_calls_indexed: usize,
     pub sqlite_files_removed: usize,
+    pub rust_analyzer: RustAnalyzerEnrichmentSummary,
     pub embedding: EmbeddingSummary,
 }
 
@@ -120,6 +124,31 @@ pub enum EmbeddingSummary {
         chunks_embedded: usize,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustAnalyzerEnrichmentSummary {
+    Disabled {
+        enable_env: String,
+    },
+    NotReady {
+        command: String,
+        reason: String,
+    },
+    SkippedNoRustFiles {
+        command: String,
+        version: String,
+    },
+    Planned {
+        command: String,
+        version: String,
+        eligible_files: usize,
+        eligible_symbols: usize,
+        eligible_calls: usize,
+    },
+}
+
+const RUST_ANALYZER_ENABLE_ENV: &str = "SYMDEX_RUST_ANALYZER";
+const RUST_ANALYZER_CMD_ENV: &str = "SYMDEX_RUST_ANALYZER_CMD";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchSnapshot {
@@ -179,7 +208,7 @@ pub enum ContinuousIndexEvent {
     },
     BatchCompleted {
         changes: WatchChangeSet,
-        summary: IndexSummary,
+        summary: Box<IndexSummary>,
     },
     BatchFailed {
         changes: WatchChangeSet,
@@ -275,7 +304,10 @@ pub fn run_continuous_index_until(
         }) {
             Ok(summary) => {
                 snapshot = watch_snapshot(&root).unwrap_or(debounced_snapshot);
-                on_event(ContinuousIndexEvent::BatchCompleted { changes, summary });
+                on_event(ContinuousIndexEvent::BatchCompleted {
+                    changes,
+                    summary: Box::new(summary),
+                });
             }
             Err(error) => {
                 snapshot = debounced_snapshot;
@@ -402,6 +434,8 @@ fn run_index_internal(
         }
     };
     let files = file_summaries(&collection.reports);
+    let rust_analyzer =
+        rust_analyzer_enrichment_summary(&collection, &RustAnalyzerEnrichmentConfig::from_env());
     let chunks_seen = collection
         .reports
         .iter()
@@ -550,6 +584,7 @@ fn run_index_internal(
         sqlite_symbols_indexed: persistence.symbols_indexed,
         sqlite_calls_indexed: persistence.calls_indexed,
         sqlite_files_removed: persistence.files_removed,
+        rust_analyzer,
         embedding,
     })
 }
@@ -664,6 +699,137 @@ fn parse_diagnostic_summary(diagnostic: &ParseDiagnostic) -> ParseDiagnosticSumm
         start_byte: diagnostic.byte_range.start,
         end_byte: diagnostic.byte_range.end,
         message: diagnostic.message.clone(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustAnalyzerEnrichmentConfig {
+    enabled: bool,
+    command: String,
+}
+
+impl RustAnalyzerEnrichmentConfig {
+    fn from_env() -> Self {
+        Self::from_values(
+            env::var(RUST_ANALYZER_ENABLE_ENV).ok().as_deref(),
+            env::var(RUST_ANALYZER_CMD_ENV).ok().as_deref(),
+        )
+    }
+
+    fn from_values(enabled: Option<&str>, command: Option<&str>) -> Self {
+        Self {
+            enabled: enabled.is_some_and(env_flag_enabled),
+            command: command
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .unwrap_or("rust-analyzer")
+                .to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RustAnalyzerReadiness {
+    Disabled,
+    Ready { version: String },
+    NotReady { reason: String },
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn rust_analyzer_enrichment_summary(
+    collection: &IndexCollection,
+    config: &RustAnalyzerEnrichmentConfig,
+) -> RustAnalyzerEnrichmentSummary {
+    let readiness = rust_analyzer_readiness(config);
+    plan_rust_analyzer_enrichment(collection, config, readiness)
+}
+
+fn rust_analyzer_readiness(config: &RustAnalyzerEnrichmentConfig) -> RustAnalyzerReadiness {
+    if !config.enabled {
+        return RustAnalyzerReadiness::Disabled;
+    }
+
+    match Command::new(&config.command).arg("--version").output() {
+        Ok(output) if output.status.success() => RustAnalyzerReadiness::Ready {
+            version: rust_analyzer_version_message(&config.command, &output),
+        },
+        Ok(output) => RustAnalyzerReadiness::NotReady {
+            reason: format!(
+                "{} --version exited with {}",
+                config.command,
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_owned(), |code| format!("status {code}"))
+            ),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => RustAnalyzerReadiness::NotReady {
+            reason: format!(
+                "{} not found; set {RUST_ANALYZER_CMD_ENV} to an installed rust-analyzer binary",
+                config.command
+            ),
+        },
+        Err(error) => RustAnalyzerReadiness::NotReady {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn rust_analyzer_version_message(command: &str, output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let version = if stdout.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    if version.is_empty() {
+        command.to_owned()
+    } else {
+        version.to_owned()
+    }
+}
+
+fn plan_rust_analyzer_enrichment(
+    collection: &IndexCollection,
+    config: &RustAnalyzerEnrichmentConfig,
+    readiness: RustAnalyzerReadiness,
+) -> RustAnalyzerEnrichmentSummary {
+    match readiness {
+        RustAnalyzerReadiness::Disabled => RustAnalyzerEnrichmentSummary::Disabled {
+            enable_env: RUST_ANALYZER_ENABLE_ENV.to_owned(),
+        },
+        RustAnalyzerReadiness::NotReady { reason } => RustAnalyzerEnrichmentSummary::NotReady {
+            command: config.command.clone(),
+            reason,
+        },
+        RustAnalyzerReadiness::Ready { version } => {
+            let rust_reports = collection
+                .reports
+                .iter()
+                .filter(|report| report.file.language == Language::Rust)
+                .collect::<Vec<_>>();
+            if rust_reports.is_empty() {
+                return RustAnalyzerEnrichmentSummary::SkippedNoRustFiles {
+                    command: config.command.clone(),
+                    version,
+                };
+            }
+
+            RustAnalyzerEnrichmentSummary::Planned {
+                command: config.command.clone(),
+                version,
+                eligible_files: rust_reports.len(),
+                eligible_symbols: rust_reports.iter().map(|report| report.symbols.len()).sum(),
+                eligible_calls: rust_reports.iter().map(|report| report.calls.len()).sum(),
+            }
+        }
     }
 }
 
@@ -1166,19 +1332,20 @@ struct ChunkText<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
-        ByteRange, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot, content_hash,
-        stable_id,
+        ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
+        ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
 
     use crate::{
-        IndexReport, WatchSnapshot, chunk_record, chunk_texts, collect_index_reports,
-        detect_watch_changes, diff_watch_snapshots, watch_snapshot,
+        IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
+        RustAnalyzerReadiness, WatchSnapshot, chunk_record, chunk_texts, collect_index_reports,
+        detect_watch_changes, diff_watch_snapshots, plan_rust_analyzer_enrichment, watch_snapshot,
     };
 
     #[test]
@@ -1296,12 +1463,130 @@ mod tests {
         assert!(!summaries[0].parse_diagnostics.is_empty());
     }
 
+    #[test]
+    fn rust_analyzer_enrichment_plan_is_disabled_by_default() {
+        let collection = collection_with_reports(Vec::new());
+        let config = RustAnalyzerEnrichmentConfig::from_values(None, None);
+
+        let summary =
+            plan_rust_analyzer_enrichment(&collection, &config, RustAnalyzerReadiness::Disabled);
+
+        assert_eq!(
+            summary,
+            RustAnalyzerEnrichmentSummary::Disabled {
+                enable_env: "SYMDEX_RUST_ANALYZER".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_enrichment_plan_reports_not_ready() {
+        let collection = collection_with_reports(vec![sample_report(Language::Rust)]);
+        let config = RustAnalyzerEnrichmentConfig::from_values(Some("1"), Some("custom-ra"));
+
+        let summary = plan_rust_analyzer_enrichment(
+            &collection,
+            &config,
+            RustAnalyzerReadiness::NotReady {
+                reason: "missing binary".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            summary,
+            RustAnalyzerEnrichmentSummary::NotReady {
+                command: "custom-ra".to_owned(),
+                reason: "missing binary".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_enrichment_plan_skips_when_no_rust_reports_exist() {
+        let collection = collection_with_reports(vec![sample_report(Language::CSharp)]);
+        let config = RustAnalyzerEnrichmentConfig::from_values(Some("true"), Some("ra"));
+
+        let summary = plan_rust_analyzer_enrichment(
+            &collection,
+            &config,
+            RustAnalyzerReadiness::Ready {
+                version: "rust-analyzer test".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            summary,
+            RustAnalyzerEnrichmentSummary::SkippedNoRustFiles {
+                command: "ra".to_owned(),
+                version: "rust-analyzer test".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_enrichment_plan_counts_eligible_rust_facts() {
+        let mut rust = sample_report(Language::Rust);
+        rust.symbols = vec![sample_symbol("one"), sample_symbol("two")];
+        rust.calls = vec![sample_call("one", "two")];
+        let collection = collection_with_reports(vec![rust, sample_report(Language::TypeScript)]);
+        let config = RustAnalyzerEnrichmentConfig::from_values(Some("on"), Some("ra"));
+
+        let summary = plan_rust_analyzer_enrichment(
+            &collection,
+            &config,
+            RustAnalyzerReadiness::Ready {
+                version: "rust-analyzer test".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            summary,
+            RustAnalyzerEnrichmentSummary::Planned {
+                command: "ra".to_owned(),
+                version: "rust-analyzer test".to_owned(),
+                eligible_files: 1,
+                eligible_symbols: 2,
+                eligible_calls: 1,
+            }
+        );
+    }
+
     fn sample_file() -> FileFacts {
         FileFacts {
             id: "file-1".to_owned(),
             relative_path: "src/lib.rs".to_owned(),
             language: Language::Rust,
             content_hash: content_hash(b"sample"),
+        }
+    }
+
+    fn sample_report(language: Language) -> IndexReport {
+        IndexReport {
+            file: FileFacts {
+                id: format!("file-{}", language.as_str()),
+                relative_path: format!("src/sample.{}", language.as_str()),
+                language,
+                content_hash: content_hash(language.as_str().as_bytes()),
+            },
+            chunks: Vec::new(),
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: String::new(),
+        }
+    }
+
+    fn collection_with_reports(reports: Vec<IndexReport>) -> IndexCollection {
+        IndexCollection {
+            files_seen: reports.len(),
+            files_skipped_unchanged: 0,
+            parser_versions: BTreeSet::new(),
+            active_paths: reports
+                .iter()
+                .map(|report| report.file.relative_path.clone())
+                .collect(),
+            reports,
         }
     }
 
@@ -1322,6 +1607,32 @@ mod tests {
             line_range: LineRange::new(1, 1),
             text_hash: content_hash(name.as_bytes()),
             excluded_reason: excluded_reason.map(str::to_owned),
+        }
+    }
+
+    fn sample_symbol(name: &str) -> Symbol {
+        Symbol {
+            id: stable_id(&["symbol", name]),
+            file_id: "file-rust".to_owned(),
+            parent_symbol_id: None,
+            name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            kind: SymbolKind::Function,
+            signature: Some(format!("fn {name}()")),
+            byte_range: ByteRange::new(0, 1),
+            line_range: LineRange::new(1, 1),
+        }
+    }
+
+    fn sample_call(caller: &str, callee: &str) -> CallEdge {
+        CallEdge {
+            id: stable_id(&["call", caller, callee]),
+            caller_symbol_id: stable_id(&["symbol", caller]),
+            callee_text: callee.to_owned(),
+            callee_symbol_id: Some(stable_id(&["symbol", callee])),
+            call_line: 1,
+            confidence: 1.0,
+            resolution_status: ResolutionStatus::ResolvedExact,
         }
     }
 

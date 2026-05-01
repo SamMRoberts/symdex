@@ -33,7 +33,9 @@ SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 
 `SYMDEX_RUST_ANALYZER=1` enables an optional `symdex doctor` readiness check for
 the configured rust-analyzer binary. The check runs `rust-analyzer --version`
-only; indexing does not run rust-analyzer project analysis by default.
+only. Indexing uses the same opt-in flag to report a metadata-only enrichment
+plan for changed Rust files, but does not run rust-analyzer project analysis by
+default.
 
 ## Expected commands
 
@@ -86,6 +88,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   service calls; unchanged files are skipped by content hash. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/Qdrant embedding.
+  When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
+  rust-analyzer enrichment readiness and eligible Rust file, symbol, and call
+  counts without applying rust-analyzer facts.
 - `index --watch <repo>`: starts continuous indexing. It polls local eligible
   Rust, C#, JavaScript, and TypeScript files, debounces event bursts, detects
   created/modified/deleted paths by content-hash snapshots, and reindexes

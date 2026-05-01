@@ -197,9 +197,12 @@ or `use crate::module as alias;` before falling back to suffix matching.
 Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
 diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is
 available when `SYMDEX_RUST_ANALYZER=1` is set, but indexing does not invoke
-project analysis by default. Future symbol and call enrichment must keep this
-opt-in boundary, preserve source-text privacy, and avoid executing indexed
-repository code.
+project analysis by default. Index runs also report a metadata-only enrichment
+plan when explicitly enabled: disabled, not ready, skipped because no changed
+Rust files were indexed, or planned with eligible Rust file, symbol, and call
+counts. This plan is reporting only; it does not mutate persisted symbols or
+calls. Future symbol and call fact application must keep this opt-in boundary,
+preserve source-text privacy, and avoid executing indexed repository code.
 
 ## Incremental indexing
 
