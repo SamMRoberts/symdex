@@ -189,7 +189,7 @@
   - [x] Delete stale Qdrant points for changed and deleted chunks before SQLite cleanup.
   - [x] Verify SQLite/Qdrant vector lifecycle state.
   - [x] Repair missing, stale, orphaned, or drifted vectors.
-- [ ] Split large store and TUI files into modules.
+- [x] Split large store and TUI files into modules.
 
 ### P1 — Debugging credibility
 

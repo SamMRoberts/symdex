@@ -1,6 +1,8 @@
 //! Terminal UI state, rendering, events, and terminal lifecycle.
 
-use std::io::{self, Stdout};
+mod navigation;
+mod terminal;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -8,12 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+pub(crate) use navigation::{IndexMode, Screen, UiAction, reduce_screen};
 use ratatui::Terminal;
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -43,6 +42,8 @@ use symdex_store::{
     StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
     qdrant_collection_name,
 };
+pub use terminal::help_text;
+use terminal::{enter_terminal, leave_terminal};
 
 pub struct TuiOptions {
     pub repo: String,
@@ -54,10 +55,6 @@ pub fn run(options: TuiOptions) -> Result<(), String> {
     let result = run_app(&mut terminal, app);
     leave_terminal(&mut terminal)?;
     result
-}
-
-pub fn help_text() -> &'static str {
-    "USAGE:\n    symdex tui [repo]\n\nStarts the local terminal UI control panel.\n\nKEYS:\n    [         Switch to the previous primary tab\n    ]         Switch to the next primary tab\n    Tab       Switch to the next mode in the active view\n    Shift+Tab Switch to the previous mode in the active view\n    Up/Down   Move selected result row\n    Enter     Run lookup, run Doctor, toggle Doctor details, or dismiss a completed job\n    o         Confirm offline indexing\n    s         Confirm semantic indexing\n    c         Toggle continuous indexing\n    r         Refresh repository and storage status\n    y / n     Confirm or cancel a pending job\n    q / Esc   Quit or cancel\n"
 }
 
 pub struct App {
@@ -1912,25 +1909,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
             return Ok(());
         }
     }
-}
-
-fn enter_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
-    enable_raw_mode().map_err(|error| error.to_string())?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|error| {
-        let _ = disable_raw_mode();
-        error.to_string()
-    })?;
-    Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| {
-        let _ = disable_raw_mode();
-        error.to_string()
-    })
-}
-
-fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), String> {
-    disable_raw_mode().map_err(|error| error.to_string())?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|error| error.to_string())?;
-    terminal.show_cursor().map_err(|error| error.to_string())
 }
 
 fn index_embedding(status: &RepositoryStatus) -> String {
@@ -5110,85 +5088,6 @@ impl ContinuousIndexStatus {
             Self::Pending => StatusTone::Warning,
             Self::Failed => StatusTone::Error,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexMode {
-    Offline,
-    Semantic,
-}
-
-impl IndexMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Offline => "offline",
-            Self::Semantic => "semantic",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Screen {
-    Dashboard,
-    ConfirmIndex(IndexMode),
-    ConfirmContinuous,
-    IndexRunning(IndexMode),
-    IndexCompleted(IndexMode),
-    IndexFailed(IndexMode),
-}
-
-impl Screen {
-    fn accepts_new_index_request(self) -> bool {
-        matches!(
-            self,
-            Self::Dashboard | Self::IndexCompleted(_) | Self::IndexFailed(_)
-        )
-    }
-
-    fn is_terminal_job_state(self) -> bool {
-        matches!(self, Self::IndexCompleted(_) | Self::IndexFailed(_))
-    }
-
-    fn index_mode(self) -> Option<IndexMode> {
-        match self {
-            Self::ConfirmIndex(mode)
-            | Self::IndexRunning(mode)
-            | Self::IndexCompleted(mode)
-            | Self::IndexFailed(mode) => Some(mode),
-            Self::Dashboard | Self::ConfirmContinuous => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UiAction {
-    RequestIndex(IndexMode),
-    RequestContinuous,
-    Confirm,
-    Cancel,
-    JobSucceeded,
-    JobFailed,
-    Dismiss,
-}
-
-fn reduce_screen(screen: Screen, action: UiAction) -> Screen {
-    match (screen, action) {
-        (screen, UiAction::RequestIndex(mode)) if screen.accepts_new_index_request() => {
-            Screen::ConfirmIndex(mode)
-        }
-        (screen, UiAction::RequestContinuous) if screen.accepts_new_index_request() => {
-            Screen::ConfirmContinuous
-        }
-        (Screen::ConfirmIndex(mode), UiAction::Confirm) => Screen::IndexRunning(mode),
-        (Screen::ConfirmContinuous, UiAction::Confirm) => Screen::Dashboard,
-        (Screen::ConfirmIndex(_) | Screen::ConfirmContinuous, UiAction::Cancel) => {
-            Screen::Dashboard
-        }
-        (Screen::IndexRunning(mode), UiAction::JobSucceeded) => Screen::IndexCompleted(mode),
-        (Screen::IndexRunning(mode), UiAction::JobFailed) => Screen::IndexFailed(mode),
-        (screen, UiAction::Dismiss) if screen.is_terminal_job_state() => Screen::Dashboard,
-        (screen, _) => screen,
     }
 }
 
