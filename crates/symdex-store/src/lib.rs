@@ -8,6 +8,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+pub const MAX_CALL_PATH_DEPTH: usize = 8;
+
+pub fn clamp_call_path_depth(depth: usize) -> usize {
+    depth.clamp(1, MAX_CALL_PATH_DEPTH)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub sqlite_path: PathBuf,
@@ -563,7 +569,7 @@ impl SqliteStore {
         target_query: &str,
         max_depth: usize,
     ) -> Result<Vec<CallPath>> {
-        let max_depth = max_depth.clamp(1, 8);
+        let max_depth = clamp_call_path_depth(max_depth);
         let sources = self.resolve_symbol_refs(repository_id, source_query)?;
         let targets = self.resolve_symbol_refs(repository_id, target_query)?;
         let target_ids = targets
@@ -2436,7 +2442,7 @@ fn call_path_from_edges(edges: &[CallPathEdge]) -> CallPath {
         terminal_resolution_status: edges
             .last()
             .map(|edge| edge.resolution_status.clone())
-            .unwrap_or_else(|| "unknown".to_owned()),
+            .unwrap_or_else(|| "unresolved".to_owned()),
         edges: edges.to_vec(),
     }
 }

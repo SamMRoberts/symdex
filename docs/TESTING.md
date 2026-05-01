@@ -35,8 +35,7 @@ Fixtures should be tiny and purpose-built.
 - deleted file cleanup
 - unresolved calls preserved
 - ambiguous calls labeled
-- bounded call path traversal order, unresolved terminal edges, cycles, and depth
-  limits
+- bounded call path traversal order, unresolved terminal edges, cycles, and depth limits
 - repo-root path enforcement
 - ignored files not indexed
 - likely secrets excluded from embeddings

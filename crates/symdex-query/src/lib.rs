@@ -9,7 +9,7 @@ use symdex_store::{
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
     IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, SemanticNeighborhoodSummary,
     SqliteStore, StorageExplorerSummary, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
-    freshness_for_hash, qdrant_collection_name,
+    clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +198,7 @@ pub fn run_call_path(
     if target_query.is_empty() {
         return Err("call path requires a target symbol query".to_owned());
     }
-    let max_depth = max_depth.clamp(1, 8);
+    let max_depth = clamp_call_path_depth(max_depth);
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
     let paths = sqlite

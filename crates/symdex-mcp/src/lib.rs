@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
-    EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, freshness_for_hash,
-    qdrant_collection_name,
+    EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
+    freshness_for_hash, qdrant_collection_name,
 };
 
 pub const TOOL_SEARCH: &str = "symdex_search";
@@ -242,7 +242,7 @@ fn tool_call_path(arguments: &Value) -> Result<Value, String> {
     let repo = required_string(arguments, "repo")?;
     let source = required_string(arguments, "source")?;
     let target = required_string(arguments, "target")?;
-    let max_depth = optional_usize(arguments, "max_depth", 4).clamp(1, 8);
+    let max_depth = clamp_call_path_depth(optional_usize(arguments, "max_depth", 4));
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let paths = sqlite()?
         .call_paths(root.id(), source, target, max_depth)
