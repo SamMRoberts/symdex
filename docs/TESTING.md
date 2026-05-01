@@ -46,6 +46,8 @@ Fixtures should be tiny and purpose-built.
 - TUI navigation and confirmation flows
 - TUI loading, empty, and error states
 - TUI render snapshots or buffer assertions for key screens
+- TUI selectable table panes render from full result sets and scroll selected
+  rows beyond the initially visible viewport.
 - TUI storage visualization state and render coverage for SQLite/Qdrant
   metadata, selected-row drill-down, empty stores, missing vectors, excluded
   chunks, and model/dimension drift
@@ -111,7 +113,8 @@ workbench rendering and input state, symbol/call graph rendering and input
 state, impact/call-path/context-pack/debug-context rendering and input state, the storage explorer
 metric table, always-visible nested storage tab header, and detail panel,
 index coverage table and selected-file detail panel with chunk, symbol, and
-call metadata, symbol outline table and
+call metadata, query and storage table scrolling beyond the initially visible
+rows, symbol outline table and
 selected-symbol detail panel, call resolution bucket table and selected-bucket
 detail panel, embedding coverage table and selected-metric detail panel with
 exclusion-reason and health summaries, index runs timeline table and
