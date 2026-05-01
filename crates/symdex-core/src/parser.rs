@@ -283,7 +283,7 @@ fn structural_chunk_facts(
 
 fn structural_chunk_name(node: Node<'_>, source: &str) -> Option<String> {
     if node.kind() == "impl_item" {
-        return impl_type_name(node, source).map(|type_name| format!("impl {type_name}"));
+        return impl_display_name(node, source).map(|name| format!("impl {name}"));
     }
     named_node_text(node, source)
         .map(clean_expression_text)
@@ -827,8 +827,8 @@ fn container_parts(language: Language, node: Node<'_>, source: &str) -> Vec<Stri
                 }
             }
             Language::Rust if current.kind() == "impl_item" => {
-                if let Some(type_name) = impl_type_name(current, source) {
-                    parts.push(type_name);
+                if let Some(container_name) = impl_container_name(current, source) {
+                    parts.push(container_name);
                 }
             }
             Language::CSharp
@@ -875,6 +875,31 @@ fn impl_type_name(node: Node<'_>, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn impl_trait_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("trait")
+        .and_then(|trait_node| node_text(trait_node, source))
+        .map(clean_expression_text)
+        .filter(|trait_name| !trait_name.is_empty())
+}
+
+fn impl_display_name(node: Node<'_>, source: &str) -> Option<String> {
+    let type_name = impl_type_name(node, source)?;
+    if let Some(trait_name) = impl_trait_name(node, source) {
+        Some(format!("{trait_name} for {type_name}"))
+    } else {
+        Some(type_name)
+    }
+}
+
+fn impl_container_name(node: Node<'_>, source: &str) -> Option<String> {
+    let type_name = impl_type_name(node, source)?;
+    if let Some(trait_name) = impl_trait_name(node, source) {
+        Some(format!("<{type_name} as {trait_name}>"))
+    } else {
+        Some(type_name)
+    }
 }
 
 fn signature_text(node: Node<'_>, source: &str) -> Option<String> {
@@ -1077,8 +1102,45 @@ impl Runnable for Mode {
         }));
         assert!(chunks.iter().any(|chunk| {
             chunk.kind == ChunkKind::ImplSummary
-                && chunk.symbol_name.as_deref() == Some("impl Mode")
+                && chunk.symbol_name.as_deref() == Some("impl Runnable for Mode")
         }));
+    }
+
+    #[test]
+    fn qualifies_rust_trait_impl_methods_with_trait_context() {
+        let source = r#"trait Runnable {
+    fn helper(&self);
+    fn run(&self);
+}
+
+struct Worker;
+
+impl Runnable for Worker {
+    fn helper(&self) {}
+
+    fn run(&self) {
+        self.helper();
+    }
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        assert!(index.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "<Worker as Runnable>::helper"
+                && symbol.kind == SymbolKind::Method
+        }));
+        assert!(index.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "<Worker as Runnable>::run"
+                && symbol.kind == SymbolKind::Method
+        }));
+        let call = index
+            .calls
+            .iter()
+            .find(|call| call.callee_text == "self.helper")
+            .expect("self.helper call should be captured");
+        assert_eq!(call.resolution_status, ResolutionStatus::ResolvedExact);
+        assert!(call.callee_symbol_id.is_some());
     }
 
     #[test]

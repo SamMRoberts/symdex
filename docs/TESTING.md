@@ -79,7 +79,8 @@ Fixtures should be tiny and purpose-built.
 - Rust macro coverage for unresolved macro call edges and metadata-only
   diagnostics that macro invocations are preserved without expansion.
 - Rust chunking coverage for function, method, type-definition, trait,
-  impl-summary, and fallback chunks.
+  impl-summary, trait impl-summary names, trait impl method qualified names, and
+  fallback chunks.
 - Optional rust-analyzer readiness coverage for default-off behavior, explicit
   truthy opt-in flags, command override parsing, and doctor check status without
   requiring rust-analyzer in ordinary tests.

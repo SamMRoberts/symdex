@@ -80,10 +80,12 @@ Current implementation extracts Rust `function_item` syntax nodes as function
 chunks, classifies functions under `impl_item` nodes as method chunks, and emits
 Rust structural chunks for `struct`, `enum`, `union`, `type`, `trait`, and
 `impl` items. `impl` items use `impl_summary` chunks, while type aliases,
-nominal types, and traits use `type_definition` chunks. A file fallback chunk is
-emitted only when no better chunkable unit exists. Files with tree-sitter syntax
-errors produce partial chunks where possible and return metadata-only parse
-diagnostics with line and byte ranges instead of failing the whole index run.
+nominal types, and traits use `type_definition` chunks. Trait impl summaries
+preserve both sides of the implementation, for example `impl Runnable for Mode`.
+A file fallback chunk is emitted only when no better chunkable unit exists.
+Files with tree-sitter syntax errors produce partial chunks where possible and
+return metadata-only parse diagnostics with line and byte ranges instead of
+failing the whole index run.
 
 Rust test discovery is metadata-only and conservative. Functions with Rust test
 attributes such as `#[test]`, `#[tokio::test]`, `#[async_std::test]`, or
@@ -187,8 +189,10 @@ Never drop unresolved calls. They are useful evidence.
 
 Current implementation extracts Rust function and method symbols from
 `function_item` nodes. Free functions use module-derived qualified names, while
-methods include the enclosing `impl` type when tree-sitter exposes it. Call
-extraction records `call_expression` nodes inside indexed functions. Resolution
+methods include the enclosing `impl` container when tree-sitter exposes it.
+Trait impl methods use Rust-like containers such as `<Mode as Runnable>::run`
+so trait methods do not collapse into inherent method names. Call extraction
+records `call_expression` nodes inside indexed functions. Resolution
 is local and conservative: exact qualified-name matches are `resolved_exact`,
 single suffix/name matches are `resolved_local_candidate`, multiple matches are
 `ambiguous`, and all other calls are preserved as `unresolved`. Rust resolution
