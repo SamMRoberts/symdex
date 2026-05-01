@@ -71,6 +71,8 @@ Fixtures should be tiny and purpose-built.
 - Rust call-resolution coverage for exact local calls, unresolved calls,
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
   and module aliases used in scoped calls.
+- Rust chunking coverage for function, method, type-definition, trait,
+  impl-summary, and fallback chunks.
 - Optional rust-analyzer readiness coverage for default-off behavior, explicit
   truthy opt-in flags, command override parsing, and doctor check status without
   requiring rust-analyzer in ordinary tests.

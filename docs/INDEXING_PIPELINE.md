@@ -78,10 +78,12 @@ Every chunk must include:
 
 Current implementation extracts Rust `function_item` syntax nodes as function
 chunks, classifies functions under `impl_item` nodes as method chunks, and emits
-a file fallback chunk only when no function-like chunks exist. Files with
-tree-sitter syntax errors produce partial chunks where possible and return
-metadata-only parse diagnostics with line and byte ranges instead of failing the
-whole index run.
+Rust structural chunks for `struct`, `enum`, `union`, `type`, `trait`, and
+`impl` items. `impl` items use `impl_summary` chunks, while type aliases,
+nominal types, and traits use `type_definition` chunks. A file fallback chunk is
+emitted only when no better chunkable unit exists. Files with tree-sitter syntax
+errors produce partial chunks where possible and return metadata-only parse
+diagnostics with line and byte ranges instead of failing the whole index run.
 
 Rust test discovery is metadata-only and conservative. Functions with Rust test
 attributes such as `#[test]`, `#[tokio::test]`, `#[async_std::test]`, or

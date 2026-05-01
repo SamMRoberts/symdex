@@ -207,7 +207,7 @@
 - [x] Improve Rust crate-prefix and simple `use` alias call resolution.
 - [ ] Improve broader module, trait, and method resolution.
 - [ ] Add macro-aware limitations and diagnostics.
-- [ ] Add type-definition and impl/trait chunks.
+- [x] Add Rust type-definition, trait, and impl-summary chunks.
 - [ ] Add cross-file and cross-module call resolution.
 
 ### P3 — Operational polish

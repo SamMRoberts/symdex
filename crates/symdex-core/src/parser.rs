@@ -33,10 +33,17 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
 
     let mut functions = Vec::new();
     collect_function_nodes(file.language, tree.root_node(), &mut functions);
+    let mut structural_chunks = Vec::new();
+    collect_structural_chunk_nodes(file.language, tree.root_node(), &mut structural_chunks);
 
     let mut chunks = Vec::new();
     let mut symbols = Vec::new();
     let mut tests = Vec::new();
+    chunks.extend(
+        structural_chunks
+            .iter()
+            .map(|chunk| structural_chunk_facts(chunk.node, file, source, chunk.kind)),
+    );
     for function in &functions {
         let (chunk, symbol) = function_facts(function.node, file, source, function.symbol_kind);
         if let Some(test) = test_facts(function.node, file, source, &symbol) {
@@ -140,6 +147,12 @@ struct FunctionNode<'tree> {
     symbol_kind: SymbolKind,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StructuralChunkNode<'tree> {
+    node: Node<'tree>,
+    kind: ChunkKind,
+}
+
 fn collect_function_nodes<'tree>(
     language: Language,
     node: Node<'tree>,
@@ -185,6 +198,53 @@ fn function_symbol_kind(language: Language, node: Node<'_>) -> Option<SymbolKind
         },
         _ => None,
     }
+}
+
+fn collect_structural_chunk_nodes<'tree>(
+    language: Language,
+    node: Node<'tree>,
+    chunks: &mut Vec<StructuralChunkNode<'tree>>,
+) {
+    if let Some(kind) = structural_chunk_kind(language, node) {
+        chunks.push(StructuralChunkNode { node, kind });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_structural_chunk_nodes(language, child, chunks);
+    }
+}
+
+fn structural_chunk_kind(language: Language, node: Node<'_>) -> Option<ChunkKind> {
+    match language {
+        Language::Rust => match node.kind() {
+            "impl_item" => Some(ChunkKind::ImplSummary),
+            "struct_item" | "enum_item" | "union_item" | "type_item" | "trait_item" => {
+                Some(ChunkKind::TypeDefinition)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn structural_chunk_facts(
+    node: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    kind: ChunkKind,
+) -> CodeChunk {
+    let symbol_name = structural_chunk_name(node, source);
+    chunk_for_node(node, file, source, kind, symbol_name, None)
+}
+
+fn structural_chunk_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "impl_item" {
+        return impl_type_name(node, source).map(|type_name| format!("impl {type_name}"));
+    }
+    named_node_text(node, source)
+        .map(clean_expression_text)
+        .filter(|name| !name.is_empty())
 }
 
 fn function_facts(
@@ -830,19 +890,36 @@ impl Counter {
 
         let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
 
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].kind, ChunkKind::Function);
         assert_eq!(chunks[0].symbol_name.as_deref(), Some("free_function"));
         assert_eq!(chunks[0].line_range.start, 1);
         assert_eq!(chunks[0].line_range.end, 3);
-        assert_eq!(chunks[1].kind, ChunkKind::Method);
-        assert_eq!(chunks[1].symbol_name.as_deref(), Some("increment"));
-        assert_eq!(chunks[1].line_range.start, 8);
+        assert_eq!(chunks[1].kind, ChunkKind::TypeDefinition);
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("Counter"));
+        assert_eq!(chunks[2].kind, ChunkKind::ImplSummary);
+        assert_eq!(chunks[2].symbol_name.as_deref(), Some("impl Counter"));
+        assert_eq!(chunks[3].kind, ChunkKind::Method);
+        assert_eq!(chunks[3].symbol_name.as_deref(), Some("increment"));
+        assert_eq!(chunks[3].line_range.start, 8);
     }
 
     #[test]
-    fn emits_file_fallback_when_no_function_chunks_exist() {
+    fn extracts_type_definition_chunks_without_file_fallback() {
         let source = "pub struct OnlyData;\n";
+
+        let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, ChunkKind::TypeDefinition);
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("OnlyData"));
+        assert_eq!(chunks[0].line_range.start, 1);
+        assert_eq!(chunks[0].line_range.end, 1);
+    }
+
+    #[test]
+    fn emits_file_fallback_when_no_chunkable_units_exist() {
+        let source = "pub const ANSWER: i32 = 42;\n";
 
         let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
 
@@ -850,6 +927,41 @@ impl Counter {
         assert_eq!(chunks[0].kind, ChunkKind::FileFallback);
         assert_eq!(chunks[0].line_range.start, 1);
         assert_eq!(chunks[0].line_range.end, 1);
+    }
+
+    #[test]
+    fn extracts_rust_type_trait_and_impl_summary_chunks() {
+        let source = r#"pub enum Mode {
+    Fast,
+}
+
+pub type Count = usize;
+
+pub trait Runnable {
+    fn run(&self);
+}
+
+impl Runnable for Mode {
+    fn run(&self) {}
+}
+"#;
+
+        let chunks = extract_rust_chunks(&file(), source).expect("chunks should parse");
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::TypeDefinition && chunk.symbol_name.as_deref() == Some("Mode")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::TypeDefinition && chunk.symbol_name.as_deref() == Some("Count")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::TypeDefinition
+                && chunk.symbol_name.as_deref() == Some("Runnable")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.kind == ChunkKind::ImplSummary
+                && chunk.symbol_name.as_deref() == Some("impl Mode")
+        }));
     }
 
     #[test]
