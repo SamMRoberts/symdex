@@ -12,7 +12,7 @@ use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, ParseDiagnostic,
     RepoRoot, ResolutionStatus, Symbol, SymbolKind, discover_indexable_files, index_source_file,
 };
-use symdex_embed::{EmbedConfig, OllamaClient};
+use symdex_embed::{EmbedConfig, LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
     RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, TestRecord, VectorPoint,
@@ -393,7 +393,7 @@ fn run_index_internal(
         "semantic"
     };
     let index_run_id = SqliteStore::new_index_run_id(root.id(), run_kind);
-    let embed_config = EmbedConfig::from_env();
+    let embed_config = LayeredEmbedConfig::from_env().fast_embed_config();
     let embedding_model = if options.offline {
         "offline".to_owned()
     } else {
@@ -542,10 +542,11 @@ fn run_index_internal(
         EmbeddingSummary::SkippedOffline
     } else {
         match persist_semantic_index(
-            &sqlite,
+            &mut sqlite,
             &root,
             &store_config,
             &collection,
+            &embed_config,
             &index_run_id,
             &mut on_progress,
         ) {
@@ -1243,14 +1244,14 @@ fn persist_structural_index(
 }
 
 fn persist_semantic_index(
-    sqlite: &SqliteStore,
+    sqlite: &mut SqliteStore,
     root: &RepoRoot,
     store_config: &StoreConfig,
     collection: &IndexCollection,
+    embed_config: &EmbedConfig,
     index_run_id: &str,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
-    let embed_config = EmbedConfig::from_env();
     let chunk_texts = chunk_texts(&collection.reports);
     if chunk_texts.is_empty() {
         on_progress(IndexProgress::new(
@@ -1344,6 +1345,17 @@ fn persist_semantic_index(
             dimension,
         )
         .map_err(|error| error.to_string())?;
+    let recorded_at = current_timestamp();
+    sqlite
+        .record_fast_semantic_generation(
+            root.id(),
+            &embed_config.model,
+            dimension,
+            &qdrant_collection,
+            collection.files_seen,
+            &recorded_at,
+        )
+        .map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
         "qdrant",
         5,
@@ -1351,7 +1363,7 @@ fn persist_semantic_index(
         format!("Upserted {} vector points", points.len()),
     ));
     Ok(EmbeddingSummary::Completed {
-        model: embed_config.model,
+        model: embed_config.model.clone(),
         dimension,
         qdrant_collection,
         chunks_embedded: points.len(),

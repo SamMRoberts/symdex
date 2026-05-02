@@ -37,11 +37,11 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q4 — Fast-layer generation tracking
 
-- [ ] Treat existing semantic indexing as the `fast` layer.
-- [ ] Record fast semantic generation rows after successful fast Qdrant upsert.
-- [ ] Record fast `chunk_embeddings` rows for embeddable chunks.
-- [ ] Make unchanged fast indexing idempotent.
-- [ ] Keep semantic search behavior unchanged except for added metadata.
+- [x] Treat existing semantic indexing as the `fast` layer.
+- [x] Record fast semantic generation rows after successful fast Qdrant upsert.
+- [x] Record fast `chunk_embeddings` rows for embeddable chunks.
+- [x] Make unchanged fast indexing idempotent.
+- [x] Keep semantic search behavior unchanged except for added metadata.
 
 ## Phase Q5 — Active-layer query routing
 

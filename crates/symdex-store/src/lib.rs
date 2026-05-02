@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use symdex_core::{SemanticLayer, SemanticLayerStatus, stable_id};
 
 pub use qdrant::{
     PointPayload, QdrantClient, RetrievedPoint, ScoredPoint, VectorPoint, qdrant_collection_name,
@@ -664,6 +665,150 @@ impl SqliteStore {
                 .map_err(StoreError::Sqlite)?;
         }
         Ok(())
+    }
+
+    pub fn record_fast_semantic_generation(
+        &mut self,
+        repository_id: &str,
+        fast_model: &str,
+        fast_dimension: usize,
+        qdrant_collection: &str,
+        files_seen: usize,
+        completed_at: &str,
+    ) -> Result<SemanticGenerationRecord> {
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let manifest = current_fast_embedding_manifest(
+            &transaction,
+            repository_id,
+            fast_model,
+            fast_dimension,
+        )?;
+        let generation_id =
+            fast_semantic_generation_id(repository_id, fast_model, fast_dimension, &manifest);
+        let generation = SemanticGenerationRecord {
+            id: generation_id.clone(),
+            repository_id: repository_id.to_owned(),
+            fast_model: fast_model.to_owned(),
+            fast_dimension,
+            fast_completed_at: completed_at.to_owned(),
+            quality_model: None,
+            quality_dimension: None,
+            quality_status: SemanticLayerStatus::FastReady.as_str().to_owned(),
+            quality_started_at: None,
+            quality_completed_at: None,
+            active_layer: SemanticLayer::Fast.as_str().to_owned(),
+            files_seen,
+            embeddable_chunks: manifest.len(),
+            fast_embedded_chunks: manifest.len(),
+            quality_embedded_chunks: 0,
+            created_at: completed_at.to_owned(),
+            updated_at: completed_at.to_owned(),
+        };
+
+        transaction
+            .execute(
+                "INSERT INTO semantic_generations (
+                   id, repository_id, fast_model, fast_dimension, fast_completed_at,
+                   quality_model, quality_dimension, quality_status, quality_started_at,
+                   quality_completed_at, active_layer, files_seen, embeddable_chunks,
+                   fast_embedded_chunks, quality_embedded_chunks, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(id) DO UPDATE SET
+                   repository_id = excluded.repository_id,
+                   fast_model = excluded.fast_model,
+                   fast_dimension = excluded.fast_dimension,
+                   fast_completed_at = excluded.fast_completed_at,
+                   quality_model = excluded.quality_model,
+                   quality_dimension = excluded.quality_dimension,
+                   quality_status = excluded.quality_status,
+                   quality_started_at = excluded.quality_started_at,
+                   quality_completed_at = excluded.quality_completed_at,
+                   active_layer = excluded.active_layer,
+                   files_seen = excluded.files_seen,
+                   embeddable_chunks = excluded.embeddable_chunks,
+                   fast_embedded_chunks = excluded.fast_embedded_chunks,
+                   quality_embedded_chunks = excluded.quality_embedded_chunks,
+                   updated_at = excluded.updated_at",
+                params![
+                    generation.id,
+                    generation.repository_id,
+                    generation.fast_model,
+                    generation.fast_dimension as i64,
+                    generation.fast_completed_at,
+                    generation.quality_model,
+                    generation
+                        .quality_dimension
+                        .map(|dimension| dimension as i64),
+                    generation.quality_status,
+                    generation.quality_started_at,
+                    generation.quality_completed_at,
+                    generation.active_layer,
+                    generation.files_seen as i64,
+                    generation.embeddable_chunks as i64,
+                    generation.fast_embedded_chunks as i64,
+                    generation.quality_embedded_chunks as i64,
+                    generation.created_at,
+                    generation.updated_at,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO chunk_embeddings (
+                       id, repository_id, file_id, chunk_id, semantic_layer, embedding_model,
+                       embedding_dimension, content_hash, text_hash, qdrant_collection,
+                       qdrant_point_id, generation_id, embedded_at, status
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     ON CONFLICT(chunk_id, semantic_layer, embedding_model, embedding_dimension)
+                     DO UPDATE SET
+                       id = excluded.id,
+                       repository_id = excluded.repository_id,
+                       file_id = excluded.file_id,
+                       content_hash = excluded.content_hash,
+                       text_hash = excluded.text_hash,
+                       qdrant_collection = excluded.qdrant_collection,
+                       qdrant_point_id = excluded.qdrant_point_id,
+                       generation_id = excluded.generation_id,
+                       embedded_at = excluded.embedded_at,
+                       status = excluded.status",
+                )
+                .map_err(StoreError::Sqlite)?;
+            let semantic_layer = SemanticLayer::Fast.as_str();
+            for row in &manifest {
+                statement
+                    .execute(params![
+                        chunk_embedding_id(
+                            repository_id,
+                            &generation_id,
+                            &row.chunk_id,
+                            semantic_layer,
+                            fast_model,
+                            fast_dimension,
+                        ),
+                        repository_id,
+                        row.file_id,
+                        row.chunk_id,
+                        semantic_layer,
+                        fast_model,
+                        fast_dimension as i64,
+                        row.content_hash,
+                        row.text_hash,
+                        qdrant_collection,
+                        row.qdrant_point_id,
+                        generation_id,
+                        completed_at,
+                        "current",
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(generation)
     }
 
     pub fn upsert_semantic_generation(&self, generation: &SemanticGenerationRecord) -> Result<()> {
@@ -2839,6 +2984,94 @@ fn collect_rows<T>(
     Ok(values)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FastEmbeddingManifestRow {
+    file_id: String,
+    chunk_id: String,
+    content_hash: String,
+    text_hash: String,
+    qdrant_point_id: String,
+}
+
+fn current_fast_embedding_manifest(
+    transaction: &rusqlite::Transaction<'_>,
+    repository_id: &str,
+    fast_model: &str,
+    fast_dimension: usize,
+) -> Result<Vec<FastEmbeddingManifestRow>> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT files.id, chunks.id, files.content_hash, chunks.text_hash,
+                    chunks.qdrant_point_id
+             FROM chunks
+             JOIN files ON chunks.file_id = files.id
+             WHERE files.repository_id = ?1
+               AND chunks.qdrant_point_id IS NOT NULL
+               AND chunks.embedding_model = ?2
+               AND chunks.embedding_dimension = ?3
+             ORDER BY chunks.id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let rows = statement
+        .query_map(
+            params![repository_id, fast_model, fast_dimension as i64],
+            |row| {
+                Ok(FastEmbeddingManifestRow {
+                    file_id: row.get(0)?,
+                    chunk_id: row.get(1)?,
+                    content_hash: row.get(2)?,
+                    text_hash: row.get(3)?,
+                    qdrant_point_id: row.get(4)?,
+                })
+            },
+        )
+        .map_err(StoreError::Sqlite)?;
+    collect_rows(rows)
+}
+
+fn fast_semantic_generation_id(
+    repository_id: &str,
+    fast_model: &str,
+    fast_dimension: usize,
+    manifest: &[FastEmbeddingManifestRow],
+) -> String {
+    let fast_dimension = fast_dimension.to_string();
+    let mut parts = vec![
+        "semantic-generation".to_owned(),
+        repository_id.to_owned(),
+        SemanticLayer::Fast.as_str().to_owned(),
+        fast_model.to_owned(),
+        fast_dimension,
+    ];
+    for row in manifest {
+        parts.push(row.chunk_id.clone());
+        parts.push(row.content_hash.clone());
+        parts.push(row.text_hash.clone());
+    }
+    let refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    stable_id(&refs)
+}
+
+fn chunk_embedding_id(
+    repository_id: &str,
+    generation_id: &str,
+    chunk_id: &str,
+    semantic_layer: &str,
+    embedding_model: &str,
+    embedding_dimension: usize,
+) -> String {
+    let embedding_dimension = embedding_dimension.to_string();
+    stable_id(&[
+        "chunk-embedding",
+        repository_id,
+        generation_id,
+        chunk_id,
+        semantic_layer,
+        embedding_model,
+        &embedding_dimension,
+    ])
+}
+
 fn semantic_generation_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<SemanticGenerationRecord> {
@@ -4032,6 +4265,162 @@ mod tests {
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 1);
         assert_eq!(status.chunks_indexed, 1);
+    }
+
+    #[test]
+    fn sqlite_records_fast_semantic_generation_from_legacy_provenance() {
+        let db = TestDb::new("fast-generation-recording");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .record_chunk_embedding_provenance(
+                &["chunk-1".to_owned(), "chunk-2".to_owned()],
+                "nomic-embed-text",
+                768,
+            )
+            .expect("legacy provenance should persist");
+
+        let generation = store
+            .record_fast_semantic_generation(
+                "repo",
+                "nomic-embed-text",
+                768,
+                "symdex_repo_nomic_embed_text",
+                1,
+                "200",
+            )
+            .expect("fast generation should persist");
+
+        assert_eq!(generation.quality_status, "fast_ready");
+        assert_eq!(generation.active_layer, "fast");
+        assert_eq!(generation.fast_model, "nomic-embed-text");
+        assert_eq!(generation.fast_dimension, 768);
+        assert_eq!(generation.embeddable_chunks, 2);
+        assert_eq!(generation.fast_embedded_chunks, 2);
+        assert_eq!(generation.quality_embedded_chunks, 0);
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should load")
+                .map(|generation| generation.id),
+            Some(generation.id.clone())
+        );
+
+        let embeddings = store
+            .chunk_embeddings_for_generation("repo", &generation.id, "fast")
+            .expect("fast manifest should load");
+        assert_eq!(embeddings.len(), 2);
+        assert!(
+            embeddings
+                .iter()
+                .all(|embedding| embedding.generation_id == generation.id)
+        );
+        assert!(embeddings.iter().all(|embedding| {
+            embedding.semantic_layer == "fast"
+                && embedding.embedding_model == "nomic-embed-text"
+                && embedding.embedding_dimension == 768
+                && embedding.content_hash == "content-hash"
+                && embedding.status == "current"
+                && !embedding.qdrant_point_id.is_empty()
+        }));
+    }
+
+    #[test]
+    fn sqlite_fast_semantic_generation_ids_are_manifest_stable() {
+        let db = TestDb::new("fast-generation-idempotent");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .record_chunk_embedding_provenance(&["chunk-1".to_owned()], "nomic-embed-text", 768)
+            .expect("legacy provenance should persist");
+
+        let first = store
+            .record_fast_semantic_generation(
+                "repo",
+                "nomic-embed-text",
+                768,
+                "symdex_repo_nomic_embed_text",
+                1,
+                "200",
+            )
+            .expect("first generation should persist");
+        let second = store
+            .record_fast_semantic_generation(
+                "repo",
+                "nomic-embed-text",
+                768,
+                "symdex_repo_nomic_embed_text",
+                1,
+                "201",
+            )
+            .expect("same generation should persist idempotently");
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            store
+                .chunk_embeddings_for_generation("repo", &first.id, "fast")
+                .expect("fast manifest should load")
+                .len(),
+            1
+        );
+
+        store
+            .replace_file_facts(
+                &sample_file("content-hash-2"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("changed file facts should persist");
+        store
+            .record_chunk_embedding_provenance(&["chunk-1".to_owned()], "nomic-embed-text", 768)
+            .expect("changed legacy provenance should persist");
+        let changed = store
+            .record_fast_semantic_generation(
+                "repo",
+                "nomic-embed-text",
+                768,
+                "symdex_repo_nomic_embed_text",
+                1,
+                "202",
+            )
+            .expect("changed generation should persist");
+
+        assert_ne!(first.id, changed.id);
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should load")
+                .map(|generation| generation.id),
+            Some(changed.id)
+        );
     }
 
     #[test]

@@ -143,10 +143,11 @@ sizes. Different model names map to different Qdrant collection names.
 
 The SQLite schema also includes additive layered semantic tables for
 `semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
-These tables support future fast/quality generation tracking and deferred
-quality work queues. The current indexing runtime still writes legacy chunk
-embedding provenance and `index_runs`; fast-layer generation writes, active
-layer routing, and quality workers are later layered-indexing slices.
+After a successful fast Qdrant upsert, semantic indexing still writes legacy
+chunk embedding provenance for compatibility, then records a deterministic fast
+semantic generation and current fast `chunk_embeddings` manifest in SQLite.
+Active-layer query routing, quality job creation, and quality workers are later
+layered-indexing slices.
 
 ## Qdrant Collections
 

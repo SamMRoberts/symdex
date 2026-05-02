@@ -7,10 +7,9 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, tests, and legacy chunk embedding provenance. Layered semantic
-tables are present for generation manifests and quality work metadata, but the
-current indexing path continues to use legacy chunk embedding columns until
-fast-layer generation tracking is wired in.
+symbols, calls, tests, legacy chunk embedding provenance, fast semantic
+generations, and fast `chunk_embeddings` manifests. Quality work metadata is
+present in the schema but remains deferred until later layered-indexing slices.
 
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
@@ -212,10 +211,12 @@ CREATE TABLE semantic_generations (
 );
 ```
 
-This table tracks metadata for a semantic generation. `active_layer` is `fast`
-or `quality`. `quality_status` uses the layered semantic status vocabulary:
-`missing`, `fast_ready`, `quality_pending`, `quality_ready`, `quality_stale`,
-`quality_blocked`, or `quality_failed`. Rows do not contain source text.
+This table tracks metadata for a semantic generation. Current semantic indexing
+records the fast layer after successful fast Qdrant upsert with
+`active_layer = fast` and `quality_status = fast_ready`. Generation IDs are
+deterministic over the current fast manifest, so unchanged manifests reuse the
+same generation ID. Future quality slices will update quality readiness and may
+activate `active_layer = quality`. Rows do not contain source text.
 
 ### `chunk_embeddings`
 
@@ -239,11 +240,12 @@ CREATE TABLE chunk_embeddings (
 );
 ```
 
-This table is the planned per-layer vector manifest. It keeps fast and quality
-metadata separate by `semantic_layer`, model, dimension, generation, collection,
-and point ID so the two layers do not share one Qdrant collection. `status` is
-metadata-only and currently supports `current`, `stale`, `blocked`, and
-`failed`.
+This table is the per-layer vector manifest. Current semantic indexing writes
+`fast` rows from the legacy chunk provenance after a successful fast Qdrant
+upsert. It keeps fast and quality metadata separate by `semantic_layer`, model,
+dimension, generation, collection, and point ID so the two layers do not share
+one Qdrant collection. `status` is metadata-only and currently supports
+`current`, `stale`, `blocked`, and `failed`.
 
 ### `quality_embedding_jobs`
 
@@ -273,8 +275,10 @@ embedding, but never include source text. Current status values are `pending`,
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
-files, chunks, symbols, and calls. Semantic indexing also fills chunk embedding
-model, dimension, and embedding timestamp metadata after vector upsert.
+files, chunks, symbols, and calls. Semantic indexing also fills legacy chunk
+embedding model, dimension, and embedding timestamp metadata after vector
+upsert, then records the fast semantic generation and fast `chunk_embeddings`
+manifest from those compatibility fields.
 `parser_version` must include the per-language parser identity and symdex
 indexer/chunker version so mixed-language indexes remain auditable.
 
