@@ -9,7 +9,7 @@ Use this folder as the agent-facing project memory.
 | Product requirements | `APP_SPEC.md` |
 | Crate layout or module boundaries | `ARCHITECTURE.md` |
 | Parsing, chunking, embeddings, reindexing | `INDEXING_PIPELINE.md` |
-| Layered fast/quality semantic indexing | `LAYERED_SEMANTIC_INDEXING.md`, `INDEXING_PIPELINE.md`, `DATA_MODEL.md`, `CONTINUOUS_INDEXING.md` |
+| Layered fast/quality semantic indexing | `LAYERED_SEMANTIC_INDEXING.md`, `LAYERED_SEMANTIC_INDEXING_TASKS.md`, `INDEXING_PIPELINE.md`, `DATA_MODEL.md`, `CONTINUOUS_INDEXING.md` |
 | Language support or parser expansion | `INDEXING_PIPELINE.md`, `ARCHITECTURE.md`, `BACKLOG.md` |
 | Continuous indexing/watch mode | `CONTINUOUS_INDEXING.md` |
 | SQLite schema or Qdrant payloads | `DATA_MODEL.md` |
@@ -42,4 +42,5 @@ recommended implementation sequence is captured in `BACKLOG.md` under
 For the `quality-index` branch, the semantic indexing direction is defined in
 `LAYERED_SEMANTIC_INDEXING.md`: fast `nomic-embed-text` indexing remains the
 availability path, while deferred `nomic-embed-text-v2-moe` quality indexing
-becomes active for default search only after it is complete and current.
+becomes active for default search only after it is complete and current. Use
+`LAYERED_SEMANTIC_INDEXING_TASKS.md` for the implementation slice order.
