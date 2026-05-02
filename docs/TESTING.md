@@ -104,6 +104,11 @@ canonical symlink escapes rejected by normalization, symlinked files and
 directories skipped during discovery, and MCP repo arguments rejected when they
 do not name a directory root.
 
+Current discovery tests cover built-in hard excludes, root and nested
+`.gitignore` scope, glob patterns using `*`, `**`, `?`, and character classes,
+directory rules, basename rules, ordered `!` negation, and protection against
+re-including built-in excluded directories.
+
 Current migration tests also assert that structural-query indexes are created
 for symbols, calls, chunks, files, and index runs.
 
@@ -115,8 +120,9 @@ indexing should use mocked adapters or the existing opt-in local service test
 flags.
 
 Current continuous indexing tests cover snapshot diff coalescing, created-file
-and modified-file detection, ignored path skips, unsupported-language path
-skips, and unchanged-content skips. TUI state/render tests cover
+and modified-file detection, ignored path skips including glob rules and
+negated includes, unsupported-language path skips, and unchanged-content skips
+through the shared discovery path. TUI state/render tests cover
 continuous-indexing
 toggle confirmation, stopping an active watcher, pending debounce display,
 queued event count, and latest error rendering.

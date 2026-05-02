@@ -213,12 +213,12 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### A3 — `.gitignore` glob and negation correctness
 
-- [ ] Replace simple ignore matching with ordered glob-aware matching.
-- [ ] Support `*`, `**`, `?`, character classes, directory rules, basename
+- [x] Replace simple ignore matching with ordered glob-aware matching.
+- [x] Support `*`, `**`, `?`, character classes, directory rules, basename
   rules, nested `.gitignore` scope, and `!` negation.
-- [ ] Preserve built-in excludes and symlink escape rejection.
-- [ ] Keep manual indexing and continuous indexing on the same discovery path.
-- [ ] Add fixture tests for generated-file excludes, negated includes, nested
+- [x] Preserve built-in excludes and symlink escape rejection.
+- [x] Keep manual indexing and continuous indexing on the same discovery path.
+- [x] Add fixture tests for generated-file excludes, negated includes, nested
   rules, and unchanged incremental-index skips.
 
 ### A4 — Multi-language test discovery

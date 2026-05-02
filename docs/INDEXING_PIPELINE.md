@@ -47,13 +47,14 @@ inference. Future languages must be added through the same discovery, parsing,
 chunking, symbol, call, hashing, secret-detection, embedding, SQLite, Qdrant,
 manual indexing, and continuous indexing contracts.
 
-Current implementation applies built-in directory excludes and simple scoped
-`.gitignore` rules from the repository root and nested directories. Literal
-file paths, directory suffix rules, and basename rules are supported. Glob
-patterns and negation rules are intentionally not implemented yet.
-Repository roots must be directories, discovered symlinked files and directories
-are skipped, and canonicalized symlink escapes are rejected by path
-normalization.
+Current implementation applies built-in directory excludes and scoped
+`.gitignore` rules from the repository root and nested directories. Rules are
+ordered and glob-aware, including `*`, `**`, `?`, character classes, directory
+rules, basename rules, nested scope, and `!` negation. Built-in excludes such as
+`.git`, `target`, `node_modules`, and `qdrant_storage` are hard excludes and
+cannot be re-included by `.gitignore` negation. Repository roots must be
+directories, discovered symlinked files and directories are skipped, and
+canonicalized symlink escapes are rejected by path normalization.
 
 ## Chunking strategy
 

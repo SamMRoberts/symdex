@@ -97,8 +97,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   enabled, the active MCP evidence contract version, and repo-specific index
   freshness/provenance readiness when a repo path is provided.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
-  applies built-in excludes and scoped simple `.gitignore` rules, hashes file
-  contents, extracts tree-sitter function and method chunks where supported,
+  applies built-in excludes and scoped glob-aware `.gitignore` rules with
+  negation, hashes file contents, extracts tree-sitter function and method chunks where supported,
   embeds chunk text with local Ollama, creates the Qdrant collection if needed,
   and upserts semantic vectors. Use
   `index --offline <repo>` for SQLite-backed discovery and chunking without

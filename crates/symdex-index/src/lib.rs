@@ -1677,13 +1677,14 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
         ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
         ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
-    use symdex_store::SymbolRecord;
+    use symdex_store::{FileRecord, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord};
 
     use crate::{
         IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
@@ -1819,6 +1820,77 @@ mod tests {
             detect_watch_changes(&root, &snapshot).expect("changes should detect");
 
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn detect_watch_changes_respects_gitignore_globs_and_negation() {
+        let repo = TestRepo::new("watch-glob-negation");
+        repo.write(".gitignore", "*.generated.rs\n!src/keep.generated.rs\n");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let snapshot = watch_snapshot(&root).expect("snapshot should load");
+
+        repo.write("src/drop.generated.rs", "pub fn ignored() {}\n");
+        repo.write("src/keep.generated.rs", "pub fn kept() {}\n");
+        let (_next, changes) =
+            detect_watch_changes(&root, &snapshot).expect("changes should detect");
+
+        assert_eq!(changes.created, vec!["src/keep.generated.rs"]);
+        assert!(changes.modified.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn incremental_collection_skips_unchanged_files_with_gitignore_globs() {
+        let repo = TestRepo::new("incremental-glob-unchanged");
+        let lib_source = "pub fn lib() {}\n";
+        repo.write(".gitignore", "*.generated.rs\n!src/keep.generated.rs\n");
+        repo.write("src/lib.rs", lib_source);
+        repo.write("src/drop.generated.rs", "pub fn ignored() {}\n");
+        repo.write("src/keep.generated.rs", "pub fn kept() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let db_dir = temp_path("incremental-glob-unchanged-db");
+        fs::create_dir_all(&db_dir).expect("db directory should be created");
+        let mut store = SqliteStore::open(&StoreConfig {
+            sqlite_path: db_dir.join("symdex.sqlite"),
+            qdrant_url: "http://localhost:6333".to_owned(),
+        })
+        .expect("store should open");
+        store.migrate().expect("store should migrate");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: root.id().to_owned(),
+                root_path: root.path().display().to_string(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &FileRecord {
+                    id: stable_id(&[root.id(), "src/lib.rs"]),
+                    repository_id: root.id().to_owned(),
+                    path: "src/lib.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: content_hash(lib_source.as_bytes()),
+                    index_run_id: "run".to_owned(),
+                    parser_version: Language::Rust.parser_version().to_owned(),
+                },
+                &[],
+                &[],
+                &[],
+            )
+            .expect("file facts should persist");
+
+        let collection = collect_index_reports(&root, Some(&store), &mut |_| {})
+            .expect("collection should succeed");
+        let _ = fs::remove_dir_all(db_dir);
+
+        assert_eq!(collection.files_seen, 2);
+        assert_eq!(collection.files_skipped_unchanged, 1);
+        assert_eq!(collection.reports.len(), 1);
+        assert_eq!(
+            collection.reports[0].file.relative_path,
+            "src/keep.generated.rs"
+        );
     }
 
     #[test]
@@ -2304,6 +2376,8 @@ mod tests {
         path: PathBuf,
     }
 
+    static NEXT_TEST_REPO_ID: AtomicU64 = AtomicU64::new(0);
+
     impl TestRepo {
         fn new(name: &str) -> Self {
             let path = temp_path(name);
@@ -2335,9 +2409,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after epoch")
             .as_nanos();
+        let id = NEXT_TEST_REPO_ID.fetch_add(1, AtomicOrdering::Relaxed);
         std::env::temp_dir().join(format!(
-            "symdex-index-{name}-{}-{nonce}",
-            std::process::id()
+            "symdex-index-{name}-{}-{nonce}-{id}",
+            std::process::id(),
         ))
     }
 }

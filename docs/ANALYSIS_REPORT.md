@@ -198,12 +198,10 @@ yet.
 
 ### 8. Glob Pattern and Negation Support in `.gitignore`
 
-The indexing pipeline doc explicitly notes that glob patterns and negation rules
-in `.gitignore` are not yet implemented — only literal paths, directory suffixes,
-and basename rules. Real repositories rely heavily on patterns like
-`**/*.generated.ts` or `!src/important.rs`. Until this is filled in, some
-repositories will index files that should be excluded, or fail to index files
-that should be included.
+This gap has been closed. Discovery now applies ordered, scoped, glob-aware
+`.gitignore` rules with `*`, `**`, `?`, character classes, directory rules,
+basename rules, nested scope, and `!` negation while preserving built-in hard
+excludes and symlink boundary checks.
 
 ---
 
@@ -417,7 +415,7 @@ plan for this now rather than needing a structural refactor later.
 | rust-analyzer fact application | 🟡 Planned, not wired | P2 |
 | Multi-language test discovery | 🟡 Rust only | P2 |
 | `staleness_check` MCP tool | 🟡 Exists in CLI, not MCP | P1 |
-| `.gitignore` glob patterns | 🟡 Not implemented | P2 |
+| `.gitignore` glob patterns | ✅ Implemented | — |
 | Structured logging / metrics | 🔴 Missing | P3 |
 | Config file / per-repo config | 🔴 Env-var only | P3 |
 | Unified context pack (struct+semantic) | 🆕 New | P1 |
