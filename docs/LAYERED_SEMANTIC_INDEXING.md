@@ -406,20 +406,25 @@ be an explicit diagnostic or experimental mode.
 
 ## Verification and repair
 
-Qdrant verification should become layer-aware:
+Qdrant verification is layer-aware:
 
 ```text
 symdex qdrant-verify <repo> --semantic-layer fast
 symdex qdrant-verify <repo> --semantic-layer quality
-symdex qdrant-verify <repo> --all-semantic-layers
+symdex qdrant-verify <repo> --semantic-layer all
 ```
 
-Expected manifests should come from `chunk_embeddings` for the selected layer.
-The old `chunks.qdrant_point_id` path may remain as a migration compatibility
-path until the layered schema is fully adopted.
+Expected manifests come from current `chunk_embeddings` rows for the selected
+latest-generation layer. Fast verification keeps the old `chunks.qdrant_point_id`
+path as a migration compatibility fallback when no layered fast manifest is
+available. Quality verification does not use the legacy fast fields, so missing
+or stale quality points are isolated from fast-layer health.
 
-Repair should rebuild missing or stale points through the normal indexing path
-for the selected layer instead of writing ad-hoc Qdrant payloads.
+Repair rebuilds missing or stale points through existing indexing paths for the
+selected layer instead of writing ad-hoc Qdrant payloads. Fast repair runs the
+normal semantic index path. Quality repair runs the quality worker path so hash
+verification, quality collection naming, job state, and activation refresh stay
+centralized.
 
 ## Configuration
 

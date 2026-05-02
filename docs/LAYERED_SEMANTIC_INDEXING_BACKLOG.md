@@ -83,9 +83,9 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q9 — Verification, repair, TUI, and MCP
 
-- [ ] Add layer-aware Qdrant verify and repair flags.
-- [ ] Build expected manifests from `chunk_embeddings`.
-- [ ] Keep missing quality points isolated from fast-layer health.
+- [x] Add layer-aware Qdrant verify and repair flags.
+- [x] Build expected manifests from `chunk_embeddings`.
+- [x] Keep missing quality points isolated from fast-layer health.
 - [ ] Add `semantic-status` CLI output.
 - [ ] Add TUI active-layer and quality-status display.
 - [ ] Add MCP semantic output metadata for active layer and fallback status.

@@ -219,6 +219,13 @@ Tasks:
   separate ad-hoc Qdrant write path.
 - Keep orphan cleanup metadata-only.
 
+Implementation note: Slice 9 adds `--semantic-layer fast|quality|all` to
+`qdrant-verify` and `qdrant-repair`. Verification reads current expected points
+from latest-generation `chunk_embeddings` for the selected layer and keeps the
+legacy `chunks.qdrant_point_id` path as a fast-layer compatibility fallback.
+Repair dispatches fast work through normal semantic indexing and quality work
+through the quality worker path.
+
 Acceptance:
 
 - Fast and quality collections can be verified independently.

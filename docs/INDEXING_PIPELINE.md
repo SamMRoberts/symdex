@@ -211,6 +211,14 @@ quality jobs and emit completion before catch-up begins. Quality catch-up then
 processes bounded batches through the normal quality worker during post-batch or
 idle watch ticks, refreshing activation state after each bounded run.
 
+Qdrant verification and repair are layer-aware maintenance paths. `qdrant-verify`
+and `qdrant-repair` accept `--semantic-layer fast|quality|all`. Verification
+builds expected fast and quality manifests from latest-generation
+`chunk_embeddings` rows for the selected layer, with the legacy
+`chunks.qdrant_point_id` path retained as a fast-layer compatibility fallback.
+Repair routes fast rebuilds through normal semantic indexing and quality rebuilds
+through the quality worker path.
+
 ## Call extraction
 
 Start conservative.

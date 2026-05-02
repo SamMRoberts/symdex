@@ -359,6 +359,7 @@ pub struct ImpactSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QdrantVerifySummary {
     pub repository_id: String,
+    pub semantic_layer: String,
     pub collection_name: String,
     pub embedding_model: String,
     pub collection_exists: bool,
@@ -371,6 +372,49 @@ pub struct QdrantVerifySummary {
     pub stale_payload_point_ids: Vec<String>,
     pub orphaned_point_ids: Vec<String>,
     pub rows: Vec<StorageHealthRow>,
+    pub layer_summaries: Vec<QdrantVerifySummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QdrantVerifySemanticLayer {
+    #[default]
+    Fast,
+    Quality,
+    All,
+}
+
+impl QdrantVerifySemanticLayer {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "fast" => Ok(Self::Fast),
+            "quality" => Ok(Self::Quality),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "unsupported semantic layer `{other}`; expected fast, quality, or all"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Quality => "quality",
+            Self::All => "all",
+        }
+    }
+
+    fn layers(self) -> Vec<SemanticLayer> {
+        match self {
+            Self::Fast => vec![SemanticLayer::Fast],
+            Self::Quality => vec![SemanticLayer::Quality],
+            Self::All => vec![SemanticLayer::Fast, SemanticLayer::Quality],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QdrantVerifyOptions {
+    pub semantic_layer: QdrantVerifySemanticLayer,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -959,44 +1003,237 @@ pub fn run_cross_store_health(repo: &str) -> Result<CrossStoreHealthSummary, Str
 }
 
 pub fn run_qdrant_verify(repo: &str) -> Result<QdrantVerifySummary, String> {
+    run_qdrant_verify_with_options(repo, QdrantVerifyOptions::default())
+}
+
+pub fn run_qdrant_verify_with_options(
+    repo: &str,
+    options: QdrantVerifyOptions,
+) -> Result<QdrantVerifySummary, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    let embed_config = EmbedConfig::from_env();
-    let expected = sqlite
-        .qdrant_expected_points(root.id())
-        .map_err(|error| error.to_string())?;
+    let targets = qdrant_verify_targets(&root, &sqlite, options.semantic_layer)?;
     let store_config = StoreConfig::from_env();
     let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
-    let collection_name = qdrant_collection_name(root.id(), &embed_config.model);
-    let collection_exists = qdrant
-        .collection_exists(&collection_name)
-        .map_err(|error| error.to_string())?;
-    if !collection_exists {
-        return Ok(qdrant_verify_summary(
+    let mut summaries = Vec::new();
+    for target in targets {
+        let collection_exists = qdrant
+            .collection_exists(&target.collection_name)
+            .map_err(|error| error.to_string())?;
+        let actual = if collection_exists {
+            qdrant
+                .scroll_points_for_repository(&target.collection_name, root.id())
+                .map_err(|error| error.to_string())?
+        } else {
+            Vec::new()
+        };
+        summaries.push(qdrant_verify_summary(
             root.id(),
-            collection_name,
-            embed_config.model,
-            false,
-            expected,
-            Vec::new(),
+            target.semantic_layer.as_str(),
+            target.collection_name,
+            target.embedding_model,
+            collection_exists,
+            target.expected,
+            actual,
         ));
     }
-    let actual = qdrant
-        .scroll_points_for_repository(&collection_name, root.id())
-        .map_err(|error| error.to_string())?;
 
-    Ok(qdrant_verify_summary(
-        root.id(),
-        collection_name,
-        embed_config.model,
-        true,
+    if options.semantic_layer == QdrantVerifySemanticLayer::All {
+        Ok(qdrant_verify_all_summary(root.id(), summaries))
+    } else {
+        summaries
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no Qdrant verification target selected".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QdrantVerifyTarget {
+    semantic_layer: SemanticLayer,
+    collection_name: String,
+    embedding_model: String,
+    expected: Vec<QdrantExpectedPoint>,
+}
+
+fn qdrant_verify_targets(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    selection: QdrantVerifySemanticLayer,
+) -> Result<Vec<QdrantVerifyTarget>, String> {
+    let routing = sqlite
+        .semantic_routing_summary(root.id())
+        .map_err(|error| error.to_string())?;
+    selection
+        .layers()
+        .into_iter()
+        .map(|layer| qdrant_verify_target(root, sqlite, routing.as_ref(), layer))
+        .collect()
+}
+
+fn qdrant_verify_target(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    routing: Option<&SemanticRoutingSummary>,
+    semantic_layer: SemanticLayer,
+) -> Result<QdrantVerifyTarget, String> {
+    match semantic_layer {
+        SemanticLayer::Fast => qdrant_verify_fast_target(root, sqlite, routing),
+        SemanticLayer::Quality => qdrant_verify_quality_target(root, sqlite, routing),
+    }
+}
+
+fn qdrant_verify_fast_target(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    routing: Option<&SemanticRoutingSummary>,
+) -> Result<QdrantVerifyTarget, String> {
+    let legacy_expected = sqlite
+        .qdrant_expected_points(root.id())
+        .map_err(|error| error.to_string())?;
+    if let Some(routing) = routing {
+        let layered_expected = sqlite
+            .qdrant_expected_points_for_generation_layer(
+                root.id(),
+                &routing.generation_id,
+                SemanticLayer::Fast,
+            )
+            .map_err(|error| error.to_string())?;
+        if !layered_expected.is_empty() || legacy_expected.is_empty() {
+            return Ok(qdrant_target_from_manifest(&routing.fast, layered_expected));
+        }
+    }
+
+    let embed_config = EmbedConfig::from_env();
+    Ok(QdrantVerifyTarget {
+        semantic_layer: SemanticLayer::Fast,
+        collection_name: qdrant_collection_name(root.id(), &embed_config.model),
+        embedding_model: embed_config.model,
+        expected: legacy_expected,
+    })
+}
+
+fn qdrant_verify_quality_target(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    routing: Option<&SemanticRoutingSummary>,
+) -> Result<QdrantVerifyTarget, String> {
+    if let Some(routing) = routing {
+        let expected = sqlite
+            .qdrant_expected_points_for_generation_layer(
+                root.id(),
+                &routing.generation_id,
+                SemanticLayer::Quality,
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(manifest) = &routing.quality {
+            return Ok(qdrant_target_from_manifest(manifest, expected));
+        }
+    }
+
+    let quality_config = LayeredEmbedConfig::from_env().quality_embed_config();
+    Ok(QdrantVerifyTarget {
+        semantic_layer: SemanticLayer::Quality,
+        collection_name: qdrant_collection_name(root.id(), &quality_config.model),
+        embedding_model: quality_config.model,
+        expected: Vec::new(),
+    })
+}
+
+fn qdrant_target_from_manifest(
+    manifest: &SemanticLayerManifestSummary,
+    expected: Vec<QdrantExpectedPoint>,
+) -> QdrantVerifyTarget {
+    QdrantVerifyTarget {
+        semantic_layer: manifest.semantic_layer,
+        collection_name: manifest.qdrant_collection.clone(),
+        embedding_model: manifest.embedding_model.clone(),
         expected,
-        actual,
-    ))
+    }
+}
+
+fn qdrant_verify_all_summary(
+    repository_id: &str,
+    summaries: Vec<QdrantVerifySummary>,
+) -> QdrantVerifySummary {
+    let expected_vector_points = summaries
+        .iter()
+        .map(|summary| summary.expected_vector_points)
+        .sum();
+    let qdrant_payload_points = summaries
+        .iter()
+        .map(|summary| summary.qdrant_payload_points)
+        .sum();
+    let missing_points = summaries.iter().map(|summary| summary.missing_points).sum();
+    let stale_payload_points = summaries
+        .iter()
+        .map(|summary| summary.stale_payload_points)
+        .sum();
+    let orphaned_points = summaries
+        .iter()
+        .map(|summary| summary.orphaned_points)
+        .sum();
+    let collection_exists = summaries.iter().all(|summary| summary.collection_exists);
+    let missing_point_ids = summaries
+        .iter()
+        .flat_map(|summary| summary.missing_point_ids.clone())
+        .collect();
+    let stale_payload_point_ids = summaries
+        .iter()
+        .flat_map(|summary| summary.stale_payload_point_ids.clone())
+        .collect();
+    let orphaned_point_ids = summaries
+        .iter()
+        .flat_map(|summary| summary.orphaned_point_ids.clone())
+        .collect();
+    let rows = summaries
+        .iter()
+        .map(|summary| StorageHealthRow {
+            status: if summary.missing_points > 0 {
+                StorageHealthStatus::Error
+            } else if summary.stale_payload_points > 0
+                || summary.orphaned_points > 0
+                || !summary.collection_exists
+            {
+                StorageHealthStatus::Warning
+            } else {
+                StorageHealthStatus::Ok
+            },
+            label: format!("{}_layer_verify", summary.semantic_layer),
+            detail: format!(
+                "layer={} collection={} expected={} missing={} stale={} orphaned={}",
+                summary.semantic_layer,
+                summary.collection_name,
+                summary.expected_vector_points,
+                summary.missing_points,
+                summary.stale_payload_points,
+                summary.orphaned_points
+            ),
+        })
+        .collect();
+
+    QdrantVerifySummary {
+        repository_id: repository_id.to_owned(),
+        semantic_layer: QdrantVerifySemanticLayer::All.as_str().to_owned(),
+        collection_name: "<multiple>".to_owned(),
+        embedding_model: "<multiple>".to_owned(),
+        collection_exists,
+        expected_vector_points,
+        qdrant_payload_points,
+        missing_points,
+        stale_payload_points,
+        orphaned_points,
+        missing_point_ids,
+        stale_payload_point_ids,
+        orphaned_point_ids,
+        rows,
+        layer_summaries: summaries,
+    }
 }
 
 fn qdrant_verify_summary(
     repository_id: &str,
+    semantic_layer: &str,
     collection_name: String,
     embedding_model: String,
     collection_exists: bool,
@@ -1104,6 +1341,7 @@ fn qdrant_verify_summary(
 
     QdrantVerifySummary {
         repository_id: repository_id.to_owned(),
+        semantic_layer: semantic_layer.to_owned(),
         collection_name,
         embedding_model,
         collection_exists,
@@ -1116,6 +1354,7 @@ fn qdrant_verify_summary(
         stale_payload_point_ids,
         orphaned_point_ids,
         rows,
+        layer_summaries: Vec::new(),
     }
 }
 
@@ -2860,13 +3099,14 @@ mod tests {
     };
 
     use crate::{
-        CallDirection, ContextEvidenceSource, ContextPackMode, FreshnessScope, QueryMode,
-        SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
-        build_debug_context_pack, build_freshness_report, build_impact_summary,
-        build_unified_context_pack, evidence_trust, freshness_rows, parse_runtime_input,
-        qdrant_verify_summary, resolve_semantic_search_target, run_call_graph, run_call_path,
-        run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
-        run_symbol_search, semantic_reasons, semantic_result_from_point,
+        CallDirection, ContextEvidenceSource, ContextPackMode, FreshnessScope,
+        QdrantVerifySemanticLayer, QueryMode, SemanticSearchOptions, SemanticSearchResult,
+        SemanticSearchSummary, build_debug_context_pack, build_freshness_report,
+        build_impact_summary, build_unified_context_pack, evidence_trust, freshness_rows,
+        parse_runtime_input, qdrant_verify_all_summary, qdrant_verify_summary,
+        resolve_semantic_search_target, run_call_graph, run_call_path, run_context_pack,
+        run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
+        semantic_reasons, semantic_result_from_point,
     };
 
     #[test]
@@ -3284,6 +3524,7 @@ mod tests {
         let missing = expected_point("point-missing", "chunk-missing", "hash-missing");
         let summary = qdrant_verify_summary(
             "repo",
+            "fast",
             "symdex_repo_model".to_owned(),
             "nomic-embed-text".to_owned(),
             true,
@@ -3296,6 +3537,7 @@ mod tests {
         );
 
         assert_eq!(summary.expected_vector_points, 3);
+        assert_eq!(summary.semantic_layer, "fast");
         assert_eq!(summary.qdrant_payload_points, 3);
         assert_eq!(summary.missing_points, 1);
         assert_eq!(summary.stale_payload_points, 1);
@@ -3320,6 +3562,7 @@ mod tests {
         let expected = expected_point("point-ok", "chunk-ok", "hash-ok");
         let summary = qdrant_verify_summary(
             "repo",
+            "fast",
             "symdex_repo_model".to_owned(),
             "nomic-embed-text".to_owned(),
             true,
@@ -3346,6 +3589,7 @@ mod tests {
         let expected = expected_point("point-missing", "chunk-missing", "hash-missing");
         let summary = qdrant_verify_summary(
             "repo",
+            "quality",
             "symdex_repo_model".to_owned(),
             "nomic-embed-text".to_owned(),
             false,
@@ -3358,6 +3602,64 @@ mod tests {
         assert!(summary.rows.iter().any(|row| {
             row.status == StorageHealthStatus::Error && row.label == "collection_missing"
         }));
+    }
+
+    #[test]
+    fn qdrant_verify_semantic_layer_parses_maintenance_modes() {
+        assert_eq!(
+            QdrantVerifySemanticLayer::parse("fast"),
+            Ok(QdrantVerifySemanticLayer::Fast)
+        );
+        assert_eq!(
+            QdrantVerifySemanticLayer::parse("quality"),
+            Ok(QdrantVerifySemanticLayer::Quality)
+        );
+        assert_eq!(
+            QdrantVerifySemanticLayer::parse("all"),
+            Ok(QdrantVerifySemanticLayer::All)
+        );
+        assert!(QdrantVerifySemanticLayer::parse("auto").is_err());
+    }
+
+    #[test]
+    fn qdrant_verify_all_summary_keeps_layer_health_independent() {
+        let fast_expected = expected_point("point-fast", "chunk-fast", "hash-fast");
+        let fast = qdrant_verify_summary(
+            "repo",
+            "fast",
+            "symdex_repo_nomic_embed_text".to_owned(),
+            "nomic-embed-text".to_owned(),
+            true,
+            vec![fast_expected.clone()],
+            vec![retrieved_point(
+                "point-fast",
+                payload_for(&fast_expected, "hash-fast"),
+            )],
+        );
+        let quality = qdrant_verify_summary(
+            "repo",
+            "quality",
+            "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
+            "nomic-embed-text-v2-moe".to_owned(),
+            false,
+            vec![expected_point(
+                "point-quality",
+                "chunk-quality",
+                "hash-quality",
+            )],
+            Vec::new(),
+        );
+
+        let summary = qdrant_verify_all_summary("repo", vec![fast.clone(), quality]);
+
+        assert_eq!(summary.semantic_layer, "all");
+        assert_eq!(summary.expected_vector_points, 2);
+        assert_eq!(summary.missing_points, 1);
+        assert_eq!(summary.layer_summaries.len(), 2);
+        assert_eq!(summary.layer_summaries[0].semantic_layer, "fast");
+        assert_eq!(summary.layer_summaries[0].missing_points, 0);
+        assert_eq!(summary.layer_summaries[1].semantic_layer, "quality");
+        assert_eq!(summary.layer_summaries[1].missing_points, 1);
     }
 
     #[test]

@@ -14,9 +14,10 @@ use symdex_index::{
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
-    ImpactSummary, QdrantVerifySummary, run_call_graph, run_call_path, run_context_pack,
-    run_debug_context_pack, run_freshness_report, run_impact, run_qdrant_verify,
-    run_semantic_search, run_symbol_search, run_unified_context_pack,
+    ImpactSummary, QdrantVerifyOptions, QdrantVerifySemanticLayer, QdrantVerifySummary,
+    run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_freshness_report,
+    run_impact, run_qdrant_verify_with_options, run_semantic_search, run_symbol_search,
+    run_unified_context_pack,
 };
 use symdex_store::{EvidenceFreshness, QdrantClient, SqliteStore, StoreConfig, sqlite_parent};
 
@@ -67,13 +68,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "qdrant-verify" => {
             require_text_output(command, output)?;
-            let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            qdrant_verify(repo)
+            let verify_args = parse_qdrant_maintenance_args(&args[1..])?;
+            qdrant_verify(&verify_args)
         }
         "qdrant-repair" => {
             require_text_output(command, output)?;
-            let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            qdrant_repair(repo)
+            let repair_args = parse_qdrant_maintenance_args(&args[1..])?;
+            qdrant_repair(&repair_args)
         }
         "symbol" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -294,39 +295,83 @@ fn staleness(repo: &str, symbol_query: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn qdrant_verify(repo: &str) -> Result<(), String> {
-    let summary = run_qdrant_verify(repo)?;
+fn qdrant_verify(args: &QdrantMaintenanceArgs) -> Result<(), String> {
+    let summary = run_qdrant_verify_with_options(
+        &args.repo,
+        QdrantVerifyOptions {
+            semantic_layer: args.semantic_layer,
+        },
+    )?;
     print_qdrant_verify_summary(&summary);
     Ok(())
 }
 
-fn qdrant_repair(repo: &str) -> Result<(), String> {
-    let before = run_qdrant_verify(repo)?;
+fn qdrant_repair(args: &QdrantMaintenanceArgs) -> Result<(), String> {
+    let options = QdrantVerifyOptions {
+        semantic_layer: args.semantic_layer,
+    };
+    let before = run_qdrant_verify_with_options(&args.repo, options)?;
     println!("pre_repair_verify:");
     print_qdrant_verify_summary(&before);
 
     let orphaned_points_deleted = delete_orphaned_qdrant_points(&before)?;
     println!("orphaned_points_deleted: {orphaned_points_deleted}");
 
-    let reindex_required = before.missing_points > 0 || before.stale_payload_points > 0;
-    if reindex_required {
-        println!("semantic_reindex: started");
-        let index_summary = run_index(&IndexOptions {
-            repo: repo.to_owned(),
-            offline: false,
-        })?;
-        print_index_summary(&index_summary);
-    } else {
-        println!("semantic_reindex: skipped");
-    }
+    repair_qdrant_summary(&args.repo, &before)?;
 
-    let after = run_qdrant_verify(repo)?;
+    let after = run_qdrant_verify_with_options(&args.repo, options)?;
     println!("post_repair_verify:");
     print_qdrant_verify_summary(&after);
     Ok(())
 }
 
+fn repair_qdrant_summary(repo: &str, summary: &QdrantVerifySummary) -> Result<(), String> {
+    if !summary.layer_summaries.is_empty() {
+        for layer_summary in &summary.layer_summaries {
+            repair_qdrant_summary(repo, layer_summary)?;
+        }
+        return Ok(());
+    }
+
+    let reindex_required = summary.missing_points > 0 || summary.stale_payload_points > 0;
+    if !reindex_required {
+        println!(
+            "semantic_repair layer={} action=skipped",
+            summary.semantic_layer
+        );
+        return Ok(());
+    }
+
+    match QdrantVerifySemanticLayer::parse(&summary.semantic_layer)? {
+        QdrantVerifySemanticLayer::Fast => {
+            println!("semantic_repair layer=fast action=reindex_started");
+            let index_summary = run_index(&IndexOptions {
+                repo: repo.to_owned(),
+                offline: false,
+            })?;
+            print_index_summary(&index_summary);
+        }
+        QdrantVerifySemanticLayer::Quality => {
+            println!("semantic_repair layer=quality action=quality_worker_started");
+            let quality_summary = run_quality_index(&QualityIndexOptions {
+                repo: repo.to_owned(),
+            })?;
+            print_quality_index_summary(&quality_summary);
+        }
+        QdrantVerifySemanticLayer::All => {}
+    }
+    Ok(())
+}
+
 fn delete_orphaned_qdrant_points(summary: &QdrantVerifySummary) -> Result<usize, String> {
+    if !summary.layer_summaries.is_empty() {
+        return summary
+            .layer_summaries
+            .iter()
+            .try_fold(0usize, |deleted, layer_summary| {
+                Ok(deleted + delete_orphaned_qdrant_points(layer_summary)?)
+            });
+    }
     if !summary.collection_exists || summary.orphaned_point_ids.is_empty() {
         return Ok(0);
     }
@@ -578,18 +623,36 @@ fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
 }
 
 fn print_qdrant_verify_summary(summary: &QdrantVerifySummary) {
-    println!("repository_id: {}", summary.repository_id);
-    println!("collection: {}", summary.collection_name);
-    println!("embedding_model: {}", summary.embedding_model);
-    println!("collection_exists: {}", summary.collection_exists);
-    println!("expected_vector_points: {}", summary.expected_vector_points);
-    println!("qdrant_payload_points: {}", summary.qdrant_payload_points);
-    println!("missing_points: {}", summary.missing_points);
-    println!("stale_payload_points: {}", summary.stale_payload_points);
-    println!("orphaned_points: {}", summary.orphaned_points);
+    print_qdrant_verify_summary_with_prefix(summary, "");
+    for layer_summary in &summary.layer_summaries {
+        println!("layer_summary: {}", layer_summary.semantic_layer);
+        print_qdrant_verify_summary_with_prefix(layer_summary, "  ");
+    }
+}
+
+fn print_qdrant_verify_summary_with_prefix(summary: &QdrantVerifySummary, prefix: &str) {
+    println!("{prefix}repository_id: {}", summary.repository_id);
+    println!("{prefix}semantic_layer: {}", summary.semantic_layer);
+    println!("{prefix}collection: {}", summary.collection_name);
+    println!("{prefix}embedding_model: {}", summary.embedding_model);
+    println!("{prefix}collection_exists: {}", summary.collection_exists);
+    println!(
+        "{prefix}expected_vector_points: {}",
+        summary.expected_vector_points
+    );
+    println!(
+        "{prefix}qdrant_payload_points: {}",
+        summary.qdrant_payload_points
+    );
+    println!("{prefix}missing_points: {}", summary.missing_points);
+    println!(
+        "{prefix}stale_payload_points: {}",
+        summary.stale_payload_points
+    );
+    println!("{prefix}orphaned_points: {}", summary.orphaned_points);
     for row in &summary.rows {
         println!(
-            "{} {} {}",
+            "{prefix}{} {} {}",
             storage_health_status_label(row.status),
             row.label,
             row.detail
@@ -1001,10 +1064,49 @@ fn parse_context_pack_args(args: &[String]) -> Result<ContextPackArgs, String> {
     })
 }
 
+fn parse_qdrant_maintenance_args(args: &[String]) -> Result<QdrantMaintenanceArgs, String> {
+    let mut positional = Vec::new();
+    let mut semantic_layer = QdrantVerifySemanticLayer::Fast;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--semantic-layer" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err("--semantic-layer requires a value".to_owned());
+            };
+            semantic_layer = QdrantVerifySemanticLayer::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--semantic-layer=") {
+            semantic_layer = QdrantVerifySemanticLayer::parse(value)?;
+        } else if arg == "--all-semantic-layers" {
+            semantic_layer = QdrantVerifySemanticLayer::All;
+        } else if arg.starts_with("--") {
+            return Err(format!("unsupported qdrant maintenance option `{arg}`"));
+        } else {
+            positional.push(arg.clone());
+        }
+        index += 1;
+    }
+
+    Ok(QdrantMaintenanceArgs {
+        repo: positional
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ".".to_owned()),
+        semantic_layer,
+    })
+}
+
 struct IndexArgs {
     repo: String,
     offline: bool,
     watch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QdrantMaintenanceArgs {
+    repo: String,
+    semantic_layer: QdrantVerifySemanticLayer,
 }
 
 struct ContextPackArgs {
@@ -1142,7 +1244,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1150,8 +1252,8 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextPackMode, OutputMode, parse_cli_invocation, parse_context_pack_args,
-        require_text_output,
+        ContextPackMode, OutputMode, QdrantVerifySemanticLayer, parse_cli_invocation,
+        parse_context_pack_args, parse_qdrant_maintenance_args, require_text_output,
     };
 
     #[test]
@@ -1210,6 +1312,37 @@ mod tests {
             .expect("context-pack args should parse");
 
         assert_eq!(args.mode, ContextPackMode::Structural);
+    }
+
+    #[test]
+    fn qdrant_maintenance_args_parse_semantic_layer_flag() {
+        let args = parse_qdrant_maintenance_args(&[
+            "repo".to_owned(),
+            "--semantic-layer".to_owned(),
+            "quality".to_owned(),
+        ])
+        .expect("qdrant args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.semantic_layer, QdrantVerifySemanticLayer::Quality);
+    }
+
+    #[test]
+    fn qdrant_maintenance_args_parse_all_alias() {
+        let args =
+            parse_qdrant_maintenance_args(&["--semantic-layer=all".to_owned(), "repo".to_owned()])
+                .expect("qdrant args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.semantic_layer, QdrantVerifySemanticLayer::All);
+    }
+
+    #[test]
+    fn qdrant_maintenance_args_reject_unknown_option() {
+        let error = parse_qdrant_maintenance_args(&["--bad".to_owned()])
+            .expect_err("unknown qdrant option should fail");
+
+        assert!(error.contains("unsupported qdrant maintenance option"));
     }
 
     #[test]

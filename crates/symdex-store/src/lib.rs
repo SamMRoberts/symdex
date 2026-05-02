@@ -480,6 +480,50 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn qdrant_expected_points_for_generation_layer(
+        &self,
+        repository_id: &str,
+        generation_id: &str,
+        semantic_layer: SemanticLayer,
+    ) -> Result<Vec<QdrantExpectedPoint>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT chunk_embeddings.qdrant_point_id, chunks.id, files.path,
+                        chunks.start_line, chunks.end_line, chunk_embeddings.text_hash,
+                        chunk_embeddings.embedding_model, chunk_embeddings.embedding_dimension
+                 FROM chunk_embeddings
+                 JOIN chunks ON chunk_embeddings.chunk_id = chunks.id
+                 JOIN files ON chunk_embeddings.file_id = files.id
+                           AND chunks.file_id = files.id
+                 WHERE chunk_embeddings.repository_id = ?1
+                   AND files.repository_id = ?1
+                   AND chunk_embeddings.generation_id = ?2
+                   AND chunk_embeddings.semantic_layer = ?3
+                   AND chunk_embeddings.status = 'current'
+                 ORDER BY files.path, chunks.start_line, chunks.id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, generation_id, semantic_layer.as_str()],
+                |row| {
+                    Ok(QdrantExpectedPoint {
+                        qdrant_point_id: row.get(0)?,
+                        chunk_id: row.get(1)?,
+                        path: row.get(2)?,
+                        start_line: row.get::<_, i64>(3)? as usize,
+                        end_line: row.get::<_, i64>(4)? as usize,
+                        text_hash: row.get(5)?,
+                        embedding_model: Some(row.get(6)?),
+                        embedding_dimension: Some(row.get::<_, i64>(7)? as usize),
+                    })
+                },
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn repository_status(&self, repository_id: &str) -> Result<RepositoryStatus> {
         let files_indexed: usize = self
             .connection
@@ -6664,6 +6708,100 @@ mod tests {
             Some("nomic-embed-text")
         );
         assert_eq!(manifest[0].embedding_dimension, Some(768));
+    }
+
+    #[test]
+    fn sqlite_builds_layered_qdrant_expected_point_manifest() {
+        let db = TestDb::new("layered-qdrant-expected-points");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
+            .expect("quality embedding should persist");
+
+        let fast = store
+            .qdrant_expected_points_for_generation_layer(
+                "repo",
+                "generation-1",
+                SemanticLayer::Fast,
+            )
+            .expect("fast manifest should load");
+        let quality = store
+            .qdrant_expected_points_for_generation_layer(
+                "repo",
+                "generation-1",
+                SemanticLayer::Quality,
+            )
+            .expect("quality manifest should load");
+
+        assert_eq!(fast.len(), 1);
+        assert_eq!(fast[0].embedding_model.as_deref(), Some("nomic-embed-text"));
+        assert_eq!(quality.len(), 1);
+        assert_eq!(
+            quality[0].embedding_model.as_deref(),
+            Some("nomic-embed-text-v2-moe")
+        );
+        assert_eq!(
+            quality[0].qdrant_point_id,
+            "01234567-89ab-cdef-fedc-ba9876543211"
+        );
+    }
+
+    #[test]
+    fn sqlite_layered_qdrant_manifest_uses_current_embeddings_only() {
+        let db = TestDb::new("layered-qdrant-current-only");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_quality_chunk_embedding("stale"))
+            .expect("stale quality embedding should persist");
+
+        let quality = store
+            .qdrant_expected_points_for_generation_layer(
+                "repo",
+                "generation-1",
+                SemanticLayer::Quality,
+            )
+            .expect("quality manifest should load");
+
+        assert!(quality.is_empty());
     }
 
     #[test]

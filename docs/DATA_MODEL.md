@@ -261,6 +261,11 @@ dimension, generation, collection, and point ID so the two layers do not share
 one Qdrant collection. `status` is metadata-only and currently supports
 `current`, `stale`, `blocked`, and `failed`.
 
+Layer-aware Qdrant verification builds expected fast and quality point manifests
+from `current` rows in this table for the latest semantic generation. The older
+`chunks.qdrant_point_id` fields remain a fast-layer compatibility fallback for
+single-model indexes that predate layered manifests.
+
 ### `quality_embedding_jobs`
 
 ```sql

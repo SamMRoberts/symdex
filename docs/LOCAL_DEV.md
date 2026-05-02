@@ -152,14 +152,18 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   current eligible files for implemented languages and reports fresh, stale,
   deleted, missing, and unknown evidence states. With a symbol query, the report
   is scoped to files involved in the matching symbols and compact context pack.
-- `qdrant-verify <repo>`: compares SQLite vector-backed chunk metadata against
-  live Qdrant point payloads for the configured embedding model. It reports
-  missing collections, missing points, stale payload metadata, and orphaned
-  points without printing source text or vectors.
-- `qdrant-repair <repo>`: runs the same verification first, deletes orphaned
-  Qdrant points, then runs semantic indexing when missing collections, missing
-  points, stale payload fields, model drift, or dimension drift require vectors
-  to be rebuilt. It finishes with a second verification report.
+- `qdrant-verify <repo>`: compares SQLite vector metadata with Qdrant payloads
+  for the selected semantic layer and reports missing, stale, or orphaned
+  points without returning source text. Use `--semantic-layer fast`,
+  `--semantic-layer quality`, or `--semantic-layer all` to verify the fast and
+  quality collections independently. Fast verification falls back to legacy
+  `chunks.qdrant_point_id` metadata for older single-model indexes when no
+  layered fast manifest exists.
+- `qdrant-repair <repo>`: deletes Qdrant orphan points, then re-runs semantic
+  indexing when missing or stale fast vector metadata requires rebuilding
+  points. With `--semantic-layer quality`, repair runs the quality worker path
+  instead so hash verification, quality job state, and activation refresh remain
+  centralized.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
   name and returns path, line ranges, and provenance metadata.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct
