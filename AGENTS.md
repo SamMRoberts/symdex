@@ -141,3 +141,6 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Mention anything unverified.
 - Call out risky assumptions.
 - Leave the repo easier to understand than you found it.
+
+## Troubleshooting
+- Utilize the symdex mcp tools to assist with debugging.
