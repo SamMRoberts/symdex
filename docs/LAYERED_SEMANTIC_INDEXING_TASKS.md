@@ -236,6 +236,11 @@ Acceptance:
 
 Goal: make active layer and quality readiness visible to users and agents.
 
+Implementation note: Slice 10 adds a shared query-layer semantic status summary
+and exposes it through `symdex semantic-status <repo>`, compact TUI Overview
+rows, and additive MCP `symdex_search` metadata. MCP search now uses the routed
+query-layer semantic search path instead of a separate fast-model-only path.
+
 Tasks:
 
 - Add semantic status summary API.

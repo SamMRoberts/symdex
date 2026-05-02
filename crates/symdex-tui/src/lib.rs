@@ -18,7 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::widgets::{Cell, Row, Table, TableState};
-use symdex_core::RepoRoot;
+use symdex_core::{RepoRoot, SemanticLayer, SemanticLayerStatus};
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
 use symdex_index::{
@@ -28,11 +28,12 @@ use symdex_index::{
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
-    ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary, SymbolSearchSummary,
-    run_call_graph, run_call_path, run_call_resolution, run_context_pack, run_cross_store_health,
-    run_debug_context_pack, run_embedding_coverage, run_freshness_report, run_impact,
-    run_index_coverage, run_index_runs_timeline, run_semantic_neighborhood, run_semantic_search,
-    run_storage_explorer, run_symbol_outline, run_symbol_search,
+    ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary, SemanticStatusLayerSummary,
+    SemanticStatusSummary, SymbolSearchSummary, run_call_graph, run_call_path, run_call_resolution,
+    run_context_pack, run_cross_store_health, run_debug_context_pack, run_embedding_coverage,
+    run_freshness_report, run_impact, run_index_coverage, run_index_runs_timeline,
+    run_semantic_neighborhood, run_semantic_search, run_semantic_status, run_storage_explorer,
+    run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
@@ -67,6 +68,7 @@ pub struct App {
     ollama_url: String,
     embed_model: String,
     status: RepositoryStatus,
+    semantic_status: SemanticStatusSummary,
     message: String,
     view: View,
     screen: Screen,
@@ -126,6 +128,7 @@ impl App {
         let cross_store_health = sqlite
             .cross_store_health_summary(root.id(), &embed_config.model)
             .map_err(|error| error.to_string())?;
+        let semantic_status = run_semantic_status(repo)?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -136,6 +139,7 @@ impl App {
             ollama_url: embed_config.ollama_url,
             embed_model: embed_config.model,
             status,
+            semantic_status,
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
@@ -188,6 +192,7 @@ impl App {
         let semantic_neighborhood =
             semantic_neighborhood_summary_from_status(&repository_id, &status);
         let cross_store_health = cross_store_health_summary_from_status(&repository_id, &status);
+        let semantic_status = semantic_status_summary_from_status(&repository_id, &status);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -197,6 +202,7 @@ impl App {
             ollama_url: "http://localhost:11434".to_owned(),
             embed_model: "nomic-embed-text".to_owned(),
             status,
+            semantic_status,
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
@@ -1749,6 +1755,18 @@ fn render_repository_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, a
             status_span("ollama", StatusTone::Success),
             Span::raw(" local"),
         ]),
+        Line::from(vec![
+            Span::styled("semantic ", metadata_style()),
+            status_span(
+                app.semantic_status.active_layer.as_str(),
+                semantic_status_tone(&app.semantic_status),
+            ),
+            Span::raw(" quality "),
+            status_span(
+                app.semantic_status.quality_status.as_str(),
+                semantic_quality_tone(&app.semantic_status),
+            ),
+        ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
@@ -1801,6 +1819,21 @@ fn render_overview_focus_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
                 },
             ),
             (
+                "layer",
+                app.semantic_status.active_layer.as_str().to_owned(),
+                semantic_status_tone(&app.semantic_status),
+            ),
+            (
+                "quality",
+                app.semantic_status.quality_status.as_str().to_owned(),
+                semantic_quality_tone(&app.semantic_status),
+            ),
+            (
+                "qjobs",
+                semantic_quality_jobs(&app.semantic_status),
+                semantic_quality_tone(&app.semantic_status),
+            ),
+            (
                 "watch",
                 app.continuous.summary(),
                 app.continuous.status_tone(),
@@ -1847,6 +1880,22 @@ fn render_overview_focus_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
             Cell::from("Storage"),
             Cell::from(app.storage.mode.label()),
             Cell::from(status_span("loaded", StatusTone::Success)),
+        ]),
+        Row::new(vec![
+            Cell::from("Semantic"),
+            Cell::from(semantic_status_mode(&app.semantic_status)),
+            Cell::from(status_span(
+                semantic_status_state(&app.semantic_status),
+                semantic_status_tone(&app.semantic_status),
+            )),
+        ]),
+        Row::new(vec![
+            Cell::from("QJobs"),
+            Cell::from(semantic_quality_jobs(&app.semantic_status)),
+            Cell::from(status_span(
+                semantic_fallback_state(&app.semantic_status),
+                semantic_quality_tone(&app.semantic_status),
+            )),
         ]),
         Row::new(vec![
             Cell::from("Query"),
@@ -2302,6 +2351,146 @@ fn index_embedding_status_span(status: &RepositoryStatus) -> Span<'static> {
         status_span("ready", StatusTone::Success)
     } else {
         status_span("none", StatusTone::Warning)
+    }
+}
+
+fn semantic_status_tone(summary: &SemanticStatusSummary) -> StatusTone {
+    match summary.quality_status {
+        SemanticLayerStatus::QualityBlocked | SemanticLayerStatus::QualityFailed => {
+            StatusTone::Error
+        }
+        SemanticLayerStatus::QualityPending
+        | SemanticLayerStatus::QualityStale
+        | SemanticLayerStatus::Missing => StatusTone::Warning,
+        SemanticLayerStatus::QualityReady if summary.active_layer == SemanticLayer::Quality => {
+            StatusTone::Success
+        }
+        SemanticLayerStatus::QualityReady => StatusTone::Warning,
+        SemanticLayerStatus::FastReady => StatusTone::Success,
+    }
+}
+
+fn semantic_quality_tone(summary: &SemanticStatusSummary) -> StatusTone {
+    match summary.quality_status {
+        SemanticLayerStatus::QualityReady => StatusTone::Success,
+        SemanticLayerStatus::QualityBlocked | SemanticLayerStatus::QualityFailed => {
+            StatusTone::Error
+        }
+        SemanticLayerStatus::FastReady => StatusTone::Dim,
+        SemanticLayerStatus::Missing
+        | SemanticLayerStatus::QualityPending
+        | SemanticLayerStatus::QualityStale => StatusTone::Warning,
+    }
+}
+
+fn semantic_status_mode(summary: &SemanticStatusSummary) -> String {
+    format!(
+        "{} {}",
+        summary.active_layer.as_str(),
+        summary.quality_status.as_str()
+    )
+}
+
+fn semantic_status_state(summary: &SemanticStatusSummary) -> &'static str {
+    if summary.fallback_reason.is_some() {
+        "fallback"
+    } else if summary.active_layer == SemanticLayer::Quality {
+        "quality"
+    } else {
+        "fast"
+    }
+}
+
+fn semantic_fallback_state(summary: &SemanticStatusSummary) -> &'static str {
+    if summary.latest_quality_error.is_some() {
+        "error"
+    } else if summary.fallback_reason.is_some() {
+        "fallback"
+    } else {
+        "ready"
+    }
+}
+
+fn semantic_quality_jobs(summary: &SemanticStatusSummary) -> String {
+    match &summary.quality_progress {
+        Some(progress) => format!(
+            "{}/{}/{}/{}",
+            progress.pending_jobs,
+            progress.running_jobs,
+            progress.failed_jobs,
+            progress.skipped_stale_jobs
+        ),
+        None => "<none>".to_owned(),
+    }
+}
+
+fn semantic_status_summary_from_status(
+    repository_id: &str,
+    status: &RepositoryStatus,
+) -> SemanticStatusSummary {
+    let fast_model = status
+        .embedding_model
+        .as_deref()
+        .unwrap_or("nomic-embed-text")
+        .to_owned();
+    let generation_id = status
+        .embedding_model
+        .as_ref()
+        .map(|_| "sample-generation".to_owned());
+    let quality_status = if status.embedding_model.is_some() {
+        SemanticLayerStatus::FastReady
+    } else {
+        SemanticLayerStatus::Missing
+    };
+    SemanticStatusSummary {
+        repository_id: repository_id.to_owned(),
+        generation_id,
+        active_layer: SemanticLayer::Fast,
+        quality_status,
+        fallback_reason: if status.embedding_model.is_some() {
+            None
+        } else {
+            Some("semantic_generation_missing_using_fast_layer".to_owned())
+        },
+        fast: SemanticStatusLayerSummary {
+            semantic_layer: SemanticLayer::Fast,
+            embedding_model: fast_model.clone(),
+            embedding_dimension: status.embedding_dimension,
+            qdrant_collection: qdrant_collection_name(repository_id, &fast_model),
+            current_chunks: if status.embedding_model.is_some() {
+                status.chunks_indexed
+            } else {
+                0
+            },
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: if status.embedding_model.is_some() {
+                status.chunks_indexed
+            } else {
+                0
+            },
+            expected_chunks: status.chunks_indexed,
+            is_complete: status.embedding_model.is_some(),
+        },
+        quality: SemanticStatusLayerSummary {
+            semantic_layer: SemanticLayer::Quality,
+            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
+            embedding_dimension: None,
+            qdrant_collection: qdrant_collection_name(repository_id, "nomic-embed-text-v2-moe"),
+            current_chunks: 0,
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 0,
+            expected_chunks: status.chunks_indexed,
+            is_complete: false,
+        },
+        quality_progress: None,
+        latest_quality_error: None,
+        quality_enabled: true,
     }
 }
 
@@ -3037,9 +3226,17 @@ fn local_services_table(app: &App) -> Table<'_> {
             Cell::from(index_embedding(&app.status)),
         ]),
         Row::new(vec![
-            Cell::from("Model"),
-            Cell::from(status_span("cfg", StatusTone::Info)),
-            Cell::from(app.embed_model.as_str()),
+            Cell::from("Semantic"),
+            Cell::from(status_span(
+                app.semantic_status.active_layer.as_str(),
+                semantic_status_tone(&app.semantic_status),
+            )),
+            Cell::from(format!(
+                "model={} quality={} qjobs={}",
+                app.embed_model.as_str(),
+                app.semantic_status.quality_status.as_str(),
+                semantic_quality_jobs(&app.semantic_status)
+            )),
         ]),
     ];
 
@@ -5750,6 +5947,21 @@ mod tests {
         assert!(rendered.contains("Mode Snapshot"));
         assert!(rendered.contains("nomic-embed-text"));
         assert_eq!(cell_fg_for_text(buffer, "ready", None), Some(Color::Green));
+    }
+
+    #[test]
+    fn renders_dashboard_semantic_status() {
+        let app = App::from_status("/tmp/repo", "repo", sample_status());
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Semantic"));
+        assert!(rendered.contains("fast_ready"));
+        assert!(rendered.contains("QJobs"));
     }
 
     #[test]

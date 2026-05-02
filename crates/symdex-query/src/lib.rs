@@ -14,10 +14,10 @@ use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
     IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, QdrantExpectedPoint,
-    RetrievedPoint, ScoredPoint, SemanticLayerManifestSummary, SemanticNeighborhoodSummary,
-    SemanticRoutingSummary, SqliteStore, StorageExplorerSummary, StorageHealthRow,
-    StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow, TestSearchRow,
-    clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
+    QualityGenerationProgress, RetrievedPoint, ScoredPoint, SemanticLayerManifestSummary,
+    SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore, StorageExplorerSummary,
+    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
+    TestSearchRow, clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +188,36 @@ pub struct SemanticSearchResult {
     pub text_hash: String,
     pub provenance: EvidenceProvenance,
     pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticStatusSummary {
+    pub repository_id: String,
+    pub generation_id: Option<String>,
+    pub active_layer: SemanticLayer,
+    pub quality_status: SemanticLayerStatus,
+    pub fallback_reason: Option<String>,
+    pub fast: SemanticStatusLayerSummary,
+    pub quality: SemanticStatusLayerSummary,
+    pub quality_progress: Option<QualityGenerationProgress>,
+    pub latest_quality_error: Option<String>,
+    pub quality_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticStatusLayerSummary {
+    pub semantic_layer: SemanticLayer,
+    pub embedding_model: String,
+    pub embedding_dimension: Option<usize>,
+    pub qdrant_collection: String,
+    pub current_chunks: usize,
+    pub stale_chunks: usize,
+    pub blocked_chunks: usize,
+    pub failed_chunks: usize,
+    pub other_chunks: usize,
+    pub total_chunks: usize,
+    pub expected_chunks: usize,
+    pub is_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1426,6 +1456,150 @@ pub fn run_semantic_search(
     run_semantic_search_with_options(repo, query, limit, SemanticSearchOptions::default())
 }
 
+pub fn run_semantic_status(repo: &str) -> Result<SemanticStatusSummary, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let layered_config = LayeredEmbedConfig::from_env();
+    let store_config = StoreConfig::from_env();
+    let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let routing = sqlite
+        .semantic_routing_summary(root.id())
+        .map_err(|error| error.to_string())?;
+    let quality_progress = match routing.as_ref() {
+        Some(summary) => Some(
+            sqlite
+                .quality_generation_progress(root.id(), &summary.generation_id)
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    let latest_quality_error = match routing.as_ref() {
+        Some(summary) => sqlite
+            .latest_quality_generation_error(root.id(), &summary.generation_id)
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    Ok(semantic_status_from_routing(
+        root.id(),
+        routing,
+        quality_progress,
+        latest_quality_error,
+        &layered_config,
+    ))
+}
+
+fn semantic_status_from_routing(
+    repository_id: &str,
+    routing: Option<SemanticRoutingSummary>,
+    quality_progress: Option<QualityGenerationProgress>,
+    latest_quality_error: Option<String>,
+    layered_config: &LayeredEmbedConfig,
+) -> SemanticStatusSummary {
+    let target = resolve_semantic_search_target(
+        repository_id,
+        SemanticSearchOptions::default(),
+        routing.as_ref(),
+        layered_config,
+    )
+    .expect("auto semantic status target should always resolve");
+    let fast_config = layered_config.fast_embed_config();
+    let quality_config = layered_config.quality_embed_config();
+    let quality_enabled = layered_config.quality_enabled;
+
+    match routing {
+        Some(summary) => {
+            let expected_chunks = summary.embeddable_chunks;
+            let fast = SemanticStatusLayerSummary::from_manifest(&summary.fast);
+            let quality = summary
+                .quality
+                .as_ref()
+                .map(SemanticStatusLayerSummary::from_manifest)
+                .unwrap_or_else(|| {
+                    SemanticStatusLayerSummary::configured(
+                        repository_id,
+                        SemanticLayer::Quality,
+                        quality_config.model.clone(),
+                        expected_chunks,
+                    )
+                });
+            SemanticStatusSummary {
+                repository_id: summary.repository_id,
+                generation_id: Some(summary.generation_id),
+                active_layer: target.semantic_layer,
+                quality_status: target.quality_status,
+                fallback_reason: target.fallback_reason,
+                fast,
+                quality,
+                quality_progress,
+                latest_quality_error,
+                quality_enabled,
+            }
+        }
+        None => SemanticStatusSummary {
+            repository_id: repository_id.to_owned(),
+            generation_id: None,
+            active_layer: target.semantic_layer,
+            quality_status: target.quality_status,
+            fallback_reason: target.fallback_reason,
+            fast: SemanticStatusLayerSummary::configured(
+                repository_id,
+                SemanticLayer::Fast,
+                fast_config.model,
+                0,
+            ),
+            quality: SemanticStatusLayerSummary::configured(
+                repository_id,
+                SemanticLayer::Quality,
+                quality_config.model,
+                0,
+            ),
+            quality_progress: None,
+            latest_quality_error: None,
+            quality_enabled,
+        },
+    }
+}
+
+impl SemanticStatusLayerSummary {
+    fn from_manifest(manifest: &SemanticLayerManifestSummary) -> Self {
+        Self {
+            semantic_layer: manifest.semantic_layer,
+            embedding_model: manifest.embedding_model.clone(),
+            embedding_dimension: Some(manifest.embedding_dimension),
+            qdrant_collection: manifest.qdrant_collection.clone(),
+            current_chunks: manifest.current_chunks,
+            stale_chunks: manifest.stale_chunks,
+            blocked_chunks: manifest.blocked_chunks,
+            failed_chunks: manifest.failed_chunks,
+            other_chunks: manifest.other_chunks,
+            total_chunks: manifest.total_chunks,
+            expected_chunks: manifest.expected_chunks,
+            is_complete: manifest.is_complete,
+        }
+    }
+
+    fn configured(
+        repository_id: &str,
+        semantic_layer: SemanticLayer,
+        embedding_model: String,
+        expected_chunks: usize,
+    ) -> Self {
+        Self {
+            semantic_layer,
+            qdrant_collection: qdrant_collection_name(repository_id, &embedding_model),
+            embedding_model,
+            embedding_dimension: None,
+            current_chunks: 0,
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 0,
+            expected_chunks,
+            is_complete: false,
+        }
+    }
+}
+
 pub fn run_semantic_search_with_options(
     repo: &str,
     query: &str,
@@ -1580,13 +1754,34 @@ fn resolve_auto_semantic_target(
         }
     }
 
+    let fallback_reason = auto_fast_fallback_reason(summary);
     Ok(resolve_fast_semantic_target(
         repository_id,
         SemanticLayerMode::Auto,
         Some(summary),
         layered_config,
-        None,
+        fallback_reason,
     ))
+}
+
+fn auto_fast_fallback_reason(summary: &SemanticRoutingSummary) -> Option<String> {
+    match summary.quality_status {
+        SemanticLayerStatus::FastReady => None,
+        SemanticLayerStatus::QualityReady if summary.active_layer == SemanticLayer::Quality => None,
+        SemanticLayerStatus::QualityReady => {
+            Some("quality_ready_not_active_using_fast_layer".to_owned())
+        }
+        _ => match summary.quality.as_ref() {
+            Some(quality) if !quality.is_complete => {
+                Some("quality_manifest_incomplete_using_fast_layer".to_owned())
+            }
+            None => Some("quality_manifest_missing_using_fast_layer".to_owned()),
+            Some(_) => Some(format!(
+                "quality_status_{}_using_fast_layer",
+                summary.quality_status.as_str()
+            )),
+        },
+    }
 }
 
 fn resolve_fast_semantic_target(
@@ -3106,8 +3301,9 @@ mod tests {
         parse_runtime_input, qdrant_verify_all_summary, qdrant_verify_summary,
         resolve_semantic_search_target, run_call_graph, run_call_path, run_context_pack,
         run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
-        semantic_reasons, semantic_result_from_point,
+        semantic_reasons, semantic_result_from_point, semantic_status_from_routing,
     };
+    use symdex_store::QualityGenerationProgress;
 
     #[test]
     fn query_mode_toggles_between_workbench_modes() {
@@ -3200,6 +3396,101 @@ mod tests {
             target.fallback_reason.as_deref(),
             Some("quality_manifest_incomplete_using_fast_layer")
         );
+    }
+
+    #[test]
+    fn semantic_routing_auto_reports_active_fast_quality_fallback_reason() {
+        let routing = sample_routing_summary(
+            SemanticLayer::Fast,
+            SemanticLayerStatus::QualityPending,
+            Some(sample_manifest(SemanticLayer::Quality, false)),
+        );
+
+        let target = resolve_semantic_search_target(
+            "repo",
+            SemanticSearchOptions::default(),
+            Some(&routing),
+            &sample_layered_config(),
+        )
+        .expect("target should resolve");
+
+        assert_eq!(target.semantic_layer, SemanticLayer::Fast);
+        assert_eq!(
+            target.fallback_reason.as_deref(),
+            Some("quality_manifest_incomplete_using_fast_layer")
+        );
+    }
+
+    #[test]
+    fn semantic_status_defaults_to_fast_without_generation() {
+        let status =
+            semantic_status_from_routing("repo", None, None, None, &sample_layered_config());
+
+        assert_eq!(status.repository_id, "repo");
+        assert_eq!(status.generation_id, None);
+        assert_eq!(status.active_layer, SemanticLayer::Fast);
+        assert_eq!(status.quality_status, SemanticLayerStatus::Missing);
+        assert_eq!(status.fast.embedding_model, "fast-model");
+        assert_eq!(status.fast.embedding_dimension, None);
+        assert_eq!(status.quality.embedding_model, "quality-model");
+        assert_eq!(status.quality_progress, None);
+        assert_eq!(
+            status.fallback_reason.as_deref(),
+            Some("semantic_generation_missing_using_fast_layer")
+        );
+    }
+
+    #[test]
+    fn semantic_status_reports_pending_quality_progress_and_error() {
+        let routing = sample_routing_summary(
+            SemanticLayer::Fast,
+            SemanticLayerStatus::QualityFailed,
+            Some(sample_manifest(SemanticLayer::Quality, false)),
+        );
+        let progress = sample_quality_progress(0, 1, 0, 1);
+        let status = semantic_status_from_routing(
+            "repo",
+            Some(routing),
+            Some(progress.clone()),
+            Some("service unavailable".to_owned()),
+            &sample_layered_config(),
+        );
+
+        assert_eq!(status.generation_id.as_deref(), Some("generation-1"));
+        assert_eq!(status.active_layer, SemanticLayer::Fast);
+        assert_eq!(status.quality_status, SemanticLayerStatus::QualityFailed);
+        assert_eq!(status.quality_progress, Some(progress));
+        assert_eq!(
+            status.latest_quality_error.as_deref(),
+            Some("service unavailable")
+        );
+        assert_eq!(
+            status.fallback_reason.as_deref(),
+            Some("quality_manifest_incomplete_using_fast_layer")
+        );
+    }
+
+    #[test]
+    fn semantic_status_reports_ready_quality_without_fallback() {
+        let routing = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+        let progress = sample_quality_progress(1, 0, 0, 0);
+        let status = semantic_status_from_routing(
+            "repo",
+            Some(routing),
+            Some(progress),
+            None,
+            &sample_layered_config(),
+        );
+
+        assert_eq!(status.active_layer, SemanticLayer::Quality);
+        assert_eq!(status.quality_status, SemanticLayerStatus::QualityReady);
+        assert_eq!(status.fallback_reason, None);
+        assert_eq!(status.quality.current_chunks, 1);
+        assert!(status.quality.is_complete);
     }
 
     #[test]
@@ -4172,6 +4463,26 @@ mod tests {
             total_chunks: 1,
             expected_chunks: 1,
             is_complete,
+        }
+    }
+
+    fn sample_quality_progress(
+        quality_embedded_chunks: usize,
+        pending_jobs: usize,
+        running_jobs: usize,
+        failed_jobs: usize,
+    ) -> QualityGenerationProgress {
+        QualityGenerationProgress {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            embeddable_chunks: 1,
+            quality_embedded_chunks,
+            pending_jobs,
+            running_jobs,
+            succeeded_jobs: quality_embedded_chunks,
+            failed_jobs,
+            skipped_stale_jobs: 0,
+            skipped_excluded_jobs: 0,
         }
     }
 

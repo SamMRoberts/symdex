@@ -1524,6 +1524,27 @@ impl SqliteStore {
         Ok(progress)
     }
 
+    pub fn latest_quality_generation_error(
+        &self,
+        repository_id: &str,
+        generation_id: &str,
+    ) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT error_summary
+                 FROM quality_embedding_jobs
+                 WHERE repository_id = ?1
+                   AND generation_id = ?2
+                   AND error_summary IS NOT NULL
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT 1",
+                params![repository_id, generation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
     pub fn refresh_quality_generation_progress(
         &mut self,
         repository_id: &str,

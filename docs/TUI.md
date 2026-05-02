@@ -146,6 +146,8 @@ terminal panes.
 - Show selected repository root and repository ID.
 - Show SQLite index counts for files, chunks, symbols, and calls.
 - Show latest embedding model and vector dimension when available.
+- Show active semantic layer, quality readiness, fallback state, and compact
+  quality job counts.
 - Show local service status for SQLite path, Ollama, and Qdrant.
 - Use status-colored labels for local service health and index freshness.
 - Use compact table rows for index counts and local service targets instead of
@@ -155,9 +157,10 @@ terminal panes.
 - The Dashboard/Overview tab is the full home surface for repository and local
   service status. Other tabs should use a compact repository summary so active
   tables and detail panes get more screen space.
-- The Overview should surface compact operational state for indexing,
-  continuous indexing, storage mode, query mode, call direction, and evidence
-  mode without showing source text.
+- The Overview should surface compact operational state for indexing, active
+  semantic layer, quality readiness, quality job counts, continuous indexing,
+  storage mode, query mode, call direction, and evidence mode without showing
+  source text.
 
 ### Storage Explorer
 

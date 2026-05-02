@@ -8,14 +8,13 @@ use std::path::Path;
 use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
-use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_query::{
-    ContextPackMode, FreshnessScope, evidence_trust, run_context_pack, run_debug_context_pack,
-    run_scoped_freshness_report_with_store_config, run_unified_context_pack,
+    ContextPackMode, FreshnessScope, SemanticSearchSummary, evidence_trust, run_context_pack,
+    run_debug_context_pack, run_scoped_freshness_report_with_store_config, run_semantic_search,
+    run_unified_context_pack,
 };
 use symdex_store::{
-    EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
-    freshness_for_hash, qdrant_collection_name,
+    EvidenceProvenance, SqliteStore, StoreConfig, clamp_call_path_depth, freshness_for_hash,
 };
 
 pub const TOOL_SEARCH: &str = "symdex_search";
@@ -169,52 +168,49 @@ fn tool_search(arguments: &Value) -> Result<Value, String> {
     let query = required_string(arguments, "query")?;
     let limit = optional_usize(arguments, "limit", 8).min(25);
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let embed_config = EmbedConfig::from_env();
-    let embed_client =
-        OllamaClient::new(embed_config.clone()).map_err(|error| error.to_string())?;
-    let batch = embed_client
-        .embed_batch(&[query.to_owned()])
-        .map_err(|error| error.to_string())?;
-    let Some(vector) = batch.embeddings.into_iter().next() else {
-        return Err("embedding query returned no vector".to_owned());
-    };
-    let qdrant = QdrantClient::new(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
-    let collection = qdrant_collection_name(root.id(), &embed_config.model);
-    let results = qdrant
-        .query_points(&collection, vector, limit)
-        .map_err(|error| error.to_string())?;
-    Ok(json!({
-        "results": results.into_iter().map(|result| {
-            let payload = result.payload;
-            let path = payload.path;
-            let symbol_name = payload.symbol_name;
-            let chunk_kind = payload.chunk_kind;
-            let reasons = semantic_reasons(result.score, &path, symbol_name.as_deref(), &chunk_kind);
-            let provenance = EvidenceProvenance {
-                content_hash: payload.content_hash,
-                index_run_id: payload.index_run_id,
-                parser_version: payload.parser_version,
-                indexed_at: payload.indexed_at,
-                embedding_model: payload.embedding_model,
-                embedding_dimension: payload.embedding_dimension,
-                embedded_at: None,
-            };
-            let freshness = evidence_freshness(&root, Some(&path), &provenance);
+    let summary = run_semantic_search(repo, query, limit)?;
+    Ok(semantic_search_summary_json(&root, summary))
+}
+
+fn semantic_search_summary_json(root: &RepoRoot, summary: SemanticSearchSummary) -> Value {
+    let repository_id = summary.repository_id;
+    let query = summary.query;
+    let qdrant_collection = summary.qdrant_collection;
+    let requested_layer = summary.requested_layer;
+    let semantic_layer = summary.semantic_layer;
+    let embedding_model = summary.embedding_model;
+    let generation_id = summary.generation_id;
+    let quality_status = summary.quality_status;
+    let fallback_reason = summary.fallback_reason;
+    json!({
+        "repository_id": repository_id,
+        "query": query,
+        "semantic_layer": semantic_layer.as_str(),
+        "requested_layer": requested_layer.as_str(),
+        "embedding_model": embedding_model,
+        "qdrant_collection": qdrant_collection,
+        "generation_id": generation_id,
+        "quality_status": quality_status.as_str(),
+        "fallback_reason": fallback_reason,
+        "results": summary.results.into_iter().map(|result| {
+            let path = result.path;
+            let provenance = result.provenance;
+            let freshness = evidence_freshness(root, Some(&path), &provenance);
             json!({
                 "path": path.clone(),
-                "start_line": payload.start_line,
-                "end_line": payload.end_line,
-                "symbol": symbol_name,
+                "start_line": result.start_line,
+                "end_line": result.end_line,
+                "symbol": result.symbol_name,
                 "score": result.score,
-                "chunk_kind": chunk_kind,
-                "text_hash": payload.text_hash,
+                "chunk_kind": result.chunk_kind,
+                "text_hash": result.text_hash,
                 "freshness": freshness.label(),
                 "trust": trust_json(freshness, &provenance, Some(result.score)),
-                "reasons": reasons,
+                "reasons": result.reasons,
                 "provenance": provenance_json(&provenance)
             })
         }).collect::<Vec<_>>()
-    }))
+    })
 }
 
 fn tool_find_symbol(arguments: &Value) -> Result<Value, String> {
@@ -509,26 +505,6 @@ fn trust_json(
 ) -> Value {
     serde_json::to_value(evidence_trust(freshness, Some(provenance), confidence))
         .expect("evidence trust should serialize")
-}
-
-fn semantic_reasons(
-    score: f64,
-    path: &str,
-    symbol_name: Option<&str>,
-    chunk_kind: &str,
-) -> Vec<String> {
-    let mut reasons = vec![
-        "semantic_vector_match".to_owned(),
-        format!("semantic_score:{score:.4}"),
-        format!("path:{path}"),
-        format!("chunk_kind:{chunk_kind}"),
-    ];
-    if let Some(symbol_name) = symbol_name {
-        reasons.push(format!("symbol_payload:{symbol_name}"));
-    } else {
-        reasons.push("symbol_payload:missing".to_owned());
-    }
-    reasons
 }
 
 fn symbol_reasons(query: &str, symbol: &symdex_store::SymbolSearchRow) -> Vec<String> {
@@ -1091,14 +1067,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
-    use symdex_core::{RepoRoot, content_hash};
-    use symdex_store::{FileRecord, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord};
+    use symdex_core::{
+        RepoRoot, SemanticLayer, SemanticLayerMode, SemanticLayerStatus, content_hash,
+    };
+    use symdex_query::{SemanticSearchResult, SemanticSearchSummary};
+    use symdex_store::{
+        EvidenceProvenance, FileRecord, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord,
+    };
 
     use crate::{
         EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, TOOL_CONTEXT_PACK, TOOL_DEBUG_CONTEXT,
-        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, TOOL_STALENESS_CHECK, evidence_tool_result, serve,
-        tool_definitions, tool_index_status_with_store, tool_names,
-        tool_staleness_check_with_store, tool_success,
+        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, TOOL_STALENESS_CHECK, evidence_tool_result,
+        semantic_search_summary_json, serve, tool_definitions, tool_index_status_with_store,
+        tool_names, tool_staleness_check_with_store, tool_success,
     };
 
     #[test]
@@ -1477,6 +1458,58 @@ mod tests {
         .expect_err("incompatible symbol/path scope should fail");
 
         assert!(error.contains("paths are outside the symbol freshness scope"));
+    }
+
+    #[test]
+    fn semantic_search_json_includes_layer_metadata() {
+        let fixture = StalenessFixture::new();
+        let summary = SemanticSearchSummary {
+            repository_id: fixture.root.id().to_owned(),
+            qdrant_collection: "symdex_repo_fast_model".to_owned(),
+            requested_layer: SemanticLayerMode::Auto,
+            semantic_layer: SemanticLayer::Fast,
+            embedding_model: "fast-model".to_owned(),
+            generation_id: Some("generation-1".to_owned()),
+            quality_status: SemanticLayerStatus::QualityPending,
+            fallback_reason: Some("quality_manifest_incomplete_using_fast_layer".to_owned()),
+            query: "main".to_owned(),
+            results: vec![SemanticSearchResult {
+                point_id: "point-1".to_owned(),
+                chunk_id: "chunk-1".to_owned(),
+                symbol_id: Some("sym-fresh".to_owned()),
+                score: 0.91,
+                path: "src/fresh.rs".to_owned(),
+                start_line: 1,
+                end_line: 1,
+                symbol_name: Some("crate::fresh".to_owned()),
+                chunk_kind: "function".to_owned(),
+                language: "rust".to_owned(),
+                text_hash: "text-hash".to_owned(),
+                provenance: EvidenceProvenance {
+                    content_hash: Some(content_hash(b"fn fresh() {}\n")),
+                    index_run_id: Some("run-1".to_owned()),
+                    parser_version: Some("parser".to_owned()),
+                    indexed_at: Some("now".to_owned()),
+                    embedding_model: Some("fast-model".to_owned()),
+                    embedding_dimension: Some(768),
+                    embedded_at: None,
+                },
+                reasons: vec!["semantic_vector_match".to_owned()],
+            }],
+        };
+
+        let value = semantic_search_summary_json(&fixture.root, summary);
+
+        assert_eq!(value["semantic_layer"], "fast");
+        assert_eq!(value["requested_layer"], "auto");
+        assert_eq!(value["embedding_model"], "fast-model");
+        assert_eq!(value["quality_status"], "quality_pending");
+        assert_eq!(
+            value["fallback_reason"],
+            "quality_manifest_incomplete_using_fast_layer"
+        );
+        assert_eq!(value["results"][0]["freshness"], "fresh");
+        assert!(value.get("source_text").is_none());
     }
 
     fn temp_store_config() -> StoreConfig {

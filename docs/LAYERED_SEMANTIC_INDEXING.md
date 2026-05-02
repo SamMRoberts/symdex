@@ -129,6 +129,27 @@ Search routing:
 
 Default semantic search must never silently query a partial quality layer.
 
+## Status visibility
+
+The shared query layer exposes a semantic status summary used by CLI and TUI
+surfaces. It reports the repository ID, latest semantic generation ID, default
+active search layer, quality status, fallback-to-fast reason, fast and quality
+model/collection metadata, per-layer coverage counts, quality job counts, and
+the latest quality job error when one is recorded. This summary is metadata-only
+and does not return source text or vectors.
+
+The CLI command is:
+
+```text
+symdex semantic-status <repo>
+```
+
+Default semantic search and MCP `symdex_search` use the same routed query path.
+MCP search responses include active layer, requested layer, embedding model,
+Qdrant collection, generation ID, quality status, and fallback reason in the
+structured `data` payload so agents can tell when results are fast fallback
+evidence rather than quality-backed evidence.
+
 ## Activation rule
 
 The quality layer may become active only when all of the following are true:

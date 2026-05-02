@@ -90,6 +90,7 @@ cargo run -p symdex-cli -- index-quality .
 cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- index --watch .
 cargo run -p symdex-cli -- index-status .
+cargo run -p symdex-cli -- semantic-status .
 cargo run -p symdex-cli -- staleness .
 cargo run -p symdex-cli -- symbol . "my_symbol"
 cargo run -p symdex-cli -- callers . "my_symbol"
@@ -110,7 +111,8 @@ Use top-level `--json` or `--output json` with read-only MCP-backed evidence
 commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 `structuredContent`. JSON mode is currently supported for `index-status`,
 `search`, `symbol`, `callers`, `callees`, `call-path`, `impact`,
-`context-pack`, and `debug-context`.
+`context-pack`, and `debug-context`. `semantic-status` supports top-level
+`--json` as plain local command JSON for semantic layer readiness metadata.
 
 - `init`: creates the local state directory for the configured SQLite path.
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
@@ -148,6 +150,11 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
   When a semantic index has completed, it also reports the latest embedding
   model and vector dimension recorded for that repository.
+- `semantic-status <repo>`: reports the active default semantic layer, latest
+  generation ID, quality readiness state, fallback-to-fast reason, fast and
+  quality model/collection metadata, per-layer coverage counts, quality job
+  counts, and the latest quality job error when one is recorded. Output remains
+  metadata-only and does not include source text or vectors.
 - `staleness <repo> [symbol]`: compares indexed file content hashes against the
   current eligible files for implemented languages and reports fresh, stale,
   deleted, missing, and unknown evidence states. With a symbol query, the report
@@ -199,8 +206,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   file; otherwise remaining arguments are treated as inline runtime text. Frame
   matches include trust scores and reason tags, and the pack does not include
   source text.
-- `search <repo> <query>`: embeds the query locally and returns ranked Qdrant
-  matches with scores, paths, line ranges, symbol names, and provenance
+- `search <repo> <query>`: embeds the query locally through the active semantic
+  routing path and returns ranked Qdrant matches with scores, paths, line
+  ranges, symbol names, active layer metadata, fallback reason, and provenance
   metadata. Text output also prints compact reason tags for each match.
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
   opens an Overview tab backed by SQLite metadata and local service

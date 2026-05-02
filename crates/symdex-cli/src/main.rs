@@ -15,8 +15,9 @@ use symdex_index::{
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
     ImpactSummary, QdrantVerifyOptions, QdrantVerifySemanticLayer, QdrantVerifySummary,
-    run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_freshness_report,
-    run_impact, run_qdrant_verify_with_options, run_semantic_search, run_symbol_search,
+    SemanticStatusLayerSummary, SemanticStatusSummary, run_call_graph, run_call_path,
+    run_context_pack, run_debug_context_pack, run_freshness_report, run_impact,
+    run_qdrant_verify_with_options, run_semantic_search, run_semantic_status, run_symbol_search,
     run_unified_context_pack,
 };
 use symdex_store::{EvidenceFreshness, QdrantClient, SqliteStore, StoreConfig, sqlite_parent};
@@ -59,6 +60,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "index-status" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             index_status(repo, output)
+        }
+        "semantic-status" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            semantic_status(repo, output)
         }
         "staleness" | "freshness" => {
             require_text_output(command, output)?;
@@ -287,6 +292,123 @@ fn index_status(repo: &str, output: OutputMode) -> Result<(), String> {
         status.last_indexed_at.as_deref().unwrap_or("<never>")
     );
     Ok(())
+}
+
+fn semantic_status(repo: &str, output: OutputMode) -> Result<(), String> {
+    let summary = run_semantic_status(repo)?;
+    if output == OutputMode::Json {
+        let json = serde_json::to_string_pretty(&semantic_status_json(&summary))
+            .map_err(|error| error.to_string())?;
+        println!("{json}");
+        return Ok(());
+    }
+    print_semantic_status_summary(&summary);
+    Ok(())
+}
+
+fn print_semantic_status_summary(summary: &SemanticStatusSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!(
+        "generation_id: {}",
+        summary.generation_id.as_deref().unwrap_or("<none>")
+    );
+    println!("active_layer: {}", summary.active_layer.as_str());
+    println!("quality_status: {}", summary.quality_status.as_str());
+    println!("quality_enabled: {}", summary.quality_enabled);
+    println!(
+        "fallback_reason: {}",
+        summary.fallback_reason.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "latest_quality_error: {}",
+        summary.latest_quality_error.as_deref().unwrap_or("<none>")
+    );
+    print_semantic_status_layer("fast", &summary.fast);
+    print_semantic_status_layer("quality", &summary.quality);
+    if let Some(progress) = &summary.quality_progress {
+        println!("quality_progress:");
+        println!("  embeddable_chunks: {}", progress.embeddable_chunks);
+        println!(
+            "  quality_embedded_chunks: {}",
+            progress.quality_embedded_chunks
+        );
+        println!("  pending_jobs: {}", progress.pending_jobs);
+        println!("  running_jobs: {}", progress.running_jobs);
+        println!("  succeeded_jobs: {}", progress.succeeded_jobs);
+        println!("  failed_jobs: {}", progress.failed_jobs);
+        println!("  skipped_stale_jobs: {}", progress.skipped_stale_jobs);
+        println!(
+            "  skipped_excluded_jobs: {}",
+            progress.skipped_excluded_jobs
+        );
+    } else {
+        println!("quality_progress: <none>");
+    }
+}
+
+fn print_semantic_status_layer(label: &str, layer: &SemanticStatusLayerSummary) {
+    println!("{label}_layer:");
+    println!("  semantic_layer: {}", layer.semantic_layer.as_str());
+    println!("  embedding_model: {}", layer.embedding_model);
+    println!(
+        "  embedding_dimension: {}",
+        layer
+            .embedding_dimension
+            .map(|dimension| dimension.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
+    println!("  qdrant_collection: {}", layer.qdrant_collection);
+    println!("  expected_chunks: {}", layer.expected_chunks);
+    println!("  current_chunks: {}", layer.current_chunks);
+    println!("  stale_chunks: {}", layer.stale_chunks);
+    println!("  blocked_chunks: {}", layer.blocked_chunks);
+    println!("  failed_chunks: {}", layer.failed_chunks);
+    println!("  other_chunks: {}", layer.other_chunks);
+    println!("  total_chunks: {}", layer.total_chunks);
+    println!("  is_complete: {}", layer.is_complete);
+}
+
+fn semantic_status_json(summary: &SemanticStatusSummary) -> serde_json::Value {
+    json!({
+        "repository_id": summary.repository_id.as_str(),
+        "generation_id": summary.generation_id.as_deref(),
+        "active_layer": summary.active_layer.as_str(),
+        "quality_status": summary.quality_status.as_str(),
+        "quality_enabled": summary.quality_enabled,
+        "fallback_reason": summary.fallback_reason.as_deref(),
+        "latest_quality_error": summary.latest_quality_error.as_deref(),
+        "fast": semantic_status_layer_json(&summary.fast),
+        "quality": semantic_status_layer_json(&summary.quality),
+        "quality_progress": summary.quality_progress.as_ref().map(|progress| json!({
+            "repository_id": progress.repository_id.as_str(),
+            "generation_id": progress.generation_id.as_str(),
+            "embeddable_chunks": progress.embeddable_chunks,
+            "quality_embedded_chunks": progress.quality_embedded_chunks,
+            "pending_jobs": progress.pending_jobs,
+            "running_jobs": progress.running_jobs,
+            "succeeded_jobs": progress.succeeded_jobs,
+            "failed_jobs": progress.failed_jobs,
+            "skipped_stale_jobs": progress.skipped_stale_jobs,
+            "skipped_excluded_jobs": progress.skipped_excluded_jobs,
+        })),
+    })
+}
+
+fn semantic_status_layer_json(layer: &SemanticStatusLayerSummary) -> serde_json::Value {
+    json!({
+        "semantic_layer": layer.semantic_layer.as_str(),
+        "embedding_model": layer.embedding_model.as_str(),
+        "embedding_dimension": layer.embedding_dimension,
+        "qdrant_collection": layer.qdrant_collection.as_str(),
+        "expected_chunks": layer.expected_chunks,
+        "current_chunks": layer.current_chunks,
+        "stale_chunks": layer.stale_chunks,
+        "blocked_chunks": layer.blocked_chunks,
+        "failed_chunks": layer.failed_chunks,
+        "other_chunks": layer.other_chunks,
+        "total_chunks": layer.total_chunks,
+        "is_complete": layer.is_complete,
+    })
 }
 
 fn staleness(repo: &str, symbol_query: Option<&str>) -> Result<(), String> {
@@ -1244,7 +1366,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1254,7 +1376,11 @@ mod tests {
     use super::{
         ContextPackMode, OutputMode, QdrantVerifySemanticLayer, parse_cli_invocation,
         parse_context_pack_args, parse_qdrant_maintenance_args, require_text_output,
+        semantic_status_json,
     };
+    use symdex_core::{SemanticLayer, SemanticLayerStatus};
+    use symdex_query::{SemanticStatusLayerSummary, SemanticStatusSummary};
+    use symdex_store::QualityGenerationProgress;
 
     #[test]
     fn cli_invocation_parses_leading_json_flag() {
@@ -1351,5 +1477,69 @@ mod tests {
             .expect_err("index-quality should be text-only");
 
         assert!(error.contains("index-quality does not support"));
+    }
+
+    #[test]
+    fn semantic_status_json_is_metadata_only() {
+        let status = sample_semantic_status();
+        let value = semantic_status_json(&status);
+
+        assert_eq!(value["repository_id"], "repo");
+        assert_eq!(value["active_layer"], "fast");
+        assert_eq!(value["quality_status"], "quality_pending");
+        assert_eq!(
+            value["fallback_reason"],
+            "quality_manifest_incomplete_using_fast_layer"
+        );
+        assert_eq!(value["fast"]["embedding_model"], "fast-model");
+        assert_eq!(value["quality_progress"]["pending_jobs"], 1);
+        assert!(value.get("source_text").is_none());
+    }
+
+    fn sample_semantic_status() -> SemanticStatusSummary {
+        SemanticStatusSummary {
+            repository_id: "repo".to_owned(),
+            generation_id: Some("generation-1".to_owned()),
+            active_layer: SemanticLayer::Fast,
+            quality_status: SemanticLayerStatus::QualityPending,
+            fallback_reason: Some("quality_manifest_incomplete_using_fast_layer".to_owned()),
+            fast: sample_semantic_status_layer(SemanticLayer::Fast, "fast-model", true),
+            quality: sample_semantic_status_layer(SemanticLayer::Quality, "quality-model", false),
+            quality_progress: Some(QualityGenerationProgress {
+                repository_id: "repo".to_owned(),
+                generation_id: "generation-1".to_owned(),
+                embeddable_chunks: 1,
+                quality_embedded_chunks: 0,
+                pending_jobs: 1,
+                running_jobs: 0,
+                succeeded_jobs: 0,
+                failed_jobs: 0,
+                skipped_stale_jobs: 0,
+                skipped_excluded_jobs: 0,
+            }),
+            latest_quality_error: None,
+            quality_enabled: true,
+        }
+    }
+
+    fn sample_semantic_status_layer(
+        semantic_layer: SemanticLayer,
+        embedding_model: &str,
+        is_complete: bool,
+    ) -> SemanticStatusLayerSummary {
+        SemanticStatusLayerSummary {
+            semantic_layer,
+            embedding_model: embedding_model.to_owned(),
+            embedding_dimension: Some(768),
+            qdrant_collection: format!("symdex_repo_{embedding_model}"),
+            current_chunks: usize::from(is_complete),
+            stale_chunks: usize::from(!is_complete),
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 1,
+            expected_chunks: 1,
+            is_complete,
+        }
     }
 }
