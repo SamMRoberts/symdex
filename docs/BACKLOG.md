@@ -223,17 +223,17 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### A4 — Multi-language test discovery
 
-- [ ] Extend the existing language-neutral `tests` table write path beyond
+- [x] Extend the existing language-neutral `tests` table write path beyond
   Rust.
-- [ ] Discover C# NUnit, xUnit, and MSTest tests conservatively from
+- [x] Discover C# NUnit, xUnit, and MSTest tests conservatively from
   tree-sitter syntax.
-- [ ] Discover JavaScript and TypeScript Jest, Vitest, and Mocha
+- [x] Discover JavaScript and TypeScript Jest, Vitest, and Mocha
   `test`/`it`/`describe` shapes conservatively.
-- [ ] Link discovered tests to symbols when syntax evidence is clear; otherwise
+- [x] Link discovered tests to symbols when syntax evidence is clear; otherwise
   preserve metadata without overclaiming call coverage.
-- [ ] Surface non-Rust `tests_likely` in impact and debug-context outputs only
+- [x] Surface non-Rust `tests_likely` in impact and debug-context outputs only
   when indexed test facts and call evidence justify it.
-- [ ] Add fixture-backed tests for each framework family.
+- [x] Add fixture-backed tests for each framework family.
 
 ### A5 — C# and Node stack trace parsing
 

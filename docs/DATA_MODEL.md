@@ -173,12 +173,15 @@ CREATE TABLE tests (
 );
 ```
 
-The current write path stores Rust test metadata for functions with recognized
-test attributes. Test rows are structural facts only: they include names,
-framework labels, paths, ranges, provenance, and optional symbol linkage, but no
-source text. The `tests` table supports exact/suffix failing-test name lookup
-for debug context packs and direct test-to-symbol call lookup for impact
-summaries.
+The current write path stores Rust, C#, JavaScript, and TypeScript test
+metadata discovered from parser evidence. Test rows are structural facts only:
+they include names, framework labels, paths, ranges, provenance, and optional
+symbol linkage, but no source text. `symbol_id` is present for symbol-backed
+tests such as Rust functions, C# methods, and unambiguous JavaScript or
+TypeScript named callbacks. It is absent for metadata-only callback-style tests,
+such as inline Jest, Vitest, or Mocha callbacks. The `tests` table supports
+exact/suffix failing-test name lookup for debug context packs and direct
+test-to-symbol call lookup for impact summaries.
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
@@ -439,10 +442,11 @@ freshness label, trust score, and the first available provenance record for that
 file. Direct call rows, transitive paths, path edges, and related-file rows also
 carry reason tags that distinguish direct caller/callee evidence, bounded
 transitive paths, and file relationships derived from call evidence. The impact
-report also includes indexed Rust tests that directly call the queried symbol
-through resolved call edges. When no direct indexed test evidence is available,
-`tests_likely` remains empty and the output includes an explanatory note instead
-of guessing.
+report also includes indexed tests that directly call the queried symbol through
+resolved call edges. Metadata-only tests without symbol linkage remain
+searchable as test facts but do not appear in `tests_likely`. When no direct
+indexed test evidence is available, `tests_likely` remains empty and the output
+includes an explanatory note instead of guessing.
 
 ## Debug context packs
 

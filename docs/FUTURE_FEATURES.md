@@ -47,8 +47,8 @@ Requirements:
 
 Impact analysis has grown from direct callers/callees into a repeatable change
 impact report with bounded transitive paths, related files, and direct indexed
-Rust test evidence. Future work is focused on broader test discovery, richer
-same-file symbol grouping, and deeper explanation metadata.
+test evidence. Future work is focused on richer same-file symbol grouping,
+broader non-Rust call resolution, and deeper explanation metadata.
 
 Requirements:
 
@@ -59,8 +59,8 @@ Requirements:
   staleness status.
 - Avoid claiming affected tests beyond indexed test evidence and documented
   mapping limits.
-- Extend likely-test evidence to C#, JavaScript, and TypeScript only after
-  parser-backed test discovery is implemented for those languages.
+- Extend likely-test evidence further for C#, JavaScript, and TypeScript as
+  non-Rust call resolution and runtime parsing become more precise.
 
 ### Pre-Edit Change Explanation
 

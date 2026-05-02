@@ -69,9 +69,12 @@ Fixtures should be tiny and purpose-built.
   files, malformed runtime input, common Rust `cargo test`, `anyhow`, `tracing`,
   full backtrace, panic-hook, and async stack-like output, and TUI debug context
   pack rendering.
-- Rust test discovery coverage for recognized test attributes, module-qualified
-  test names, SQLite test persistence/replacement, failing-test name mapping,
-  and impact likely-test evidence from direct indexed test calls.
+- Test discovery coverage for Rust recognized test attributes, C# NUnit/xUnit/
+  MSTest attributes, JavaScript and TypeScript Jest/Vitest/Mocha `test` / `it` /
+  `describe` shapes, module- or suite-qualified test names, SQLite test
+  persistence/replacement, failing-test name mapping, metadata-only anonymous
+  callback rows, and impact likely-test evidence only from direct indexed test
+  calls.
 - Rust call-resolution coverage for exact local calls, unresolved calls,
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
   module aliases used in scoped calls, simple grouped `use` aliases,

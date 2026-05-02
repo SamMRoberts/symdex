@@ -88,13 +88,18 @@ Files with tree-sitter syntax errors produce partial chunks where possible and
 return metadata-only parse diagnostics with line and byte ranges instead of
 failing the whole index run.
 
-Rust test discovery is metadata-only and conservative. Functions with Rust test
+Test discovery is metadata-only and conservative. Functions with Rust test
 attributes such as `#[test]`, `#[tokio::test]`, `#[async_std::test]`, or
 `#[actix_rt::test]` are persisted as indexed test facts with symbol linkage,
-qualified names, byte ranges, and line ranges. C#, JavaScript, and TypeScript
-test discovery is intentionally not claimed yet; future support must use the
-same parser, symbol, call, secret-detection, provenance, and path-boundary
-contracts.
+qualified names, byte ranges, and line ranges. C# methods with NUnit, xUnit,
+or MSTest test attributes are persisted through the same symbol-linked path.
+JavaScript and TypeScript Jest, Vitest, and Mocha `test` / `it` calls are
+discovered from tree-sitter call expressions when framework imports or
+test-like paths provide conservative evidence. Nested `describe` calls provide
+suite context for qualified names. Named callback tests are linked to an indexed
+symbol only when the callback reference is unambiguous; anonymous callback tests
+are persisted as metadata-only rows with no symbol link so they cannot overclaim
+call coverage.
 
 Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token

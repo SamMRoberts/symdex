@@ -159,14 +159,17 @@ means Rust call resolution quality currently tops out at the conservative local
 heuristic level, missing trait implementations, generic instantiations, and
 closure captures.
 
-### 4. Impact Analysis Test Discovery Is Rust-Only
+### 4. Impact Analysis Test Discovery Is Conservative Across Languages
 
-`tests_likely` in the impact output lists indexed Rust tests that directly call
-the queried symbol through resolved call edges. This is good. But the test
-discovery infrastructure (the `tests` table, `DiscoveredTest`, the
-`#[test]`/`#[tokio::test]` attribute scanner) is Rust-only. C#, JS, and TS test
-discovery is explicitly not claimed yet. For a tool designed to help debug
-failing tests across languages, this is a significant gap in practice.
+`tests_likely` in the impact output lists indexed tests that directly call the
+queried symbol through resolved call edges. Rust test attributes, C# NUnit,
+xUnit, and MSTest attributes, and JavaScript/TypeScript Jest, Vitest, and Mocha
+test calls are now persisted as test facts. JS/TS inline callback tests remain
+metadata-only unless a named callback can be linked unambiguously to an indexed
+symbol, so they are searchable but do not overclaim likely-test call coverage.
+For a tool designed to help debug failing tests across languages, the remaining
+gap is richer runtime parsing and stronger non-Rust call resolution rather than
+the table write path itself.
 
 ### 5. The `staleness` Command Is Underexposed in MCP
 
@@ -269,7 +272,7 @@ when the agent can guarantee the index is fresh.
 - Tool response must include the index run ID for freshness correlation in
   follow-up queries
 
-### Priority 4 — Multi-Language Test Discovery
+### Priority 4 — Multi-Language Test Discovery (Implemented)
 
 **What:** Extend the `DiscoveredTest` and test-discovery pipeline to cover:
 
@@ -279,17 +282,18 @@ when the agent can guarantee the index is fresh.
   equivalents, Mocha `it()`/`describe()`
 
 Store discovered tests in the `tests` table with the same schema (language slug,
-framework, qualified name, symbol linkage, byte/line ranges, provenance). Extend
-`symdex_impact` to surface `tests_likely` for all languages, not just Rust.
+framework, qualified name, optional symbol linkage, byte/line ranges,
+provenance). `symdex_impact` surfaces `tests_likely` for any language when a
+stored test has direct resolved call evidence.
 
 **Why:** A large fraction of real debugging workflows start with "this test is
 failing." If the agent cannot map the failing test name to indexed symbols and
 call edges, the debug context pack is much less useful for JS/TS and C#
 codebases.
 
-**Fit:** The `tests` table schema is already language-neutral. The tree-sitter
-grammars for C#, JS, and TS are already wired. This is a parser-level addition
-following the exact same pattern as Rust test discovery.
+**Fit:** The `tests` table schema is language-neutral. The tree-sitter grammars
+for C#, JS, and TS are wired. The implemented path preserves metadata-only rows
+for callback tests that cannot be linked safely.
 
 ### Priority 5 — Stack Trace Parser for C#, JS/TS, and Python (Partial)
 
@@ -413,7 +417,7 @@ plan for this now rather than needing a structural refactor later.
 | C#/JS/TS call resolution depth | 🟡 Conservative only | P2 |
 | Context pack (structural only) | 🟡 Needs semantic merge | P1 |
 | rust-analyzer fact application | 🟡 Planned, not wired | P2 |
-| Multi-language test discovery | 🟡 Rust only | P2 |
+| Multi-language test discovery | ✅ Implemented conservatively | — |
 | `staleness_check` MCP tool | 🟡 Exists in CLI, not MCP | P1 |
 | `.gitignore` glob patterns | ✅ Implemented | — |
 | Structured logging / metrics | 🔴 Missing | P3 |
@@ -435,10 +439,8 @@ plan for this now rather than needing a structural refactor later.
    closes a real agent workflow gap
 3. **`.gitignore` glob patterns** — correctness fix, affects every repository
    that uses patterns
-4. **Multi-language test discovery** — extends the `tests` table write path for
-   C#/JS/TS, high debugging value
-5. **C#/Node.js stack trace parsing** — pure parser addition, no schema changes
-6. **Design doc for `symdex_request_reindex`** — needs design before code, but
+4. **C#/Node.js stack trace parsing** — pure parser addition, no schema changes
+5. **Design doc for `symdex_request_reindex`** — needs design before code, but
    should be next write-capable tool
-7. **Design doc for `symdex_explain_change`** — most powerful future agent
+6. **Design doc for `symdex_explain_change`** — most powerful future agent
    integration feature

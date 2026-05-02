@@ -264,8 +264,9 @@ Output separates:
 Direct and transitive evidence rows include provenance, freshness labels, and
 trust scores. Related-file rows include path, relationship count, freshness,
 trust, and provenance.
-`tests_likely` contains indexed Rust test qualified names when a discovered test
-directly calls the queried symbol through resolved call evidence. When no direct
+`tests_likely` contains indexed test qualified names when a discovered test
+directly calls the queried symbol through resolved call evidence. Metadata-only
+tests without symbol linkage are not used for likely-test claims. When no direct
 indexed test evidence is available, the list stays empty and a note explains
 that no likely-test evidence was found.
 
@@ -468,9 +469,11 @@ Output:
 
 The tool parses panic/file locations, stack-frame symbols, indexed-language file
 paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
-evidence, maps failing test names to indexed Rust tests when available, keeps
+evidence, maps failing test names to indexed tests when available, keeps
 unmatched runtime test names as fallbacks, adds freshness, trust, and
-provenance, and returns source-free metadata only.
+provenance, and returns source-free metadata only. C# and Node/V8 stack-frame
+parsing remains planned separately; this mapping only uses test names that the
+runtime parser already extracts.
 
 Planned parser expansion: keep the Rust parser behavior and add conservative C#
 and Node/V8 stack frame patterns. Unmapped frames must remain visible with an

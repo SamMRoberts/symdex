@@ -3197,6 +3197,27 @@ mod tests {
     }
 
     #[test]
+    fn impact_includes_non_rust_tests_only_with_direct_call_evidence() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_csharp_test_calling_callee(&mut fixture.store, &repository_id);
+
+        let summary = build_impact_summary(&fixture.root, &fixture.store, "callee")
+            .expect("impact summary should build");
+
+        assert_eq!(
+            summary.tests_likely,
+            vec!["Demo::CalculatorTests::AddsNumbers"]
+        );
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note == "likely_tests_from_indexed_direct_test_calls")
+        );
+    }
+
+    #[test]
     fn freshness_rows_compare_indexed_and_current_hashes() {
         let indexed = vec![
             snapshot("src/deleted.rs", "old"),
@@ -3699,6 +3720,57 @@ mod tests {
                 }],
             )
             .expect("test file should persist");
+    }
+
+    fn persist_csharp_test_calling_callee(store: &mut SqliteStore, repository_id: &str) {
+        store
+            .replace_file_facts_with_tests(
+                &FileRecord {
+                    id: "file-csharp-test".to_owned(),
+                    repository_id: repository_id.to_owned(),
+                    path: "tests/CalculatorTests.cs".to_owned(),
+                    language: "csharp".to_owned(),
+                    content_hash: "hash-csharp-test".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-csharp-test",
+                    "file-csharp-test",
+                    "AddsNumbers",
+                    "Demo::CalculatorTests::AddsNumbers",
+                )],
+                &[],
+                &[CallRecord {
+                    id: "call-csharp-test-callee".to_owned(),
+                    caller_symbol_id: "sym-csharp-test".to_owned(),
+                    callee_text: "callee".to_owned(),
+                    callee_symbol_id: Some("sym-callee".to_owned()),
+                    call_line: 6,
+                    confidence: 1.0,
+                    resolution_status: "resolved_exact".to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                }],
+                &[TestRecord {
+                    id: "test-csharp-adds-numbers".to_owned(),
+                    repository_id: repository_id.to_owned(),
+                    file_id: "file-csharp-test".to_owned(),
+                    path: "tests/CalculatorTests.cs".to_owned(),
+                    symbol_id: Some("sym-csharp-test".to_owned()),
+                    name: "AddsNumbers".to_owned(),
+                    qualified_name: "Demo::CalculatorTests::AddsNumbers".to_owned(),
+                    framework: "nunit".to_owned(),
+                    language: "csharp".to_owned(),
+                    start_line: 4,
+                    end_line: 8,
+                    start_byte: 0,
+                    end_byte: 96,
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                }],
+            )
+            .expect("C# test file should persist");
     }
 
     fn complete_provenance() -> EvidenceProvenance {
