@@ -63,8 +63,8 @@ setting for the current single-model path and is used as the fast-model fallback
 when `SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality
 jobs when quality indexing is enabled and the quality model is available.
 `symdex index-quality <repo>` manually drains those queued jobs in bounded
-batches. Background quality execution and quality activation remain separate
-later slices.
+batches, then reports whether SQLite activation made quality the active layer or
+kept default search on fast. Background quality execution remains a later slice.
 
 `SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
 persisted as metadata-only structural evidence with
@@ -135,7 +135,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   jobs for the latest generation. It claims bounded batches, re-reads files
   from disk, verifies file and chunk hashes, writes quality Qdrant points and
   quality `chunk_embeddings` rows, and reports succeeded, failed, and stale
-  counts. Fast search remains active until a later activation step.
+  counts along with `quality_status`, `active_layer`, and
+  `activation_reason`. Fast search remains active for partial, stale, blocked,
+  or failed quality state; complete current quality coverage switches default
+  search to quality.
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
   When a semantic index has completed, it also reports the latest embedding
   model and vector dimension recorded for that repository.

@@ -899,6 +899,8 @@ fn print_quality_index_summary(summary: &QualityIndexSummary) {
             .unwrap_or_else(|| "<none>".to_owned())
     );
     println!("quality_status: {}", summary.quality_status);
+    println!("active_layer: {}", summary.active_layer);
+    println!("activation_reason: {}", summary.activation_reason);
     println!("qdrant_collection: {}", summary.qdrant_collection);
     println!("claimed_jobs: {}", summary.claimed_jobs);
     println!("succeeded_jobs: {}", summary.succeeded_jobs);

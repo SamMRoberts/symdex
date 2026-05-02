@@ -16,9 +16,9 @@ use symdex_core::{
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkEmbeddingRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload,
-    QdrantClient, QualityEmbeddingJobRecord, QualityGenerationProgress, QualityJobCompletion,
-    QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore, StoreConfig,
-    SymbolRecord, TestRecord, VectorPoint, current_timestamp, qdrant_collection_name,
+    QdrantClient, QualityActivationSummary, QualityEmbeddingJobRecord, QualityGenerationProgress,
+    QualityJobCompletion, QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore,
+    StoreConfig, SymbolRecord, TestRecord, VectorPoint, current_timestamp, qdrant_collection_name,
     qdrant_point_id,
 };
 
@@ -146,6 +146,8 @@ pub struct QualityIndexSummary {
     pub skipped_stale_jobs: usize,
     pub remaining_pending_jobs: usize,
     pub quality_status: String,
+    pub active_layer: String,
+    pub activation_reason: String,
     pub progress: QualityGenerationProgress,
 }
 
@@ -373,42 +375,32 @@ pub fn run_quality_index_with_progress(
     }
 
     let refreshed_at = current_timestamp();
-    let progress = sqlite
-        .refresh_quality_generation_progress(
-            root.id(),
-            &generation.id,
-            quality_dimension,
-            &refreshed_at,
-        )
+    let activation = sqlite
+        .refresh_quality_activation(root.id(), &generation.id, quality_dimension, &refreshed_at)
         .map_err(|error| error.to_string())?;
-    let final_generation = sqlite
-        .latest_semantic_generation(root.id())
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "semantic generation disappeared while quality indexing".to_owned())?;
 
     on_progress(IndexProgress::new(
         "quality_index",
         stats.claimed_jobs,
         stats.claimed_jobs,
-        format!(
-            "Quality worker completed: {} succeeded, {} failed, {} stale",
-            stats.succeeded_jobs, stats.failed_jobs, stats.skipped_stale_jobs
-        ),
+        quality_activation_progress_message(&stats, &activation),
     ));
 
     Ok(QualityIndexSummary {
         repository_id: root.id().to_owned(),
         generation_id: generation.id,
         quality_model,
-        quality_dimension: final_generation.quality_dimension,
+        quality_dimension,
         qdrant_collection,
         claimed_jobs: stats.claimed_jobs,
         succeeded_jobs: stats.succeeded_jobs,
         failed_jobs: stats.failed_jobs,
         skipped_stale_jobs: stats.skipped_stale_jobs,
-        remaining_pending_jobs: progress.pending_jobs,
-        quality_status: final_generation.quality_status,
-        progress,
+        remaining_pending_jobs: activation.progress.pending_jobs,
+        quality_status: activation.quality_status.as_str().to_owned(),
+        active_layer: activation.active_layer.as_str().to_owned(),
+        activation_reason: activation.reason.as_str().to_owned(),
+        progress: activation.progress,
     })
 }
 
@@ -1684,6 +1676,21 @@ struct QualityWorkerStats {
     succeeded_jobs: usize,
     failed_jobs: usize,
     skipped_stale_jobs: usize,
+}
+
+fn quality_activation_progress_message(
+    stats: &QualityWorkerStats,
+    activation: &QualityActivationSummary,
+) -> String {
+    format!(
+        "Quality worker completed: {} succeeded, {} failed, {} stale; status={} active_layer={} reason={}",
+        stats.succeeded_jobs,
+        stats.failed_jobs,
+        stats.skipped_stale_jobs,
+        activation.quality_status.as_str(),
+        activation.active_layer.as_str(),
+        activation.reason.as_str()
+    )
 }
 
 struct QualityWorkerContext<'a> {

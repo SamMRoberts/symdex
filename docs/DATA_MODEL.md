@@ -215,8 +215,21 @@ This table tracks metadata for a semantic generation. Current semantic indexing
 records the fast layer after successful fast Qdrant upsert with
 `active_layer = fast` and `quality_status = fast_ready`. Generation IDs are
 deterministic over the current fast manifest, so unchanged manifests reuse the
-same generation ID. Future quality slices will update quality readiness and may
-activate `active_layer = quality`. Rows do not contain source text.
+same generation ID and preserve existing quality fields such as
+`quality_status`, `quality_dimension`, `quality_completed_at`, `active_layer`,
+and `quality_embedded_chunks`. A changed fast manifest creates or selects a new
+generation whose default active layer is fast until quality catches up. Rows do
+not contain source text.
+
+The manual quality worker refreshes activation state from SQLite manifests and
+job counts. A latest generation becomes `quality_ready` with
+`active_layer = quality` only when the current quality manifest covers every
+embeddable chunk, the quality model and dimension are known, and no pending,
+running, failed, or `skipped_stale` jobs remain. Partial coverage remains
+`quality_pending`; terminal failures become `quality_failed`; blocked
+generations remain `quality_blocked`; and latest-generation `skipped_stale`
+jobs keep default routing on fast until a later generation can complete cleanly.
+`quality_completed_at` is set only by successful activation.
 
 ### `chunk_embeddings`
 
@@ -294,7 +307,9 @@ After worker progress, `semantic_generations.quality_embedded_chunks` is
 refreshed from current quality manifest rows. The first successful quality
 embedding records `quality_dimension`. If failures remain and no pending or
 running jobs remain for the latest generation, `quality_status` becomes
-`quality_failed`; `active_layer` remains `fast` until the activation slice.
+`quality_failed`; otherwise a complete, clean latest generation is atomically
+marked `quality_ready` with `active_layer = quality`. Latest-generation
+`skipped_stale` jobs are treated as incomplete work, not successful coverage.
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for

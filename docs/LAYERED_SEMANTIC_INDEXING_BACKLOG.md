@@ -65,13 +65,13 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q7 — Quality activation
 
-- [ ] Activate quality only when the latest fast generation has complete quality
+- [x] Activate quality only when the latest fast generation has complete quality
   coverage.
-- [ ] Keep default search on fast while quality is partial, stale, blocked, or
+- [x] Keep default search on fast while quality is partial, stale, blocked, or
   failed.
-- [ ] Switch default search back to fast immediately after new fast generation
+- [x] Switch default search back to fast immediately after new fast generation
   changes make quality stale.
-- [ ] Add tests for complete, partial, stale, blocked, and failed quality states.
+- [x] Add tests for complete, partial, stale, blocked, and failed quality states.
 
 ## Phase Q8 — Continuous indexing integration
 

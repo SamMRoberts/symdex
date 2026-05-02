@@ -139,11 +139,16 @@ The quality layer may become active only when all of the following are true:
 - The quality vector dimension is known and stable for that model/collection.
 - Every current embeddable chunk has a current quality embedding row.
 - No current quality jobs for the generation are pending or running.
-- Stale jobs from older generations are skipped or ignored.
-- Qdrant verification for the quality manifest has no missing current points.
+- The latest generation has no `failed` or `skipped_stale` quality jobs.
+- A `quality_blocked` generation stays blocked until a later queue retry can
+  produce complete quality coverage.
 
 Activation must be atomic from the query layer's perspective: a search should
 see either active `fast` or active `quality`, never an in-between state.
+Current activation is gated by SQLite generation metadata, quality job state,
+and the per-layer `chunk_embeddings` manifest. Layer-aware Qdrant manifest
+verification is deferred to the verify/repair slice; activation does not return
+source text or Qdrant vectors.
 
 ## Manual indexing behavior
 
@@ -232,9 +237,11 @@ symdex index-quality <repo>
 It drains all pending jobs for the latest semantic generation by repeatedly
 claiming bounded batches using `SYMDEX_QUALITY_BATCH_SIZE`. It writes quality
 Qdrant points and quality `chunk_embeddings` rows, records the first successful
-quality dimension on the generation, and leaves `active_layer` as `fast`.
-Quality activation and default search routing to quality remain separate
-activation work.
+quality dimension on the generation, refreshes SQLite activation state, and
+reports the resulting `quality_status`, `active_layer`, and activation reason.
+Default search remains on `fast` until the latest generation has complete
+quality coverage and no pending, running, failed, or stale quality jobs; only
+then does the worker atomically switch `active_layer` to `quality`.
 
 ## Job staleness
 
@@ -250,6 +257,11 @@ Stale pending or running jobs should transition to `skipped_stale` and must not
 activate quality. Terminal job history such as `succeeded`, `failed`,
 `skipped_stale`, and `skipped_excluded` is preserved when a new fast generation
 supersedes older quality work.
+
+If `skipped_stale` exists on the latest generation, activation keeps
+`quality_status = quality_pending` and `active_layer = fast`. A later fast
+generation and quality queue pass must produce a clean, complete manifest before
+quality can become active.
 
 If quality indexing is enabled but the configured quality model or local service
 is unavailable during queue readiness checks, mark the latest semantic

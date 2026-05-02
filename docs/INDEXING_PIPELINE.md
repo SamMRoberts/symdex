@@ -156,8 +156,11 @@ generation and compact `chunk_embeddings` summaries before choosing the active
 model and Qdrant collection. The manual quality worker is available through
 `symdex index-quality <repo>`; it drains pending latest-generation jobs in
 bounded batches, revalidates hashes from disk before embedding, writes quality
-Qdrant points and quality `chunk_embeddings` rows, and keeps default routing on
-fast until a later activation step marks quality ready.
+Qdrant points and quality `chunk_embeddings` rows, then refreshes activation
+state in SQLite. Activation switches default routing to quality only when the
+latest fast generation has complete current quality coverage, a known quality
+dimension, and no pending, running, failed, or stale quality jobs. Partial,
+stale, blocked, or failed quality state leaves `active_layer = fast`.
 
 ## Qdrant Collections
 

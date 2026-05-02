@@ -168,10 +168,14 @@ Tasks:
 - Count current embeddable chunks for the latest fast generation.
 - Count current quality embeddings for the same generation.
 - Verify no pending/running jobs remain for that generation.
-- Optionally run layer-aware Qdrant manifest verification before activation.
+- Defer layer-aware Qdrant manifest verification to Slice 9 verify/repair work.
 - Atomically set active layer to `quality` when complete.
 - Set active layer back to `fast` when a new fast generation makes quality
   stale.
+
+Implementation note: Slice 7 activation is SQLite-gated. It uses the latest
+semantic generation, quality job counts, and per-layer `chunk_embeddings`
+coverage to decide whether quality can become active.
 
 Acceptance:
 
