@@ -146,7 +146,9 @@ The SQLite schema also includes additive layered semantic tables for
 After a successful fast Qdrant upsert, semantic indexing still writes legacy
 chunk embedding provenance for compatibility, then records a deterministic fast
 semantic generation and current fast `chunk_embeddings` manifest in SQLite.
-Active-layer query routing, quality job creation, and quality workers are later
+Semantic search consults SQLite readiness metadata from the latest semantic
+generation and compact `chunk_embeddings` summaries before choosing the active
+model and Qdrant collection. Quality job creation and quality workers are later
 layered-indexing slices.
 
 ## Qdrant Collections
@@ -185,6 +187,10 @@ provenance, and index-run lifecycle behavior as `symdex index <repo>`.
 
 Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
 with the embedded query vector, `with_payload: true`, and `with_vector: false`.
+The embedded query model and target collection come from active-layer routing:
+auto search uses quality only when the active generation is `quality_ready` and
+the quality manifest is complete, otherwise it uses the fast layer. Forced
+quality routing fails clearly when quality is unavailable or incomplete.
 
 ## Call extraction
 

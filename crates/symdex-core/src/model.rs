@@ -11,6 +11,16 @@ impl SemanticLayer {
             Self::Quality => "quality",
         }
     }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "fast" => Ok(Self::Fast),
+            "quality" => Ok(Self::Quality),
+            other => Err(format!(
+                "unsupported semantic layer `{other}`; expected `fast` or `quality`"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +36,17 @@ impl SemanticLayerMode {
             Self::Auto => "auto",
             Self::Fast => "fast",
             Self::Quality => "quality",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "" | "auto" => Ok(Self::Auto),
+            "fast" => Ok(Self::Fast),
+            "quality" => Ok(Self::Quality),
+            other => Err(format!(
+                "unsupported semantic layer mode `{other}`; expected `auto`, `fast`, or `quality`"
+            )),
         }
     }
 }
@@ -51,6 +72,21 @@ impl SemanticLayerStatus {
             Self::QualityStale => "quality_stale",
             Self::QualityBlocked => "quality_blocked",
             Self::QualityFailed => "quality_failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "missing" => Ok(Self::Missing),
+            "fast_ready" => Ok(Self::FastReady),
+            "quality_pending" => Ok(Self::QualityPending),
+            "quality_ready" => Ok(Self::QualityReady),
+            "quality_stale" => Ok(Self::QualityStale),
+            "quality_blocked" => Ok(Self::QualityBlocked),
+            "quality_failed" => Ok(Self::QualityFailed),
+            other => Err(format!(
+                "unsupported semantic layer status `{other}`; expected layered semantic status value"
+            )),
         }
     }
 
@@ -310,10 +346,35 @@ mod tests {
     }
 
     #[test]
+    fn semantic_layer_parses_storage_vocabulary() {
+        assert_eq!(SemanticLayer::parse("fast"), Ok(SemanticLayer::Fast));
+        assert_eq!(SemanticLayer::parse("quality"), Ok(SemanticLayer::Quality));
+        assert!(SemanticLayer::parse("auto").is_err());
+    }
+
+    #[test]
     fn semantic_layer_mode_names_match_cli_vocabulary() {
         assert_eq!(SemanticLayerMode::Auto.as_str(), "auto");
         assert_eq!(SemanticLayerMode::Fast.as_str(), "fast");
         assert_eq!(SemanticLayerMode::Quality.as_str(), "quality");
+    }
+
+    #[test]
+    fn semantic_layer_mode_parses_cli_vocabulary() {
+        assert_eq!(SemanticLayerMode::parse(""), Ok(SemanticLayerMode::Auto));
+        assert_eq!(
+            SemanticLayerMode::parse("auto"),
+            Ok(SemanticLayerMode::Auto)
+        );
+        assert_eq!(
+            SemanticLayerMode::parse("fast"),
+            Ok(SemanticLayerMode::Fast)
+        );
+        assert_eq!(
+            SemanticLayerMode::parse("quality"),
+            Ok(SemanticLayerMode::Quality)
+        );
+        assert!(SemanticLayerMode::parse("slow").is_err());
     }
 
     #[test]
@@ -334,6 +395,39 @@ mod tests {
             SemanticLayerStatus::QualityFailed.as_str(),
             "quality_failed"
         );
+    }
+
+    #[test]
+    fn semantic_layer_status_parses_design_lifecycle() {
+        assert_eq!(
+            SemanticLayerStatus::parse("missing"),
+            Ok(SemanticLayerStatus::Missing)
+        );
+        assert_eq!(
+            SemanticLayerStatus::parse("fast_ready"),
+            Ok(SemanticLayerStatus::FastReady)
+        );
+        assert_eq!(
+            SemanticLayerStatus::parse("quality_pending"),
+            Ok(SemanticLayerStatus::QualityPending)
+        );
+        assert_eq!(
+            SemanticLayerStatus::parse("quality_ready"),
+            Ok(SemanticLayerStatus::QualityReady)
+        );
+        assert_eq!(
+            SemanticLayerStatus::parse("quality_stale"),
+            Ok(SemanticLayerStatus::QualityStale)
+        );
+        assert_eq!(
+            SemanticLayerStatus::parse("quality_blocked"),
+            Ok(SemanticLayerStatus::QualityBlocked)
+        );
+        assert_eq!(
+            SemanticLayerStatus::parse("quality_failed"),
+            Ok(SemanticLayerStatus::QualityFailed)
+        );
+        assert!(SemanticLayerStatus::parse("current").is_err());
     }
 
     #[test]

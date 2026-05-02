@@ -5,15 +5,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Serialize;
-use symdex_core::{DiscoveryOptions, NormalizedRepoPath, RepoRoot, discover_indexable_files};
-use symdex_embed::{EmbedConfig, OllamaClient};
+use symdex_core::{
+    DiscoveryOptions, NormalizedRepoPath, RepoRoot, SemanticLayer, SemanticLayerMode,
+    SemanticLayerStatus, discover_indexable_files,
+};
+use symdex_embed::{EmbedConfig, LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
     IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, QdrantExpectedPoint,
-    RetrievedPoint, ScoredPoint, SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary,
-    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
-    TestSearchRow, clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
+    RetrievedPoint, ScoredPoint, SemanticLayerManifestSummary, SemanticNeighborhoodSummary,
+    SemanticRoutingSummary, SqliteStore, StorageExplorerSummary, StorageHealthRow,
+    StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow, TestSearchRow,
+    clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,10 +146,29 @@ pub struct SymbolSearchSummary {
     pub symbols: Vec<SymbolSearchRow>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticSearchOptions {
+    pub semantic_layer: SemanticLayerMode,
+}
+
+impl Default for SemanticSearchOptions {
+    fn default() -> Self {
+        Self {
+            semantic_layer: SemanticLayerMode::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticSearchSummary {
     pub repository_id: String,
     pub qdrant_collection: String,
+    pub requested_layer: SemanticLayerMode,
+    pub semantic_layer: SemanticLayer,
+    pub embedding_model: String,
+    pub generation_id: Option<String>,
+    pub quality_status: SemanticLayerStatus,
+    pub fallback_reason: Option<String>,
     pub query: String,
     pub results: Vec<SemanticSearchResult>,
 }
@@ -641,7 +664,7 @@ pub fn run_unified_context_pack(
     let structural = sqlite
         .context_pack(root.id(), query, limit)
         .map_err(|error| error.to_string())?;
-    let semantic = semantic_search_for_root(&root, query, limit);
+    let semantic = semantic_search_for_root(&root, query, limit, SemanticSearchOptions::default());
     Ok(build_unified_context_pack(
         structural,
         semantic,
@@ -1161,21 +1184,39 @@ pub fn run_semantic_search(
     query: &str,
     limit: usize,
 ) -> Result<SemanticSearchSummary, String> {
+    run_semantic_search_with_options(repo, query, limit, SemanticSearchOptions::default())
+}
+
+pub fn run_semantic_search_with_options(
+    repo: &str,
+    query: &str,
+    limit: usize,
+    options: SemanticSearchOptions,
+) -> Result<SemanticSearchSummary, String> {
     let query = query.trim();
     if query.is_empty() {
         return Err("semantic search requires a query".to_owned());
     }
 
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    semantic_search_for_root(&root, query, limit)
+    semantic_search_for_root(&root, query, limit, options)
 }
 
 fn semantic_search_for_root(
     root: &RepoRoot,
     query: &str,
     limit: usize,
+    options: SemanticSearchOptions,
 ) -> Result<SemanticSearchSummary, String> {
-    let embed_config = EmbedConfig::from_env();
+    let layered_config = LayeredEmbedConfig::from_env();
+    let store_config = StoreConfig::from_env();
+    let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let routing = sqlite
+        .semantic_routing_summary(root.id())
+        .map_err(|error| error.to_string())?;
+    let target =
+        resolve_semantic_search_target(root.id(), options, routing.as_ref(), &layered_config)?;
+    let embed_config = embed_config_for_semantic_target(&layered_config, &target);
     let embed_client =
         OllamaClient::new(embed_config.clone()).map_err(|error| error.to_string())?;
     let query_embedding = embed_client
@@ -1185,11 +1226,9 @@ fn semantic_search_for_root(
         return Err("embedding query returned no vector".to_owned());
     };
 
-    let store_config = StoreConfig::from_env();
     let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
-    let qdrant_collection = qdrant_collection_name(root.id(), &embed_config.model);
     let results = qdrant
-        .query_points(&qdrant_collection, vector, limit)
+        .query_points(&target.qdrant_collection, vector, limit)
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(semantic_result_from_point)
@@ -1197,10 +1236,214 @@ fn semantic_search_for_root(
 
     Ok(SemanticSearchSummary {
         repository_id: root.id().to_owned(),
-        qdrant_collection,
+        qdrant_collection: target.qdrant_collection,
+        requested_layer: target.requested_layer,
+        semantic_layer: target.semantic_layer,
+        embedding_model: target.embedding_model,
+        generation_id: target.generation_id,
+        quality_status: target.quality_status,
+        fallback_reason: target.fallback_reason,
         query: query.to_owned(),
         results,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticSearchTarget {
+    requested_layer: SemanticLayerMode,
+    semantic_layer: SemanticLayer,
+    embedding_model: String,
+    qdrant_collection: String,
+    generation_id: Option<String>,
+    quality_status: SemanticLayerStatus,
+    fallback_reason: Option<String>,
+}
+
+fn resolve_semantic_search_target(
+    repository_id: &str,
+    options: SemanticSearchOptions,
+    routing: Option<&SemanticRoutingSummary>,
+    layered_config: &LayeredEmbedConfig,
+) -> Result<SemanticSearchTarget, String> {
+    match options.semantic_layer {
+        SemanticLayerMode::Auto => {
+            resolve_auto_semantic_target(repository_id, routing, layered_config)
+        }
+        SemanticLayerMode::Fast => Ok(resolve_fast_semantic_target(
+            repository_id,
+            options.semantic_layer,
+            routing,
+            layered_config,
+            None,
+        )),
+        SemanticLayerMode::Quality => {
+            resolve_quality_semantic_target(repository_id, options.semantic_layer, routing)
+        }
+    }
+}
+
+fn resolve_auto_semantic_target(
+    repository_id: &str,
+    routing: Option<&SemanticRoutingSummary>,
+    layered_config: &LayeredEmbedConfig,
+) -> Result<SemanticSearchTarget, String> {
+    let Some(summary) = routing else {
+        return Ok(resolve_fast_semantic_target(
+            repository_id,
+            SemanticLayerMode::Auto,
+            None,
+            layered_config,
+            Some("semantic_generation_missing_using_fast_layer".to_owned()),
+        ));
+    };
+
+    if summary.active_layer == SemanticLayer::Quality {
+        match summary.quality.as_ref() {
+            Some(quality) if summary.quality_status.quality_is_current() && quality.is_complete => {
+                return Ok(target_from_manifest(
+                    SemanticLayerMode::Auto,
+                    SemanticLayerStatus::QualityReady,
+                    Some(summary.generation_id.clone()),
+                    quality,
+                    None,
+                ));
+            }
+            Some(quality) if !quality.is_complete => {
+                return Ok(resolve_fast_semantic_target(
+                    repository_id,
+                    SemanticLayerMode::Auto,
+                    Some(summary),
+                    layered_config,
+                    Some("quality_manifest_incomplete_using_fast_layer".to_owned()),
+                ));
+            }
+            Some(_) => {
+                return Ok(resolve_fast_semantic_target(
+                    repository_id,
+                    SemanticLayerMode::Auto,
+                    Some(summary),
+                    layered_config,
+                    Some(format!(
+                        "quality_status_{}_using_fast_layer",
+                        summary.quality_status.as_str()
+                    )),
+                ));
+            }
+            None => {
+                return Ok(resolve_fast_semantic_target(
+                    repository_id,
+                    SemanticLayerMode::Auto,
+                    Some(summary),
+                    layered_config,
+                    Some("quality_manifest_missing_using_fast_layer".to_owned()),
+                ));
+            }
+        }
+    }
+
+    Ok(resolve_fast_semantic_target(
+        repository_id,
+        SemanticLayerMode::Auto,
+        Some(summary),
+        layered_config,
+        None,
+    ))
+}
+
+fn resolve_fast_semantic_target(
+    repository_id: &str,
+    requested_layer: SemanticLayerMode,
+    routing: Option<&SemanticRoutingSummary>,
+    layered_config: &LayeredEmbedConfig,
+    fallback_reason: Option<String>,
+) -> SemanticSearchTarget {
+    if let Some(summary) = routing {
+        return target_from_manifest(
+            requested_layer,
+            summary.quality_status,
+            Some(summary.generation_id.clone()),
+            &summary.fast,
+            fallback_reason,
+        );
+    }
+
+    let fast_config = layered_config.fast_embed_config();
+    SemanticSearchTarget {
+        requested_layer,
+        semantic_layer: SemanticLayer::Fast,
+        embedding_model: fast_config.model.clone(),
+        qdrant_collection: qdrant_collection_name(repository_id, &fast_config.model),
+        generation_id: None,
+        quality_status: SemanticLayerStatus::Missing,
+        fallback_reason,
+    }
+}
+
+fn resolve_quality_semantic_target(
+    repository_id: &str,
+    requested_layer: SemanticLayerMode,
+    routing: Option<&SemanticRoutingSummary>,
+) -> Result<SemanticSearchTarget, String> {
+    let Some(summary) = routing else {
+        return Err(format!(
+            "quality semantic layer is unavailable for repository `{repository_id}`: no semantic generation recorded"
+        ));
+    };
+    if !summary.quality_status.quality_is_current() {
+        return Err(format!(
+            "quality semantic layer is unavailable for repository `{repository_id}`: status is `{}`",
+            summary.quality_status.as_str()
+        ));
+    }
+    let Some(quality) = summary.quality.as_ref() else {
+        return Err(format!(
+            "quality semantic layer is unavailable for repository `{repository_id}`: quality manifest is missing"
+        ));
+    };
+    if !quality.is_complete {
+        return Err(format!(
+            "quality semantic layer is unavailable for repository `{repository_id}`: quality manifest is incomplete ({}/{})",
+            quality.current_chunks, quality.expected_chunks
+        ));
+    }
+
+    Ok(target_from_manifest(
+        requested_layer,
+        summary.quality_status,
+        Some(summary.generation_id.clone()),
+        quality,
+        None,
+    ))
+}
+
+fn target_from_manifest(
+    requested_layer: SemanticLayerMode,
+    quality_status: SemanticLayerStatus,
+    generation_id: Option<String>,
+    manifest: &SemanticLayerManifestSummary,
+    fallback_reason: Option<String>,
+) -> SemanticSearchTarget {
+    SemanticSearchTarget {
+        requested_layer,
+        semantic_layer: manifest.semantic_layer,
+        embedding_model: manifest.embedding_model.clone(),
+        qdrant_collection: manifest.qdrant_collection.clone(),
+        generation_id,
+        quality_status,
+        fallback_reason,
+    }
+}
+
+fn embed_config_for_semantic_target(
+    layered_config: &LayeredEmbedConfig,
+    target: &SemanticSearchTarget,
+) -> EmbedConfig {
+    let mut embed_config = match target.semantic_layer {
+        SemanticLayer::Fast => layered_config.fast_embed_config(),
+        SemanticLayer::Quality => layered_config.quality_embed_config(),
+    };
+    embed_config.model = target.embedding_model.clone();
+    embed_config
 }
 
 fn semantic_result_from_point(point: ScoredPoint) -> SemanticSearchResult {
@@ -1322,6 +1565,28 @@ fn build_unified_context_pack(
         Ok(summary) => {
             notes.push("semantic_evidence_included".to_owned());
             notes.push(format!("semantic_collection:{}", summary.qdrant_collection));
+            notes.push(format!(
+                "semantic_requested_layer:{}",
+                summary.requested_layer.as_str()
+            ));
+            notes.push(format!(
+                "semantic_active_layer:{}",
+                summary.semantic_layer.as_str()
+            ));
+            notes.push(format!(
+                "semantic_embedding_model:{}",
+                summary.embedding_model
+            ));
+            notes.push(format!(
+                "semantic_quality_status:{}",
+                summary.quality_status.as_str()
+            ));
+            if let Some(generation_id) = &summary.generation_id {
+                notes.push(format!("semantic_generation_id:{generation_id}"));
+            }
+            if let Some(fallback_reason) = &summary.fallback_reason {
+                notes.push(format!("semantic_fallback:{fallback_reason}"));
+            }
             notes.push(format!("semantic_results:{}", summary.results.len()));
             for result in &summary.results {
                 let source = semantic_context_source(result, &items, &files);
@@ -2582,19 +2847,24 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use symdex_core::{RepoRoot, content_hash};
+    use symdex_core::{
+        RepoRoot, SemanticLayer, SemanticLayerMode, SemanticLayerStatus, content_hash,
+    };
+    use symdex_embed::LayeredEmbedConfig;
     use symdex_store::{
         CallRecord, CallSearchRow, ContextPack, ContextPackLimits, EvidenceFreshness,
         EvidenceProvenance, FileFreshnessSnapshot, FileRecord, PointPayload, QdrantExpectedPoint,
-        RepositoryRecord, RetrievedPoint, ScoredPoint, SqliteStore, StorageHealthStatus,
-        StoreConfig, SymbolRecord, SymbolSearchRow, TestRecord,
+        RepositoryRecord, RetrievedPoint, ScoredPoint, SemanticLayerManifestSummary,
+        SemanticRoutingSummary, SqliteStore, StorageHealthStatus, StoreConfig, SymbolRecord,
+        SymbolSearchRow, TestRecord,
     };
 
     use crate::{
         CallDirection, ContextEvidenceSource, ContextPackMode, FreshnessScope, QueryMode,
-        SemanticSearchResult, SemanticSearchSummary, build_debug_context_pack,
-        build_freshness_report, build_impact_summary, build_unified_context_pack, evidence_trust,
-        freshness_rows, parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
+        SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
+        build_debug_context_pack, build_freshness_report, build_impact_summary,
+        build_unified_context_pack, evidence_trust, freshness_rows, parse_runtime_input,
+        qdrant_verify_summary, resolve_semantic_search_target, run_call_graph, run_call_path,
         run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
         run_symbol_search, semantic_reasons, semantic_result_from_point,
     };
@@ -2621,6 +2891,138 @@ mod tests {
     fn semantic_search_rejects_empty_query_before_service_calls() {
         let error = run_semantic_search(".", " ", 10).expect_err("empty query should fail");
         assert!(error.contains("requires a query"));
+    }
+
+    #[test]
+    fn semantic_routing_defaults_to_fast_without_generation() {
+        let target = resolve_semantic_search_target(
+            "repo",
+            SemanticSearchOptions::default(),
+            None,
+            &sample_layered_config(),
+        )
+        .expect("target should resolve");
+
+        assert_eq!(target.requested_layer, SemanticLayerMode::Auto);
+        assert_eq!(target.semantic_layer, SemanticLayer::Fast);
+        assert_eq!(target.embedding_model, "fast-model");
+        assert_eq!(target.qdrant_collection, "symdex_repo_fast_model");
+        assert_eq!(target.quality_status, SemanticLayerStatus::Missing);
+        assert_eq!(
+            target.fallback_reason.as_deref(),
+            Some("semantic_generation_missing_using_fast_layer")
+        );
+    }
+
+    #[test]
+    fn semantic_routing_auto_uses_ready_active_quality() {
+        let routing = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+
+        let target = resolve_semantic_search_target(
+            "repo",
+            SemanticSearchOptions::default(),
+            Some(&routing),
+            &sample_layered_config(),
+        )
+        .expect("target should resolve");
+
+        assert_eq!(target.requested_layer, SemanticLayerMode::Auto);
+        assert_eq!(target.semantic_layer, SemanticLayer::Quality);
+        assert_eq!(target.embedding_model, "quality-model");
+        assert_eq!(target.qdrant_collection, "symdex_repo_quality_model");
+        assert_eq!(target.quality_status, SemanticLayerStatus::QualityReady);
+        assert_eq!(target.fallback_reason, None);
+    }
+
+    #[test]
+    fn semantic_routing_auto_falls_back_when_quality_is_pending() {
+        let routing = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityPending,
+            Some(sample_manifest(SemanticLayer::Quality, false)),
+        );
+
+        let target = resolve_semantic_search_target(
+            "repo",
+            SemanticSearchOptions::default(),
+            Some(&routing),
+            &sample_layered_config(),
+        )
+        .expect("target should resolve");
+
+        assert_eq!(target.semantic_layer, SemanticLayer::Fast);
+        assert_eq!(target.embedding_model, "fast-model");
+        assert_eq!(
+            target.fallback_reason.as_deref(),
+            Some("quality_manifest_incomplete_using_fast_layer")
+        );
+    }
+
+    #[test]
+    fn semantic_routing_forced_fast_uses_fast_manifest() {
+        let routing = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+
+        let target = resolve_semantic_search_target(
+            "repo",
+            SemanticSearchOptions {
+                semantic_layer: SemanticLayerMode::Fast,
+            },
+            Some(&routing),
+            &sample_layered_config(),
+        )
+        .expect("target should resolve");
+
+        assert_eq!(target.requested_layer, SemanticLayerMode::Fast);
+        assert_eq!(target.semantic_layer, SemanticLayer::Fast);
+        assert_eq!(target.embedding_model, "fast-model");
+        assert_eq!(target.fallback_reason, None);
+    }
+
+    #[test]
+    fn semantic_routing_forced_quality_requires_ready_complete_manifest() {
+        let pending = sample_routing_summary(
+            SemanticLayer::Fast,
+            SemanticLayerStatus::QualityPending,
+            Some(sample_manifest(SemanticLayer::Quality, false)),
+        );
+        let error = resolve_semantic_search_target(
+            "repo",
+            SemanticSearchOptions {
+                semantic_layer: SemanticLayerMode::Quality,
+            },
+            Some(&pending),
+            &sample_layered_config(),
+        )
+        .expect_err("pending quality should fail");
+        assert!(error.contains("status is `quality_pending`"));
+
+        let ready = sample_routing_summary(
+            SemanticLayer::Fast,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+        let target = resolve_semantic_search_target(
+            "repo",
+            SemanticSearchOptions {
+                semantic_layer: SemanticLayerMode::Quality,
+            },
+            Some(&ready),
+            &sample_layered_config(),
+        )
+        .expect("ready quality should resolve");
+
+        assert_eq!(target.requested_layer, SemanticLayerMode::Quality);
+        assert_eq!(target.semantic_layer, SemanticLayer::Quality);
+        assert_eq!(target.embedding_model, "quality-model");
+        assert_eq!(target.fallback_reason, None);
     }
 
     #[test]
@@ -2790,6 +3192,12 @@ mod tests {
         let semantic = SemanticSearchSummary {
             repository_id: "repo".to_owned(),
             qdrant_collection: "symdex_repo_model".to_owned(),
+            requested_layer: SemanticLayerMode::Auto,
+            semantic_layer: SemanticLayer::Fast,
+            embedding_model: "model".to_owned(),
+            generation_id: Some("generation-1".to_owned()),
+            quality_status: SemanticLayerStatus::FastReady,
+            fallback_reason: None,
             query: "main".to_owned(),
             results: vec![
                 semantic_result(
@@ -3404,6 +3812,64 @@ mod tests {
                 "metadata_only_no_source_text".to_owned(),
                 "direct_relationships_only".to_owned(),
             ],
+        }
+    }
+
+    fn sample_layered_config() -> LayeredEmbedConfig {
+        LayeredEmbedConfig {
+            ollama_url: "http://localhost:11434".to_owned(),
+            fast_model: "fast-model".to_owned(),
+            quality_model: "quality-model".to_owned(),
+            quality_enabled: true,
+            truncate: true,
+            batch_size: 16,
+            quality_batch_size: 4,
+            quality_workers: 1,
+            max_chunk_bytes: 32_768,
+        }
+    }
+
+    fn sample_routing_summary(
+        active_layer: SemanticLayer,
+        quality_status: SemanticLayerStatus,
+        quality: Option<SemanticLayerManifestSummary>,
+    ) -> SemanticRoutingSummary {
+        SemanticRoutingSummary {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            active_layer,
+            quality_status,
+            embeddable_chunks: 1,
+            fast_embedded_chunks: 1,
+            quality_embedded_chunks: usize::from(quality.as_ref().is_some_and(|manifest| {
+                manifest.semantic_layer == SemanticLayer::Quality && manifest.is_complete
+            })),
+            fast: sample_manifest(SemanticLayer::Fast, true),
+            quality,
+        }
+    }
+
+    fn sample_manifest(
+        semantic_layer: SemanticLayer,
+        is_complete: bool,
+    ) -> SemanticLayerManifestSummary {
+        let (embedding_model, qdrant_collection) = match semantic_layer {
+            SemanticLayer::Fast => ("fast-model", "symdex_repo_fast_model"),
+            SemanticLayer::Quality => ("quality-model", "symdex_repo_quality_model"),
+        };
+        SemanticLayerManifestSummary {
+            semantic_layer,
+            embedding_model: embedding_model.to_owned(),
+            embedding_dimension: 768,
+            qdrant_collection: qdrant_collection.to_owned(),
+            current_chunks: usize::from(is_complete),
+            stale_chunks: usize::from(!is_complete),
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 1,
+            expected_chunks: 1,
+            is_complete,
         }
     }
 

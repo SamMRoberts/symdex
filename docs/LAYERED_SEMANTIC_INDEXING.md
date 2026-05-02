@@ -330,7 +330,7 @@ Default routing:
 
 ```text
 if latest semantic generation active_layer == quality
-   and quality_status == current
+  and quality_status == quality_ready
    and quality manifest is complete:
      embed query with quality model
      search quality collection
@@ -338,6 +338,11 @@ else:
      embed query with fast model
      search fast collection
 ```
+
+The shared query library resolves this from SQLite using the latest semantic
+generation plus compact `chunk_embeddings` coverage summaries. If no semantic
+generation exists, auto and forced-fast routing fall back to the configured fast
+model and collection naming convention for compatibility with older indexes.
 
 Search summaries should expose:
 
@@ -348,7 +353,7 @@ Search summaries should expose:
 - `generation_id`
 - whether the query fell back to fast because quality was unavailable
 
-Useful CLI flags:
+Planned CLI flags:
 
 ```text
 --semantic-layer auto     # default

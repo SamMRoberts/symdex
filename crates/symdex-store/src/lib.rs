@@ -885,6 +885,126 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)
     }
 
+    pub fn semantic_routing_summary(
+        &self,
+        repository_id: &str,
+    ) -> Result<Option<SemanticRoutingSummary>> {
+        let Some(generation) = self.latest_semantic_generation(repository_id)? else {
+            return Ok(None);
+        };
+
+        let active_layer = SemanticLayer::parse(&generation.active_layer)
+            .map_err(|error| StoreError::UnexpectedResponse(error.to_owned()))?;
+        let quality_status = SemanticLayerStatus::parse(&generation.quality_status)
+            .map_err(|error| StoreError::UnexpectedResponse(error.to_owned()))?;
+        let fast = self.semantic_layer_manifest_summary(
+            &generation,
+            SemanticLayer::Fast,
+            &generation.fast_model,
+            generation.fast_dimension,
+        )?;
+
+        let quality = match (&generation.quality_model, generation.quality_dimension) {
+            (Some(model), Some(dimension)) => Some(self.semantic_layer_manifest_summary(
+                &generation,
+                SemanticLayer::Quality,
+                model,
+                dimension,
+            )?),
+            _ => self
+                .semantic_layer_manifest_aggregate(&generation, SemanticLayer::Quality)?
+                .map(|aggregate| {
+                    SemanticLayerManifestSummary::from_aggregate(
+                        SemanticLayer::Quality,
+                        generation.embeddable_chunks,
+                        aggregate,
+                    )
+                })
+                .transpose()?,
+        };
+
+        Ok(Some(SemanticRoutingSummary {
+            repository_id: generation.repository_id,
+            generation_id: generation.id,
+            active_layer,
+            quality_status,
+            embeddable_chunks: generation.embeddable_chunks,
+            fast_embedded_chunks: generation.fast_embedded_chunks,
+            quality_embedded_chunks: generation.quality_embedded_chunks,
+            fast,
+            quality,
+        }))
+    }
+
+    fn semantic_layer_manifest_summary(
+        &self,
+        generation: &SemanticGenerationRecord,
+        semantic_layer: SemanticLayer,
+        embedding_model: &str,
+        embedding_dimension: usize,
+    ) -> Result<SemanticLayerManifestSummary> {
+        let Some(aggregate) = self.semantic_layer_manifest_aggregate(generation, semantic_layer)?
+        else {
+            return Ok(SemanticLayerManifestSummary::empty(
+                semantic_layer,
+                generation.embeddable_chunks,
+                embedding_model.to_owned(),
+                embedding_dimension,
+                qdrant_collection_name(&generation.repository_id, embedding_model),
+            ));
+        };
+
+        SemanticLayerManifestSummary::from_aggregate(
+            semantic_layer,
+            generation.embeddable_chunks,
+            aggregate,
+        )
+    }
+
+    fn semantic_layer_manifest_aggregate(
+        &self,
+        generation: &SemanticGenerationRecord,
+        semantic_layer: SemanticLayer,
+    ) -> Result<Option<SemanticLayerManifestAggregate>> {
+        self.connection
+            .query_row(
+                "SELECT embedding_model, embedding_dimension, qdrant_collection,
+                        SUM(CASE WHEN status = 'current' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'stale' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status NOT IN ('current', 'stale', 'blocked', 'failed') THEN 1 ELSE 0 END),
+                        COUNT(*)
+                 FROM chunk_embeddings
+                 WHERE repository_id = ?1
+                   AND generation_id = ?2
+                   AND semantic_layer = ?3
+                 GROUP BY embedding_model, embedding_dimension, qdrant_collection
+                 ORDER BY 4 DESC, 9 DESC, embedding_model, qdrant_collection
+                 LIMIT 1",
+                params![
+                    generation.repository_id,
+                    generation.id,
+                    semantic_layer.as_str()
+                ],
+                |row| {
+                    Ok(SemanticLayerManifestAggregate {
+                        embedding_model: row.get(0)?,
+                        embedding_dimension: row.get::<_, i64>(1)?,
+                        qdrant_collection: row.get(2)?,
+                        current_chunks: row.get::<_, i64>(3)?,
+                        stale_chunks: row.get::<_, i64>(4)?,
+                        blocked_chunks: row.get::<_, i64>(5)?,
+                        failed_chunks: row.get::<_, i64>(6)?,
+                        other_chunks: row.get::<_, i64>(7)?,
+                        total_chunks: row.get::<_, i64>(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
     pub fn upsert_chunk_embedding(&self, embedding: &ChunkEmbeddingRecord) -> Result<()> {
         self.connection
             .execute(
@@ -2473,6 +2593,109 @@ pub struct SemanticGenerationRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticRoutingSummary {
+    pub repository_id: String,
+    pub generation_id: String,
+    pub active_layer: SemanticLayer,
+    pub quality_status: SemanticLayerStatus,
+    pub embeddable_chunks: usize,
+    pub fast_embedded_chunks: usize,
+    pub quality_embedded_chunks: usize,
+    pub fast: SemanticLayerManifestSummary,
+    pub quality: Option<SemanticLayerManifestSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticLayerManifestSummary {
+    pub semantic_layer: SemanticLayer,
+    pub embedding_model: String,
+    pub embedding_dimension: usize,
+    pub qdrant_collection: String,
+    pub current_chunks: usize,
+    pub stale_chunks: usize,
+    pub blocked_chunks: usize,
+    pub failed_chunks: usize,
+    pub other_chunks: usize,
+    pub total_chunks: usize,
+    pub expected_chunks: usize,
+    pub is_complete: bool,
+}
+
+impl SemanticLayerManifestSummary {
+    fn empty(
+        semantic_layer: SemanticLayer,
+        expected_chunks: usize,
+        embedding_model: String,
+        embedding_dimension: usize,
+        qdrant_collection: String,
+    ) -> Self {
+        Self {
+            semantic_layer,
+            embedding_model,
+            embedding_dimension,
+            qdrant_collection,
+            current_chunks: 0,
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 0,
+            expected_chunks,
+            is_complete: expected_chunks == 0,
+        }
+    }
+
+    fn from_aggregate(
+        semantic_layer: SemanticLayer,
+        expected_chunks: usize,
+        aggregate: SemanticLayerManifestAggregate,
+    ) -> Result<Self> {
+        let embedding_dimension =
+            usize_count(aggregate.embedding_dimension, "embedding dimension")?;
+        let current_chunks = usize_count(aggregate.current_chunks, "current chunk count")?;
+        let stale_chunks = usize_count(aggregate.stale_chunks, "stale chunk count")?;
+        let blocked_chunks = usize_count(aggregate.blocked_chunks, "blocked chunk count")?;
+        let failed_chunks = usize_count(aggregate.failed_chunks, "failed chunk count")?;
+        let other_chunks = usize_count(aggregate.other_chunks, "other chunk count")?;
+        let total_chunks = usize_count(aggregate.total_chunks, "total chunk count")?;
+        let is_complete = current_chunks == expected_chunks
+            && total_chunks == expected_chunks
+            && stale_chunks == 0
+            && blocked_chunks == 0
+            && failed_chunks == 0
+            && other_chunks == 0;
+
+        Ok(Self {
+            semantic_layer,
+            embedding_model: aggregate.embedding_model,
+            embedding_dimension,
+            qdrant_collection: aggregate.qdrant_collection,
+            current_chunks,
+            stale_chunks,
+            blocked_chunks,
+            failed_chunks,
+            other_chunks,
+            total_chunks,
+            expected_chunks,
+            is_complete,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticLayerManifestAggregate {
+    embedding_model: String,
+    embedding_dimension: i64,
+    qdrant_collection: String,
+    current_chunks: i64,
+    stale_chunks: i64,
+    blocked_chunks: i64,
+    failed_chunks: i64,
+    other_chunks: i64,
+    total_chunks: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkEmbeddingRecord {
     pub id: String,
     pub repository_id: String,
@@ -2982,6 +3205,12 @@ fn collect_rows<T>(
         values.push(row.map_err(StoreError::Sqlite)?);
     }
     Ok(values)
+}
+
+fn usize_count(value: i64, label: &str) -> Result<usize> {
+    value
+        .try_into()
+        .map_err(|_| StoreError::UnexpectedResponse(format!("negative {label}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3965,6 +4194,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::params;
+    use symdex_core::{SemanticLayer, SemanticLayerStatus};
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
@@ -4265,6 +4495,158 @@ mod tests {
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 1);
         assert_eq!(status.chunks_indexed, 1);
+    }
+
+    #[test]
+    fn semantic_routing_summary_is_empty_without_generation() {
+        let db = TestDb::new("semantic-routing-empty");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+
+        assert_eq!(
+            store
+                .semantic_routing_summary("repo")
+                .expect("routing summary should load"),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_routing_summary_reports_fast_ready_manifest() {
+        let db = TestDb::new("semantic-routing-fast-ready");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        let mut generation = sample_semantic_generation();
+        generation.quality_model = None;
+        generation.quality_dimension = None;
+        generation.quality_status = "fast_ready".to_owned();
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+
+        let summary = store
+            .semantic_routing_summary("repo")
+            .expect("routing summary should load")
+            .expect("routing summary should exist");
+
+        assert_eq!(summary.active_layer, SemanticLayer::Fast);
+        assert_eq!(summary.quality_status, SemanticLayerStatus::FastReady);
+        assert_eq!(summary.fast.embedding_model, "nomic-embed-text");
+        assert_eq!(summary.fast.current_chunks, 1);
+        assert_eq!(summary.fast.expected_chunks, 1);
+        assert!(summary.fast.is_complete);
+        assert_eq!(summary.quality, None);
+    }
+
+    #[test]
+    fn semantic_routing_summary_reports_ready_quality_manifest() {
+        let db = TestDb::new("semantic-routing-quality-ready");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        let mut generation = sample_semantic_generation();
+        generation.quality_status = "quality_ready".to_owned();
+        generation.active_layer = "quality".to_owned();
+        generation.quality_embedded_chunks = 1;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
+            .expect("quality embedding should persist");
+
+        let summary = store
+            .semantic_routing_summary("repo")
+            .expect("routing summary should load")
+            .expect("routing summary should exist");
+
+        let quality = summary.quality.expect("quality summary should exist");
+        assert_eq!(summary.active_layer, SemanticLayer::Quality);
+        assert_eq!(summary.quality_status, SemanticLayerStatus::QualityReady);
+        assert_eq!(quality.embedding_model, "nomic-embed-text-v2-moe");
+        assert_eq!(
+            quality.qdrant_collection,
+            "symdex_repo_nomic_embed_text_v2_moe"
+        );
+        assert_eq!(quality.current_chunks, 1);
+        assert!(quality.is_complete);
+    }
+
+    #[test]
+    fn semantic_routing_summary_reports_incomplete_quality_manifest() {
+        let db = TestDb::new("semantic-routing-quality-incomplete");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        let mut generation = sample_semantic_generation();
+        generation.quality_status = "quality_stale".to_owned();
+        generation.quality_embedded_chunks = 1;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&sample_quality_chunk_embedding("stale"))
+            .expect("quality embedding should persist");
+
+        let summary = store
+            .semantic_routing_summary("repo")
+            .expect("routing summary should load")
+            .expect("routing summary should exist");
+
+        let quality = summary.quality.expect("quality summary should exist");
+        assert_eq!(summary.quality_status, SemanticLayerStatus::QualityStale);
+        assert_eq!(quality.current_chunks, 0);
+        assert_eq!(quality.stale_chunks, 1);
+        assert!(!quality.is_complete);
     }
 
     #[test]
@@ -6015,6 +6397,18 @@ mod tests {
             generation_id: "generation-1".to_owned(),
             embedded_at: "101".to_owned(),
             status: "current".to_owned(),
+        }
+    }
+
+    fn sample_quality_chunk_embedding(status: &str) -> ChunkEmbeddingRecord {
+        ChunkEmbeddingRecord {
+            id: format!("quality-embedding-{status}"),
+            semantic_layer: "quality".to_owned(),
+            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
+            qdrant_collection: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
+            qdrant_point_id: "01234567-89ab-cdef-fedc-ba9876543211".to_owned(),
+            status: status.to_owned(),
+            ..sample_chunk_embedding()
         }
     }
 

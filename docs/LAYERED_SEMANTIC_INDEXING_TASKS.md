@@ -78,6 +78,10 @@ Acceptance:
 Goal: make query routing consult SQLite readiness state while still usually
 routing to fast.
 
+Status: implemented in the shared store/query library. The CLI `--semantic-layer`
+flag remains deferred so text output and MCP-backed JSON output can be kept in
+parity when it is exposed.
+
 Tasks:
 
 - Add store query for active semantic layer and generation status.

@@ -45,12 +45,12 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q5 — Active-layer query routing
 
-- [ ] Add store API for active semantic layer and quality status.
-- [ ] Route default semantic search through active-layer metadata.
-- [ ] Add forced search modes: auto, fast, quality.
-- [ ] Fail clearly when forced quality search is requested but quality is not
+- [x] Add store API for active semantic layer and quality status.
+- [x] Route default semantic search through active-layer metadata.
+- [x] Add forced search modes: auto, fast, quality.
+- [x] Fail clearly when forced quality search is requested but quality is not
   current.
-- [ ] Include active layer, model, collection, generation, quality status, and
+- [x] Include active layer, model, collection, generation, quality status, and
   fallback reason in semantic search summaries.
 
 ## Phase Q6 — Quality queue and manual worker
