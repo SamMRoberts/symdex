@@ -78,8 +78,6 @@ feature contracts.
 
 - Unified context packs that merge structural and semantic evidence in one
   agent-facing response.
-- A read-only MCP staleness check so agents can explicitly verify whether
-  index evidence is fresh before querying or requesting reindexing.
 - More correct `.gitignore` glob and negation handling during discovery.
 - Multi-language test discovery for C#, JavaScript, and TypeScript.
 - Runtime-to-source mapping for C# and Node/V8 stack traces in addition to the

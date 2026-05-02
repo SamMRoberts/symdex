@@ -192,7 +192,9 @@ trust scoring, explainability reason tags, and the TUI evidence freshness panel.
 Current cross-agent reuse tests cover the shared MCP evidence contract envelope,
 read-only tool annotations, underscore-only tool names, repo root validation,
 and two independent MCP readers using the same SQLite index-status path without
-write-capable tools.
+write-capable tools. Current MCP staleness tests cover tool schema, path
+validation, symbol scope, explicit paths, stale/deleted/missing/unknown states,
+and source-free envelope output.
 Current diagnostics tests cover optional rust-analyzer readiness configuration
 without invoking project analysis or requiring rust-analyzer to be installed.
 

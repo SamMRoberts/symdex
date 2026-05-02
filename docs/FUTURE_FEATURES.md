@@ -161,9 +161,7 @@ Requirements:
 - Compare indexed content hashes and timestamps against current eligible files.
 - Label evidence as fresh, stale, missing, deleted, or unknown where relevant.
 - Surface staleness in CLI outputs, TUI status panels, MCP responses, context
-  packs, and debug packs.
-- Add a direct read-only MCP staleness check so agents can verify index
-  freshness before deciding whether to query, reindex, or ask the user.
+  packs, debug packs, and the direct read-only MCP staleness check.
 - Avoid automatic destructive cleanup; stale evidence warnings should guide
   reindexing or continuous indexing.
 

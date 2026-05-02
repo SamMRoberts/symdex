@@ -476,6 +476,79 @@ Planned parser expansion: keep the Rust parser behavior and add conservative C#
 and Node/V8 stack frame patterns. Unmapped frames must remain visible with an
 explicit status instead of being dropped.
 
+### `symdex_staleness_check`
+
+Read-only tool for explicit index freshness checks.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "optional::symbol",
+  "paths": ["optional/path.rs"]
+}
+```
+
+Output:
+
+```json
+{
+  "repository_id": "stable-repo-id",
+  "symbol_query": "optional::symbol",
+  "scope": {
+    "symbol": "optional::symbol",
+    "paths": ["optional/path.rs"]
+  },
+  "counts": {
+    "fresh": 1,
+    "stale": 1,
+    "deleted": 0,
+    "missing": 0,
+    "unknown": 0
+  },
+  "files": [
+    {
+      "path": "optional/path.rs",
+      "freshness": "stale",
+      "indexed_content_hash": "sha256:old",
+      "current_content_hash": "sha256:new",
+      "indexed_at": "2026-04-30T12:00:00Z",
+      "index_run_id": "repo-...",
+      "parser_version": "tree-sitter-rust-...",
+      "trust": {
+        "score": 0.74,
+        "level": "medium",
+        "factors": ["freshness:stale"]
+      },
+      "reasons": [
+        "explicit_staleness_check",
+        "path:optional/path.rs",
+        "freshness:stale"
+      ],
+      "provenance": {
+        "content_hash": "sha256:old",
+        "index_run_id": "repo-...",
+        "parser_version": "tree-sitter-rust-...",
+        "indexed_at": "2026-04-30T12:00:00Z",
+        "embedding_model": null,
+        "embedding_dimension": null,
+        "embedded_at": null
+      }
+    }
+  ]
+}
+```
+
+The tool reuses the same freshness logic as `symdex staleness`. It accepts a
+repository-wide request, a `symbol` scope, an explicit `paths` scope, or both
+when every requested path is inside the symbol-derived file scope. Incompatible
+symbol/path combinations fail closed. Paths are validated against the repository
+root; deleted or unknown files should be passed as repository-relative paths.
+Returned states are `fresh`, `stale`, `deleted`, `missing`, or `unknown`, and
+rows include indexed and current hashes when available. The tool returns
+source-free metadata only.
+
 ### `symdex_index_status`
 
 Return local SQLite index counts.
@@ -515,30 +588,6 @@ Do not add mutation tools until a dedicated design doc exists. Candidate future 
 
 These tools are not implemented yet. They are documented here so future work
 keeps the same local-only, compact, metadata-first contract.
-
-### `symdex_staleness_check`
-
-Read-only tool for explicit index freshness checks.
-
-Input:
-
-```json
-{
-  "repo": "/path/to/repo",
-  "symbol": "optional::symbol",
-  "paths": ["optional/path.rs"]
-}
-```
-
-Rules:
-
-- Accept either `symbol`, `paths`, both when they are compatible, or neither for
-  a repository-wide report.
-- Reuse the same staleness logic as `symdex staleness`.
-- Enforce repository root boundaries and fail closed on ambiguous paths.
-- Return freshness states `fresh`, `stale`, `deleted`, `missing`, or `unknown`.
-- Include indexed and current hashes for stale files.
-- Do not return source text.
 
 ### `symdex_semantic_neighborhood`
 

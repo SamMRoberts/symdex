@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Serialize;
-use symdex_core::{DiscoveryOptions, RepoRoot, discover_indexable_files};
+use symdex_core::{DiscoveryOptions, NormalizedRepoPath, RepoRoot, discover_indexable_files};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
@@ -394,6 +394,12 @@ pub struct FreshnessSummary {
     pub context_pack: Option<ContextPack>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreshnessScope {
+    pub symbol_query: Option<String>,
+    pub paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeFailureInput {
     pub frames: Vec<RuntimeFrame>,
@@ -758,21 +764,50 @@ pub fn run_freshness_report(
     repo: &str,
     symbol_query: Option<&str>,
 ) -> Result<FreshnessSummary, String> {
+    run_scoped_freshness_report(
+        repo,
+        FreshnessScope {
+            symbol_query: symbol_query.map(str::to_owned),
+            paths: Vec::new(),
+        },
+    )
+}
+
+pub fn run_scoped_freshness_report(
+    repo: &str,
+    scope: FreshnessScope,
+) -> Result<FreshnessSummary, String> {
+    run_scoped_freshness_report_with_store_config(repo, scope, &StoreConfig::from_env())
+}
+
+pub fn run_scoped_freshness_report_with_store_config(
+    repo: &str,
+    scope: FreshnessScope,
+    store_config: &StoreConfig,
+) -> Result<FreshnessSummary, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
-    let current_hashes = discover_indexable_files(&root, &DiscoveryOptions::default())
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|file| (file.facts.relative_path, file.facts.content_hash))
-        .collect::<BTreeMap<_, _>>();
+    let sqlite = sqlite_for_read_with_config(store_config)?;
+    build_freshness_report(&root, &sqlite, scope)
+}
+
+fn build_freshness_report(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    scope: FreshnessScope,
+) -> Result<FreshnessSummary, String> {
+    let current_hashes = current_hashes(root)?;
     let indexed = sqlite
         .indexed_file_freshness_snapshots(root.id())
         .map_err(|error| error.to_string())?;
 
+    let explicit_paths = normalize_freshness_paths(&scope.paths)?;
+
     let mut focus_symbols = Vec::new();
     let mut context_pack = None;
-    let mut scoped_paths = BTreeSet::new();
-    let query = symbol_query
+    let mut symbol_scoped_paths = BTreeSet::new();
+    let query = scope
+        .symbol_query
+        .as_deref()
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .map(str::to_owned);
@@ -781,16 +816,36 @@ pub fn run_freshness_report(
             .find_symbols(root.id(), query)
             .map_err(|error| error.to_string())?;
         for symbol in &focus_symbols {
-            scoped_paths.insert(symbol.path.clone());
+            symbol_scoped_paths.insert(symbol.path.clone());
         }
         let pack = sqlite
             .context_pack(root.id(), query, 8)
             .map_err(|error| error.to_string())?;
         for path in &pack.files {
-            scoped_paths.insert(path.clone());
+            symbol_scoped_paths.insert(path.clone());
         }
         context_pack = Some(pack);
     }
+
+    if query.is_some() && !explicit_paths.is_empty() {
+        let incompatible = explicit_paths
+            .iter()
+            .filter(|path| !symbol_scoped_paths.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !incompatible.is_empty() {
+            return Err(format!(
+                "paths are outside the symbol freshness scope: {}",
+                incompatible.join(", ")
+            ));
+        }
+    }
+
+    let scoped_paths = if !explicit_paths.is_empty() {
+        explicit_paths
+    } else {
+        symbol_scoped_paths
+    };
 
     Ok(FreshnessSummary {
         repository_id: root.id().to_owned(),
@@ -799,6 +854,17 @@ pub fn run_freshness_report(
         focus_symbols,
         context_pack,
     })
+}
+
+fn normalize_freshness_paths(paths: &[String]) -> Result<BTreeSet<String>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            NormalizedRepoPath::new(path)
+                .map(|path| path.as_str().to_owned())
+                .map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 pub fn run_storage_explorer(repo: &str) -> Result<StorageExplorerSummary, String> {
@@ -2085,8 +2151,11 @@ fn looks_like_runtime_noise(line: &str) -> bool {
 }
 
 fn sqlite_for_read() -> Result<SqliteStore, String> {
-    let store_config = StoreConfig::from_env();
-    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    sqlite_for_read_with_config(&StoreConfig::from_env())
+}
+
+fn sqlite_for_read_with_config(store_config: &StoreConfig) -> Result<SqliteStore, String> {
+    let sqlite = SqliteStore::open(store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     Ok(sqlite)
 }
@@ -2485,6 +2554,21 @@ fn freshness_rows(
             index_run_id: None,
             parser_version: None,
         });
+        seen.insert(path.clone());
+    }
+    for path in scoped_paths {
+        if seen.contains(path) {
+            continue;
+        }
+        rows.push(FileFreshnessRow {
+            path: path.clone(),
+            freshness: freshness_for_hash(None, None),
+            indexed_content_hash: None,
+            current_content_hash: None,
+            indexed_at: None,
+            index_run_id: None,
+            parser_version: None,
+        });
     }
     rows.sort_by(|left, right| left.path.cmp(&right.path));
     rows
@@ -2495,9 +2579,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use symdex_core::RepoRoot;
+    use symdex_core::{RepoRoot, content_hash};
     use symdex_store::{
         CallRecord, CallSearchRow, ContextPack, ContextPackLimits, EvidenceFreshness,
         EvidenceProvenance, FileFreshnessSnapshot, FileRecord, PointPayload, QdrantExpectedPoint,
@@ -2506,12 +2591,12 @@ mod tests {
     };
 
     use crate::{
-        CallDirection, ContextEvidenceSource, ContextPackMode, QueryMode, SemanticSearchResult,
-        SemanticSearchSummary, build_debug_context_pack, build_impact_summary,
-        build_unified_context_pack, evidence_trust, freshness_rows, parse_runtime_input,
-        qdrant_verify_summary, run_call_graph, run_call_path, run_context_pack,
-        run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
-        semantic_reasons, semantic_result_from_point,
+        CallDirection, ContextEvidenceSource, ContextPackMode, FreshnessScope, QueryMode,
+        SemanticSearchResult, SemanticSearchSummary, build_debug_context_pack,
+        build_freshness_report, build_impact_summary, build_unified_context_pack, evidence_trust,
+        freshness_rows, parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
+        run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
+        run_symbol_search, semantic_reasons, semantic_result_from_point,
     };
 
     #[test]
@@ -3139,6 +3224,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn freshness_rows_include_unknown_for_explicit_scoped_paths() {
+        let rows = freshness_rows(
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::from(["src/unknown.rs".to_owned()]),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "src/unknown.rs");
+        assert_eq!(rows[0].freshness, EvidenceFreshness::Unknown);
+        assert_eq!(rows[0].indexed_content_hash, None);
+        assert_eq!(rows[0].current_content_hash, None);
+    }
+
+    #[test]
+    fn scoped_freshness_report_returns_explicit_paths_only() {
+        let mut fixture = DebugFixture::new();
+        let missing_path = fixture.root.path().join("src/missing.rs");
+        fs::write(&missing_path, "fn missing() {}\n").expect("missing file should be written");
+        let fresh_hash = content_hash(b"fn fresh() {}\n");
+        fixture
+            .store
+            .replace_file_facts(
+                &FileRecord {
+                    id: "file-fresh".to_owned(),
+                    repository_id: fixture.root.id().to_owned(),
+                    path: "src/fresh.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: fresh_hash,
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-fresh",
+                    "file-fresh",
+                    "fresh",
+                    "crate::fresh",
+                )],
+                &[],
+                &[],
+            )
+            .expect("fresh file should be updated");
+
+        let summary = build_freshness_report(
+            &fixture.root,
+            &fixture.store,
+            FreshnessScope {
+                symbol_query: None,
+                paths: vec![
+                    "src/unknown.rs".to_owned(),
+                    "src/fresh.rs".to_owned(),
+                    "src/missing.rs".to_owned(),
+                ],
+            },
+        )
+        .expect("scoped freshness should build");
+
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .map(|row| (row.path.as_str(), row.freshness))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/fresh.rs", EvidenceFreshness::Fresh),
+                ("src/missing.rs", EvidenceFreshness::Missing),
+                ("src/unknown.rs", EvidenceFreshness::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_freshness_report_rejects_paths_outside_symbol_scope() {
+        let fixture = DebugFixture::new();
+
+        let error = build_freshness_report(
+            &fixture.root,
+            &fixture.store,
+            FreshnessScope {
+                symbol_query: Some("fresh".to_owned()),
+                paths: vec!["src/stale.rs".to_owned()],
+            },
+        )
+        .expect_err("incompatible symbol/path scope should fail");
+
+        assert!(error.contains("paths are outside the symbol freshness scope"));
+        assert!(error.contains("src/stale.rs"));
+    }
+
+    #[test]
+    fn scoped_freshness_report_accepts_paths_inside_symbol_scope() {
+        let fixture = DebugFixture::new();
+
+        let summary = build_freshness_report(
+            &fixture.root,
+            &fixture.store,
+            FreshnessScope {
+                symbol_query: Some("fresh".to_owned()),
+                paths: vec!["src/fresh.rs".to_owned()],
+            },
+        )
+        .expect("compatible symbol/path scope should build");
+
+        assert_eq!(summary.symbol_query.as_deref(), Some("fresh"));
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "src/fresh.rs");
+    }
+
     fn snapshot(path: &str, content_hash: &str) -> FileFreshnessSnapshot {
         FileFreshnessSnapshot {
             path: path.to_owned(),
@@ -3223,15 +3417,18 @@ mod tests {
         _db_path: PathBuf,
     }
 
+    static NEXT_DEBUG_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
     impl DebugFixture {
         fn new() -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time should be valid")
                 .as_nanos();
+            let fixture_id = NEXT_DEBUG_FIXTURE_ID.fetch_add(1, AtomicOrdering::Relaxed);
             let base = std::env::temp_dir().join(format!(
-                "symdex-debug-query-test-{}-{nonce}",
-                std::process::id()
+                "symdex-debug-query-test-{}-{nonce}-{fixture_id}",
+                std::process::id(),
             ));
             let root_path = base.join("repo");
             fs::create_dir_all(root_path.join("src")).expect("repo should be created");

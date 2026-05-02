@@ -200,15 +200,15 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### A2 — MCP staleness check
 
-- [ ] Add read-only `symdex_staleness_check` to MCP.
-- [ ] Reuse the existing CLI staleness logic rather than duplicating file hash
+- [x] Add read-only `symdex_staleness_check` to MCP.
+- [x] Reuse the existing CLI staleness logic rather than duplicating file hash
   comparison in `symdex-mcp`.
-- [ ] Accept `repo` plus optional `symbol` or `paths` scope.
-- [ ] Return `fresh`, `stale`, `deleted`, `missing`, or `unknown` per scoped
+- [x] Accept `repo` plus optional `symbol` or `paths` scope.
+- [x] Return `fresh`, `stale`, `deleted`, `missing`, or `unknown` per scoped
   file, including indexed and current hashes for stale files.
-- [ ] Mirror the same evidence envelope, repo-boundary checks, and compact
+- [x] Mirror the same evidence envelope, repo-boundary checks, and compact
   output rules as other MCP tools.
-- [ ] Add MCP contract tests for path validation, symbol scope, explicit paths,
+- [x] Add MCP contract tests for path validation, symbol scope, explicit paths,
   and stale/deleted/missing states.
 
 ### A3 — `.gitignore` glob and negation correctness
