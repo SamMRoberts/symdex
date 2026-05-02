@@ -282,6 +282,20 @@ generation is marked `quality_blocked` and no pending quality jobs are created.
 `semantic_generations.quality_dimension` remains null until the quality worker
 records actual quality embeddings.
 
+The manual quality worker claims oldest `pending` jobs in bounded batches,
+marks them `running`, increments `attempts`, and then revalidates current file
+and chunk metadata before embedding. Successful jobs transactionally write a
+quality-layer `chunk_embeddings` row and move to `succeeded`. Service or vector
+write failures move to `failed` with a compact metadata-only error summary.
+Stale jobs, including chunks that now have an `excluded_reason`, move to
+`skipped_stale` and are not embedded.
+
+After worker progress, `semantic_generations.quality_embedded_chunks` is
+refreshed from current quality manifest rows. The first successful quality
+embedding records `quality_dimension`. If failures remain and no pending or
+running jobs remain for the latest generation, `quality_status` becomes
+`quality_failed`; `active_layer` remains `fast` until the activation slice.
+
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
 files, chunks, symbols, and calls. Semantic indexing also fills legacy chunk

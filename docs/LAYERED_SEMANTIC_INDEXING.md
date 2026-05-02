@@ -147,7 +147,7 @@ see either active `fast` or active `quality`, never an in-between state.
 
 ## Manual indexing behavior
 
-`senmatic index` terminology below means the current non-offline indexing path.
+`semantic index` terminology below means the current non-offline indexing path.
 
 ```text
 symdex index <repo>
@@ -216,13 +216,25 @@ while enabled:
     record chunk_embeddings row for the quality layer
     mark job succeeded
 
-  if all current generation jobs are complete:
-    verify quality manifest against Qdrant metadata
-    activate quality layer atomically
+  if failures remain and no pending/running work remains:
+    mark the generation quality_failed
 ```
 
 The worker must never trust stale queued source text. It should store metadata
 and re-read source files only long enough to embed current chunks.
+
+The implemented manual entry point is:
+
+```text
+symdex index-quality <repo>
+```
+
+It drains all pending jobs for the latest semantic generation by repeatedly
+claiming bounded batches using `SYMDEX_QUALITY_BATCH_SIZE`. It writes quality
+Qdrant points and quality `chunk_embeddings` rows, records the first successful
+quality dimension on the generation, and leaves `active_layer` as `fast`.
+Quality activation and default search routing to quality remain separate
+activation work.
 
 ## Job staleness
 

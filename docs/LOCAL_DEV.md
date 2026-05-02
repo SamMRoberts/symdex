@@ -60,9 +60,11 @@ Layered semantic indexing helpers also recognize `SYMDEX_FAST_EMBED_MODEL`,
 defaults to `nomic-embed-text`; the quality model defaults to
 `nomic-embed-text-v2-moe`. `SYMDEX_EMBED_MODEL` remains the compatibility
 setting for the current single-model path and is used as the fast-model fallback
-when `SYMDEX_FAST_EMBED_MODEL` is unset. Quality indexing configuration does not
-start background quality work until the later layered-indexing worker and
-routing slices are implemented.
+when `SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality
+jobs when quality indexing is enabled and the quality model is available.
+`symdex index-quality <repo>` manually drains those queued jobs in bounded
+batches. Background quality execution and quality activation remain separate
+later slices.
 
 `SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
 persisted as metadata-only structural evidence with
@@ -81,6 +83,7 @@ cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- doctor .
 cargo run -p symdex-cli -- index .
+cargo run -p symdex-cli -- index-quality .
 cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- index --watch .
 cargo run -p symdex-cli -- index-status .
@@ -128,6 +131,11 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   created/modified/deleted paths by content-hash snapshots, and reindexes
   changed content through the incremental indexing path until stopped with
   `Ctrl+C`.
+- `index-quality <repo>`: manually processes queued quality semantic embedding
+  jobs for the latest generation. It claims bounded batches, re-reads files
+  from disk, verifies file and chunk hashes, writes quality Qdrant points and
+  quality `chunk_embeddings` rows, and reports succeeded, failed, and stale
+  counts. Fast search remains active until a later activation step.
 - `index-status <repo>`: reports SQLite file and chunk counts for the repository.
   When a semantic index has completed, it also reports the latest embedding
   model and vector dimension recorded for that repository.

@@ -9,13 +9,15 @@ use std::thread;
 use std::time::Duration;
 
 use symdex_core::{
-    CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, ParseDiagnostic,
-    RepoRoot, ResolutionStatus, Symbol, SymbolKind, discover_indexable_files, index_source_file,
+    CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, NormalizedRepoPath,
+    ParseDiagnostic, RepoRoot, ResolutionStatus, SemanticLayer, Symbol, SymbolKind, content_hash,
+    discover_indexable_files, index_source_file,
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
-    CallRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
-    QualityEmbeddingJobRecord, QualityQueueSummary, RepositoryRecord, SqliteStore, StoreConfig,
+    CallRecord, ChunkEmbeddingRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload,
+    QdrantClient, QualityEmbeddingJobRecord, QualityGenerationProgress, QualityJobCompletion,
+    QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore, StoreConfig,
     SymbolRecord, TestRecord, VectorPoint, current_timestamp, qdrant_collection_name,
     qdrant_point_id,
 };
@@ -32,6 +34,11 @@ pub struct ContinuousIndexOptions {
     pub offline: bool,
     pub poll_interval: Duration,
     pub debounce: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityIndexOptions {
+    pub repo: String,
 }
 
 impl ContinuousIndexOptions {
@@ -124,6 +131,22 @@ pub enum EmbeddingSummary {
         qdrant_collection: String,
         chunks_embedded: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityIndexSummary {
+    pub repository_id: String,
+    pub generation_id: String,
+    pub quality_model: String,
+    pub quality_dimension: Option<usize>,
+    pub qdrant_collection: String,
+    pub claimed_jobs: usize,
+    pub succeeded_jobs: usize,
+    pub failed_jobs: usize,
+    pub skipped_stale_jobs: usize,
+    pub remaining_pending_jobs: usize,
+    pub quality_status: String,
+    pub progress: QualityGenerationProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +266,150 @@ struct RunScope<'a> {
 
 pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
     run_index_with_progress(options, |_| {})
+}
+
+pub fn run_quality_index(options: &QualityIndexOptions) -> Result<QualityIndexSummary, String> {
+    run_quality_index_with_progress(options, |_| {})
+}
+
+pub fn run_quality_index_with_progress(
+    options: &QualityIndexOptions,
+    mut on_progress: impl FnMut(IndexProgress),
+) -> Result<QualityIndexSummary, String> {
+    let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
+    let store_config = StoreConfig::from_env();
+    let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    sqlite.migrate().map_err(|error| error.to_string())?;
+    let repository = RepositoryRecord {
+        id: root.id().to_owned(),
+        root_path: root.path().display().to_string(),
+    };
+    sqlite
+        .upsert_repository(&repository)
+        .map_err(|error| error.to_string())?;
+    let generation = sqlite
+        .latest_semantic_generation(root.id())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "no semantic generation has been recorded; run `symdex index` first".to_owned()
+        })?;
+    let layered_embed_config = LayeredEmbedConfig::from_env();
+    if !layered_embed_config.quality_enabled {
+        return Err("quality indexing is disabled by configuration".to_owned());
+    }
+
+    let quality_config = layered_embed_config.quality_embed_config();
+    let quality_model = quality_config.model.clone();
+    let qdrant_collection = qdrant_collection_name(root.id(), &quality_model);
+    let embed_client = OllamaClient::new(quality_config).map_err(|error| error.to_string())?;
+    if !embed_client
+        .model_available()
+        .map_err(|error| error.to_string())?
+    {
+        let now = current_timestamp();
+        let _ = sqlite.mark_quality_generation_blocked(&generation, &quality_model, &now);
+        return Err(format!(
+            "quality embedding model `{quality_model}` is not available"
+        ));
+    }
+
+    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
+    let mut stats = QualityWorkerStats::default();
+    let mut quality_dimension = generation.quality_dimension;
+    let batch_size = layered_embed_config.quality_batch_size.max(1);
+
+    loop {
+        let claimed_at = current_timestamp();
+        let claimed = sqlite
+            .claim_quality_embedding_jobs(root.id(), &generation.id, batch_size, &claimed_at)
+            .map_err(|error| error.to_string())?;
+        if claimed.is_empty() {
+            break;
+        }
+        stats.claimed_jobs += claimed.len();
+        on_progress(IndexProgress::new(
+            "quality_index",
+            stats.claimed_jobs,
+            stats.claimed_jobs + 1,
+            format!("Claimed {} quality jobs", claimed.len()),
+        ));
+
+        let job_ids = claimed.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
+        let source_rows = sqlite
+            .quality_job_source_rows(&job_ids)
+            .map_err(|error| error.to_string())?;
+        let mut source_rows = source_rows
+            .into_iter()
+            .map(|row| (row.job.id.clone(), row))
+            .collect::<BTreeMap<_, _>>();
+        for job in claimed {
+            let Some(row) = source_rows.remove(&job.id) else {
+                let completed_at = current_timestamp();
+                sqlite
+                    .complete_quality_embedding_job(
+                        &job.id,
+                        QualityJobCompletion::SkippedStale,
+                        &completed_at,
+                    )
+                    .map_err(|error| error.to_string())?;
+                stats.skipped_stale_jobs += 1;
+                continue;
+            };
+            process_quality_job(
+                &QualityWorkerContext {
+                    root: &root,
+                    qdrant: &qdrant,
+                    embed_client: &embed_client,
+                    latest_generation_id: &generation.id,
+                    quality_model: &quality_model,
+                    qdrant_collection: &qdrant_collection,
+                },
+                &mut sqlite,
+                &mut quality_dimension,
+                &mut stats,
+                row,
+            )?;
+        }
+    }
+
+    let refreshed_at = current_timestamp();
+    let progress = sqlite
+        .refresh_quality_generation_progress(
+            root.id(),
+            &generation.id,
+            quality_dimension,
+            &refreshed_at,
+        )
+        .map_err(|error| error.to_string())?;
+    let final_generation = sqlite
+        .latest_semantic_generation(root.id())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "semantic generation disappeared while quality indexing".to_owned())?;
+
+    on_progress(IndexProgress::new(
+        "quality_index",
+        stats.claimed_jobs,
+        stats.claimed_jobs,
+        format!(
+            "Quality worker completed: {} succeeded, {} failed, {} stale",
+            stats.succeeded_jobs, stats.failed_jobs, stats.skipped_stale_jobs
+        ),
+    ));
+
+    Ok(QualityIndexSummary {
+        repository_id: root.id().to_owned(),
+        generation_id: generation.id,
+        quality_model,
+        quality_dimension: final_generation.quality_dimension,
+        qdrant_collection,
+        claimed_jobs: stats.claimed_jobs,
+        succeeded_jobs: stats.succeeded_jobs,
+        failed_jobs: stats.failed_jobs,
+        skipped_stale_jobs: stats.skipped_stale_jobs,
+        remaining_pending_jobs: progress.pending_jobs,
+        quality_status: final_generation.quality_status,
+        progress,
+    })
 }
 
 pub fn run_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
@@ -1511,6 +1678,335 @@ fn quality_embedding_jobs(
         .collect()
 }
 
+#[derive(Debug, Default)]
+struct QualityWorkerStats {
+    claimed_jobs: usize,
+    succeeded_jobs: usize,
+    failed_jobs: usize,
+    skipped_stale_jobs: usize,
+}
+
+struct QualityWorkerContext<'a> {
+    root: &'a RepoRoot,
+    qdrant: &'a QdrantClient,
+    embed_client: &'a OllamaClient,
+    latest_generation_id: &'a str,
+    quality_model: &'a str,
+    qdrant_collection: &'a str,
+}
+
+fn process_quality_job(
+    context: &QualityWorkerContext<'_>,
+    sqlite: &mut SqliteStore,
+    quality_dimension: &mut Option<usize>,
+    stats: &mut QualityWorkerStats,
+    row: QualityJobSourceRow,
+) -> Result<(), String> {
+    let completed_at = current_timestamp();
+    let prepared = match prepare_quality_job(context.root, context.latest_generation_id, &row) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            sqlite
+                .complete_quality_embedding_job(
+                    &row.job.id,
+                    QualityJobCompletion::SkippedStale,
+                    &completed_at,
+                )
+                .map_err(|error| error.to_string())?;
+            stats.skipped_stale_jobs += 1;
+            return Ok(());
+        }
+        Err(error) => {
+            sqlite
+                .complete_quality_embedding_job(
+                    &row.job.id,
+                    QualityJobCompletion::Failed {
+                        error_summary: error_summary(&error),
+                    },
+                    &completed_at,
+                )
+                .map_err(|store_error| store_error.to_string())?;
+            stats.failed_jobs += 1;
+            return Ok(());
+        }
+    };
+
+    let embeddings = match context
+        .embed_client
+        .embed_batch(std::slice::from_ref(&prepared.text))
+    {
+        Ok(embeddings) => embeddings,
+        Err(error) => {
+            sqlite
+                .complete_quality_embedding_job(
+                    &prepared.row.job.id,
+                    QualityJobCompletion::Failed {
+                        error_summary: error_summary(&error.to_string()),
+                    },
+                    &completed_at,
+                )
+                .map_err(|store_error| store_error.to_string())?;
+            stats.failed_jobs += 1;
+            return Ok(());
+        }
+    };
+    let dimension = embeddings.dimension().unwrap_or(0);
+    if dimension == 0 {
+        complete_failed_quality_job(
+            sqlite,
+            &prepared.row.job.id,
+            "quality embedding returned an empty vector",
+            &completed_at,
+            stats,
+        )?;
+        return Ok(());
+    }
+    if let Some(previous_dimension) = *quality_dimension
+        && previous_dimension != dimension
+    {
+        complete_failed_quality_job(
+            sqlite,
+            &prepared.row.job.id,
+            &format!(
+                "quality embedding dimension changed: previous={previous_dimension} current={dimension}"
+            ),
+            &completed_at,
+            stats,
+        )?;
+        return Ok(());
+    }
+    if let Err(error) =
+        sqlite.ensure_embedding_compatible(context.root.id(), context.quality_model, dimension)
+    {
+        complete_failed_quality_job(
+            sqlite,
+            &prepared.row.job.id,
+            &error.to_string(),
+            &completed_at,
+            stats,
+        )?;
+        return Ok(());
+    }
+    if let Err(error) = context
+        .qdrant
+        .ensure_collection(context.qdrant_collection, dimension)
+    {
+        complete_failed_quality_job(
+            sqlite,
+            &prepared.row.job.id,
+            &error.to_string(),
+            &completed_at,
+            stats,
+        )?;
+        return Ok(());
+    }
+
+    let Some(vector) = embeddings.embeddings.into_iter().next() else {
+        complete_failed_quality_job(
+            sqlite,
+            &prepared.row.job.id,
+            "quality embedding response did not include a vector",
+            &completed_at,
+            stats,
+        )?;
+        return Ok(());
+    };
+    let point = match quality_vector_point(
+        context.root.id(),
+        &prepared.row,
+        vector,
+        context.quality_model,
+        dimension,
+        &completed_at,
+    ) {
+        Ok(point) => point,
+        Err(error) => {
+            complete_failed_quality_job(
+                sqlite,
+                &prepared.row.job.id,
+                &error,
+                &completed_at,
+                stats,
+            )?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = context
+        .qdrant
+        .upsert_points(context.qdrant_collection, std::slice::from_ref(&point))
+    {
+        complete_failed_quality_job(
+            sqlite,
+            &prepared.row.job.id,
+            &error.to_string(),
+            &completed_at,
+            stats,
+        )?;
+        return Ok(());
+    }
+
+    let embedding = quality_chunk_embedding_record(
+        context.root.id(),
+        &prepared.row,
+        context.quality_model,
+        dimension,
+        context.qdrant_collection,
+        &point.id,
+        &completed_at,
+    );
+    sqlite
+        .complete_quality_embedding_job(
+            &prepared.row.job.id,
+            QualityJobCompletion::Succeeded {
+                embedding: Box::new(embedding),
+            },
+            &completed_at,
+        )
+        .map_err(|error| error.to_string())?;
+    *quality_dimension = Some(dimension);
+    stats.succeeded_jobs += 1;
+    Ok(())
+}
+
+fn complete_failed_quality_job(
+    sqlite: &mut SqliteStore,
+    job_id: &str,
+    error: &str,
+    completed_at: &str,
+    stats: &mut QualityWorkerStats,
+) -> Result<(), String> {
+    sqlite
+        .complete_quality_embedding_job(
+            job_id,
+            QualityJobCompletion::Failed {
+                error_summary: error_summary(error),
+            },
+            completed_at,
+        )
+        .map_err(|store_error| store_error.to_string())?;
+    stats.failed_jobs += 1;
+    Ok(())
+}
+
+struct PreparedQualityJob {
+    row: QualityJobSourceRow,
+    text: String,
+}
+
+fn prepare_quality_job(
+    root: &RepoRoot,
+    latest_generation_id: &str,
+    row: &QualityJobSourceRow,
+) -> Result<Option<PreparedQualityJob>, String> {
+    if row.job.generation_id != latest_generation_id {
+        return Ok(None);
+    }
+    if row.current_file_id.as_deref() != Some(row.job.file_id.as_str())
+        || row.current_content_hash.as_deref() != Some(row.job.content_hash.as_str())
+        || row.current_text_hash.as_deref() != Some(row.job.text_hash.as_str())
+        || row.excluded_reason.is_some()
+    {
+        return Ok(None);
+    }
+    let (Some(start_byte), Some(end_byte)) = (row.start_byte, row.end_byte) else {
+        return Ok(None);
+    };
+    if start_byte >= end_byte {
+        return Ok(None);
+    }
+    let normalized = NormalizedRepoPath::new(&row.job.path).map_err(|error| error.to_string())?;
+    let path = root.path().join(normalized.as_str());
+    let source =
+        fs::read_to_string(&path).map_err(|_| "source file is no longer readable".to_owned())?;
+    let normalized_existing = root
+        .normalize_existing_path(&path)
+        .map_err(|error| error.to_string())?;
+    if normalized_existing.as_str() != row.job.path {
+        return Ok(None);
+    }
+    if content_hash(source.as_bytes()) != row.job.content_hash {
+        return Ok(None);
+    }
+    let Some(text) = source.get(start_byte..end_byte).map(str::to_owned) else {
+        return Ok(None);
+    };
+    if content_hash(text.as_bytes()) != row.job.text_hash {
+        return Ok(None);
+    }
+    Ok(Some(PreparedQualityJob {
+        row: row.clone(),
+        text,
+    }))
+}
+
+fn quality_vector_point(
+    repository_id: &str,
+    row: &QualityJobSourceRow,
+    vector: Vec<f32>,
+    embedding_model: &str,
+    embedding_dimension: usize,
+    indexed_at: &str,
+) -> Result<VectorPoint, String> {
+    Ok(VectorPoint {
+        id: qdrant_point_id(&row.job.chunk_id).map_err(|error| error.to_string())?,
+        vector,
+        payload: PointPayload {
+            repository_id: repository_id.to_owned(),
+            file_id: row.job.file_id.clone(),
+            chunk_id: row.job.chunk_id.clone(),
+            symbol_id: row.symbol_id.clone(),
+            symbol_name: row.symbol_name.clone(),
+            path: row.job.path.clone(),
+            language: row.language.clone().unwrap_or_default(),
+            chunk_kind: row.chunk_kind.clone().unwrap_or_default(),
+            start_line: row.start_line.unwrap_or_default(),
+            end_line: row.end_line.unwrap_or_default(),
+            text_hash: row.job.text_hash.clone(),
+            parser_version: row.parser_version.clone(),
+            content_hash: Some(row.job.content_hash.clone()),
+            index_run_id: row.index_run_id.clone(),
+            embedding_model: Some(embedding_model.to_owned()),
+            embedding_dimension: Some(embedding_dimension),
+            indexed_at: Some(indexed_at.to_owned()),
+        },
+    })
+}
+
+fn quality_chunk_embedding_record(
+    repository_id: &str,
+    row: &QualityJobSourceRow,
+    embedding_model: &str,
+    embedding_dimension: usize,
+    qdrant_collection: &str,
+    qdrant_point_id: &str,
+    embedded_at: &str,
+) -> ChunkEmbeddingRecord {
+    let semantic_layer = SemanticLayer::Quality.as_str();
+    ChunkEmbeddingRecord {
+        id: SqliteStore::chunk_embedding_id(
+            repository_id,
+            &row.job.generation_id,
+            &row.job.chunk_id,
+            semantic_layer,
+            embedding_model,
+            embedding_dimension,
+        ),
+        repository_id: repository_id.to_owned(),
+        file_id: row.job.file_id.clone(),
+        chunk_id: row.job.chunk_id.clone(),
+        semantic_layer: semantic_layer.to_owned(),
+        embedding_model: embedding_model.to_owned(),
+        embedding_dimension,
+        content_hash: row.job.content_hash.clone(),
+        text_hash: row.job.text_hash.clone(),
+        qdrant_collection: qdrant_collection.to_owned(),
+        qdrant_point_id: qdrant_point_id.to_owned(),
+        generation_id: row.job.generation_id.clone(),
+        embedded_at: embedded_at.to_owned(),
+        status: "current".to_owned(),
+    }
+}
+
 fn delete_stale_qdrant_points(
     sqlite: &SqliteStore,
     root: &RepoRoot,
@@ -1837,13 +2333,17 @@ mod tests {
         ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
         ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
-    use symdex_store::{FileRecord, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord};
+    use symdex_store::{
+        FileRecord, QualityEmbeddingJobRecord, QualityJobSourceRow, RepositoryRecord, SqliteStore,
+        StoreConfig, SymbolRecord,
+    };
 
     use crate::{
         IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
         RustAnalyzerReadiness, WatchSnapshot, apply_embedding_size_limits, chunk_record,
         chunk_texts, collect_index_reports, detect_watch_changes, diff_watch_snapshots,
-        plan_rust_analyzer_enrichment, quality_embedding_jobs, resolve_cross_file_rust_calls,
+        plan_rust_analyzer_enrichment, prepare_quality_job, quality_chunk_embedding_record,
+        quality_embedding_jobs, quality_vector_point, resolve_cross_file_rust_calls,
         watch_snapshot,
     };
 
@@ -1912,6 +2412,83 @@ mod tests {
         assert_eq!(jobs[0].error_summary, None);
         assert_eq!(jobs[0].created_at, "500");
         assert_eq!(jobs[0].updated_at, "500");
+    }
+
+    #[test]
+    fn prepare_quality_job_extracts_hash_verified_text() {
+        let repo = TestRepo::new("quality-prepare-success");
+        let source = "pub fn public() {}\n";
+        repo.write("src/lib.rs", source);
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let row = sample_quality_source_row(source, 0, source.len(), None);
+
+        let prepared = prepare_quality_job(&root, "generation-1", &row)
+            .expect("prepare should not fail")
+            .expect("job should be current");
+
+        assert_eq!(prepared.text, source);
+        assert_eq!(prepared.row.job.id, "quality-job-1");
+    }
+
+    #[test]
+    fn prepare_quality_job_skips_stale_or_excluded_rows() {
+        let repo = TestRepo::new("quality-prepare-stale");
+        let source = "pub fn public() {}\n";
+        repo.write("src/lib.rs", source);
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let excluded = sample_quality_source_row(source, 0, source.len(), Some("secret_detected"));
+        let mut stale_hash = sample_quality_source_row(source, 0, source.len(), None);
+        stale_hash.job.text_hash = "stale-text".to_owned();
+
+        assert!(
+            prepare_quality_job(&root, "generation-1", &excluded)
+                .expect("excluded should not fail")
+                .is_none()
+        );
+        assert!(
+            prepare_quality_job(&root, "generation-1", &stale_hash)
+                .expect("stale should not fail")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn quality_metadata_builders_do_not_include_source_text() {
+        let source = "pub fn public() {}\n";
+        let row = sample_quality_source_row(source, 0, source.len(), None);
+        let point = quality_vector_point(
+            "repo",
+            &row,
+            vec![0.1, 0.2, 0.3],
+            "nomic-embed-text-v2-moe",
+            3,
+            "700",
+        )
+        .expect("point should build");
+        let embedding = quality_chunk_embedding_record(
+            "repo",
+            &row,
+            "nomic-embed-text-v2-moe",
+            3,
+            "symdex_repo_nomic_embed_text_v2_moe",
+            &point.id,
+            "700",
+        );
+
+        assert_eq!(point.payload.path, "src/lib.rs");
+        assert_eq!(
+            point.payload.embedding_model.as_deref(),
+            Some("nomic-embed-text-v2-moe")
+        );
+        assert_eq!(point.payload.embedding_dimension, Some(3));
+        assert_eq!(
+            point.payload.content_hash.as_deref(),
+            Some(row.job.content_hash.as_str())
+        );
+        assert_eq!(point.payload.text_hash, row.job.text_hash);
+        assert_eq!(embedding.semantic_layer, "quality");
+        assert_eq!(embedding.embedding_dimension, 3);
+        assert_eq!(embedding.status, "current");
     }
 
     #[test]
@@ -2500,6 +3077,48 @@ mod tests {
             line_range: LineRange::new(1, 1),
             text_hash: content_hash(name.as_bytes()),
             excluded_reason: excluded_reason.map(str::to_owned),
+        }
+    }
+
+    fn sample_quality_source_row(
+        source: &str,
+        start_byte: usize,
+        end_byte: usize,
+        excluded_reason: Option<&str>,
+    ) -> QualityJobSourceRow {
+        let text = &source[start_byte..end_byte];
+        let source_hash = content_hash(source.as_bytes());
+        let text_hash = content_hash(text.as_bytes());
+        QualityJobSourceRow {
+            job: QualityEmbeddingJobRecord {
+                id: "quality-job-1".to_owned(),
+                repository_id: "repo".to_owned(),
+                generation_id: "generation-1".to_owned(),
+                chunk_id: stable_id(&["chunk", "quality-fixture"]),
+                file_id: "file-1".to_owned(),
+                path: "src/lib.rs".to_owned(),
+                content_hash: source_hash.clone(),
+                text_hash: text_hash.clone(),
+                status: "running".to_owned(),
+                attempts: 1,
+                error_summary: None,
+                created_at: "500".to_owned(),
+                updated_at: "501".to_owned(),
+            },
+            current_file_id: Some("file-1".to_owned()),
+            current_content_hash: Some(source_hash),
+            language: Some("rust".to_owned()),
+            chunk_kind: Some("function".to_owned()),
+            current_text_hash: Some(text_hash),
+            start_line: Some(1),
+            end_line: Some(1),
+            start_byte: Some(start_byte),
+            end_byte: Some(end_byte),
+            excluded_reason: excluded_reason.map(str::to_owned),
+            symbol_id: Some("symbol-1".to_owned()),
+            symbol_name: Some("public".to_owned()),
+            index_run_id: Some("run-1".to_owned()),
+            parser_version: Some(Language::Rust.parser_version().to_owned()),
         }
     }
 

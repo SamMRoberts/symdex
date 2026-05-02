@@ -9,7 +9,8 @@ use symdex_diagnostics::{
 };
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexSummary,
-    RustAnalyzerEnrichmentSummary, WatchChangeSet, run_continuous_index, run_index,
+    QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
+    run_continuous_index, run_index, run_quality_index,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
@@ -48,6 +49,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             require_text_output(command, output)?;
             let index_args = parse_index_args(&args[1..]);
             index(&index_args)
+        }
+        "index-quality" => {
+            require_text_output(command, output)?;
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            index_quality(repo)
         }
         "index-status" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -224,6 +230,14 @@ fn index(args: &IndexArgs) -> Result<(), String> {
         offline: args.offline,
     })?;
     print_index_summary(&summary);
+    Ok(())
+}
+
+fn index_quality(repo: &str) -> Result<(), String> {
+    let summary = run_quality_index(&QualityIndexOptions {
+        repo: repo.to_owned(),
+    })?;
+    print_quality_index_summary(&summary);
     Ok(())
 }
 
@@ -873,6 +887,37 @@ fn print_index_summary(summary: &IndexSummary) {
     }
 }
 
+fn print_quality_index_summary(summary: &QualityIndexSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!("generation_id: {}", summary.generation_id);
+    println!("quality_model: {}", summary.quality_model);
+    println!(
+        "quality_dimension: {}",
+        summary
+            .quality_dimension
+            .map(|dimension| dimension.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
+    println!("quality_status: {}", summary.quality_status);
+    println!("qdrant_collection: {}", summary.qdrant_collection);
+    println!("claimed_jobs: {}", summary.claimed_jobs);
+    println!("succeeded_jobs: {}", summary.succeeded_jobs);
+    println!("failed_jobs: {}", summary.failed_jobs);
+    println!("skipped_stale_jobs: {}", summary.skipped_stale_jobs);
+    println!("remaining_pending_jobs: {}", summary.remaining_pending_jobs);
+    println!(
+        "progress: embeddable_chunks={} quality_embedded_chunks={} pending={} running={} succeeded={} failed={} skipped_stale={} skipped_excluded={}",
+        summary.progress.embeddable_chunks,
+        summary.progress.quality_embedded_chunks,
+        summary.progress.pending_jobs,
+        summary.progress.running_jobs,
+        summary.progress.succeeded_jobs,
+        summary.progress.failed_jobs,
+        summary.progress.skipped_stale_jobs,
+        summary.progress.skipped_excluded_jobs
+    );
+}
+
 fn print_diagnostic_report(report: &DiagnosticReport) {
     println!("symdex doctor");
     println!("workspace: {}", report.workspace);
@@ -1037,14 +1082,17 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextPackMode, OutputMode, parse_cli_invocation, parse_context_pack_args};
+    use super::{
+        ContextPackMode, OutputMode, parse_cli_invocation, parse_context_pack_args,
+        require_text_output,
+    };
 
     #[test]
     fn cli_invocation_parses_leading_json_flag() {
@@ -1102,5 +1150,13 @@ mod tests {
             .expect("context-pack args should parse");
 
         assert_eq!(args.mode, ContextPackMode::Structural);
+    }
+
+    #[test]
+    fn index_quality_rejects_json_output() {
+        let error = require_text_output("index-quality", OutputMode::Json)
+            .expect_err("index-quality should be text-only");
+
+        assert!(error.contains("index-quality does not support"));
     }
 }

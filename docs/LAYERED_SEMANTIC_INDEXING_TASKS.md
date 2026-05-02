@@ -132,6 +132,8 @@ Acceptance:
 
 ## Slice 6 — Manual quality worker
 
+Status: implemented.
+
 Goal: implement an explicit `index-quality` path before automatic background
 execution.
 

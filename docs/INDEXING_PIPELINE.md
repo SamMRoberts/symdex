@@ -153,7 +153,11 @@ generation. If the quality model or service is unavailable, the latest
 generation is marked `quality_blocked` and no pending quality jobs are created.
 Semantic search consults SQLite readiness metadata from the latest semantic
 generation and compact `chunk_embeddings` summaries before choosing the active
-model and Qdrant collection. Quality workers are a later layered-indexing slice.
+model and Qdrant collection. The manual quality worker is available through
+`symdex index-quality <repo>`; it drains pending latest-generation jobs in
+bounded batches, revalidates hashes from disk before embedding, writes quality
+Qdrant points and quality `chunk_embeddings` rows, and keeps default routing on
+fast until a later activation step marks quality ready.
 
 ## Qdrant Collections
 
