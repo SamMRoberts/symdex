@@ -442,6 +442,8 @@ fn env_usize(value: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use crate::{
         DEFAULT_EMBED_BATCH_SIZE, DEFAULT_EMBED_MAX_CHUNK_BYTES, DEFAULT_EMBED_TRUNCATE,
         DEFAULT_FAST_EMBED_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_QUALITY_EMBED_BATCH_SIZE,
@@ -582,6 +584,64 @@ mod tests {
         assert!(!quality.truncate);
         assert_eq!(quality.batch_size, 6);
         assert_eq!(quality.max_chunk_bytes, 4096);
+    }
+
+    #[test]
+    fn layered_embed_config_from_env_can_read_layer_overrides() {
+        let output =
+            Command::new(std::env::current_exe().expect("test binary path should resolve"))
+                .args([
+                    "--exact",
+                    "tests::layered_embed_config_from_env_child_assertions",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SYMDEX_TEST_LAYERED_ENV", "1")
+                .env("SYMDEX_OLLAMA_URL", "http://127.0.0.1:11435")
+                .env("SYMDEX_EMBED_MODEL", "legacy-fast-env")
+                .env("SYMDEX_FAST_EMBED_MODEL", "layer-fast-env")
+                .env("SYMDEX_QUALITY_EMBED_MODEL", "layer-quality-env")
+                .env("SYMDEX_QUALITY_INDEX", "0")
+                .env("SYMDEX_EMBED_TRUNCATE", "false")
+                .env("SYMDEX_EMBED_BATCH_SIZE", "11")
+                .env("SYMDEX_QUALITY_BATCH_SIZE", "7")
+                .env("SYMDEX_QUALITY_WORKERS", "3")
+                .env("SYMDEX_EMBED_MAX_CHUNK_BYTES", "2048")
+                .output()
+                .expect("child test process should run");
+
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned by layered_embed_config_from_env_can_read_layer_overrides"]
+    fn layered_embed_config_from_env_child_assertions() {
+        if std::env::var("SYMDEX_TEST_LAYERED_ENV").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let legacy = EmbedConfig::from_env();
+        assert_eq!(legacy.ollama_url, "http://127.0.0.1:11435");
+        assert_eq!(legacy.model, "legacy-fast-env");
+        assert!(!legacy.truncate);
+        assert_eq!(legacy.batch_size, 11);
+        assert_eq!(legacy.max_chunk_bytes, 2048);
+
+        let layered = LayeredEmbedConfig::from_env();
+        assert_eq!(layered.ollama_url, "http://127.0.0.1:11435");
+        assert_eq!(layered.fast_model, "layer-fast-env");
+        assert_eq!(layered.quality_model, "layer-quality-env");
+        assert!(!layered.quality_enabled);
+        assert!(!layered.truncate);
+        assert_eq!(layered.batch_size, 11);
+        assert_eq!(layered.quality_batch_size, 7);
+        assert_eq!(layered.quality_workers, 3);
+        assert_eq!(layered.max_chunk_bytes, 2048);
     }
 
     #[test]
