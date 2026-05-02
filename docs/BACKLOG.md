@@ -186,16 +186,16 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### A1 — Unified context pack
 
-- [ ] Add a `unified` mode to `symdex context-pack` and
+- [x] Add a `unified` mode to `symdex context-pack` and
   `symdex_context_pack`.
-- [ ] Run structural context-pack retrieval and semantic search in one
+- [x] Run structural context-pack retrieval and semantic search in one
   `symdex-query` orchestration path.
-- [ ] Merge and deduplicate results by chunk, symbol, and file evidence.
-- [ ] Annotate each returned item with evidence source: `structural`,
+- [x] Merge and deduplicate results by chunk, symbol, and file evidence.
+- [x] Annotate each returned item with evidence source: `structural`,
   `semantic`, or `both`.
-- [ ] Preserve `symdex.context_pack.v1` compatibility or document a versioned
+- [x] Preserve `symdex.context_pack.v1` compatibility or document a versioned
   context-pack schema bump before changing output shape.
-- [ ] Add CLI JSON, MCP, and query-layer tests covering structural-only,
+- [x] Add CLI JSON, MCP, and query-layer tests covering structural-only,
   semantic-only, overlapping, stale, and missing-vector evidence.
 
 ### A2 — MCP staleness check

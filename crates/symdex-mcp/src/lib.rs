@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_query::{evidence_trust, run_debug_context_pack};
+use symdex_query::{
+    ContextPackMode, evidence_trust, run_context_pack, run_debug_context_pack,
+    run_unified_context_pack,
+};
 use symdex_store::{
     EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
     freshness_for_hash, qdrant_collection_name,
@@ -371,11 +374,18 @@ fn tool_context_pack(arguments: &Value) -> Result<Value, String> {
     let repo = required_string(arguments, "repo")?;
     let symbol = required_string(arguments, "symbol")?;
     let limit = optional_usize(arguments, "limit", 8).min(25);
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let pack = sqlite()?
-        .context_pack(root.id(), symbol, limit)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(pack).map_err(|error| error.to_string())
+    let mode = optional_string(arguments, "mode")
+        .map(ContextPackMode::parse)
+        .transpose()?
+        .unwrap_or(ContextPackMode::Structural);
+    match mode {
+        ContextPackMode::Structural => serde_json::to_value(run_context_pack(repo, symbol, limit)?)
+            .map_err(|error| error.to_string()),
+        ContextPackMode::Unified => {
+            serde_json::to_value(run_unified_context_pack(repo, symbol, limit)?)
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn tool_debug_context(arguments: &Value) -> Result<Value, String> {
@@ -697,6 +707,14 @@ fn optional_usize(arguments: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn optional_string<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn success_response(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -827,11 +845,16 @@ fn tool_definitions() -> Vec<Value> {
         tool_definition(
             TOOL_CONTEXT_PACK,
             "Context Pack",
-            "Return compact metadata-only evidence for an editing context.",
+            "Return compact metadata-only evidence for an editing context. Use mode unified to merge structural and semantic evidence.",
             &["repo", "symbol"],
             vec![
                 ("repo", "string", "Repository root path"),
                 ("symbol", "string", "Symbol id, name, or qualified name"),
+                (
+                    "mode",
+                    "string",
+                    "Context-pack mode: structural or unified. Defaults to structural.",
+                ),
                 (
                     "limit",
                     "integer",
@@ -915,8 +938,8 @@ mod tests {
 
     use crate::{
         EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, TOOL_CONTEXT_PACK, TOOL_DEBUG_CONTEXT,
-        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve, tool_index_status_with_store, tool_names,
-        tool_success,
+        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, evidence_tool_result, serve, tool_definitions,
+        tool_index_status_with_store, tool_names, tool_success,
     };
 
     #[test]
@@ -978,6 +1001,42 @@ mod tests {
                 .as_bool()
                 .expect("readOnlyHint should be bool")
         }));
+    }
+
+    #[test]
+    fn context_pack_tool_schema_advertises_optional_mode() {
+        let tools = tool_definitions();
+        let context_pack = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_CONTEXT_PACK)
+            .expect("context-pack tool should be listed");
+
+        assert_eq!(
+            context_pack["inputSchema"]["properties"]["mode"]["type"],
+            "string"
+        );
+        assert!(
+            !context_pack["inputSchema"]["required"]
+                .as_array()
+                .expect("required should be an array")
+                .iter()
+                .any(|value| value == "mode")
+        );
+    }
+
+    #[test]
+    fn context_pack_rejects_unknown_mode_before_querying() {
+        let error = evidence_tool_result(
+            TOOL_CONTEXT_PACK,
+            &json!({
+                "repo": ".",
+                "symbol": "main",
+                "mode": "semantic"
+            }),
+        )
+        .expect_err("unsupported mode should fail");
+
+        assert!(error.contains("unsupported context-pack mode"));
     }
 
     #[test]

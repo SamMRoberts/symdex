@@ -279,11 +279,13 @@ Input:
 {
   "repo": "/path/to/repo",
   "symbol": "foo::retry::run_with_backoff",
+  "mode": "structural",
   "limit": 8
 }
 ```
 
-Output:
+Structural output, returned by default, preserves the original
+`symdex.context_pack.v1` shape:
 
 ```json
 {
@@ -307,13 +309,102 @@ Output:
 ```
 
 The context pack is intentionally compact and does not return source text. It is
-currently structural only; semantic hits can be combined by calling
-`symdex_search` separately.
+metadata-only in every mode.
 
-Planned next step: add a `mode: "unified"` option that combines structural
-context-pack evidence with semantic search evidence in one call. Unified rows
-should identify whether they came from `structural`, `semantic`, or `both`
-evidence paths while preserving compact metadata-only output.
+`mode: "unified"` returns `symdex.context_pack.v2`, which runs structural
+context-pack retrieval and semantic search in one `symdex-query` orchestration
+path. It merges and deduplicates symbol, chunk, and file evidence, and labels
+each returned item with `evidence_source`: `structural`, `semantic`, or `both`.
+The outer MCP envelope remains `symdex.mcp.evidence.v1`.
+
+Unified input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "foo::retry::run_with_backoff",
+  "mode": "unified",
+  "limit": 8
+}
+```
+
+Unified output:
+
+```json
+{
+  "format": "symdex.context_pack.v2",
+  "mode": "unified",
+  "repository_id": "stable-repo-id",
+  "query": "foo::retry::run_with_backoff",
+  "items": [
+    {
+      "id": "symbol:sym-123",
+      "item_kind": "symbol",
+      "evidence_source": "both",
+      "relationship": "focus_symbol",
+      "point_id": "qdrant-point-id",
+      "chunk_id": "chunk-123",
+      "symbol_id": "sym-123",
+      "symbol": "foo::retry::run_with_backoff",
+      "path": "crates/foo/src/retry.rs",
+      "start_line": 42,
+      "end_line": 88,
+      "score": 0.82,
+      "chunk_kind": "function",
+      "text_hash": "sha256:...",
+      "freshness": "fresh",
+      "trust": {
+        "score": 0.93,
+        "level": "high",
+        "factors": ["freshness:fresh", "confidence:0.82"]
+      },
+      "reasons": [
+        "relationship:focus_symbol",
+        "semantic_vector_match"
+      ],
+      "provenance": {
+        "content_hash": "sha256:...",
+        "index_run_id": "repo-semantic-...",
+        "parser_version": "tree-sitter-rust-...",
+        "indexed_at": "2026-04-30T12:00:00Z",
+        "embedding_model": "nomic-embed-text",
+        "embedding_dimension": 768,
+        "embedded_at": null
+      }
+    }
+  ],
+  "files": [
+    {
+      "path": "crates/foo/src/retry.rs",
+      "evidence_source": "both",
+      "freshness": "fresh",
+      "trust": {
+        "score": 0.75,
+        "level": "medium",
+        "factors": ["freshness:fresh"]
+      },
+      "reasons": ["context_pack_file_from_structural_evidence"]
+    }
+  ],
+  "limits": {
+    "max_symbols": 8,
+    "max_callers": 8,
+    "max_callees": 8,
+    "max_semantic": 8
+  },
+  "notes": [
+    "metadata_only_no_source_text",
+    "unified_structural_semantic_requested",
+    "structural_direct_relationships_only",
+    "semantic_evidence_included"
+  ]
+}
+```
+
+If local semantic services or the expected Qdrant collection are unavailable,
+unified mode still returns structural evidence in v2 format and adds a compact
+note such as `semantic_unavailable:local_service_unavailable` or
+`semantic_unavailable:missing_vector_collection`.
 
 ### `symdex_debug_context`
 

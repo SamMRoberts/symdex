@@ -242,6 +242,14 @@ storage schema. Examples include `semantic_vector_match`,
 `symbols_at_runtime_location`, `symbol_name_fallback_match`, and
 `related_file_from_call_evidence`.
 
+Unified context packs are also query-time derived metadata. Structural
+context-pack mode preserves the `symdex.context_pack.v1` shape. Unified mode
+returns `symdex.context_pack.v2`, merging SQLite symbol/call/file evidence with
+Qdrant semantic chunk evidence and annotating rows with `evidence_source` values
+of `structural`, `semantic`, or `both`. This does not add storage tables or
+persist merged rows; the v2 pack is assembled from existing SQLite and Qdrant
+metadata for each query.
+
 Use cosine distance unless a selected embedding model requires otherwise.
 
 Before writing vectors, symdex checks the latest successful run for the same

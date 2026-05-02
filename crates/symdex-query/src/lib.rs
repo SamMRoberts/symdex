@@ -1,5 +1,6 @@
 //! Query orchestration shared by the CLI and TUI.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -10,7 +11,7 @@ use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot,
     IndexCoverageSummary, IndexRunsTimelineSummary, QdrantClient, QdrantExpectedPoint,
-    RetrievedPoint, SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary,
+    RetrievedPoint, ScoredPoint, SemanticNeighborhoodSummary, SqliteStore, StorageExplorerSummary,
     StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary, SymbolSearchRow,
     TestSearchRow, clamp_call_path_depth, freshness_for_hash, qdrant_collection_name,
 };
@@ -41,6 +42,75 @@ impl QueryMode {
 pub enum CallDirection {
     Callers,
     Callees,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextPackMode {
+    Structural,
+    Unified,
+}
+
+impl ContextPackMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "" | "structural" => Ok(Self::Structural),
+            "unified" => Ok(Self::Unified),
+            other => Err(format!(
+                "unsupported context-pack mode `{other}`; expected `structural` or `unified`"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Structural => "structural",
+            Self::Unified => "unified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextEvidenceSource {
+    Structural,
+    Semantic,
+    Both,
+}
+
+impl ContextEvidenceSource {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Both, _) | (_, Self::Both) => Self::Both,
+            (Self::Structural, Self::Semantic) | (Self::Semantic, Self::Structural) => Self::Both,
+            (same, _) => same,
+        }
+    }
+
+    fn sort_rank(self) -> usize {
+        match self {
+            Self::Both => 0,
+            Self::Structural => 1,
+            Self::Semantic => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextEvidenceItemKind {
+    Symbol,
+    Call,
+    Chunk,
+}
+
+impl ContextEvidenceItemKind {
+    fn sort_rank(self) -> usize {
+        match self {
+            Self::Symbol => 0,
+            Self::Call => 1,
+            Self::Chunk => 2,
+        }
+    }
 }
 
 impl CallDirection {
@@ -82,14 +152,154 @@ pub struct SemanticSearchSummary {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticSearchResult {
+    pub point_id: String,
+    pub chunk_id: String,
+    pub symbol_id: Option<String>,
     pub score: f64,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
     pub symbol_name: Option<String>,
     pub chunk_kind: String,
+    pub language: String,
+    pub text_hash: String,
     pub provenance: EvidenceProvenance,
     pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnifiedContextPack {
+    pub format: String,
+    pub mode: String,
+    pub repository_id: String,
+    pub query: String,
+    pub items: Vec<ContextEvidenceItem>,
+    pub files: Vec<ContextEvidenceFile>,
+    pub limits: UnifiedContextPackLimits,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnifiedContextPackLimits {
+    pub max_symbols: usize,
+    pub max_callers: usize,
+    pub max_callees: usize,
+    pub max_semantic: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextEvidenceItem {
+    pub id: String,
+    pub item_kind: ContextEvidenceItemKind,
+    pub evidence_source: ContextEvidenceSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_hash: Option<String>,
+    pub freshness: String,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<EvidenceProvenance>,
+}
+
+impl ContextEvidenceItem {
+    fn merge(&mut self, other: ContextEvidenceItem) {
+        let other_source = other.evidence_source;
+        let other_has_score = other.score.is_some();
+        self.evidence_source = self.evidence_source.merge(other.evidence_source);
+        merge_option(&mut self.relationship, other.relationship);
+        merge_option(&mut self.point_id, other.point_id);
+        merge_option(&mut self.chunk_id, other.chunk_id);
+        merge_option(&mut self.symbol_id, other.symbol_id);
+        merge_option(&mut self.symbol, other.symbol);
+        merge_option(&mut self.symbol_name, other.symbol_name);
+        merge_option(&mut self.symbol_kind, other.symbol_kind);
+        merge_option(&mut self.path, other.path);
+        merge_option(&mut self.start_line, other.start_line);
+        merge_option(&mut self.end_line, other.end_line);
+        merge_option(&mut self.call_line, other.call_line);
+        merge_option(&mut self.callee_text, other.callee_text);
+        merge_option(&mut self.confidence, other.confidence);
+        merge_option(&mut self.resolution_status, other.resolution_status);
+        merge_option(&mut self.chunk_kind, other.chunk_kind);
+        merge_option(&mut self.language, other.language);
+        merge_option(&mut self.text_hash, other.text_hash);
+        merge_score(&mut self.score, other.score);
+
+        if other_has_score
+            || matches!(
+                other_source,
+                ContextEvidenceSource::Semantic | ContextEvidenceSource::Both
+            )
+            || self.provenance.is_none()
+        {
+            self.freshness = other.freshness;
+            self.trust = other.trust;
+            self.provenance = other.provenance;
+        }
+        extend_unique(&mut self.reasons, other.reasons);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextEvidenceFile {
+    pub path: String,
+    pub evidence_source: ContextEvidenceSource,
+    pub freshness: String,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<EvidenceProvenance>,
+}
+
+impl ContextEvidenceFile {
+    fn merge(&mut self, other: ContextEvidenceFile) {
+        let other_source = other.evidence_source;
+        self.evidence_source = self.evidence_source.merge(other.evidence_source);
+        if matches!(
+            other_source,
+            ContextEvidenceSource::Semantic | ContextEvidenceSource::Both
+        ) || self.provenance.is_none()
+        {
+            self.freshness = other.freshness;
+            self.trust = other.trust;
+            self.provenance = other.provenance;
+        }
+        extend_unique(&mut self.reasons, other.reasons);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -408,6 +618,30 @@ pub fn run_context_pack(repo: &str, query: &str, limit: usize) -> Result<Context
     sqlite
         .context_pack(root.id(), query, limit)
         .map_err(|error| error.to_string())
+}
+
+pub fn run_unified_context_pack(
+    repo: &str,
+    query: &str,
+    limit: usize,
+) -> Result<UnifiedContextPack, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("context-pack requires a symbol query".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let current_hashes = current_hashes(&root)?;
+    let structural = sqlite
+        .context_pack(root.id(), query, limit)
+        .map_err(|error| error.to_string())?;
+    let semantic = semantic_search_for_root(&root, query, limit);
+    Ok(build_unified_context_pack(
+        structural,
+        semantic,
+        &current_hashes,
+        limit,
+    ))
 }
 
 pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
@@ -867,6 +1101,14 @@ pub fn run_semantic_search(
     }
 
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    semantic_search_for_root(&root, query, limit)
+}
+
+fn semantic_search_for_root(
+    root: &RepoRoot,
+    query: &str,
+    limit: usize,
+) -> Result<SemanticSearchSummary, String> {
     let embed_config = EmbedConfig::from_env();
     let embed_client =
         OllamaClient::new(embed_config.clone()).map_err(|error| error.to_string())?;
@@ -884,30 +1126,7 @@ pub fn run_semantic_search(
         .query_points(&qdrant_collection, vector, limit)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .map(|point| {
-            let path = point.payload.path;
-            let symbol_name = point.payload.symbol_name;
-            let chunk_kind = point.payload.chunk_kind;
-            let reasons = semantic_reasons(point.score, &path, symbol_name.as_deref(), &chunk_kind);
-            SemanticSearchResult {
-                score: point.score,
-                path,
-                start_line: point.payload.start_line,
-                end_line: point.payload.end_line,
-                symbol_name,
-                chunk_kind,
-                provenance: EvidenceProvenance {
-                    content_hash: point.payload.content_hash,
-                    index_run_id: point.payload.index_run_id,
-                    parser_version: point.payload.parser_version,
-                    indexed_at: point.payload.indexed_at,
-                    embedding_model: point.payload.embedding_model,
-                    embedding_dimension: point.payload.embedding_dimension,
-                    embedded_at: None,
-                },
-                reasons,
-            }
-        })
+        .map(semantic_result_from_point)
         .collect();
 
     Ok(SemanticSearchSummary {
@@ -916,6 +1135,473 @@ pub fn run_semantic_search(
         query: query.to_owned(),
         results,
     })
+}
+
+fn semantic_result_from_point(point: ScoredPoint) -> SemanticSearchResult {
+    let point_id = qdrant_value_id(&point.id);
+    let path = point.payload.path;
+    let symbol_name = point.payload.symbol_name;
+    let chunk_kind = point.payload.chunk_kind;
+    let reasons = semantic_reasons(point.score, &path, symbol_name.as_deref(), &chunk_kind);
+    SemanticSearchResult {
+        point_id,
+        chunk_id: point.payload.chunk_id,
+        symbol_id: point.payload.symbol_id,
+        score: point.score,
+        path,
+        start_line: point.payload.start_line,
+        end_line: point.payload.end_line,
+        symbol_name,
+        chunk_kind,
+        language: point.payload.language,
+        text_hash: point.payload.text_hash,
+        provenance: EvidenceProvenance {
+            content_hash: point.payload.content_hash,
+            index_run_id: point.payload.index_run_id,
+            parser_version: point.payload.parser_version,
+            indexed_at: point.payload.indexed_at,
+            embedding_model: point.payload.embedding_model,
+            embedding_dimension: point.payload.embedding_dimension,
+            embedded_at: None,
+        },
+        reasons,
+    }
+}
+
+fn build_unified_context_pack(
+    structural: ContextPack,
+    semantic: Result<SemanticSearchSummary, String>,
+    current_hashes: &BTreeMap<String, String>,
+    limit: usize,
+) -> UnifiedContextPack {
+    let max_rows = limit.clamp(1, 25);
+    let mut notes = vec![
+        "metadata_only_no_source_text".to_owned(),
+        "unified_structural_semantic_requested".to_owned(),
+        "structural_direct_relationships_only".to_owned(),
+    ];
+    let mut items = BTreeMap::new();
+    let mut files = BTreeMap::new();
+
+    for symbol in &structural.focus_symbols {
+        upsert_context_item(
+            &mut items,
+            structural_symbol_item(&structural.query, symbol, current_hashes),
+        );
+        upsert_context_file(
+            &mut files,
+            &symbol.path,
+            ContextEvidenceSource::Structural,
+            Some(symbol.provenance.clone()),
+            current_hashes,
+            vec![
+                "context_pack_file_from_structural_evidence".to_owned(),
+                "relationship:focus_symbol".to_owned(),
+            ],
+        );
+    }
+
+    for row in &structural.direct_callers {
+        upsert_context_item(
+            &mut items,
+            structural_call_item("direct_caller", row, current_hashes),
+        );
+        if let Some(path) = &row.path {
+            upsert_context_file(
+                &mut files,
+                path,
+                ContextEvidenceSource::Structural,
+                Some(row.provenance.clone()),
+                current_hashes,
+                vec![
+                    "context_pack_file_from_structural_evidence".to_owned(),
+                    "relationship:direct_caller".to_owned(),
+                ],
+            );
+        }
+    }
+
+    for row in &structural.direct_callees {
+        upsert_context_item(
+            &mut items,
+            structural_call_item("direct_callee", row, current_hashes),
+        );
+        if let Some(path) = &row.path {
+            upsert_context_file(
+                &mut files,
+                path,
+                ContextEvidenceSource::Structural,
+                Some(row.provenance.clone()),
+                current_hashes,
+                vec![
+                    "context_pack_file_from_structural_evidence".to_owned(),
+                    "relationship:direct_callee".to_owned(),
+                ],
+            );
+        }
+    }
+
+    for path in &structural.files {
+        upsert_context_file(
+            &mut files,
+            path,
+            ContextEvidenceSource::Structural,
+            None,
+            current_hashes,
+            vec!["context_pack_file_from_structural_file_set".to_owned()],
+        );
+    }
+
+    match semantic {
+        Ok(summary) => {
+            notes.push("semantic_evidence_included".to_owned());
+            notes.push(format!("semantic_collection:{}", summary.qdrant_collection));
+            notes.push(format!("semantic_results:{}", summary.results.len()));
+            for result in &summary.results {
+                let source = semantic_context_source(result, &items, &files);
+                let item_id = semantic_context_key(result, &items);
+                upsert_context_item(
+                    &mut items,
+                    semantic_context_item(item_id, result, source, current_hashes),
+                );
+                upsert_context_file(
+                    &mut files,
+                    &result.path,
+                    source,
+                    Some(result.provenance.clone()),
+                    current_hashes,
+                    vec![
+                        "context_pack_file_from_semantic_evidence".to_owned(),
+                        format!("chunk_id:{}", result.chunk_id),
+                    ],
+                );
+            }
+        }
+        Err(error) => notes.push(semantic_unavailable_note(&error)),
+    }
+
+    let mut items = items.into_values().collect::<Vec<_>>();
+    items.sort_by(compare_context_items);
+    let files = files.into_values().collect::<Vec<_>>();
+
+    UnifiedContextPack {
+        format: "symdex.context_pack.v2".to_owned(),
+        mode: ContextPackMode::Unified.label().to_owned(),
+        repository_id: structural.repository_id,
+        query: structural.query,
+        items,
+        files,
+        limits: UnifiedContextPackLimits {
+            max_symbols: max_rows,
+            max_callers: max_rows,
+            max_callees: max_rows,
+            max_semantic: max_rows,
+        },
+        notes,
+    }
+}
+
+fn structural_symbol_item(
+    query: &str,
+    symbol: &SymbolSearchRow,
+    current_hashes: &BTreeMap<String, String>,
+) -> ContextEvidenceItem {
+    let freshness =
+        freshness_for_provenance(Some(&symbol.path), &symbol.provenance, current_hashes);
+    let trust = evidence_trust(freshness, Some(&symbol.provenance), None);
+    ContextEvidenceItem {
+        id: format!("symbol:{}", symbol.id),
+        item_kind: ContextEvidenceItemKind::Symbol,
+        evidence_source: ContextEvidenceSource::Structural,
+        relationship: Some("focus_symbol".to_owned()),
+        point_id: None,
+        chunk_id: None,
+        symbol_id: Some(symbol.id.clone()),
+        symbol: Some(symbol.qualified_name.clone()),
+        symbol_name: Some(symbol.name.clone()),
+        symbol_kind: Some(symbol.kind.clone()),
+        path: Some(symbol.path.clone()),
+        start_line: Some(symbol.start_line),
+        end_line: Some(symbol.end_line),
+        call_line: None,
+        callee_text: None,
+        confidence: None,
+        resolution_status: None,
+        score: None,
+        chunk_kind: None,
+        language: None,
+        text_hash: None,
+        freshness: freshness.label().to_owned(),
+        trust,
+        reasons: symbol_context_reasons(query, symbol),
+        provenance: Some(symbol.provenance.clone()),
+    }
+}
+
+fn structural_call_item(
+    relationship: &str,
+    row: &CallSearchRow,
+    current_hashes: &BTreeMap<String, String>,
+) -> ContextEvidenceItem {
+    let freshness = freshness_for_provenance(row.path.as_deref(), &row.provenance, current_hashes);
+    let trust = evidence_trust(freshness, Some(&row.provenance), Some(row.confidence));
+    ContextEvidenceItem {
+        id: structural_call_key(relationship, row),
+        item_kind: ContextEvidenceItemKind::Call,
+        evidence_source: ContextEvidenceSource::Structural,
+        relationship: Some(relationship.to_owned()),
+        point_id: None,
+        chunk_id: None,
+        symbol_id: row.symbol_id.clone(),
+        symbol: row
+            .symbol_qualified_name
+            .clone()
+            .or_else(|| row.symbol_name.clone()),
+        symbol_name: row.symbol_name.clone(),
+        symbol_kind: row.symbol_kind.clone(),
+        path: row.path.clone(),
+        start_line: row.start_line,
+        end_line: row.end_line,
+        call_line: Some(row.call_line),
+        callee_text: Some(row.callee_text.clone()),
+        confidence: Some(row.confidence),
+        resolution_status: Some(row.resolution_status.clone()),
+        score: None,
+        chunk_kind: None,
+        language: None,
+        text_hash: None,
+        freshness: freshness.label().to_owned(),
+        trust,
+        reasons: call_reasons(row, relationship),
+        provenance: Some(row.provenance.clone()),
+    }
+}
+
+fn semantic_context_item(
+    id: String,
+    result: &SemanticSearchResult,
+    source: ContextEvidenceSource,
+    current_hashes: &BTreeMap<String, String>,
+) -> ContextEvidenceItem {
+    let freshness =
+        freshness_for_provenance(Some(&result.path), &result.provenance, current_hashes);
+    let trust = evidence_trust(freshness, Some(&result.provenance), Some(result.score));
+    let mut reasons = result.reasons.clone();
+    reasons.push(format!("point_id:{}", result.point_id));
+    reasons.push(format!("chunk_id:{}", result.chunk_id));
+    if let Some(symbol_id) = &result.symbol_id {
+        reasons.push(format!("symbol_id:{symbol_id}"));
+    }
+    ContextEvidenceItem {
+        id,
+        item_kind: ContextEvidenceItemKind::Chunk,
+        evidence_source: source,
+        relationship: Some("semantic_neighbor".to_owned()),
+        point_id: Some(result.point_id.clone()),
+        chunk_id: Some(result.chunk_id.clone()),
+        symbol_id: result.symbol_id.clone(),
+        symbol: result.symbol_name.clone(),
+        symbol_name: result.symbol_name.clone(),
+        symbol_kind: None,
+        path: Some(result.path.clone()),
+        start_line: Some(result.start_line),
+        end_line: Some(result.end_line),
+        call_line: None,
+        callee_text: None,
+        confidence: None,
+        resolution_status: None,
+        score: Some(result.score),
+        chunk_kind: Some(result.chunk_kind.clone()),
+        language: Some(result.language.clone()),
+        text_hash: Some(result.text_hash.clone()),
+        freshness: freshness.label().to_owned(),
+        trust,
+        reasons,
+        provenance: Some(result.provenance.clone()),
+    }
+}
+
+fn semantic_context_key(
+    result: &SemanticSearchResult,
+    items: &BTreeMap<String, ContextEvidenceItem>,
+) -> String {
+    if let Some(symbol_id) = &result.symbol_id {
+        let key = format!("symbol:{symbol_id}");
+        if items.contains_key(&key) {
+            return key;
+        }
+    }
+    format!("chunk:{}", result.chunk_id)
+}
+
+fn semantic_context_source(
+    result: &SemanticSearchResult,
+    items: &BTreeMap<String, ContextEvidenceItem>,
+    files: &BTreeMap<String, ContextEvidenceFile>,
+) -> ContextEvidenceSource {
+    let symbol_overlap = result
+        .symbol_id
+        .as_ref()
+        .map(|symbol_id| items.contains_key(&format!("symbol:{symbol_id}")))
+        .unwrap_or(false);
+    if symbol_overlap || files.contains_key(&result.path) {
+        ContextEvidenceSource::Both
+    } else {
+        ContextEvidenceSource::Semantic
+    }
+}
+
+fn upsert_context_item(
+    items: &mut BTreeMap<String, ContextEvidenceItem>,
+    item: ContextEvidenceItem,
+) {
+    if let Some(existing) = items.get_mut(&item.id) {
+        existing.merge(item);
+    } else {
+        items.insert(item.id.clone(), item);
+    }
+}
+
+fn upsert_context_file(
+    files: &mut BTreeMap<String, ContextEvidenceFile>,
+    path: &str,
+    source: ContextEvidenceSource,
+    provenance: Option<EvidenceProvenance>,
+    current_hashes: &BTreeMap<String, String>,
+    reasons: Vec<String>,
+) {
+    let freshness = provenance
+        .as_ref()
+        .map_or(EvidenceFreshness::Unknown, |provenance| {
+            freshness_for_provenance(Some(path), provenance, current_hashes)
+        });
+    let trust = evidence_trust(freshness, provenance.as_ref(), None);
+    let file = ContextEvidenceFile {
+        path: path.to_owned(),
+        evidence_source: source,
+        freshness: freshness.label().to_owned(),
+        trust,
+        reasons,
+        provenance,
+    };
+    if let Some(existing) = files.get_mut(path) {
+        existing.merge(file);
+    } else {
+        files.insert(path.to_owned(), file);
+    }
+}
+
+fn symbol_context_reasons(query: &str, symbol: &SymbolSearchRow) -> Vec<String> {
+    let mut reasons = vec![
+        "relationship:focus_symbol".to_owned(),
+        "symbol_index_match".to_owned(),
+        format!("kind:{}", symbol.kind),
+        format!("path:{}", symbol.path),
+    ];
+    if symbol.qualified_name == query {
+        reasons.push("query_match:qualified_name_exact".to_owned());
+    } else if symbol.name == query {
+        reasons.push("query_match:name_exact".to_owned());
+    } else if symbol.qualified_name.ends_with(query) {
+        reasons.push("query_match:qualified_name_suffix".to_owned());
+    } else {
+        reasons.push("query_match:sqlite_like".to_owned());
+    }
+    reasons
+}
+
+fn structural_call_key(relationship: &str, row: &CallSearchRow) -> String {
+    format!(
+        "call:{relationship}:{}:{}:{}:{}:{}",
+        row.path.as_deref().unwrap_or(""),
+        row.call_line,
+        row.callee_text,
+        row.symbol_id.as_deref().unwrap_or(""),
+        row.start_line.unwrap_or(0),
+    )
+}
+
+fn compare_context_items(left: &ContextEvidenceItem, right: &ContextEvidenceItem) -> Ordering {
+    left.evidence_source
+        .sort_rank()
+        .cmp(&right.evidence_source.sort_rank())
+        .then_with(|| left.item_kind.sort_rank().cmp(&right.item_kind.sort_rank()))
+        .then_with(|| compare_optional_f64_desc(left.score, right.score))
+        .then_with(|| compare_optional_f64_desc(left.confidence, right.confidence))
+        .then_with(|| {
+            left.relationship
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right.relationship.as_deref().unwrap_or(""))
+        })
+        .then_with(|| {
+            left.path
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right.path.as_deref().unwrap_or(""))
+        })
+        .then_with(|| {
+            left.start_line
+                .unwrap_or(usize::MAX)
+                .cmp(&right.start_line.unwrap_or(usize::MAX))
+        })
+        .then_with(|| {
+            left.end_line
+                .unwrap_or(usize::MAX)
+                .cmp(&right.end_line.unwrap_or(usize::MAX))
+        })
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn compare_optional_f64_desc(left: Option<f64>, right: Option<f64>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn merge_option<T>(target: &mut Option<T>, incoming: Option<T>) {
+    if target.is_none() {
+        *target = incoming;
+    }
+}
+
+fn merge_score(target: &mut Option<f64>, incoming: Option<f64>) {
+    if let Some(incoming) = incoming
+        && target.map(|score| incoming > score).unwrap_or(true)
+    {
+        *target = Some(incoming);
+    }
+}
+
+fn extend_unique(target: &mut Vec<String>, incoming: Vec<String>) {
+    for value in incoming {
+        if !target.iter().any(|existing| existing == &value) {
+            target.push(value);
+        }
+    }
+}
+
+fn semantic_unavailable_note(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let category =
+        if lower.contains("404") || lower.contains("not found") || lower.contains("collection") {
+            "missing_vector_collection"
+        } else if lower.contains("connection")
+            || lower.contains("refused")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("error sending request")
+        {
+            "local_service_unavailable"
+        } else if lower.contains("embedding") || lower.contains("ollama") {
+            "embedding_unavailable"
+        } else {
+            "query_error"
+        };
+    format!("semantic_unavailable:{category}")
 }
 
 fn build_debug_context_pack(
@@ -1813,16 +2499,19 @@ mod tests {
 
     use symdex_core::RepoRoot;
     use symdex_store::{
-        CallRecord, EvidenceFreshness, EvidenceProvenance, FileFreshnessSnapshot, FileRecord,
-        PointPayload, QdrantExpectedPoint, RepositoryRecord, RetrievedPoint, SqliteStore,
-        StorageHealthStatus, StoreConfig, SymbolRecord, TestRecord,
+        CallRecord, CallSearchRow, ContextPack, ContextPackLimits, EvidenceFreshness,
+        EvidenceProvenance, FileFreshnessSnapshot, FileRecord, PointPayload, QdrantExpectedPoint,
+        RepositoryRecord, RetrievedPoint, ScoredPoint, SqliteStore, StorageHealthStatus,
+        StoreConfig, SymbolRecord, SymbolSearchRow, TestRecord,
     };
 
     use crate::{
-        CallDirection, QueryMode, build_debug_context_pack, build_impact_summary, evidence_trust,
-        freshness_rows, parse_runtime_input, qdrant_verify_summary, run_call_graph, run_call_path,
-        run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
-        run_symbol_search, semantic_reasons,
+        CallDirection, ContextEvidenceSource, ContextPackMode, QueryMode, SemanticSearchResult,
+        SemanticSearchSummary, build_debug_context_pack, build_impact_summary,
+        build_unified_context_pack, evidence_trust, freshness_rows, parse_runtime_input,
+        qdrant_verify_summary, run_call_graph, run_call_path, run_context_pack,
+        run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
+        semantic_reasons, semantic_result_from_point,
     };
 
     #[test]
@@ -1944,6 +2633,149 @@ mod tests {
     fn context_pack_rejects_empty_query() {
         let error = run_context_pack(".", " ", 8).expect_err("empty query should fail");
         assert!(error.contains("requires a symbol query"));
+    }
+
+    #[test]
+    fn context_pack_mode_parses_supported_values() {
+        assert_eq!(
+            ContextPackMode::parse("structural").expect("structural should parse"),
+            ContextPackMode::Structural
+        );
+        assert_eq!(
+            ContextPackMode::parse("unified").expect("unified should parse"),
+            ContextPackMode::Unified
+        );
+        assert!(ContextPackMode::parse("semantic").is_err());
+    }
+
+    #[test]
+    fn unified_context_pack_falls_back_to_structural_evidence_when_semantic_unavailable() {
+        let structural = sample_context_pack();
+        let current_hashes = BTreeMap::from([("src/lib.rs".to_owned(), "hash-current".to_owned())]);
+
+        let pack = build_unified_context_pack(
+            structural,
+            Err("connection refused".to_owned()),
+            &current_hashes,
+            8,
+        );
+
+        assert_eq!(pack.format, "symdex.context_pack.v2");
+        assert_eq!(pack.mode, "unified");
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| { note == "semantic_unavailable:local_service_unavailable" })
+        );
+        assert!(pack.items.iter().any(|item| {
+            item.id == "symbol:sym-main"
+                && item.evidence_source == ContextEvidenceSource::Structural
+                && item.freshness == "stale"
+        }));
+        assert!(pack.files.iter().any(|file| {
+            file.path == "src/lib.rs" && file.evidence_source == ContextEvidenceSource::Structural
+        }));
+        let json = serde_json::to_value(&pack).expect("pack should serialize");
+        assert!(json.get("source_text").is_none());
+        assert!(pack.items.iter().all(|item| {
+            let item_json = serde_json::to_value(item).expect("item should serialize");
+            item_json.get("source_text").is_none()
+        }));
+    }
+
+    #[test]
+    fn unified_context_pack_notes_missing_vector_collection() {
+        let pack = build_unified_context_pack(
+            sample_context_pack(),
+            Err("Qdrant collection not found".to_owned()),
+            &BTreeMap::new(),
+            8,
+        );
+
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| { note == "semantic_unavailable:missing_vector_collection" })
+        );
+    }
+
+    #[test]
+    fn unified_context_pack_merges_overlapping_semantic_and_structural_evidence() {
+        let structural = sample_context_pack();
+        let semantic = SemanticSearchSummary {
+            repository_id: "repo".to_owned(),
+            qdrant_collection: "symdex_repo_model".to_owned(),
+            query: "main".to_owned(),
+            results: vec![
+                semantic_result(
+                    "point-main",
+                    "chunk-main",
+                    Some("sym-main"),
+                    "src/lib.rs",
+                    0.91,
+                ),
+                semantic_result("point-other", "chunk-other", None, "src/other.rs", 0.88),
+            ],
+        };
+        let current_hashes = BTreeMap::from([
+            ("src/lib.rs".to_owned(), "hash-indexed".to_owned()),
+            ("src/other.rs".to_owned(), "hash-indexed".to_owned()),
+        ]);
+
+        let pack = build_unified_context_pack(structural, Ok(semantic), &current_hashes, 8);
+
+        let merged = pack
+            .items
+            .iter()
+            .find(|item| item.id == "symbol:sym-main")
+            .expect("semantic symbol hit should merge with structural symbol");
+        assert_eq!(merged.evidence_source, ContextEvidenceSource::Both);
+        assert_eq!(merged.score, Some(0.91));
+        assert_eq!(merged.point_id.as_deref(), Some("point-main"));
+        assert_eq!(merged.text_hash.as_deref(), Some("text-chunk-main"));
+        assert_eq!(merged.freshness, "fresh");
+
+        let semantic_only = pack
+            .items
+            .iter()
+            .find(|item| item.id == "chunk:chunk-other")
+            .expect("semantic-only chunk should be retained");
+        assert_eq!(
+            semantic_only.evidence_source,
+            ContextEvidenceSource::Semantic
+        );
+        assert_eq!(semantic_only.score, Some(0.88));
+        assert!(pack.files.iter().any(|file| {
+            file.path == "src/lib.rs" && file.evidence_source == ContextEvidenceSource::Both
+        }));
+        assert!(pack.notes.iter().any(|note| note == "semantic_results:2"));
+        assert_eq!(pack.items[0].evidence_source, ContextEvidenceSource::Both);
+    }
+
+    #[test]
+    fn semantic_result_preserves_qdrant_identity_fields() {
+        let expected = expected_point("point-id", "chunk-id", "text-hash");
+        let result = semantic_result_from_point(ScoredPoint {
+            id: serde_json::Value::String("point-id".to_owned()),
+            score: 0.77,
+            payload: PointPayload {
+                symbol_id: Some("sym-id".to_owned()),
+                symbol_name: Some("crate::run".to_owned()),
+                ..payload_for(&expected, "text-hash")
+            },
+        });
+
+        assert_eq!(result.point_id, "point-id");
+        assert_eq!(result.chunk_id, "chunk-id");
+        assert_eq!(result.symbol_id.as_deref(), Some("sym-id"));
+        assert_eq!(result.text_hash, "text-hash");
+        assert_eq!(result.language, "rust");
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason == "semantic_score:0.7700")
+        );
     }
 
     #[test]
@@ -2317,6 +3149,73 @@ mod tests {
         }
     }
 
+    fn sample_context_pack() -> ContextPack {
+        ContextPack {
+            format: "symdex.context_pack.v1".to_owned(),
+            repository_id: "repo".to_owned(),
+            query: "main".to_owned(),
+            focus_symbols: vec![SymbolSearchRow {
+                id: "sym-main".to_owned(),
+                name: "main".to_owned(),
+                qualified_name: "crate::main".to_owned(),
+                kind: "function".to_owned(),
+                path: "src/lib.rs".to_owned(),
+                start_line: 1,
+                end_line: 5,
+                provenance: complete_provenance_with_hash("hash-indexed"),
+            }],
+            direct_callers: vec![CallSearchRow {
+                callee_text: "main".to_owned(),
+                call_line: 12,
+                confidence: 1.0,
+                resolution_status: "resolved_exact".to_owned(),
+                symbol_id: Some("sym-caller".to_owned()),
+                symbol_name: Some("caller".to_owned()),
+                symbol_qualified_name: Some("crate::caller".to_owned()),
+                symbol_kind: Some("function".to_owned()),
+                path: Some("src/lib.rs".to_owned()),
+                start_line: Some(10),
+                end_line: Some(15),
+                provenance: complete_provenance_with_hash("hash-indexed"),
+            }],
+            direct_callees: Vec::new(),
+            files: vec!["src/lib.rs".to_owned()],
+            limits: ContextPackLimits {
+                max_symbols: 8,
+                max_callers: 8,
+                max_callees: 8,
+            },
+            notes: vec![
+                "metadata_only_no_source_text".to_owned(),
+                "direct_relationships_only".to_owned(),
+            ],
+        }
+    }
+
+    fn semantic_result(
+        point_id: &str,
+        chunk_id: &str,
+        symbol_id: Option<&str>,
+        path: &str,
+        score: f64,
+    ) -> SemanticSearchResult {
+        SemanticSearchResult {
+            point_id: point_id.to_owned(),
+            chunk_id: chunk_id.to_owned(),
+            symbol_id: symbol_id.map(str::to_owned),
+            score,
+            path: path.to_owned(),
+            start_line: 1,
+            end_line: 5,
+            symbol_name: symbol_id.map(|_| "crate::main".to_owned()),
+            chunk_kind: "function".to_owned(),
+            language: "rust".to_owned(),
+            text_hash: format!("text-{chunk_id}"),
+            provenance: complete_semantic_provenance("hash-indexed"),
+            reasons: semantic_reasons(score, path, symbol_id.map(|_| "crate::main"), "function"),
+        }
+    }
+
     struct DebugFixture {
         root: RepoRoot,
         store: SqliteStore,
@@ -2606,14 +3505,26 @@ mod tests {
     }
 
     fn complete_provenance() -> EvidenceProvenance {
+        complete_provenance_with_hash("hash")
+    }
+
+    fn complete_provenance_with_hash(content_hash: &str) -> EvidenceProvenance {
         EvidenceProvenance {
-            content_hash: Some("hash".to_owned()),
+            content_hash: Some(content_hash.to_owned()),
             index_run_id: Some("run".to_owned()),
             parser_version: Some("parser".to_owned()),
             indexed_at: Some("now".to_owned()),
             embedding_model: None,
             embedding_dimension: None,
             embedded_at: None,
+        }
+    }
+
+    fn complete_semantic_provenance(content_hash: &str) -> EvidenceProvenance {
+        EvidenceProvenance {
+            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_dimension: Some(768),
+            ..complete_provenance_with_hash(content_hash)
         }
     }
 

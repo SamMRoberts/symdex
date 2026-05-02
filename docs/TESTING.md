@@ -60,6 +60,10 @@ Fixtures should be tiny and purpose-built.
 - Evidence explainability coverage for semantic result reasons, direct impact
   call reasons, related-file reasons, MCP contract reason availability, and
   debug-context frame match reasons.
+- Unified context-pack coverage for structural-only fallback, semantic-only
+  chunks, overlapping structural/semantic evidence marked as `both`, stale
+  freshness labels, missing-vector or unavailable-semantic notes, and continued
+  absence of source text.
 - Debug context coverage for parsed panic/file locations, stack-frame symbols,
   failing test names, mapped frames, unmapped frames, stale frames, deleted
   files, malformed runtime input, common Rust `cargo test`, `anyhow`, `tracing`,

@@ -60,6 +60,7 @@ cargo run -p symdex-cli -- callees . "my_symbol"
 cargo run -p symdex-cli -- call-path . "source_symbol" "target_symbol" 4
 cargo run -p symdex-cli -- impact . "my_symbol"
 cargo run -p symdex-cli -- context-pack . "my_symbol"
+cargo run -p symdex-cli -- context-pack . "my_symbol" --mode unified
 cargo run -p symdex-cli -- debug-context . panic.log
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- tui .
@@ -127,10 +128,15 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   compact reason tags explaining why each evidence row was returned. Likely tests
   list indexed Rust tests that directly call the queried symbol when discovered
   test metadata and resolved call evidence are present.
-- `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
-  context. The current format is `symdex.context_pack.v1` and includes focus
-  symbols, direct callers, direct callees, involved files, section limits, and
-  notes. It does not include source text.
+- `context-pack <repo> <symbol> [--mode structural|unified]`: prints compact
+  JSON evidence for editing context. The default structural mode preserves
+  `symdex.context_pack.v1` and includes focus symbols, direct callers, direct
+  callees, involved files, section limits, and notes. Unified mode returns
+  `symdex.context_pack.v2`, runs structural retrieval and semantic search in one
+  query path, deduplicates symbol/chunk/file evidence, and labels rows with
+  `evidence_source` values of `structural`, `semantic`, or `both`. It does not
+  include source text. If local semantic services are unavailable, unified mode
+  returns structural evidence with a compact `semantic_unavailable:*` note.
 - `debug-context <repo> <runtime-input|file|->`: parses runtime failure input
   such as stack traces, panic locations, failing test names, frame symbols, and
   indexed-language file paths, then prints `symdex.debug_context.v1` JSON. Rust
@@ -160,9 +166,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
-  `symdex_debug_context`, and `symdex_index_status`. Planned next MCP work is a
-  unified `symdex_context_pack` mode followed by a read-only
-  `symdex_staleness_check` wrapper over the existing CLI staleness logic.
+  `symdex_debug_context`, and `symdex_index_status`. `symdex_context_pack`
+  accepts `mode: "unified"` for combined structural and semantic context-pack
+  evidence. Planned next MCP work is a read-only `symdex_staleness_check`
+  wrapper over the existing CLI staleness logic.
 
 `doctor` checks whether Qdrant is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector

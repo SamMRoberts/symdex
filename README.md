@@ -46,6 +46,7 @@ cargo run -p symdex-cli -- callers <repo> <symbol>
 cargo run -p symdex-cli -- callees <repo> <symbol>
 cargo run -p symdex-cli -- impact <repo> <symbol>
 cargo run -p symdex-cli -- context-pack <repo> <symbol>
+cargo run -p symdex-cli -- context-pack <repo> <symbol> --mode unified
 cargo run -p symdex-cli -- tui [repo]
 cargo run -p symdex-cli -- serve-mcp
 ```
@@ -99,6 +100,8 @@ MCP tools:
 - `symdex_index_status`
 - `symdex_debug_context`
 
-The next planned MCP additions are a unified context-pack mode and a read-only
-`symdex_staleness_check` tool, followed by `.gitignore` glob correctness and
-broader test/runtime mapping work.
+`symdex_context_pack` defaults to structural `symdex.context_pack.v1` output and
+accepts `mode: "unified"` for `symdex.context_pack.v2` output that merges
+structural context-pack evidence with semantic search metadata. The next planned
+MCP addition is a read-only `symdex_staleness_check` tool, followed by
+`.gitignore` glob correctness and broader test/runtime mapping work.
