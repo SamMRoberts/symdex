@@ -9,6 +9,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 ## First Reads
 - Read this file before changing code, docs, tests, or configuration.
 - Read `docs/README.md` next; it maps tasks to the right deeper docs.
+- For semantic indexing changes, read `docs/LAYERED_SEMANTIC_INDEXING.md`,
+  `docs/INDEXING_PIPELINE.md`, `docs/DATA_MODEL.md`, and
+  `docs/CONTINUOUS_INDEXING.md` before implementation.
 - For planning new implementation work, read `docs/ANALYSIS_REPORT.md` and
   `docs/BACKLOG.md` before choosing the next slice.
 - Do not load every doc by default. Load only what is relevant.
@@ -24,7 +27,11 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
 - Qdrant stores dense vectors plus filterable payload fields.
-- Ollama generates local embeddings with `nomic-embed-text`.
+- Ollama generates local embeddings. The default fast semantic layer uses
+  `nomic-embed-text`; the deferred quality semantic layer uses
+  `nomic-embed-text-v2-moe` when configured and available.
+- Semantic search must use the fast layer until the quality layer is complete
+  and current for the latest fast semantic generation, then route to quality.
 - tree-sitter extracts syntax-aware chunks and symbol boundaries.
 - The system must work offline after dependencies and models are installed.
 - Rust remains the stable baseline and first fully validated language.
@@ -67,6 +74,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Prefer integration tests for CLI, database, Qdrant, Ollama, and MCP behavior.
 - Do not rely on host-specific absolute paths in tests.
 - Make incremental indexing testable without Qdrant or Ollama.
+- Make quality semantic indexing testable without live Ollama/Qdrant by isolating
+  job selection, generation state, routing, and stale-job transitions.
 - Use symdex mcp tools to assist with debugging.
 
 ## Code Quality
@@ -88,8 +97,19 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Store symbol identity separately from display names.
 - Preserve unresolved call edges instead of dropping them.
 - Keep call resolution conservative; false certainty is worse than an unresolved edge.
-- Record embedding model name and vector dimension with every index version.
-- A model or dimension change requires collection migration or full reindex.
+- Record embedding model name and vector dimension with every semantic layer.
+- A model or dimension change requires collection migration or full reindex for
+  the affected layer.
+- Treat SQLite as the source of truth for structural facts and semantic-layer
+  readiness. Treat Qdrant collections as projections of embeddable chunks.
+- Fast indexing with `nomic-embed-text` must remain the availability path for
+  manual and continuous indexing.
+- Quality indexing with `nomic-embed-text-v2-moe` must run as deferred work and
+  must not block continuous indexing or normal edit loops.
+- Do not route default semantic search to the quality layer until it is complete
+  and current for the latest fast semantic generation.
+- If quality indexing is missing, stale, partial, failed, or blocked, fail open
+  to the fast semantic layer and expose quality status metadata.
 - Respect `.gitignore` plus project-level ignore config.
 - Continuous indexing must use the same ignore, path-boundary, hashing, parser, secret-detection, and embedding rules as manual indexing.
 - Continuous indexing must debounce file events and coalesce bursts before reindexing.
@@ -102,6 +122,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Tool names must be stable, descriptive, and versionable.
 - Tool outputs must fit agent context windows.
 - Include file paths, line ranges, scores, and confidence where relevant.
+- Include active semantic layer, embedding model, and quality-layer status in
+  semantic outputs when available.
 - Never return full files unless the tool contract explicitly allows it.
 - Prefer ranked evidence over prose explanations.
 - Validate all MCP inputs.
@@ -118,6 +140,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Show compact evidence by default: paths, line ranges, scores, confidence, resolution status, symbols, and context-pack metadata.
 - Visualize SQLite as the structural source of truth: repositories, files, chunks, symbols, calls, and index runs.
 - Visualize Qdrant as the semantic projection of embeddable chunks: collection, vector model/dimension, point payload metadata, and semantic coverage.
+- Show active semantic layer, fast readiness, quality readiness, stale quality
+  state, quality job progress, and fallback-to-fast status when layered
+  indexing is enabled.
 - Prefer tables, split panes, gauges, and compact relationship views over prose-only summaries.
 - Cross-store visualizations must make mismatches obvious, such as chunks with no vector point, excluded chunks, missing collections, or model/dimension drift.
 - Do not show source text by default; source previews require a future explicit design.
