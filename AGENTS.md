@@ -67,6 +67,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Prefer integration tests for CLI, database, Qdrant, Ollama, and MCP behavior.
 - Do not rely on host-specific absolute paths in tests.
 - Make incremental indexing testable without Qdrant or Ollama.
+- Use symdex mcp tools to assist with debugging.
 
 ## Code Quality
 - Use idiomatic Rust and clear ownership boundaries.
