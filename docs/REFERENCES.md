@@ -23,7 +23,7 @@ Verified sources for the chosen stack.
 
 - Ollama API docs: https://docs.ollama.com/api
 - Ollama embeddings docs: https://docs.ollama.com/capabilities/embeddings
-- nomic-embed-text-v2-moe model: https://ollama.com/library/nomic-embed-text-v2-moe
+- nomic-embed-text model: https://ollama.com/library/nomic-embed-text
 
 ## MCP
 

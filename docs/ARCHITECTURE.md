@@ -105,7 +105,7 @@ Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
 Local embedding adapter:
 
 - Ollama HTTP client
-- `nomic-embed-text-v2-moe` model checks
+- `nomic-embed-text` model checks
 - batch embedding requests
 - vector dimension discovery
 - retry behavior for transient local service failures

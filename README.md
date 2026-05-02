@@ -80,7 +80,7 @@ Semantic indexing and semantic search require:
 
 - Qdrant on `localhost:6333`
 - Ollama on `localhost:11434`
-- the `nomic-embed-text-v2-moe` model installed in Ollama
+- the `nomic-embed-text` model installed in Ollama
 
 Structural indexing, SQLite status, symbol queries, call queries, impact, context
 packs, diagnostics, and offline TUI workflows remain local and usable without

@@ -104,7 +104,7 @@ to Ollama and do not get Qdrant point IDs.
 
 ## Embeddings
 
-Use Ollama with `nomic-embed-text-v2-moe`.
+Use Ollama with `nomic-embed-text`.
 
 Current implementation uses Ollama `POST /api/embed` for batch embeddings and
 `GET /api/tags` for local model availability. `SYMDEX_EMBED_TRUNCATE` defaults
