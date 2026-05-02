@@ -58,6 +58,14 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
         chunks.push(chunk);
         symbols.push(symbol);
     }
+    collect_javascript_test_facts(
+        file.language,
+        tree.root_node(),
+        file,
+        source,
+        &symbols,
+        &mut tests,
+    );
 
     if chunks.is_empty() && !source.trim().is_empty() {
         chunks.push(file_fallback_chunk(file, source));
@@ -446,9 +454,84 @@ fn test_facts(
 
 fn test_framework(language: Language, node: Node<'_>, source: &str) -> Option<String> {
     match language {
+        Language::CSharp => csharp_test_framework(node, source),
         Language::Rust => rust_test_framework(node, source),
         _ => None,
     }
+}
+
+fn csharp_test_framework(node: Node<'_>, source: &str) -> Option<String> {
+    csharp_attribute_texts(node, source)
+        .into_iter()
+        .find_map(|attribute| csharp_test_framework_from_attribute(&attribute))
+}
+
+fn csharp_attribute_texts(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "attribute_list"
+            && let Some(text) = node_text(child, source)
+        {
+            attributes.push(text.to_owned());
+        }
+    }
+
+    let mut sibling = node.prev_named_sibling();
+    while let Some(current) = sibling {
+        if current.kind() != "attribute_list" {
+            break;
+        }
+        if let Some(text) = node_text(current, source) {
+            attributes.push(text.to_owned());
+        }
+        sibling = current.prev_named_sibling();
+    }
+    attributes
+}
+
+fn csharp_test_framework_from_attribute(attribute: &str) -> Option<String> {
+    let names = csharp_attribute_names(attribute);
+    if names
+        .iter()
+        .any(|name| matches!(name.as_str(), "test" | "testcase"))
+    {
+        return Some("nunit".to_owned());
+    }
+    if names
+        .iter()
+        .any(|name| matches!(name.as_str(), "fact" | "theory"))
+    {
+        return Some("xunit".to_owned());
+    }
+    if names
+        .iter()
+        .any(|name| matches!(name.as_str(), "testmethod" | "datatestmethod"))
+    {
+        return Some("mstest".to_owned());
+    }
+    None
+}
+
+fn csharp_attribute_names(attribute: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for segment in attribute.split('[').skip(1) {
+        let inner = segment.split(']').next().unwrap_or(segment);
+        for entry in inner.split(',') {
+            let name = entry.split('(').next().unwrap_or(entry).trim();
+            let name = clean_expression_text(name);
+            let name = name
+                .rsplit('.')
+                .next()
+                .unwrap_or(name.as_str())
+                .trim_end_matches("Attribute")
+                .to_ascii_lowercase();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 fn rust_test_framework(node: Node<'_>, source: &str) -> Option<String> {
@@ -493,6 +576,239 @@ fn rust_test_framework_from_attribute(attribute: &str) -> Option<String> {
     }
     path.strip_suffix("::test")
         .map(|prefix| format!("{prefix}::test"))
+}
+
+fn collect_javascript_test_facts(
+    language: Language,
+    node: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    symbols: &[Symbol],
+    tests: &mut Vec<DiscoveredTest>,
+) {
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return;
+    }
+    collect_javascript_test_facts_from_node(node, file, source, symbols, tests);
+}
+
+fn collect_javascript_test_facts_from_node(
+    node: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    symbols: &[Symbol],
+    tests: &mut Vec<DiscoveredTest>,
+) {
+    if node.kind() == "call_expression"
+        && let Some(test) = javascript_test_fact(node, file, source, symbols)
+    {
+        tests.push(test);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_javascript_test_facts_from_node(child, file, source, symbols, tests);
+    }
+}
+
+fn javascript_test_fact(
+    call: Node<'_>,
+    file: &FileFacts,
+    source: &str,
+    symbols: &[Symbol],
+) -> Option<DiscoveredTest> {
+    let callee = callee_text(file.language, call, source)?;
+    let callee_kind = javascript_test_callee_kind(&callee)?;
+    if callee_kind != JavascriptTestCalleeKind::Test {
+        return None;
+    }
+    let framework = javascript_test_framework(file.language, &file.relative_path, source)?;
+    let name = javascript_first_static_string_argument(call, source)?;
+    let callback_symbol = javascript_test_callback_symbol(call, source, symbols);
+    let mut parts = module_parts(&file.relative_path);
+    parts.extend(javascript_suite_parts(call, source));
+    parts.push(name.clone());
+    let qualified_name = parts.join("::");
+
+    Some(DiscoveredTest {
+        id: stable_id(&[
+            &file.id,
+            "test",
+            &qualified_name,
+            &call.start_byte().to_string(),
+        ]),
+        file_id: file.id.clone(),
+        relative_path: file.relative_path.clone(),
+        symbol_id: callback_symbol.map(|symbol| symbol.id.clone()),
+        name,
+        qualified_name,
+        framework,
+        language: file.language,
+        byte_range: ByteRange::new(call.start_byte(), call.end_byte()),
+        line_range: LineRange::new(call.start_position().row + 1, call.end_position().row + 1),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JavascriptTestCalleeKind {
+    Suite,
+    Test,
+}
+
+fn javascript_test_callee_kind(callee: &str) -> Option<JavascriptTestCalleeKind> {
+    let base = javascript_test_callee_base(callee)?;
+    match base {
+        "describe" => Some(JavascriptTestCalleeKind::Suite),
+        "it" | "test" => Some(JavascriptTestCalleeKind::Test),
+        _ => None,
+    }
+}
+
+fn javascript_test_callee_base(callee: &str) -> Option<&str> {
+    let mut parts = callee.split('.');
+    let base = parts.next()?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let modifiers_are_supported =
+        parts.all(|part| matches!(part.trim(), "only" | "skip" | "concurrent"));
+    if modifiers_are_supported {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+fn javascript_test_framework(
+    language: Language,
+    relative_path: &str,
+    source: &str,
+) -> Option<String> {
+    let compact = source.replace([' ', '\n'], "");
+    if compact.contains("from'vitest'")
+        || compact.contains("from\"vitest\"")
+        || compact.contains("require('vitest')")
+        || compact.contains("require(\"vitest\")")
+    {
+        return Some("vitest".to_owned());
+    }
+    if compact.contains("from'mocha'")
+        || compact.contains("from\"mocha\"")
+        || compact.contains("require('mocha')")
+        || compact.contains("require(\"mocha\")")
+    {
+        return Some("mocha".to_owned());
+    }
+    if compact.contains("from'@jest/globals'")
+        || compact.contains("from\"@jest/globals\"")
+        || compact.contains("require('@jest/globals')")
+        || compact.contains("require(\"@jest/globals\")")
+    {
+        return Some("jest".to_owned());
+    }
+    if is_test_like_path(relative_path) {
+        return Some(match language {
+            Language::JavaScript => "javascript_test".to_owned(),
+            Language::TypeScript => "typescript_test".to_owned(),
+            _ => return None,
+        });
+    }
+    None
+}
+
+fn is_test_like_path(relative_path: &str) -> bool {
+    relative_path.contains("/__tests__/")
+        || relative_path.contains(".test.")
+        || relative_path.contains(".spec.")
+}
+
+fn javascript_suite_parts(call: Node<'_>, source: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut parent = call.parent();
+    while let Some(current) = parent {
+        if current.kind() == "call_expression"
+            && let Some(callee) = callee_text(Language::JavaScript, current, source)
+            && javascript_test_callee_kind(&callee) == Some(JavascriptTestCalleeKind::Suite)
+            && let Some(name) = javascript_first_static_string_argument(current, source)
+        {
+            parts.push(name);
+        }
+        parent = current.parent();
+    }
+    parts.reverse();
+    parts
+}
+
+fn javascript_first_static_string_argument(call: Node<'_>, source: &str) -> Option<String> {
+    javascript_argument_nodes(call)
+        .into_iter()
+        .next()
+        .and_then(|argument| javascript_static_string(argument, source))
+}
+
+fn javascript_test_callback_symbol<'a>(
+    call: Node<'_>,
+    source: &str,
+    symbols: &'a [Symbol],
+) -> Option<&'a Symbol> {
+    let callback = javascript_argument_nodes(call).into_iter().nth(1)?;
+    if callback.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(callback, source).map(clean_expression_text)?;
+    let candidates = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.name == name || symbol.qualified_name.ends_with(&format!("::{name}"))
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [symbol] => Some(*symbol),
+        _ => None,
+    }
+}
+
+fn javascript_argument_nodes(call: Node<'_>) -> Vec<Node<'_>> {
+    let Some(arguments) = call
+        .child_by_field_name("arguments")
+        .or_else(|| call.named_child(1))
+        .filter(|node| node.kind() == "arguments")
+    else {
+        return Vec::new();
+    };
+    let mut argument_nodes = Vec::new();
+    let mut cursor = arguments.walk();
+    for child in arguments.named_children(&mut cursor) {
+        argument_nodes.push(child);
+    }
+    argument_nodes
+}
+
+fn javascript_static_string(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "string" | "template_string") {
+        return None;
+    }
+    if node.kind() == "template_string" {
+        let mut cursor = node.walk();
+        if node
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "template_substitution")
+        {
+            return None;
+        }
+    }
+    let text = node_text(node, source)?.trim();
+    let quote = text.chars().next()?;
+    if !matches!(quote, '\'' | '"' | '`') || !text.ends_with(quote) || text.len() < 2 {
+        return None;
+    }
+    let inner = &text[quote.len_utf8()..text.len() - quote.len_utf8()];
+    Some(
+        inner
+            .replace("\\'", "'")
+            .replace("\\\"", "\"")
+            .replace("\\`", "`"),
+    )
 }
 
 fn collect_call_edges(
@@ -1475,6 +1791,178 @@ mod tests {
     }
 
     #[test]
+    fn discovers_csharp_framework_tests_from_method_attributes() {
+        let source = r#"namespace Demo;
+
+class CalculatorTests {
+    [Test]
+    public void NUnitTest() {}
+
+    [TestCase(1, 2)]
+    public void NUnitCase(int left, int right) {}
+
+    [Fact]
+    public void XUnitFact() {}
+
+    [Theory]
+    [InlineData(1)]
+    public void XUnitTheory(int value) {}
+
+    [TestMethod]
+    public void MsTestMethod() {}
+
+    [DataTestMethod]
+    [DataRow(1)]
+    public void MsDataTestMethod(int value) {}
+
+    [SetUp]
+    public void BeforeEach() {}
+
+    [DataRow(2)]
+    public void DataOnly(int value) {}
+}
+"#;
+
+        let file = file_with_language("src/CalculatorTests.cs", Language::CSharp);
+        let index = index_source_file(&file, source).expect("C# should parse");
+
+        assert_eq!(index.tests.len(), 6);
+        for (name, framework) in [
+            ("NUnitTest", "nunit"),
+            ("NUnitCase", "nunit"),
+            ("XUnitFact", "xunit"),
+            ("XUnitTheory", "xunit"),
+            ("MsTestMethod", "mstest"),
+            ("MsDataTestMethod", "mstest"),
+        ] {
+            assert!(index.tests.iter().any(|test| {
+                test.name == name
+                    && test.framework == framework
+                    && test
+                        .qualified_name
+                        .ends_with(&format!("CalculatorTests::{name}"))
+                    && test.symbol_id.is_some()
+            }));
+        }
+        assert!(index.tests.iter().all(|test| test.name != "BeforeEach"));
+        assert!(index.tests.iter().all(|test| test.name != "DataOnly"));
+    }
+
+    #[test]
+    fn discovers_javascript_tests_without_linking_inline_callbacks() {
+        let source = r#"import { describe, it, test } from "@jest/globals";
+
+function target() {}
+
+function namedCase() {
+  target();
+}
+
+describe("math", () => {
+  test("named works", namedCase);
+  it("inline works", () => target());
+});
+"#;
+
+        let file = file_with_language("web/math.test.js", Language::JavaScript);
+        let index = index_source_file(&file, source).expect("JavaScript should parse");
+
+        assert_eq!(index.tests.len(), 2);
+        let named = index
+            .tests
+            .iter()
+            .find(|test| test.name == "named works")
+            .expect("named callback test should be discovered");
+        assert_eq!(named.framework, "jest");
+        assert_eq!(named.qualified_name, "web::math.test::math::named works");
+        assert!(named.symbol_id.is_some());
+
+        let inline = index
+            .tests
+            .iter()
+            .find(|test| test.name == "inline works")
+            .expect("inline callback test should be discovered");
+        assert_eq!(inline.framework, "jest");
+        assert_eq!(inline.qualified_name, "web::math.test::math::inline works");
+        assert!(inline.symbol_id.is_none());
+    }
+
+    #[test]
+    fn discovers_typescript_vitest_tests_with_conservative_symbol_linking() {
+        let source = r#"import { describe, it, test } from "vitest";
+
+function target(): void {}
+
+const namedCase = (): void => {
+  target();
+};
+
+describe("math", () => {
+  it.only("named works", namedCase);
+  test("inline works", () => target());
+});
+"#;
+
+        let file = file_with_language("web/math.spec.ts", Language::TypeScript);
+        let index = index_source_file(&file, source).expect("TypeScript should parse");
+
+        assert_eq!(index.tests.len(), 2);
+        let named = index
+            .tests
+            .iter()
+            .find(|test| test.name == "named works")
+            .expect("named callback test should be discovered");
+        assert_eq!(named.framework, "vitest");
+        assert!(named.symbol_id.is_some());
+
+        let inline = index
+            .tests
+            .iter()
+            .find(|test| test.name == "inline works")
+            .expect("inline callback test should be discovered");
+        assert_eq!(inline.framework, "vitest");
+        assert!(inline.symbol_id.is_none());
+    }
+
+    #[test]
+    fn discovers_mocha_tests_from_import_evidence() {
+        let source = r#"import { describe, it } from "mocha";
+
+function namedCase() {}
+
+describe("service", function () {
+  it("runs", namedCase);
+});
+"#;
+
+        let file = file_with_language("test/service.js", Language::JavaScript);
+        let index = index_source_file(&file, source).expect("Mocha JavaScript should parse");
+
+        assert_eq!(index.tests.len(), 1);
+        assert_eq!(index.tests[0].framework, "mocha");
+        assert_eq!(
+            index.tests[0].qualified_name,
+            "test::service::service::runs"
+        );
+        assert!(index.tests[0].symbol_id.is_some());
+    }
+
+    #[test]
+    fn ignores_javascript_test_like_calls_without_framework_or_path_evidence() {
+        let source = r#"function test(name, callback) {
+  callback();
+}
+
+test("not a framework test", () => {});
+"#;
+
+        let file = file_with_language("web/app.js", Language::JavaScript);
+        let index = index_source_file(&file, source).expect("JavaScript should parse");
+
+        assert!(index.tests.is_empty());
+    }
+
+    #[test]
     fn syntax_errors_emit_partial_index_with_diagnostics() {
         let source = "pub fn broken( {}\n";
 
@@ -2078,6 +2566,76 @@ const helper = (value: string): string => value.trim();
             assert!(
                 !index.calls.is_empty(),
                 "{fixture} should emit at least one call edge"
+            );
+        }
+    }
+
+    #[test]
+    fn indexes_active_language_test_fixtures() {
+        for (fixture, relative_path, language, expected_framework, expected_tests) in [
+            (
+                "csharp_nunit_basic/CalculatorTests.cs",
+                "CalculatorTests.cs",
+                Language::CSharp,
+                "nunit",
+                2,
+            ),
+            (
+                "csharp_xunit_basic/CalculatorTests.cs",
+                "CalculatorTests.cs",
+                Language::CSharp,
+                "xunit",
+                2,
+            ),
+            (
+                "csharp_mstest_basic/CalculatorTests.cs",
+                "CalculatorTests.cs",
+                Language::CSharp,
+                "mstest",
+                2,
+            ),
+            (
+                "javascript_jest_basic/src/math.test.js",
+                "src/math.test.js",
+                Language::JavaScript,
+                "jest",
+                2,
+            ),
+            (
+                "javascript_mocha_basic/test/math.js",
+                "test/math.js",
+                Language::JavaScript,
+                "mocha",
+                1,
+            ),
+            (
+                "typescript_vitest_basic/src/math.spec.ts",
+                "src/math.spec.ts",
+                Language::TypeScript,
+                "vitest",
+                2,
+            ),
+        ] {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures")
+                    .join(fixture),
+            )
+            .expect("fixture should be readable");
+            let file = file_with_language(relative_path, language);
+            let index = index_source_file(&file, &source).expect("fixture should parse");
+
+            assert_eq!(
+                index.tests.len(),
+                expected_tests,
+                "{fixture} should discover expected tests"
+            );
+            assert!(
+                index
+                    .tests
+                    .iter()
+                    .all(|test| test.framework == expected_framework),
+                "{fixture} should label tests as {expected_framework}"
             );
         }
     }

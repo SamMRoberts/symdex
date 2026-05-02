@@ -27,6 +27,9 @@ SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
+SYMDEX_EMBED_TRUNCATE=true
+SYMDEX_EMBED_BATCH_SIZE=16
+SYMDEX_EMBED_MAX_CHUNK_BYTES=32768
 SYMDEX_RUST_ANALYZER=0
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
@@ -36,6 +39,19 @@ the configured rust-analyzer binary. The check runs `rust-analyzer --version`
 only. Indexing uses the same opt-in flag to report a metadata-only enrichment
 plan for changed Rust files, but does not run rust-analyzer project analysis by
 default.
+
+`SYMDEX_EMBED_TRUNCATE` defaults to `true`, matching Ollama's embedding API
+behavior for oversized local inputs. Set it to `false` only when you want
+semantic indexing to fail instead of truncating chunks that exceed the embedding
+model context window.
+
+`SYMDEX_EMBED_BATCH_SIZE` defaults to `16`. Symdex splits semantic indexing
+requests into batches before calling Ollama `/api/embed`, which avoids oversized
+request payloads while preserving result order.
+
+`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
+persisted as metadata-only structural evidence with
+`chunk_too_large_for_embedding` and are not sent to Ollama.
 
 ## Expected commands
 
@@ -60,6 +76,7 @@ cargo run -p symdex-cli -- callees . "my_symbol"
 cargo run -p symdex-cli -- call-path . "source_symbol" "target_symbol" 4
 cargo run -p symdex-cli -- impact . "my_symbol"
 cargo run -p symdex-cli -- context-pack . "my_symbol"
+cargo run -p symdex-cli -- context-pack . "my_symbol" --mode unified
 cargo run -p symdex-cli -- debug-context . panic.log
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- tui .
@@ -80,8 +97,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   enabled, the active MCP evidence contract version, and repo-specific index
   freshness/provenance readiness when a repo path is provided.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
-  applies built-in excludes and scoped simple `.gitignore` rules, hashes file
-  contents, extracts tree-sitter function and method chunks where supported,
+  applies built-in excludes and scoped glob-aware `.gitignore` rules with
+  negation, hashes file contents, extracts tree-sitter function and method chunks where supported,
   embeds chunk text with local Ollama, creates the Qdrant collection if needed,
   and upserts semantic vectors. Use
   `index --offline <repo>` for SQLite-backed discovery and chunking without
@@ -125,12 +142,17 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   labels. Evidence rows include trust scores derived from freshness,
   provenance completeness, confidence, and index metadata completeness, plus
   compact reason tags explaining why each evidence row was returned. Likely tests
-  list indexed Rust tests that directly call the queried symbol when discovered
-  test metadata and resolved call evidence are present.
-- `context-pack <repo> <symbol>`: prints compact JSON evidence for editing
-  context. The current format is `symdex.context_pack.v1` and includes focus
-  symbols, direct callers, direct callees, involved files, section limits, and
-  notes. It does not include source text.
+  list indexed tests that directly call the queried symbol when discovered test
+  metadata and resolved call evidence are present.
+- `context-pack <repo> <symbol> [--mode structural|unified]`: prints compact
+  JSON evidence for editing context. The default structural mode preserves
+  `symdex.context_pack.v1` and includes focus symbols, direct callers, direct
+  callees, involved files, section limits, and notes. Unified mode returns
+  `symdex.context_pack.v2`, runs structural retrieval and semantic search in one
+  query path, deduplicates symbol/chunk/file evidence, and labels rows with
+  `evidence_source` values of `structural`, `semantic`, or `both`. It does not
+  include source text. If local semantic services are unavailable, unified mode
+  returns structural evidence with a compact `semantic_unavailable:*` note.
 - `debug-context <repo> <runtime-input|file|->`: parses runtime failure input
   such as stack traces, panic locations, failing test names, frame symbols, and
   indexed-language file paths, then prints `symdex.debug_context.v1` JSON. Rust
@@ -160,7 +182,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
-  `symdex_debug_context`, and `symdex_index_status`.
+  `symdex_debug_context`, `symdex_staleness_check`, and
+  `symdex_index_status`. `symdex_context_pack` accepts `mode: "unified"` for
+  combined structural and semantic context-pack evidence.
 
 `doctor` checks whether Qdrant is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector

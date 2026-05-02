@@ -12,9 +12,10 @@ use symdex_index::{
     RustAnalyzerEnrichmentSummary, WatchChangeSet, run_continuous_index, run_index,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, CallPathSummary, FreshnessSummary, ImpactSummary,
-    QdrantVerifySummary, run_call_graph, run_call_path, run_context_pack, run_debug_context_pack,
-    run_freshness_report, run_impact, run_qdrant_verify, run_semantic_search, run_symbol_search,
+    CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
+    ImpactSummary, QdrantVerifySummary, run_call_graph, run_call_path, run_context_pack,
+    run_debug_context_pack, run_freshness_report, run_impact, run_qdrant_verify,
+    run_semantic_search, run_symbol_search, run_unified_context_pack,
 };
 use symdex_store::{EvidenceFreshness, QdrantClient, SqliteStore, StoreConfig, sqlite_parent};
 
@@ -99,9 +100,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
             impact(repo, query, output)
         }
         "context-pack" => {
-            let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            let query = args.get(2).map(String::as_str).unwrap_or("");
-            context_pack(repo, query, output)
+            let context_args = parse_context_pack_args(&args[1..])?;
+            context_pack(
+                &context_args.repo,
+                &context_args.query,
+                context_args.mode,
+                output,
+            )
         }
         "debug-context" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -586,23 +591,38 @@ fn storage_health_status_label(status: symdex_store::StorageHealthStatus) -> &'s
     }
 }
 
-fn context_pack(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
+fn context_pack(
+    repo: &str,
+    query: &str,
+    mode: ContextPackMode,
+    output: OutputMode,
+) -> Result<(), String> {
     if output == OutputMode::Json {
         return print_mcp_json_tool(
             symdex_mcp::TOOL_CONTEXT_PACK,
-            json!({ "repo": repo, "symbol": query, "limit": 8 }),
+            json!({ "repo": repo, "symbol": query, "limit": 8, "mode": mode.label() }),
         );
     }
-    let pack = run_context_pack(repo, query, 8).map_err(|error| {
-        if error.contains("requires a symbol query") {
-            "context-pack requires a symbol query".to_owned()
-        } else {
-            error
+    let json = match mode {
+        ContextPackMode::Structural => {
+            let pack = run_context_pack(repo, query, 8).map_err(context_pack_error)?;
+            serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())?
         }
-    })?;
-    let json = serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())?;
+        ContextPackMode::Unified => {
+            let pack = run_unified_context_pack(repo, query, 8).map_err(context_pack_error)?;
+            serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())?
+        }
+    };
     println!("{json}");
     Ok(())
+}
+
+fn context_pack_error(error: String) -> String {
+    if error.contains("requires a symbol query") {
+        "context-pack requires a symbol query".to_owned()
+    } else {
+        error
+    }
 }
 
 fn debug_context(repo: &str, input_parts: &[String], output: OutputMode) -> Result<(), String> {
@@ -902,10 +922,48 @@ fn parse_index_args(args: &[String]) -> IndexArgs {
     }
 }
 
+fn parse_context_pack_args(args: &[String]) -> Result<ContextPackArgs, String> {
+    let mut positional = Vec::new();
+    let mut mode = ContextPackMode::Structural;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--mode" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err("--mode requires a value".to_owned());
+            };
+            mode = ContextPackMode::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--mode=") {
+            mode = ContextPackMode::parse(value)?;
+        } else if arg.starts_with("--") {
+            return Err(format!("unsupported context-pack option `{arg}`"));
+        } else {
+            positional.push(arg.clone());
+        }
+        index += 1;
+    }
+
+    Ok(ContextPackArgs {
+        repo: positional
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ".".to_owned()),
+        query: positional.get(1).cloned().unwrap_or_default(),
+        mode,
+    })
+}
+
 struct IndexArgs {
     repo: String,
     offline: bool,
     watch: bool,
+}
+
+struct ContextPackArgs {
+    repo: String,
+    query: String,
+    mode: ContextPackMode,
 }
 
 fn print_continuous_index_event(event: ContinuousIndexEvent) {
@@ -979,14 +1037,14 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol>  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputMode, parse_cli_invocation};
+    use super::{ContextPackMode, OutputMode, parse_cli_invocation, parse_context_pack_args};
 
     #[test]
     fn cli_invocation_parses_leading_json_flag() {
@@ -1021,5 +1079,28 @@ mod tests {
             .expect_err("unknown output should fail");
 
         assert!(error.contains("unsupported output format"));
+    }
+
+    #[test]
+    fn context_pack_args_parse_unified_mode() {
+        let args = parse_context_pack_args(&[
+            "repo".to_owned(),
+            "main".to_owned(),
+            "--mode".to_owned(),
+            "unified".to_owned(),
+        ])
+        .expect("context-pack args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.query, "main");
+        assert_eq!(args.mode, ContextPackMode::Unified);
+    }
+
+    #[test]
+    fn context_pack_args_default_to_structural_mode() {
+        let args = parse_context_pack_args(&["repo".to_owned(), "main".to_owned()])
+            .expect("context-pack args should parse");
+
+        assert_eq!(args.mode, ContextPackMode::Structural);
     }
 }

@@ -264,8 +264,9 @@ Output separates:
 Direct and transitive evidence rows include provenance, freshness labels, and
 trust scores. Related-file rows include path, relationship count, freshness,
 trust, and provenance.
-`tests_likely` contains indexed Rust test qualified names when a discovered test
-directly calls the queried symbol through resolved call evidence. When no direct
+`tests_likely` contains indexed test qualified names when a discovered test
+directly calls the queried symbol through resolved call evidence. Metadata-only
+tests without symbol linkage are not used for likely-test claims. When no direct
 indexed test evidence is available, the list stays empty and a note explains
 that no likely-test evidence was found.
 
@@ -279,11 +280,13 @@ Input:
 {
   "repo": "/path/to/repo",
   "symbol": "foo::retry::run_with_backoff",
+  "mode": "structural",
   "limit": 8
 }
 ```
 
-Output:
+Structural output, returned by default, preserves the original
+`symdex.context_pack.v1` shape:
 
 ```json
 {
@@ -307,8 +310,102 @@ Output:
 ```
 
 The context pack is intentionally compact and does not return source text. It is
-currently structural only; semantic hits can be combined by calling
-`symdex_search` separately.
+metadata-only in every mode.
+
+`mode: "unified"` returns `symdex.context_pack.v2`, which runs structural
+context-pack retrieval and semantic search in one `symdex-query` orchestration
+path. It merges and deduplicates symbol, chunk, and file evidence, and labels
+each returned item with `evidence_source`: `structural`, `semantic`, or `both`.
+The outer MCP envelope remains `symdex.mcp.evidence.v1`.
+
+Unified input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "foo::retry::run_with_backoff",
+  "mode": "unified",
+  "limit": 8
+}
+```
+
+Unified output:
+
+```json
+{
+  "format": "symdex.context_pack.v2",
+  "mode": "unified",
+  "repository_id": "stable-repo-id",
+  "query": "foo::retry::run_with_backoff",
+  "items": [
+    {
+      "id": "symbol:sym-123",
+      "item_kind": "symbol",
+      "evidence_source": "both",
+      "relationship": "focus_symbol",
+      "point_id": "qdrant-point-id",
+      "chunk_id": "chunk-123",
+      "symbol_id": "sym-123",
+      "symbol": "foo::retry::run_with_backoff",
+      "path": "crates/foo/src/retry.rs",
+      "start_line": 42,
+      "end_line": 88,
+      "score": 0.82,
+      "chunk_kind": "function",
+      "text_hash": "sha256:...",
+      "freshness": "fresh",
+      "trust": {
+        "score": 0.93,
+        "level": "high",
+        "factors": ["freshness:fresh", "confidence:0.82"]
+      },
+      "reasons": [
+        "relationship:focus_symbol",
+        "semantic_vector_match"
+      ],
+      "provenance": {
+        "content_hash": "sha256:...",
+        "index_run_id": "repo-semantic-...",
+        "parser_version": "tree-sitter-rust-...",
+        "indexed_at": "2026-04-30T12:00:00Z",
+        "embedding_model": "nomic-embed-text",
+        "embedding_dimension": 768,
+        "embedded_at": null
+      }
+    }
+  ],
+  "files": [
+    {
+      "path": "crates/foo/src/retry.rs",
+      "evidence_source": "both",
+      "freshness": "fresh",
+      "trust": {
+        "score": 0.75,
+        "level": "medium",
+        "factors": ["freshness:fresh"]
+      },
+      "reasons": ["context_pack_file_from_structural_evidence"]
+    }
+  ],
+  "limits": {
+    "max_symbols": 8,
+    "max_callers": 8,
+    "max_callees": 8,
+    "max_semantic": 8
+  },
+  "notes": [
+    "metadata_only_no_source_text",
+    "unified_structural_semantic_requested",
+    "structural_direct_relationships_only",
+    "semantic_evidence_included"
+  ]
+}
+```
+
+If local semantic services or the expected Qdrant collection are unavailable,
+unified mode still returns structural evidence in v2 format and adds a compact
+note such as `semantic_unavailable:local_service_unavailable` or
+`semantic_unavailable:missing_vector_collection`.
 
 ### `symdex_debug_context`
 
@@ -372,9 +469,88 @@ Output:
 
 The tool parses panic/file locations, stack-frame symbols, indexed-language file
 paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
-evidence, maps failing test names to indexed Rust tests when available, keeps
+evidence, maps failing test names to indexed tests when available, keeps
 unmatched runtime test names as fallbacks, adds freshness, trust, and
-provenance, and returns source-free metadata only.
+provenance, and returns source-free metadata only. C# and Node/V8 stack-frame
+parsing remains planned separately; this mapping only uses test names that the
+runtime parser already extracts.
+
+Planned parser expansion: keep the Rust parser behavior and add conservative C#
+and Node/V8 stack frame patterns. Unmapped frames must remain visible with an
+explicit status instead of being dropped.
+
+### `symdex_staleness_check`
+
+Read-only tool for explicit index freshness checks.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "optional::symbol",
+  "paths": ["optional/path.rs"]
+}
+```
+
+Output:
+
+```json
+{
+  "repository_id": "stable-repo-id",
+  "symbol_query": "optional::symbol",
+  "scope": {
+    "symbol": "optional::symbol",
+    "paths": ["optional/path.rs"]
+  },
+  "counts": {
+    "fresh": 1,
+    "stale": 1,
+    "deleted": 0,
+    "missing": 0,
+    "unknown": 0
+  },
+  "files": [
+    {
+      "path": "optional/path.rs",
+      "freshness": "stale",
+      "indexed_content_hash": "sha256:old",
+      "current_content_hash": "sha256:new",
+      "indexed_at": "2026-04-30T12:00:00Z",
+      "index_run_id": "repo-...",
+      "parser_version": "tree-sitter-rust-...",
+      "trust": {
+        "score": 0.74,
+        "level": "medium",
+        "factors": ["freshness:stale"]
+      },
+      "reasons": [
+        "explicit_staleness_check",
+        "path:optional/path.rs",
+        "freshness:stale"
+      ],
+      "provenance": {
+        "content_hash": "sha256:old",
+        "index_run_id": "repo-...",
+        "parser_version": "tree-sitter-rust-...",
+        "indexed_at": "2026-04-30T12:00:00Z",
+        "embedding_model": null,
+        "embedding_dimension": null,
+        "embedded_at": null
+      }
+    }
+  ]
+}
+```
+
+The tool reuses the same freshness logic as `symdex staleness`. It accepts a
+repository-wide request, a `symbol` scope, an explicit `paths` scope, or both
+when every requested path is inside the symbol-derived file scope. Incompatible
+symbol/path combinations fail closed. Paths are validated against the repository
+root; deleted or unknown files should be passed as repository-relative paths.
+Returned states are `fresh`, `stale`, `deleted`, `missing`, or `unknown`, and
+rows include indexed and current hashes when available. The tool returns
+source-free metadata only.
 
 ### `symdex_index_status`
 
@@ -410,3 +586,60 @@ Do not add mutation tools until a dedicated design doc exists. Candidate future 
 - request reindex
 - clear index
 - persist context pack
+
+## Planned MCP tools
+
+These tools are not implemented yet. They are documented here so future work
+keeps the same local-only, compact, metadata-first contract.
+
+### `symdex_semantic_neighborhood`
+
+Read-only tool for finding vector-nearest chunks to an indexed chunk or symbol.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "optional::symbol",
+  "chunk_id": "optional-chunk-id",
+  "limit": 8
+}
+```
+
+Rules:
+
+- Require exactly one of `symbol` or `chunk_id`.
+- Look up the existing vector point and query local Qdrant for nearest
+  neighbors.
+- Return path, line range, symbol, chunk kind, score, freshness, trust, reason
+  tags, and provenance.
+- Do not embed source text into the response or return vectors.
+
+### `symdex_request_reindex`
+
+Potential future write-capable tool. Do not implement until a design doc is
+approved.
+
+Required design decisions before code:
+
+- caller trust and confirmation model
+- repo and path scoping
+- offline structural default behavior
+- explicit `semantic: true` opt-in for Qdrant/Ollama work
+- concurrency with manual and continuous indexing
+- index run ID reporting and failure semantics
+
+### `symdex_explain_change`
+
+Potential future read-only pre-edit safety tool. Do not implement until a design
+doc is approved.
+
+Expected shape:
+
+- Input is a repo plus proposed change targets containing path, line range, and
+  short description.
+- The tool maps changed ranges to indexed symbols, runs impact analysis,
+  deduplicates evidence, and returns likely affected symbols, files, tests, and
+  call paths.
+- Output stays metadata-only with freshness, trust, reason tags, and provenance.

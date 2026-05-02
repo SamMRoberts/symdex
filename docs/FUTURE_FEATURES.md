@@ -15,6 +15,21 @@ MVP contracts.
 
 ## Feature Set
 
+### Unified Context Packs
+
+Unified context packs should combine structural and semantic evidence for an
+editing target in one compact response.
+
+Requirements:
+
+- Start from the existing symbol-focused context pack.
+- Add a `unified` mode that also runs semantic search for the target.
+- Merge and deduplicate evidence from focus symbols, callers, callees, involved
+  files, and semantic matches.
+- Label each row's evidence source as structural, semantic, or both.
+- Preserve source-text omission, freshness, trust, reason tags, provenance, and
+  deterministic ordering.
+
 ### Call Path Tracing
 
 Call path tracing should find explicit paths through the call graph between a
@@ -32,8 +47,8 @@ Requirements:
 
 Impact analysis has grown from direct callers/callees into a repeatable change
 impact report with bounded transitive paths, related files, and direct indexed
-Rust test evidence. Future work is focused on broader test discovery, richer
-same-file symbol grouping, and deeper explanation metadata.
+test evidence. Future work is focused on richer same-file symbol grouping,
+broader non-Rust call resolution, and deeper explanation metadata.
 
 Requirements:
 
@@ -44,6 +59,24 @@ Requirements:
   staleness status.
 - Avoid claiming affected tests beyond indexed test evidence and documented
   mapping limits.
+- Extend likely-test evidence further for C#, JavaScript, and TypeScript as
+  non-Rust call resolution and runtime parsing become more precise.
+
+### Pre-Edit Change Explanation
+
+Pre-edit change explanation should give agents a deterministic safety briefing
+before they modify files.
+
+Requirements:
+
+- Accept proposed change targets as path plus line range plus short
+  description.
+- Enforce repository root boundaries for every path.
+- Map line ranges to indexed symbols and related files.
+- Reuse impact analysis, call path traversal, likely-test mapping, freshness,
+  trust, and provenance.
+- Return compact evidence without source text.
+- Remain read-only unless a future design explicitly adds write behavior.
 
 ### Debug Context Packs
 
@@ -115,6 +148,8 @@ Requirements:
 - Produce focused debugging evidence through CLI, TUI, MCP, and debug context
   packs.
 - Preserve unmapped frames with explicit status instead of dropping them.
+- Expand beyond Rust with conservative C# and Node/V8 stack frame parsing before
+  adding lower-priority runtimes.
 
 ### Staleness Detection
 
@@ -126,9 +161,38 @@ Requirements:
 - Compare indexed content hashes and timestamps against current eligible files.
 - Label evidence as fresh, stale, missing, deleted, or unknown where relevant.
 - Surface staleness in CLI outputs, TUI status panels, MCP responses, context
-  packs, and debug packs.
+  packs, debug packs, and the direct read-only MCP staleness check.
 - Avoid automatic destructive cleanup; stale evidence warnings should guide
   reindexing or continuous indexing.
+
+### Scoped Reindex Requests
+
+Scoped reindex requests are a potential future write-capable MCP workflow. They
+must have a design doc before implementation.
+
+Requirements:
+
+- Scope every request to one configured repository root.
+- Allow optional path-scoped reindexing and explicit full reindex requests.
+- Default to offline structural reindexing.
+- Require explicit `semantic: true` before using Ollama or Qdrant.
+- Do not execute indexed repository code.
+- Return index run IDs and status so follow-up evidence can cite the new run.
+- Define caller trust, confirmation, concurrency, and failure semantics before
+  code is written.
+
+### Semantic Neighborhoods
+
+Semantic neighborhoods should expose "code similar to this indexed chunk or
+symbol" as reusable metadata-only evidence.
+
+Requirements:
+
+- Start from an existing indexed chunk or symbol, not from arbitrary source text.
+- Query local Qdrant for nearest vector neighbors.
+- Return path, line range, symbol, chunk kind, score, freshness, trust, reason
+  tags, and provenance.
+- Do not return vectors or source text.
 
 ### Languages After Active Targets
 

@@ -3661,6 +3661,41 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_persists_metadata_only_non_rust_tests_without_likely_claims() {
+        let db = TestDb::new("metadata-only-tests");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let symbols = vec![sample_symbol("target-symbol", "target", "target")];
+        let tests = vec![sample_metadata_test(
+            "test-js-inline",
+            "inline works",
+            "src::math.test::math::inline works",
+        )];
+        store
+            .replace_file_facts_with_tests(&sample_file("hash-1"), &symbols, &[], &[], &tests)
+            .expect("metadata-only test facts should persist");
+
+        let matched = store
+            .tests_matching_name("repo", "inline works")
+            .expect("test lookup should run");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].framework, "jest");
+        assert_eq!(matched[0].language, "javascript");
+        assert!(
+            store
+                .likely_tests_for_symbol("repo", "target")
+                .expect("likely tests should load")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn sqlite_collects_qdrant_point_ids_before_replacement_and_deletion() {
         let db = TestDb::new("qdrant-point-cleanup");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -4999,6 +5034,26 @@ mod tests {
             end_line: 10,
             start_byte: 64,
             end_byte: 128,
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        }
+    }
+
+    fn sample_metadata_test(id: &str, name: &str, qualified_name: &str) -> TestRecord {
+        TestRecord {
+            id: id.to_owned(),
+            repository_id: "repo".to_owned(),
+            file_id: "file".to_owned(),
+            symbol_id: None,
+            name: name.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            framework: "jest".to_owned(),
+            language: "javascript".to_owned(),
+            path: "src/math.test.js".to_owned(),
+            start_line: 10,
+            end_line: 10,
+            start_byte: 128,
+            end_byte: 192,
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
         }

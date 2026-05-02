@@ -76,19 +76,14 @@ symdex serve-mcp
 These are planned but not yet implemented. See `FUTURE_FEATURES.md` for the
 feature contracts.
 
-- Call path tracing through persisted call graph edges.
-- Repeatable impact analysis with callers, callees, bounded paths, related
-  files, and likely tests when test mapping exists.
-- Debug context packs for stack traces, failing tests, panic locations, symbols,
-  and file paths.
-- Index provenance for what was indexed, when, with which parser/model/vector
-  dimension, and from which content hash.
-- Local/private indexing with user-controlled model, vector database, and
-  storage.
-- Cross-agent reuse of the same local index through stable CLI, TUI, and MCP
-  evidence contracts.
-- Runtime-to-source mapping from stack traces and test failures into indexed
-  files, symbols, call graph edges, and tests.
-- Staleness detection for evidence that no longer matches current file hashes.
+- Unified context packs that merge structural and semantic evidence in one
+  agent-facing response.
+- Multi-language test discovery for C#, JavaScript, and TypeScript.
+- Runtime-to-source mapping for C# and Node/V8 stack traces in addition to the
+  existing Rust-focused debug context behavior.
+- Future write-capable reindex requests only after an explicit design doc and
+  trust/confirmation model.
+- Pre-edit change explanation that maps proposed line-range edits to impact,
+  likely tests, freshness, and trust before an agent changes files.
 - Future languages beyond Rust, C#, JavaScript, and TypeScript, added only
-  through the same evidence contracts.
+  through the same evidence contracts after active targets are reliable.

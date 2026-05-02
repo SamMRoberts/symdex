@@ -393,10 +393,11 @@ fn run_index_internal(
         "semantic"
     };
     let index_run_id = SqliteStore::new_index_run_id(root.id(), run_kind);
+    let embed_config = EmbedConfig::from_env();
     let embedding_model = if options.offline {
         "offline".to_owned()
     } else {
-        EmbedConfig::from_env().model
+        embed_config.model.clone()
     };
     let run_scope = RunScope {
         index_run_id: &index_run_id,
@@ -453,6 +454,7 @@ fn run_index_internal(
         }
     };
     resolve_cross_file_rust_calls(&mut collection, &persisted_rust_symbols);
+    apply_embedding_size_limits(&mut collection.reports, embed_config.max_chunk_bytes);
     let files = file_summaries(&collection.reports);
     let rust_analyzer =
         rust_analyzer_enrichment_summary(&collection, &RustAnalyzerEnrichmentConfig::from_env());
@@ -1442,6 +1444,20 @@ fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
         .collect()
 }
 
+fn apply_embedding_size_limits(reports: &mut [IndexReport], max_chunk_bytes: usize) -> usize {
+    let mut excluded = 0;
+    for report in reports {
+        for chunk in &mut report.chunks {
+            let chunk_bytes = chunk.byte_range.end.saturating_sub(chunk.byte_range.start);
+            if chunk.excluded_reason.is_none() && chunk_bytes > max_chunk_bytes {
+                chunk.excluded_reason = Some("chunk_too_large_for_embedding".to_owned());
+                excluded += 1;
+            }
+        }
+    }
+    excluded
+}
+
 fn vector_point(
     repository_id: &str,
     chunk: &ChunkText<'_>,
@@ -1661,19 +1677,20 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
         ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
         ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
-    use symdex_store::SymbolRecord;
+    use symdex_store::{FileRecord, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord};
 
     use crate::{
         IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
-        RustAnalyzerReadiness, WatchSnapshot, chunk_record, chunk_texts, collect_index_reports,
-        detect_watch_changes, diff_watch_snapshots, plan_rust_analyzer_enrichment,
-        resolve_cross_file_rust_calls, watch_snapshot,
+        RustAnalyzerReadiness, WatchSnapshot, apply_embedding_size_limits, chunk_record,
+        chunk_texts, collect_index_reports, detect_watch_changes, diff_watch_snapshots,
+        plan_rust_analyzer_enrichment, resolve_cross_file_rust_calls, watch_snapshot,
     };
 
     #[test]
@@ -1707,6 +1724,35 @@ mod tests {
             secret_record.excluded_reason.as_deref(),
             Some("likely_access_token")
         );
+    }
+
+    #[test]
+    fn embedding_size_limits_exclude_oversized_chunks_before_embedding() {
+        let file = sample_file();
+        let source = "a".repeat(128);
+        let small = sample_chunk("small", 0, 16, None);
+        let large = sample_chunk("large", 16, 128, None);
+        let mut reports = vec![IndexReport {
+            file,
+            chunks: vec![small.clone(), large.clone()],
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source,
+        }];
+
+        let excluded = apply_embedding_size_limits(&mut reports, 64);
+        let chunks = chunk_texts(&reports);
+
+        assert_eq!(excluded, 1);
+        assert_eq!(reports[0].chunks[0].excluded_reason, None);
+        assert_eq!(
+            reports[0].chunks[1].excluded_reason.as_deref(),
+            Some("chunk_too_large_for_embedding")
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk.id, small.id);
     }
 
     #[test]
@@ -1774,6 +1820,77 @@ mod tests {
             detect_watch_changes(&root, &snapshot).expect("changes should detect");
 
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn detect_watch_changes_respects_gitignore_globs_and_negation() {
+        let repo = TestRepo::new("watch-glob-negation");
+        repo.write(".gitignore", "*.generated.rs\n!src/keep.generated.rs\n");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let snapshot = watch_snapshot(&root).expect("snapshot should load");
+
+        repo.write("src/drop.generated.rs", "pub fn ignored() {}\n");
+        repo.write("src/keep.generated.rs", "pub fn kept() {}\n");
+        let (_next, changes) =
+            detect_watch_changes(&root, &snapshot).expect("changes should detect");
+
+        assert_eq!(changes.created, vec!["src/keep.generated.rs"]);
+        assert!(changes.modified.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn incremental_collection_skips_unchanged_files_with_gitignore_globs() {
+        let repo = TestRepo::new("incremental-glob-unchanged");
+        let lib_source = "pub fn lib() {}\n";
+        repo.write(".gitignore", "*.generated.rs\n!src/keep.generated.rs\n");
+        repo.write("src/lib.rs", lib_source);
+        repo.write("src/drop.generated.rs", "pub fn ignored() {}\n");
+        repo.write("src/keep.generated.rs", "pub fn kept() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let db_dir = temp_path("incremental-glob-unchanged-db");
+        fs::create_dir_all(&db_dir).expect("db directory should be created");
+        let mut store = SqliteStore::open(&StoreConfig {
+            sqlite_path: db_dir.join("symdex.sqlite"),
+            qdrant_url: "http://localhost:6333".to_owned(),
+        })
+        .expect("store should open");
+        store.migrate().expect("store should migrate");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: root.id().to_owned(),
+                root_path: root.path().display().to_string(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &FileRecord {
+                    id: stable_id(&[root.id(), "src/lib.rs"]),
+                    repository_id: root.id().to_owned(),
+                    path: "src/lib.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: content_hash(lib_source.as_bytes()),
+                    index_run_id: "run".to_owned(),
+                    parser_version: Language::Rust.parser_version().to_owned(),
+                },
+                &[],
+                &[],
+                &[],
+            )
+            .expect("file facts should persist");
+
+        let collection = collect_index_reports(&root, Some(&store), &mut |_| {})
+            .expect("collection should succeed");
+        let _ = fs::remove_dir_all(db_dir);
+
+        assert_eq!(collection.files_seen, 2);
+        assert_eq!(collection.files_skipped_unchanged, 1);
+        assert_eq!(collection.reports.len(), 1);
+        assert_eq!(
+            collection.reports[0].file.relative_path,
+            "src/keep.generated.rs"
+        );
     }
 
     #[test]
@@ -2259,6 +2376,8 @@ mod tests {
         path: PathBuf,
     }
 
+    static NEXT_TEST_REPO_ID: AtomicU64 = AtomicU64::new(0);
+
     impl TestRepo {
         fn new(name: &str) -> Self {
             let path = temp_path(name);
@@ -2290,9 +2409,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after epoch")
             .as_nanos();
+        let id = NEXT_TEST_REPO_ID.fetch_add(1, AtomicOrdering::Relaxed);
         std::env::temp_dir().join(format!(
-            "symdex-index-{name}-{}-{nonce}",
-            std::process::id()
+            "symdex-index-{name}-{}-{nonce}-{id}",
+            std::process::id(),
         ))
     }
 }

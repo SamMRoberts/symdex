@@ -25,8 +25,8 @@ enabled, modified or newly created eligible files are automatically reindexed.
 - Watch for eligible file create and modify events under the configured
   repository root. The current implementation uses a polling watcher that
   compares discovered file content hashes across intervals.
-- Ignore files and directories excluded by built-in excludes, `.gitignore`, and
-  future `.symdexignore` rules.
+- Ignore files and directories excluded by built-in excludes, glob-aware
+  `.gitignore` rules, and future `.symdexignore` rules.
 - Reject symlink escapes and paths outside the configured repository root.
 - Debounce and coalesce bursts of filesystem events before indexing.
 - Reindex only files whose content hash changed.

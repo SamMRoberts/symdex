@@ -3,12 +3,16 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, Write};
+use std::path::Path;
 
 use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_query::{evidence_trust, run_debug_context_pack};
+use symdex_query::{
+    ContextPackMode, FreshnessScope, evidence_trust, run_context_pack, run_debug_context_pack,
+    run_scoped_freshness_report_with_store_config, run_unified_context_pack,
+};
 use symdex_store::{
     EvidenceProvenance, QdrantClient, SqliteStore, StoreConfig, clamp_call_path_depth,
     freshness_for_hash, qdrant_collection_name,
@@ -22,11 +26,12 @@ pub const TOOL_CALL_PATH: &str = "symdex_call_path";
 pub const TOOL_IMPACT: &str = "symdex_impact";
 pub const TOOL_CONTEXT_PACK: &str = "symdex_context_pack";
 pub const TOOL_DEBUG_CONTEXT: &str = "symdex_debug_context";
+pub const TOOL_STALENESS_CHECK: &str = "symdex_staleness_check";
 pub const TOOL_INDEX_STATUS: &str = "symdex_index_status";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub fn tool_names() -> [&'static str; 9] {
+pub fn tool_names() -> [&'static str; 10] {
     [
         TOOL_SEARCH,
         TOOL_FIND_SYMBOL,
@@ -36,6 +41,7 @@ pub fn tool_names() -> [&'static str; 9] {
         TOOL_IMPACT,
         TOOL_CONTEXT_PACK,
         TOOL_DEBUG_CONTEXT,
+        TOOL_STALENESS_CHECK,
         TOOL_INDEX_STATUS,
     ]
 }
@@ -152,6 +158,7 @@ fn dispatch_tool(name: &str, arguments: &Value) -> Result<Value, String> {
         TOOL_IMPACT => tool_impact(arguments),
         TOOL_CONTEXT_PACK => tool_context_pack(arguments),
         TOOL_DEBUG_CONTEXT => tool_debug_context(arguments),
+        TOOL_STALENESS_CHECK => tool_staleness_check(arguments),
         TOOL_INDEX_STATUS => tool_index_status(arguments),
         _ => Err(format!("Unknown tool: {name}")),
     }
@@ -371,11 +378,18 @@ fn tool_context_pack(arguments: &Value) -> Result<Value, String> {
     let repo = required_string(arguments, "repo")?;
     let symbol = required_string(arguments, "symbol")?;
     let limit = optional_usize(arguments, "limit", 8).min(25);
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let pack = sqlite()?
-        .context_pack(root.id(), symbol, limit)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(pack).map_err(|error| error.to_string())
+    let mode = optional_string(arguments, "mode")
+        .map(ContextPackMode::parse)
+        .transpose()?
+        .unwrap_or(ContextPackMode::Structural);
+    match mode {
+        ContextPackMode::Structural => serde_json::to_value(run_context_pack(repo, symbol, limit)?)
+            .map_err(|error| error.to_string()),
+        ContextPackMode::Unified => {
+            serde_json::to_value(run_unified_context_pack(repo, symbol, limit)?)
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn tool_debug_context(arguments: &Value) -> Result<Value, String> {
@@ -384,6 +398,62 @@ fn tool_debug_context(arguments: &Value) -> Result<Value, String> {
     let limit = optional_usize(arguments, "limit", 8).min(25);
     let pack = run_debug_context_pack(repo, input, limit)?;
     serde_json::to_value(pack).map_err(|error| error.to_string())
+}
+
+fn tool_staleness_check(arguments: &Value) -> Result<Value, String> {
+    tool_staleness_check_with_store(arguments, &StoreConfig::from_env())
+}
+
+fn tool_staleness_check_with_store(
+    arguments: &Value,
+    store_config: &StoreConfig,
+) -> Result<Value, String> {
+    let repo = required_string(arguments, "repo")?;
+    let symbol = optional_string(arguments, "symbol").map(str::to_owned);
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let paths = optional_normalized_paths(arguments, "paths", &root)?;
+    let summary = run_scoped_freshness_report_with_store_config(
+        repo,
+        FreshnessScope {
+            symbol_query: symbol.clone(),
+            paths: paths.clone(),
+        },
+        store_config,
+    )?;
+
+    Ok(json!({
+        "repository_id": summary.repository_id,
+        "symbol_query": summary.symbol_query,
+        "scope": {
+            "symbol": symbol,
+            "paths": paths
+        },
+        "counts": freshness_counts_json(&summary),
+        "files": summary.files.into_iter().map(|row| {
+            let provenance = EvidenceProvenance {
+                content_hash: row.indexed_content_hash.clone(),
+                index_run_id: row.index_run_id.clone(),
+                parser_version: row.parser_version.clone(),
+                indexed_at: row.indexed_at.clone(),
+                embedding_model: None,
+                embedding_dimension: None,
+                embedded_at: None,
+            };
+            let reasons = freshness_reasons(&row.path, row.freshness);
+            json!({
+                "path": row.path,
+                "freshness": row.freshness.label(),
+                "indexed_content_hash": row.indexed_content_hash,
+                "current_content_hash": row.current_content_hash,
+                "indexed_at": row.indexed_at,
+                "index_run_id": row.index_run_id,
+                "parser_version": row.parser_version,
+                "trust": trust_json(row.freshness, &provenance, None),
+                "reasons": reasons,
+                "provenance": provenance_json(&provenance)
+            })
+        }).collect::<Vec<_>>()
+    }))
 }
 
 fn tool_index_status(arguments: &Value) -> Result<Value, String> {
@@ -535,6 +605,64 @@ fn related_file_reasons(relationship_count: usize) -> Vec<String> {
         format!("relationship_count:{relationship_count}"),
         "provenance:first_related_edge".to_owned(),
     ]
+}
+
+fn freshness_counts_json(summary: &symdex_query::FreshnessSummary) -> Value {
+    json!({
+        "fresh": summary.count(symdex_store::EvidenceFreshness::Fresh),
+        "stale": summary.count(symdex_store::EvidenceFreshness::Stale),
+        "deleted": summary.count(symdex_store::EvidenceFreshness::Deleted),
+        "missing": summary.count(symdex_store::EvidenceFreshness::Missing),
+        "unknown": summary.count(symdex_store::EvidenceFreshness::Unknown)
+    })
+}
+
+fn freshness_reasons(path: &str, freshness: symdex_store::EvidenceFreshness) -> Vec<String> {
+    vec![
+        "explicit_staleness_check".to_owned(),
+        format!("path:{path}"),
+        format!("freshness:{}", freshness.label()),
+    ]
+}
+
+fn optional_normalized_paths(
+    arguments: &Value,
+    key: &str,
+    root: &RepoRoot,
+) -> Result<Vec<String>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(Vec::new());
+    };
+    let paths = value
+        .as_array()
+        .ok_or_else(|| format!("optional argument `{key}` must be an array of strings"))?;
+    let mut normalized = BTreeSet::new();
+    for value in paths {
+        let path = value
+            .as_str()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| format!("optional argument `{key}` must contain non-empty strings"))?;
+        normalized.insert(normalize_staleness_path(root, path)?);
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn normalize_staleness_path(root: &RepoRoot, path: &str) -> Result<String, String> {
+    let path_value = Path::new(path);
+    if path_value.is_absolute() {
+        return root
+            .normalize_existing_path(path_value)
+            .map(|path| path.as_str().to_owned())
+            .map_err(|error| {
+                format!(
+                    "absolute staleness paths must exist inside the repository; pass deleted or unknown files as repo-relative paths: {error}"
+                )
+            });
+    }
+    NormalizedRepoPath::new(path)
+        .map(|path| path.as_str().to_owned())
+        .map_err(|error| error.to_string())
 }
 
 fn current_content_hash(root: &RepoRoot, path: &str) -> Result<Option<String>, String> {
@@ -697,6 +825,14 @@ fn optional_usize(arguments: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn optional_string<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn success_response(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -741,6 +877,7 @@ fn evidence_contract_json() -> Value {
         "path_policy": "repository_root_required",
         "freshness": "included_when_available",
         "provenance": "included_when_available",
+        "trust": "included_when_available",
         "reasons": "included_when_available"
     })
 }
@@ -827,11 +964,16 @@ fn tool_definitions() -> Vec<Value> {
         tool_definition(
             TOOL_CONTEXT_PACK,
             "Context Pack",
-            "Return compact metadata-only evidence for an editing context.",
+            "Return compact metadata-only evidence for an editing context. Use mode unified to merge structural and semantic evidence.",
             &["repo", "symbol"],
             vec![
                 ("repo", "string", "Repository root path"),
                 ("symbol", "string", "Symbol id, name, or qualified name"),
+                (
+                    "mode",
+                    "string",
+                    "Context-pack mode: structural or unified. Defaults to structural.",
+                ),
                 (
                     "limit",
                     "integer",
@@ -858,6 +1000,7 @@ fn tool_definitions() -> Vec<Value> {
                 ),
             ],
         ),
+        staleness_tool_definition(),
         tool_definition(
             TOOL_INDEX_STATUS,
             "Index Status",
@@ -866,6 +1009,41 @@ fn tool_definitions() -> Vec<Value> {
             vec![("repo", "string", "Repository root path")],
         ),
     ]
+}
+
+fn staleness_tool_definition() -> Value {
+    json!({
+        "name": TOOL_STALENESS_CHECK,
+        "title": "Staleness Check",
+        "description": "Return compact metadata-only freshness states for indexed repository files.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository root path"
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Optional symbol id, name, or qualified name to scope freshness"
+                },
+                "paths": {
+                    "type": "array",
+                    "description": "Optional repository-relative paths to scope freshness",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": ["repo"]
+        },
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
 }
 
 fn tool_definition(
@@ -908,15 +1086,19 @@ fn tool_definition(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
-    use symdex_store::StoreConfig;
+    use symdex_core::{RepoRoot, content_hash};
+    use symdex_store::{FileRecord, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord};
 
     use crate::{
         EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, TOOL_CONTEXT_PACK, TOOL_DEBUG_CONTEXT,
-        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, serve, tool_index_status_with_store, tool_names,
-        tool_success,
+        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, TOOL_STALENESS_CHECK, evidence_tool_result, serve,
+        tool_definitions, tool_index_status_with_store, tool_names,
+        tool_staleness_check_with_store, tool_success,
     };
 
     #[test]
@@ -972,12 +1154,76 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_FIND_SYMBOL));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_CONTEXT_PACK));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_DEBUG_CONTEXT));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == TOOL_STALENESS_CHECK)
+        );
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_INDEX_STATUS));
         assert!(tools.iter().all(|tool| {
             tool["annotations"]["readOnlyHint"]
                 .as_bool()
                 .expect("readOnlyHint should be bool")
         }));
+    }
+
+    #[test]
+    fn context_pack_tool_schema_advertises_optional_mode() {
+        let tools = tool_definitions();
+        let context_pack = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_CONTEXT_PACK)
+            .expect("context-pack tool should be listed");
+
+        assert_eq!(
+            context_pack["inputSchema"]["properties"]["mode"]["type"],
+            "string"
+        );
+        assert!(
+            !context_pack["inputSchema"]["required"]
+                .as_array()
+                .expect("required should be an array")
+                .iter()
+                .any(|value| value == "mode")
+        );
+    }
+
+    #[test]
+    fn staleness_tool_schema_advertises_optional_symbol_and_paths() {
+        let tools = tool_definitions();
+        let staleness = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_STALENESS_CHECK)
+            .expect("staleness tool should be listed");
+
+        assert_eq!(
+            staleness["inputSchema"]["properties"]["symbol"]["type"],
+            "string"
+        );
+        assert_eq!(
+            staleness["inputSchema"]["properties"]["paths"]["type"],
+            "array"
+        );
+        assert_eq!(
+            staleness["inputSchema"]["properties"]["paths"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(staleness["inputSchema"]["required"], json!(["repo"]));
+    }
+
+    #[test]
+    fn context_pack_rejects_unknown_mode_before_querying() {
+        let error = evidence_tool_result(
+            TOOL_CONTEXT_PACK,
+            &json!({
+                "repo": ".",
+                "symbol": "main",
+                "mode": "semantic"
+            }),
+        )
+        .expect_err("unsupported mode should fail");
+
+        assert!(error.contains("unsupported context-pack mode"));
     }
 
     #[test]
@@ -998,6 +1244,10 @@ mod tests {
         assert_eq!(
             result["structuredContent"]["contract"]["source_text"],
             "omitted_by_default"
+        );
+        assert_eq!(
+            result["structuredContent"]["contract"]["trust"],
+            "included_when_available"
         );
         assert_eq!(
             result["structuredContent"]["contract"]["reasons"],
@@ -1106,6 +1356,129 @@ mod tests {
         assert_eq!(wrapped["structuredContent"]["contract"]["read_only"], true);
     }
 
+    #[test]
+    fn staleness_rejects_invalid_path_arguments() {
+        let fixture = StalenessFixture::new();
+        let repo = fixture.root.path().display().to_string();
+
+        for paths in [json!([""]), json!(["../escape.rs"]), json!([42])] {
+            let error = tool_staleness_check_with_store(
+                &json!({
+                    "repo": repo,
+                    "paths": paths
+                }),
+                &fixture.store_config,
+            )
+            .expect_err("invalid paths should fail");
+            assert!(!error.is_empty());
+        }
+
+        let outside =
+            std::env::temp_dir().join(format!("symdex-outside-staleness-{}", std::process::id()));
+        fs::write(&outside, "fn outside() {}\n").expect("outside file should be written");
+        let error = tool_staleness_check_with_store(
+            &json!({
+                "repo": repo,
+                "paths": [outside.display().to_string()]
+            }),
+            &fixture.store_config,
+        )
+        .expect_err("outside absolute path should fail");
+        let _ = fs::remove_file(outside);
+        assert!(error.contains("absolute staleness paths must exist inside the repository"));
+    }
+
+    #[test]
+    fn staleness_reports_explicit_path_states_in_envelope_shape() {
+        let fixture = StalenessFixture::new();
+        let result = tool_staleness_check_with_store(
+            &json!({
+                "repo": fixture.root.path().display().to_string(),
+                "paths": [
+                    "src/fresh.rs",
+                    "src/stale.rs",
+                    "src/deleted.rs",
+                    "src/missing.rs",
+                    "src/unknown.rs"
+                ]
+            }),
+            &fixture.store_config,
+        )
+        .expect("staleness check should succeed");
+        let wrapped = tool_success(result);
+        let data = &wrapped["structuredContent"]["data"];
+
+        assert_eq!(
+            wrapped["structuredContent"]["schema_version"],
+            EVIDENCE_CONTRACT_SCHEMA
+        );
+        assert_eq!(data["counts"]["fresh"], 1);
+        assert_eq!(data["counts"]["stale"], 1);
+        assert_eq!(data["counts"]["deleted"], 1);
+        assert_eq!(data["counts"]["missing"], 1);
+        assert_eq!(data["counts"]["unknown"], 1);
+        assert_eq!(
+            data["files"]
+                .as_array()
+                .expect("files should be array")
+                .iter()
+                .map(|row| (
+                    row["path"].as_str().expect("path"),
+                    row["freshness"].as_str().expect("freshness")
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/deleted.rs", "deleted"),
+                ("src/fresh.rs", "fresh"),
+                ("src/missing.rs", "missing"),
+                ("src/stale.rs", "stale"),
+                ("src/unknown.rs", "unknown"),
+            ]
+        );
+        let stale = data["files"]
+            .as_array()
+            .expect("files should be array")
+            .iter()
+            .find(|row| row["freshness"] == "stale")
+            .expect("stale row should be present");
+        assert!(stale["indexed_content_hash"].as_str().is_some());
+        assert!(stale["current_content_hash"].as_str().is_some());
+        assert!(stale["trust"]["factors"].is_array());
+        assert!(stale["provenance"].is_object());
+        assert!(stale["reasons"].is_array());
+        assert!(!wrapped.to_string().contains("fn stale"));
+    }
+
+    #[test]
+    fn staleness_supports_symbol_scope_and_rejects_incompatible_paths() {
+        let fixture = StalenessFixture::new();
+        let repo = fixture.root.path().display().to_string();
+        let scoped = tool_staleness_check_with_store(
+            &json!({
+                "repo": repo,
+                "symbol": "fresh"
+            }),
+            &fixture.store_config,
+        )
+        .expect("symbol-scoped staleness should succeed");
+
+        assert_eq!(scoped["symbol_query"], "fresh");
+        assert_eq!(scoped["files"].as_array().expect("files").len(), 1);
+        assert_eq!(scoped["files"][0]["path"], "src/fresh.rs");
+
+        let error = tool_staleness_check_with_store(
+            &json!({
+                "repo": repo,
+                "symbol": "fresh",
+                "paths": ["src/stale.rs"]
+            }),
+            &fixture.store_config,
+        )
+        .expect_err("incompatible symbol/path scope should fail");
+
+        assert!(error.contains("paths are outside the symbol freshness scope"));
+    }
+
     fn temp_store_config() -> StoreConfig {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1120,5 +1493,145 @@ mod tests {
             sqlite_path: dir.join("symdex.sqlite"),
             qdrant_url: "http://localhost:6333".to_owned(),
         }
+    }
+
+    struct StalenessFixture {
+        root: RepoRoot,
+        store_config: StoreConfig,
+        _base: PathBuf,
+    }
+
+    static NEXT_STALENESS_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    impl StalenessFixture {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be available")
+                .as_nanos();
+            let fixture_id = NEXT_STALENESS_FIXTURE_ID.fetch_add(1, AtomicOrdering::Relaxed);
+            let base = std::env::temp_dir().join(format!(
+                "symdex-mcp-staleness-{}-{unique}-{fixture_id}",
+                std::process::id(),
+            ));
+            let root_path = base.join("repo");
+            fs::create_dir_all(root_path.join("src")).expect("repo should be created");
+            let fresh_source = b"fn fresh() {}\n";
+            let stale_source = b"fn stale() {}\n";
+            fs::write(root_path.join("src/fresh.rs"), fresh_source)
+                .expect("fresh file should be written");
+            fs::write(root_path.join("src/stale.rs"), stale_source)
+                .expect("stale file should be written");
+            fs::write(root_path.join("src/missing.rs"), "fn missing() {}\n")
+                .expect("missing file should be written");
+
+            let root = RepoRoot::open(&root_path).expect("repo should open");
+            let store_config = StoreConfig {
+                sqlite_path: base.join("symdex.sqlite"),
+                qdrant_url: "http://localhost:6333".to_owned(),
+            };
+            let mut store = SqliteStore::open(&store_config).expect("store should open");
+            store.migrate().expect("store should migrate");
+            store
+                .upsert_repository(&RepositoryRecord {
+                    id: root.id().to_owned(),
+                    root_path: root.path().display().to_string(),
+                })
+                .expect("repository should persist");
+            persist_file(
+                &mut store,
+                root.id(),
+                StalenessFileFixture {
+                    file_id: "file-fresh",
+                    path: "src/fresh.rs",
+                    content_hash: &content_hash(fresh_source),
+                    symbol_id: "sym-fresh",
+                    symbol_name: "fresh",
+                    qualified_name: "crate::fresh",
+                },
+            );
+            persist_file(
+                &mut store,
+                root.id(),
+                StalenessFileFixture {
+                    file_id: "file-stale",
+                    path: "src/stale.rs",
+                    content_hash: "old-stale-hash",
+                    symbol_id: "sym-stale",
+                    symbol_name: "stale",
+                    qualified_name: "crate::stale",
+                },
+            );
+            persist_file(
+                &mut store,
+                root.id(),
+                StalenessFileFixture {
+                    file_id: "file-deleted",
+                    path: "src/deleted.rs",
+                    content_hash: "old-deleted-hash",
+                    symbol_id: "sym-deleted",
+                    symbol_name: "deleted",
+                    qualified_name: "crate::deleted",
+                },
+            );
+
+            Self {
+                root,
+                store_config,
+                _base: base,
+            }
+        }
+    }
+
+    struct StalenessFileFixture<'a> {
+        file_id: &'a str,
+        path: &'a str,
+        content_hash: &'a str,
+        symbol_id: &'a str,
+        symbol_name: &'a str,
+        qualified_name: &'a str,
+    }
+
+    impl Drop for StalenessFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self._base);
+        }
+    }
+
+    fn persist_file(
+        store: &mut SqliteStore,
+        repository_id: &str,
+        fixture: StalenessFileFixture<'_>,
+    ) {
+        store
+            .replace_file_facts(
+                &FileRecord {
+                    id: fixture.file_id.to_owned(),
+                    repository_id: repository_id.to_owned(),
+                    path: fixture.path.to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: fixture.content_hash.to_owned(),
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[SymbolRecord {
+                    id: fixture.symbol_id.to_owned(),
+                    file_id: fixture.file_id.to_owned(),
+                    parent_symbol_id: None,
+                    name: fixture.symbol_name.to_owned(),
+                    qualified_name: fixture.qualified_name.to_owned(),
+                    kind: "function".to_owned(),
+                    signature: Some(format!("fn {}()", fixture.symbol_name)),
+                    start_line: 1,
+                    end_line: 1,
+                    start_byte: 0,
+                    end_byte: 16,
+                    index_run_id: "run".to_owned(),
+                    parser_version: "parser".to_owned(),
+                }],
+                &[],
+                &[],
+            )
+            .expect("file should persist");
     }
 }

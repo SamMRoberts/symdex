@@ -47,13 +47,14 @@ inference. Future languages must be added through the same discovery, parsing,
 chunking, symbol, call, hashing, secret-detection, embedding, SQLite, Qdrant,
 manual indexing, and continuous indexing contracts.
 
-Current implementation applies built-in directory excludes and simple scoped
-`.gitignore` rules from the repository root and nested directories. Literal
-file paths, directory suffix rules, and basename rules are supported. Glob
-patterns and negation rules are intentionally not implemented yet.
-Repository roots must be directories, discovered symlinked files and directories
-are skipped, and canonicalized symlink escapes are rejected by path
-normalization.
+Current implementation applies built-in directory excludes and scoped
+`.gitignore` rules from the repository root and nested directories. Rules are
+ordered and glob-aware, including `*`, `**`, `?`, character classes, directory
+rules, basename rules, nested scope, and `!` negation. Built-in excludes such as
+`.git`, `target`, `node_modules`, and `qdrant_storage` are hard excludes and
+cannot be re-included by `.gitignore` negation. Repository roots must be
+directories, discovered symlinked files and directories are skipped, and
+canonicalized symlink escapes are rejected by path normalization.
 
 ## Chunking strategy
 
@@ -87,13 +88,18 @@ Files with tree-sitter syntax errors produce partial chunks where possible and
 return metadata-only parse diagnostics with line and byte ranges instead of
 failing the whole index run.
 
-Rust test discovery is metadata-only and conservative. Functions with Rust test
+Test discovery is metadata-only and conservative. Functions with Rust test
 attributes such as `#[test]`, `#[tokio::test]`, `#[async_std::test]`, or
 `#[actix_rt::test]` are persisted as indexed test facts with symbol linkage,
-qualified names, byte ranges, and line ranges. C#, JavaScript, and TypeScript
-test discovery is intentionally not claimed yet; future support must use the
-same parser, symbol, call, secret-detection, provenance, and path-boundary
-contracts.
+qualified names, byte ranges, and line ranges. C# methods with NUnit, xUnit,
+or MSTest test attributes are persisted through the same symbol-linked path.
+JavaScript and TypeScript Jest, Vitest, and Mocha `test` / `it` calls are
+discovered from tree-sitter call expressions when framework imports or
+test-like paths provide conservative evidence. Nested `describe` calls provide
+suite context for qualified names. Named callback tests are linked to an indexed
+symbol only when the callback reference is unambiguous; anonymous callback tests
+are persisted as metadata-only rows with no symbol link so they cannot overclaim
+call coverage.
 
 Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token
@@ -105,8 +111,14 @@ to Ollama and do not get Qdrant point IDs.
 
 Use Ollama with `nomic-embed-text`.
 
-Current implementation uses Ollama `POST /api/embed` with `truncate: false` for
-batch embeddings and `GET /api/tags` for local model availability. Vector
+Current implementation uses Ollama `POST /api/embed` for batch embeddings and
+`GET /api/tags` for local model availability. `SYMDEX_EMBED_TRUNCATE` defaults
+to `true`, so oversized local inputs are truncated by Ollama instead of failing
+the entire semantic indexing run with a 400 response. `SYMDEX_EMBED_BATCH_SIZE`
+defaults to `16`, so full-repository semantic indexing is split into smaller
+Ollama requests while preserving embedding order. `SYMDEX_EMBED_MAX_CHUNK_BYTES`
+defaults to `32768`; larger chunks are kept as metadata-only structural evidence
+with `chunk_too_large_for_embedding` and are omitted from Ollama/Qdrant. Vector
 dimension probing embeds a tiny diagnostic string through the same local model.
 
 Store:

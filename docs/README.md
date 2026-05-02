@@ -19,6 +19,7 @@ Use this folder as the agent-facing project memory.
 | Test expectations | `TESTING.md` |
 | Privacy, secret handling, path safety | `SECURITY.md` |
 | Future feature planning | `FUTURE_FEATURES.md` |
+| Post-analysis implementation priorities | `ANALYSIS_REPORT.md`, `BACKLOG.md` |
 | Planning implementation work | `BACKLOG.md` |
 | External references | `REFERENCES.md` |
 
@@ -29,3 +30,10 @@ Do not treat this folder as optional. If a code change modifies behavior describ
 ## Project summary
 
 symdex is a local-only code intelligence backend for AI coding agents. It combines syntax-aware indexing, semantic search, call/callee relationships, compact context packs, a terminal UI, and MCP tools so agents can ground code edits in repository evidence instead of guessing.
+
+## Current planning signal
+
+`ANALYSIS_REPORT.md` identifies the next product shift as moving from strong
+evidence metadata toward actionable debugging intelligence. The current
+recommended implementation sequence is captured in `BACKLOG.md` under
+"Analysis-driven next steps"; use that section when choosing new work.

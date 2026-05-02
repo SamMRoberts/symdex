@@ -60,14 +60,21 @@ Fixtures should be tiny and purpose-built.
 - Evidence explainability coverage for semantic result reasons, direct impact
   call reasons, related-file reasons, MCP contract reason availability, and
   debug-context frame match reasons.
+- Unified context-pack coverage for structural-only fallback, semantic-only
+  chunks, overlapping structural/semantic evidence marked as `both`, stale
+  freshness labels, missing-vector or unavailable-semantic notes, and continued
+  absence of source text.
 - Debug context coverage for parsed panic/file locations, stack-frame symbols,
   failing test names, mapped frames, unmapped frames, stale frames, deleted
   files, malformed runtime input, common Rust `cargo test`, `anyhow`, `tracing`,
   full backtrace, panic-hook, and async stack-like output, and TUI debug context
   pack rendering.
-- Rust test discovery coverage for recognized test attributes, module-qualified
-  test names, SQLite test persistence/replacement, failing-test name mapping,
-  and impact likely-test evidence from direct indexed test calls.
+- Test discovery coverage for Rust recognized test attributes, C# NUnit/xUnit/
+  MSTest attributes, JavaScript and TypeScript Jest/Vitest/Mocha `test` / `it` /
+  `describe` shapes, module- or suite-qualified test names, SQLite test
+  persistence/replacement, failing-test name mapping, metadata-only anonymous
+  callback rows, and impact likely-test evidence only from direct indexed test
+  calls.
 - Rust call-resolution coverage for exact local calls, unresolved calls,
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
   module aliases used in scoped calls, simple grouped `use` aliases,
@@ -100,6 +107,11 @@ canonical symlink escapes rejected by normalization, symlinked files and
 directories skipped during discovery, and MCP repo arguments rejected when they
 do not name a directory root.
 
+Current discovery tests cover built-in hard excludes, root and nested
+`.gitignore` scope, glob patterns using `*`, `**`, `?`, and character classes,
+directory rules, basename rules, ordered `!` negation, and protection against
+re-including built-in excluded directories.
+
 Current migration tests also assert that structural-query indexes are created
 for symbols, calls, chunks, files, and index runs.
 
@@ -111,8 +123,9 @@ indexing should use mocked adapters or the existing opt-in local service test
 flags.
 
 Current continuous indexing tests cover snapshot diff coalescing, created-file
-and modified-file detection, ignored path skips, unsupported-language path
-skips, and unchanged-content skips. TUI state/render tests cover
+and modified-file detection, ignored path skips including glob rules and
+negated includes, unsupported-language path skips, and unchanged-content skips
+through the shared discovery path. TUI state/render tests cover
 continuous-indexing
 toggle confirmation, stopping an active watcher, pending debounce display,
 queued event count, and latest error rendering.
@@ -188,7 +201,9 @@ trust scoring, explainability reason tags, and the TUI evidence freshness panel.
 Current cross-agent reuse tests cover the shared MCP evidence contract envelope,
 read-only tool annotations, underscore-only tool names, repo root validation,
 and two independent MCP readers using the same SQLite index-status path without
-write-capable tools.
+write-capable tools. Current MCP staleness tests cover tool schema, path
+validation, symbol scope, explicit paths, stale/deleted/missing/unknown states,
+and source-free envelope output.
 Current diagnostics tests cover optional rust-analyzer readiness configuration
 without invoking project analysis or requiring rust-analyzer to be installed.
 
