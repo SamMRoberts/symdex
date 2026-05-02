@@ -32,6 +32,7 @@ pub struct IndexOptions {
 pub struct ContinuousIndexOptions {
     pub repo: String,
     pub offline: bool,
+    pub quality_catch_up: bool,
     pub poll_interval: Duration,
     pub debounce: Duration,
 }
@@ -46,6 +47,7 @@ impl ContinuousIndexOptions {
         Self {
             repo: repo.into(),
             offline,
+            quality_catch_up: true,
             poll_interval: Duration::from_millis(1_000),
             debounce: Duration::from_millis(250),
         }
@@ -152,6 +154,29 @@ pub struct QualityIndexSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuousQualityState {
+    pub repository_id: String,
+    pub generation_id: String,
+    pub active_layer: String,
+    pub quality_status: String,
+    pub activation_reason: Option<String>,
+    pub embeddable_chunks: usize,
+    pub quality_embedded_chunks: usize,
+    pub pending_jobs: usize,
+    pub running_jobs: usize,
+    pub succeeded_jobs: usize,
+    pub failed_jobs: usize,
+    pub skipped_stale_jobs: usize,
+    pub skipped_excluded_jobs: usize,
+}
+
+impl ContinuousQualityState {
+    fn has_work(&self) -> bool {
+        self.pending_jobs > 0 || self.running_jobs > 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustAnalyzerEnrichmentSummary {
     Disabled {
         enable_env: String,
@@ -240,6 +265,22 @@ pub enum ContinuousIndexEvent {
         changes: WatchChangeSet,
         error: String,
     },
+    QualityState {
+        state: ContinuousQualityState,
+    },
+    QualityStarted {
+        state: ContinuousQualityState,
+    },
+    QualityProgress {
+        progress: IndexProgress,
+    },
+    QualityCompleted {
+        summary: Box<QualityIndexSummary>,
+    },
+    QualityFailed {
+        state: Option<ContinuousQualityState>,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +317,14 @@ pub fn run_quality_index(options: &QualityIndexOptions) -> Result<QualityIndexSu
 
 pub fn run_quality_index_with_progress(
     options: &QualityIndexOptions,
+    on_progress: impl FnMut(IndexProgress),
+) -> Result<QualityIndexSummary, String> {
+    run_quality_index_limited_with_progress(options, None, on_progress)
+}
+
+fn run_quality_index_limited_with_progress(
+    options: &QualityIndexOptions,
+    max_jobs: Option<usize>,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<QualityIndexSummary, String> {
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
@@ -321,9 +370,17 @@ pub fn run_quality_index_with_progress(
     let batch_size = layered_embed_config.quality_batch_size.max(1);
 
     loop {
+        let remaining_limit = max_jobs.map(|limit| limit.saturating_sub(stats.claimed_jobs));
+        if matches!(remaining_limit, Some(0)) {
+            break;
+        }
+        let claim_limit = remaining_limit
+            .map(|remaining| remaining.min(batch_size))
+            .unwrap_or(batch_size)
+            .max(1);
         let claimed_at = current_timestamp();
         let claimed = sqlite
-            .claim_quality_embedding_jobs(root.id(), &generation.id, batch_size, &claimed_at)
+            .claim_quality_embedding_jobs(root.id(), &generation.id, claim_limit, &claimed_at)
             .map_err(|error| error.to_string())?;
         if claimed.is_empty() {
             break;
@@ -405,7 +462,11 @@ pub fn run_quality_index_with_progress(
 }
 
 pub fn run_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
-    run_index_internal(options, true, |_| {})
+    run_index_internal(options, true, None, |_| {})
+}
+
+fn run_watch_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
+    run_index_internal(options, true, Some("watch"), |_| {})
 }
 
 pub fn run_continuous_index(
@@ -438,6 +499,7 @@ pub fn run_continuous_index_until(
             on_event(ContinuousIndexEvent::Idle {
                 files_seen: snapshot.len(),
             });
+            run_continuous_quality_catch_up(options, &mut on_event, false);
             continue;
         }
 
@@ -458,7 +520,7 @@ pub fn run_continuous_index_until(
             changes: changes.clone(),
         });
 
-        match run_incremental_index(&IndexOptions {
+        match run_watch_incremental_index(&IndexOptions {
             repo: options.repo.clone(),
             offline: options.offline,
         }) {
@@ -468,6 +530,7 @@ pub fn run_continuous_index_until(
                     changes,
                     summary: Box::new(summary),
                 });
+                run_continuous_quality_catch_up(options, &mut on_event, true);
             }
             Err(error) => {
                 snapshot = debounced_snapshot;
@@ -476,6 +539,95 @@ pub fn run_continuous_index_until(
         }
     }
     Ok(())
+}
+
+fn run_continuous_quality_catch_up(
+    options: &ContinuousIndexOptions,
+    on_event: &mut impl FnMut(ContinuousIndexEvent),
+    emit_state_without_work: bool,
+) {
+    let layered_config = LayeredEmbedConfig::from_env();
+    if !should_run_continuous_quality_catch_up(options, &layered_config) {
+        return;
+    }
+
+    let state = match continuous_quality_state(&options.repo, None) {
+        Ok(Some(state)) => state,
+        Ok(None) => return,
+        Err(error) => {
+            on_event(ContinuousIndexEvent::QualityFailed { state: None, error });
+            return;
+        }
+    };
+    if !state.has_work() && !emit_state_without_work {
+        return;
+    }
+    on_event(ContinuousIndexEvent::QualityState {
+        state: state.clone(),
+    });
+    if !state.has_work() {
+        return;
+    }
+
+    on_event(ContinuousIndexEvent::QualityStarted { state });
+    match run_quality_index_limited_with_progress(
+        &QualityIndexOptions {
+            repo: options.repo.clone(),
+        },
+        Some(layered_config.quality_batch_size.max(1)),
+        |progress| on_event(ContinuousIndexEvent::QualityProgress { progress }),
+    ) {
+        Ok(summary) => on_event(ContinuousIndexEvent::QualityCompleted {
+            summary: Box::new(summary),
+        }),
+        Err(error) => {
+            let state = continuous_quality_state(&options.repo, Some("quality_worker_failed"))
+                .ok()
+                .flatten();
+            on_event(ContinuousIndexEvent::QualityFailed { state, error });
+        }
+    }
+}
+
+fn should_run_continuous_quality_catch_up(
+    options: &ContinuousIndexOptions,
+    layered_config: &LayeredEmbedConfig,
+) -> bool {
+    options.quality_catch_up && !options.offline && layered_config.quality_enabled
+}
+
+fn continuous_quality_state(
+    repo: &str,
+    activation_reason: Option<&str>,
+) -> Result<Option<ContinuousQualityState>, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let store_config = StoreConfig::from_env();
+    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    sqlite.migrate().map_err(|error| error.to_string())?;
+    let Some(routing) = sqlite
+        .semantic_routing_summary(root.id())
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let progress = sqlite
+        .quality_generation_progress(root.id(), &routing.generation_id)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(ContinuousQualityState {
+        repository_id: root.id().to_owned(),
+        generation_id: routing.generation_id,
+        active_layer: routing.active_layer.as_str().to_owned(),
+        quality_status: routing.quality_status.as_str().to_owned(),
+        activation_reason: activation_reason.map(str::to_owned),
+        embeddable_chunks: progress.embeddable_chunks,
+        quality_embedded_chunks: progress.quality_embedded_chunks,
+        pending_jobs: progress.pending_jobs,
+        running_jobs: progress.running_jobs,
+        succeeded_jobs: progress.succeeded_jobs,
+        failed_jobs: progress.failed_jobs,
+        skipped_stale_jobs: progress.skipped_stale_jobs,
+        skipped_excluded_jobs: progress.skipped_excluded_jobs,
+    }))
 }
 
 pub fn watch_snapshot(root: &RepoRoot) -> Result<WatchSnapshot, String> {
@@ -516,12 +668,13 @@ pub fn run_index_with_progress(
     options: &IndexOptions,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<IndexSummary, String> {
-    run_index_internal(options, options.offline, &mut on_progress)
+    run_index_internal(options, options.offline, None, &mut on_progress)
 }
 
 fn run_index_internal(
     options: &IndexOptions,
     skip_unchanged: bool,
+    run_kind_override: Option<&'static str>,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<IndexSummary, String> {
     on_progress(IndexProgress::new(
@@ -547,11 +700,7 @@ fn run_index_internal(
         "Repository and SQLite store ready",
     ));
 
-    let run_kind = if options.offline {
-        "offline"
-    } else {
-        "semantic"
-    };
+    let run_kind = index_run_kind(options.offline, run_kind_override);
     let index_run_id = SqliteStore::new_index_run_id(root.id(), run_kind);
     let layered_embed_config = LayeredEmbedConfig::from_env();
     let embed_config = layered_embed_config.fast_embed_config();
@@ -771,6 +920,10 @@ fn run_index_internal(
         rust_analyzer,
         embedding,
     })
+}
+
+fn index_run_kind(offline: bool, override_kind: Option<&'static str>) -> &'static str {
+    override_kind.unwrap_or(if offline { "offline" } else { "semantic" })
 }
 
 fn collect_index_reports(
@@ -2340,18 +2493,20 @@ mod tests {
         ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
         ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
+    use symdex_embed::{LayeredEmbedConfig, LayeredEmbedConfigValues};
     use symdex_store::{
         FileRecord, QualityEmbeddingJobRecord, QualityJobSourceRow, RepositoryRecord, SqliteStore,
         StoreConfig, SymbolRecord,
     };
 
     use crate::{
-        IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
-        RustAnalyzerReadiness, WatchSnapshot, apply_embedding_size_limits, chunk_record,
-        chunk_texts, collect_index_reports, detect_watch_changes, diff_watch_snapshots,
-        plan_rust_analyzer_enrichment, prepare_quality_job, quality_chunk_embedding_record,
-        quality_embedding_jobs, quality_vector_point, resolve_cross_file_rust_calls,
-        watch_snapshot,
+        ContinuousIndexOptions, IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig,
+        RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness, WatchSnapshot,
+        apply_embedding_size_limits, chunk_record, chunk_texts, collect_index_reports,
+        detect_watch_changes, diff_watch_snapshots, index_run_kind, plan_rust_analyzer_enrichment,
+        prepare_quality_job, quality_chunk_embedding_record, quality_embedding_jobs,
+        quality_vector_point, resolve_cross_file_rust_calls,
+        should_run_continuous_quality_catch_up, watch_snapshot,
     };
 
     #[test]
@@ -2554,6 +2709,44 @@ mod tests {
             changes.paths(),
             vec!["src/created.rs", "src/lib.rs", "src/deleted.rs"]
         );
+    }
+
+    #[test]
+    fn index_run_kind_distinguishes_watch_batches() {
+        assert_eq!(index_run_kind(false, None), "semantic");
+        assert_eq!(index_run_kind(true, None), "offline");
+        assert_eq!(index_run_kind(false, Some("watch")), "watch");
+        assert_eq!(index_run_kind(true, Some("watch")), "watch");
+    }
+
+    #[test]
+    fn continuous_quality_catch_up_policy_requires_semantic_watch_and_quality_enabled() {
+        let enabled = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues::default());
+        let disabled = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            quality_enabled: Some("0"),
+            ..LayeredEmbedConfigValues::default()
+        });
+        let semantic_watch = ContinuousIndexOptions::new(".", false);
+        let offline_watch = ContinuousIndexOptions::new(".", true);
+        let mut no_catch_up = ContinuousIndexOptions::new(".", false);
+        no_catch_up.quality_catch_up = false;
+
+        assert!(should_run_continuous_quality_catch_up(
+            &semantic_watch,
+            &enabled
+        ));
+        assert!(!should_run_continuous_quality_catch_up(
+            &offline_watch,
+            &enabled
+        ));
+        assert!(!should_run_continuous_quality_catch_up(
+            &semantic_watch,
+            &disabled
+        ));
+        assert!(!should_run_continuous_quality_catch_up(
+            &no_catch_up,
+            &enabled
+        ));
     }
 
     #[test]

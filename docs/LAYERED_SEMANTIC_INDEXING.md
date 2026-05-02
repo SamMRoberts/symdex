@@ -196,6 +196,14 @@ When a file changes:
 This keeps continuous indexing latency bounded by the fast layer and structural
 work. Quality indexing may lag behind active edits.
 
+The implemented watch path performs cooperative quality catch-up when semantic
+watch mode is active and quality indexing is enabled. After a fast watch batch
+completes, and on later idle ticks, watch mode processes at most
+`SYMDEX_QUALITY_BATCH_SIZE` quality jobs through the same hash-verifying worker
+used by `symdex index-quality <repo>`. If more work remains, later idle ticks
+continue the catch-up. CLI and TUI events report active layer, quality status,
+activation reason, and job counts without exposing source text.
+
 ## Quality worker behavior
 
 The quality worker may be an explicit CLI command, a background task started by

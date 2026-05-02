@@ -62,7 +62,8 @@ Continuous indexing records compact batch summaries in `index_runs` through the
 same indexing path, so watch-driven updates are visible in storage views. The UI
 can distinguish manual/offline and semantic batches through `run_kind`, status,
 timestamps, files seen/indexed, chunks embedded, model, dimension, and any
-metadata-only error summary.
+metadata-only error summary. Watch-driven batches are currently recorded with
+`run_kind = watch`.
 
 ### `files`
 

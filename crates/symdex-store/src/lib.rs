@@ -2584,7 +2584,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT id, started_at, finished_at, status, embedding_model,
                         embedding_dimension, files_seen, files_indexed,
-                        chunks_embedded, error_summary
+                        chunks_embedded, error_summary, run_kind
                  FROM index_runs
                  WHERE repository_id = ?1
                  ORDER BY started_at DESC, finished_at DESC, id DESC
@@ -2606,6 +2606,7 @@ impl SqliteStore {
                     files_indexed: row.get::<_, i64>(7)? as usize,
                     chunks_embedded: row.get::<_, i64>(8)? as usize,
                     error_summary: row.get(9)?,
+                    run_kind: row.get(10)?,
                 })
             })
             .map_err(StoreError::Sqlite)?;
@@ -3707,6 +3708,7 @@ pub struct IndexRunTimelineRow {
     pub files_indexed: usize,
     pub chunks_embedded: usize,
     pub error_summary: Option<String>,
+    pub run_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7271,6 +7273,7 @@ mod tests {
                 files_indexed: 3,
                 chunks_embedded: 7,
                 error_summary: None,
+                run_kind: "semantic",
             },
         );
         insert_index_run_fixture(
@@ -7286,6 +7289,7 @@ mod tests {
                 files_indexed: 2,
                 chunks_embedded: 1,
                 error_summary: Some("qdrant unavailable"),
+                run_kind: "watch",
             },
         );
 
@@ -7300,11 +7304,13 @@ mod tests {
         assert_eq!(summary.runs[0].files_seen, 5);
         assert_eq!(summary.runs[0].files_indexed, 2);
         assert_eq!(summary.runs[0].chunks_embedded, 1);
+        assert_eq!(summary.runs[0].run_kind, "watch");
         assert_eq!(
             summary.runs[0].error_summary.as_deref(),
             Some("qdrant unavailable")
         );
         assert_eq!(summary.runs[1].id, "run-old");
+        assert_eq!(summary.runs[1].run_kind, "semantic");
         let debug = format!("{summary:?}");
         assert!(!debug.contains("source_text"));
     }
@@ -7464,6 +7470,7 @@ mod tests {
                 files_indexed: 1,
                 chunks_embedded: 1,
                 error_summary: None,
+                run_kind: "semantic",
             },
         );
         insert_index_run_fixture(
@@ -7479,6 +7486,7 @@ mod tests {
                 files_indexed: 1,
                 chunks_embedded: 1,
                 error_summary: None,
+                run_kind: "semantic",
             },
         );
 
@@ -8091,6 +8099,7 @@ mod tests {
         files_indexed: usize,
         chunks_embedded: usize,
         error_summary: Option<&'static str>,
+        run_kind: &'static str,
     }
 
     fn insert_index_run_fixture(store: &SqliteStore, fixture: IndexRunFixture) {
@@ -8100,9 +8109,9 @@ mod tests {
                 "INSERT INTO index_runs (
                    id, repository_id, started_at, finished_at, status, embedding_model,
                    embedding_dimension, files_seen, files_indexed, chunks_embedded,
-                   error_summary
+                                     error_summary, run_kind
                  )
-                 VALUES (?1, 'repo', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                 VALUES (?1, 'repo', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     fixture.id,
                     fixture.started_at,
@@ -8114,6 +8123,7 @@ mod tests {
                     fixture.files_indexed as i64,
                     fixture.chunks_embedded as i64,
                     fixture.error_summary,
+                    fixture.run_kind,
                 ],
             )
             .expect("index run fixture should insert");

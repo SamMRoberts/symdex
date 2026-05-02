@@ -75,11 +75,11 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q8 — Continuous indexing integration
 
-- [ ] Ensure watch batches update fast synchronously and queue quality work.
-- [ ] Ensure watch batches do not wait for `nomic-embed-text-v2-moe`.
-- [ ] Mark quality stale on changed/deleted embeddable chunks.
-- [ ] Add optional background quality worker behavior for watch mode.
-- [ ] Surface fast/quality state in watch events and TUI state.
+- [x] Ensure watch batches update fast synchronously and queue quality work.
+- [x] Ensure watch batches do not wait for `nomic-embed-text-v2-moe`.
+- [x] Mark quality stale on changed/deleted embeddable chunks.
+- [x] Add optional background quality worker behavior for watch mode.
+- [x] Surface fast/quality state in watch events and TUI state.
 
 ## Phase Q9 — Verification, repair, TUI, and MCP
 

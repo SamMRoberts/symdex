@@ -22,9 +22,9 @@ use symdex_core::RepoRoot;
 use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
 use symdex_embed::EmbedConfig;
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexProgress,
-    IndexSummary, RustAnalyzerEnrichmentSummary, run_continuous_index_until,
-    run_index_with_progress,
+    ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, EmbeddingSummary,
+    IndexOptions, IndexProgress, IndexSummary, RustAnalyzerEnrichmentSummary,
+    run_continuous_index_until, run_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
@@ -1020,10 +1020,7 @@ impl App {
         self.continuous = ContinuousIndexState {
             enabled: true,
             status: ContinuousIndexStatus::Starting,
-            files_seen: 0,
-            queued_events: 0,
-            last_reindexed_file: None,
-            latest_error: None,
+            ..ContinuousIndexState::default()
         };
         self.continuous_receiver = Some(receiver);
         self.continuous_stop = Some(active);
@@ -1035,9 +1032,7 @@ impl App {
         if let Some(active) = &self.continuous_stop {
             active.store(false, Ordering::SeqCst);
         }
-        self.continuous.enabled = false;
-        self.continuous.status = ContinuousIndexStatus::Off;
-        self.continuous.queued_events = 0;
+        self.continuous = ContinuousIndexState::default();
         self.continuous_receiver = None;
         self.continuous_stop = None;
         self.message = "Continuous indexing stopped.".to_owned();
@@ -1279,6 +1274,45 @@ impl App {
                 self.continuous.queued_events = changes.event_count();
                 self.continuous.latest_error = Some(error);
                 self.message = "Continuous indexing batch failed.".to_owned();
+            }
+            ContinuousIndexEvent::QualityState { state } => {
+                self.continuous.apply_quality_state(&state);
+                self.message = format!(
+                    "Quality state: {} on {}.",
+                    state.quality_status, state.active_layer
+                );
+            }
+            ContinuousIndexEvent::QualityStarted { state } => {
+                self.continuous.apply_quality_state(&state);
+                self.continuous.latest_quality_error = None;
+                self.message = format!(
+                    "Quality catch-up started: {} pending jobs.",
+                    state.pending_jobs
+                );
+            }
+            ContinuousIndexEvent::QualityProgress { progress } => {
+                self.message = progress.message;
+            }
+            ContinuousIndexEvent::QualityCompleted { summary } => {
+                self.continuous.active_layer = Some(summary.active_layer.clone());
+                self.continuous.quality_status = Some(summary.quality_status.clone());
+                self.continuous.activation_reason = Some(summary.activation_reason.clone());
+                self.continuous.quality_pending_jobs = summary.progress.pending_jobs;
+                self.continuous.quality_running_jobs = summary.progress.running_jobs;
+                self.continuous.quality_failed_jobs = summary.progress.failed_jobs;
+                self.continuous.quality_stale_jobs = summary.progress.skipped_stale_jobs;
+                self.continuous.latest_quality_error = None;
+                self.message = format!(
+                    "Quality catch-up completed: {} on {}.",
+                    summary.quality_status, summary.active_layer
+                );
+            }
+            ContinuousIndexEvent::QualityFailed { state, error } => {
+                if let Some(state) = &state {
+                    self.continuous.apply_quality_state(state);
+                }
+                self.continuous.latest_quality_error = Some(error);
+                self.message = "Quality catch-up failed.".to_owned();
             }
         }
     }
@@ -2448,6 +2482,7 @@ fn index_runs_timeline_summary_from_status(
                 files_indexed: status.files_indexed,
                 chunks_embedded: status.chunks_indexed,
                 error_summary: None,
+                run_kind: "semantic".to_owned(),
             }]
         })
         .unwrap_or_default();
@@ -3866,6 +3901,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         let tone = index_run_status_tone(run.status.as_str());
         Row::new(vec![
             Cell::from(run.started_at.as_str()),
+            Cell::from(run.run_kind.as_str()),
             Cell::from(status_span(run.status.as_str(), tone)),
             Cell::from(run.files_seen.to_string()),
             Cell::from(run.files_indexed.to_string()),
@@ -3883,6 +3919,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         rows,
         [
             Constraint::Percentage(24),
+            Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Length(5),
@@ -3892,7 +3929,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         ],
     )
     .header(table_header([
-        "Started", "Status", "Seen", "Idx", "Emb", "Model", "Dim",
+        "Started", "Kind", "Status", "Seen", "Idx", "Emb", "Model", "Dim",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
         "Index Runs Timeline | Runs: {}",
@@ -3919,6 +3956,9 @@ fn index_runs_timeline_detail_panel(
         Line::from(vec![
             Span::styled("Run: ", Style::new().add_modifier(Modifier::BOLD)),
             Span::raw(run.id.as_str()),
+            Span::raw(" "),
+            Span::styled("Kind: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(run.run_kind.as_str()),
             Span::raw(" "),
             status_span(run.status.as_str(), tone),
         ]),
@@ -5515,6 +5555,14 @@ struct ContinuousIndexState {
     queued_events: usize,
     last_reindexed_file: Option<String>,
     latest_error: Option<String>,
+    active_layer: Option<String>,
+    quality_status: Option<String>,
+    activation_reason: Option<String>,
+    quality_pending_jobs: usize,
+    quality_running_jobs: usize,
+    quality_failed_jobs: usize,
+    quality_stale_jobs: usize,
+    latest_quality_error: Option<String>,
 }
 
 impl Default for ContinuousIndexState {
@@ -5526,6 +5574,14 @@ impl Default for ContinuousIndexState {
             queued_events: 0,
             last_reindexed_file: None,
             latest_error: None,
+            active_layer: None,
+            quality_status: None,
+            activation_reason: None,
+            quality_pending_jobs: 0,
+            quality_running_jobs: 0,
+            quality_failed_jobs: 0,
+            quality_stale_jobs: 0,
+            latest_quality_error: None,
         }
     }
 }
@@ -5544,14 +5600,47 @@ impl ContinuousIndexState {
     }
 
     fn summary(&self) -> String {
-        format!(
-            "state={} files_seen={} queued={} last={} error={}",
+        let base = format!(
+            "state={} files={} queued={} last={} err={}",
             self.status.label(),
             self.files_seen,
             self.queued_events,
             self.last_reindexed_file.as_deref().unwrap_or("<none>"),
             self.latest_error.as_deref().unwrap_or("<none>")
+        );
+        if self.active_layer.is_none()
+            && self.quality_status.is_none()
+            && self.activation_reason.is_none()
+            && self.quality_pending_jobs == 0
+            && self.quality_running_jobs == 0
+            && self.quality_failed_jobs == 0
+            && self.quality_stale_jobs == 0
+            && self.latest_quality_error.is_none()
+        {
+            return base;
+        }
+        format!(
+            "{} layer={} quality={} qjobs={}/{}/{}/{} reason={} qerr={}",
+            base,
+            self.active_layer.as_deref().unwrap_or("<none>"),
+            self.quality_status.as_deref().unwrap_or("<none>"),
+            self.quality_pending_jobs,
+            self.quality_running_jobs,
+            self.quality_failed_jobs,
+            self.quality_stale_jobs,
+            self.activation_reason.as_deref().unwrap_or("<none>"),
+            self.latest_quality_error.as_deref().unwrap_or("<none>")
         )
+    }
+
+    fn apply_quality_state(&mut self, state: &ContinuousQualityState) {
+        self.active_layer = Some(state.active_layer.clone());
+        self.quality_status = Some(state.quality_status.clone());
+        self.activation_reason = state.activation_reason.clone();
+        self.quality_pending_jobs = state.pending_jobs;
+        self.quality_running_jobs = state.running_jobs;
+        self.quality_failed_jobs = state.failed_jobs;
+        self.quality_stale_jobs = state.skipped_stale_jobs;
     }
 }
 
@@ -5613,10 +5702,10 @@ mod tests {
         EvidenceFreshness, EvidenceProvenance, FileCallDetailRow, FileChunkDetailRow,
         FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
         IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
-        QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
-        SemanticNeighborhoodSummary, SqliteStorageSummary, StorageExplorerSummary,
-        StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
-        SymbolSearchRow,
+        QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
+        SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
+        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
+        SymbolOutlineSummary, SymbolSearchRow,
     };
 
     use crate::{
@@ -6923,6 +7012,91 @@ mod tests {
     }
 
     #[test]
+    fn continuous_indexing_quality_events_update_status() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let state = symdex_index::ContinuousQualityState {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            active_layer: "fast".to_owned(),
+            quality_status: "quality_pending".to_owned(),
+            activation_reason: None,
+            embeddable_chunks: 2,
+            quality_embedded_chunks: 1,
+            pending_jobs: 1,
+            running_jobs: 0,
+            succeeded_jobs: 1,
+            failed_jobs: 0,
+            skipped_stale_jobs: 0,
+            skipped_excluded_jobs: 0,
+        };
+
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::QualityState {
+            state: state.clone(),
+        });
+        assert_eq!(app.continuous.active_layer.as_deref(), Some("fast"));
+        assert_eq!(
+            app.continuous.quality_status.as_deref(),
+            Some("quality_pending")
+        );
+        assert_eq!(app.continuous.quality_pending_jobs, 1);
+        assert_eq!(app.message, "Quality state: quality_pending on fast.");
+
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::QualityCompleted {
+            summary: Box::new(symdex_index::QualityIndexSummary {
+                repository_id: "repo".to_owned(),
+                generation_id: "generation-1".to_owned(),
+                quality_model: "nomic-embed-text-v2-moe".to_owned(),
+                quality_dimension: Some(768),
+                qdrant_collection: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
+                claimed_jobs: 1,
+                succeeded_jobs: 1,
+                failed_jobs: 0,
+                skipped_stale_jobs: 0,
+                remaining_pending_jobs: 0,
+                quality_status: "quality_ready".to_owned(),
+                active_layer: "quality".to_owned(),
+                activation_reason: "quality_complete".to_owned(),
+                progress: QualityGenerationProgress {
+                    repository_id: "repo".to_owned(),
+                    generation_id: "generation-1".to_owned(),
+                    embeddable_chunks: 2,
+                    quality_embedded_chunks: 2,
+                    pending_jobs: 0,
+                    running_jobs: 0,
+                    succeeded_jobs: 2,
+                    failed_jobs: 0,
+                    skipped_stale_jobs: 0,
+                    skipped_excluded_jobs: 0,
+                },
+            }),
+        });
+        assert_eq!(app.continuous.active_layer.as_deref(), Some("quality"));
+        assert_eq!(
+            app.continuous.quality_status.as_deref(),
+            Some("quality_ready")
+        );
+        assert_eq!(
+            app.continuous.activation_reason.as_deref(),
+            Some("quality_complete")
+        );
+        assert_eq!(app.continuous.quality_pending_jobs, 0);
+        assert_eq!(
+            app.message,
+            "Quality catch-up completed: quality_ready on quality."
+        );
+
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::QualityFailed {
+            state: Some(state),
+            error: "quality model unavailable".to_owned(),
+        });
+        assert_eq!(
+            app.continuous.latest_quality_error.as_deref(),
+            Some("quality model unavailable")
+        );
+        assert_eq!(app.message, "Quality catch-up failed.");
+    }
+
+    #[test]
     fn renders_continuous_indexing_status() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
@@ -6933,6 +7107,10 @@ mod tests {
         app.continuous.queued_events = 2;
         app.continuous.last_reindexed_file = Some("src/lib.rs".to_owned());
         app.continuous.latest_error = Some("ollama unavailable".to_owned());
+        app.continuous.active_layer = Some("fast".to_owned());
+        app.continuous.quality_status = Some("quality_pending".to_owned());
+        app.continuous.quality_pending_jobs = 3;
+        app.continuous.activation_reason = Some("quality_jobs_pending".to_owned());
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
@@ -6946,6 +7124,8 @@ mod tests {
         assert!(rendered.contains("pending"));
         assert!(rendered.contains("queued=2"));
         assert!(rendered.contains("src/lib.rs"));
+        assert!(rendered.contains("quality_pending"));
+        assert!(rendered.contains("qjobs=3/0/0/0"));
         assert!(rendered.contains("ollama unavailable"));
         assert_eq!(
             cell_fg_for_text(buffer, "pending", None),
@@ -7769,6 +7949,7 @@ mod tests {
                     files_indexed: 2,
                     chunks_embedded: 1,
                     error_summary: Some("qdrant unavailable".to_owned()),
+                    run_kind: "watch".to_owned(),
                 },
                 IndexRunTimelineRow {
                     id: "run-success".to_owned(),
@@ -7781,6 +7962,7 @@ mod tests {
                     files_indexed: 3,
                     chunks_embedded: 7,
                     error_summary: None,
+                    run_kind: "semantic".to_owned(),
                 },
             ],
         }

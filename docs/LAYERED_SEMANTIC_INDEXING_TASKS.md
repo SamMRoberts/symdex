@@ -195,6 +195,11 @@ Tasks:
 - Pause/yield quality work while a fast manual/watch index run is active.
 - Surface watch events and quality state separately.
 
+Implementation note: Slice 8 uses the shared incremental fast indexing path for
+watch batches, records watch batches with `run_kind = watch`, and performs
+cooperative quality catch-up in bounded `SYMDEX_QUALITY_BATCH_SIZE` batches
+after fast watch batches and during idle watch ticks.
+
 Acceptance:
 
 - Continuous indexing does not wait for `nomic-embed-text-v2-moe`.

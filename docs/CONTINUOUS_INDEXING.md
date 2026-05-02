@@ -135,13 +135,20 @@ Current implementation status:
   the shared indexing APIs directly.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
+- Watch-driven batches are recorded with `run_kind = watch` in local index-run
+  metadata so storage views can distinguish watch updates from manual runs.
+- In semantic watch mode, when `SYMDEX_QUALITY_INDEX` is enabled, watch mode
+  automatically runs cooperative quality catch-up after fast batches and during
+  idle ticks. Each catch-up tick uses the same hash-verifying quality worker
+  path as `symdex index-quality <repo>` and is bounded by
+  `SYMDEX_QUALITY_BATCH_SIZE` before returning to watch polling.
 - The TUI Indexing view exposes a `c` toggle with first-enable confirmation,
   explicit `on` / `off` labels, pending debounce state, queued event count,
-  last reindexed file, latest error display, and an animated activity indicator
+  last reindexed file, active semantic layer, quality status, quality job
+  counts, latest watch and quality errors, and an animated activity indicator
   while continuous indexing is on.
-- Layered fast/quality semantic indexing remains planned for the
-  `quality-index` branch. Implement it according to
-  `docs/LAYERED_SEMANTIC_INDEXING.md`.
+- CLI watch output prints metadata-only quality state, progress, completion,
+  and failure events alongside fast watch events.
 
 ## Observability
 

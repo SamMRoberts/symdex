@@ -64,7 +64,10 @@ when `SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality
 jobs when quality indexing is enabled and the quality model is available.
 `symdex index-quality <repo>` manually drains those queued jobs in bounded
 batches, then reports whether SQLite activation made quality the active layer or
-kept default search on fast. Background quality execution remains a later slice.
+kept default search on fast. `symdex index --watch <repo>` also performs
+cooperative quality catch-up in semantic watch mode when quality indexing is
+enabled, processing bounded quality batches during post-batch and idle watch
+ticks.
 
 `SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
 persisted as metadata-only structural evidence with
@@ -130,7 +133,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   Rust, C#, JavaScript, and TypeScript files, debounces event bursts, detects
   created/modified/deleted paths by content-hash snapshots, and reindexes
   changed content through the incremental indexing path until stopped with
-  `Ctrl+C`.
+  `Ctrl+C`. Semantic watch batches queue quality jobs when quality indexing is
+  enabled, then process bounded quality catch-up batches between fast watch
+  work. Watch output includes metadata-only quality state, progress,
+  completion, and failure events.
 - `index-quality <repo>`: manually processes queued quality semantic embedding
   jobs for the latest generation. It claims bounded batches, re-reads files
   from disk, verifies file and chunk hashes, writes quality Qdrant points and

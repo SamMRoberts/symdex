@@ -140,6 +140,8 @@ recorded as partial runs with metadata-only error summaries. Before upserting
 vectors, semantic indexing rejects a same-repository, same-model dimension
 change so an existing Qdrant collection is not reused with incompatible vector
 sizes. Different model names map to different Qdrant collection names.
+Continuous watch batches use the same incremental indexing path and are recorded
+with `run_kind = watch` in index-run metadata.
 
 The SQLite schema also includes additive layered semantic tables for
 `semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
@@ -202,6 +204,12 @@ The embedded query model and target collection come from active-layer routing:
 auto search uses quality only when the active generation is `quality_ready` and
 the quality manifest is complete, otherwise it uses the fast layer. Forced
 quality routing fails clearly when quality is unavailable or incomplete.
+
+`symdex index --watch <repo>` performs cooperative quality catch-up in semantic
+watch mode when quality indexing is enabled. Watch-driven fast batches queue
+quality jobs and emit completion before catch-up begins. Quality catch-up then
+processes bounded batches through the normal quality worker during post-batch or
+idle watch ticks, refreshing activation state after each bounded run.
 
 ## Call extraction
 

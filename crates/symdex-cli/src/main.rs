@@ -1044,7 +1044,65 @@ fn print_continuous_index_event(event: ContinuousIndexEvent) {
                 error
             );
         }
+        ContinuousIndexEvent::QualityState { state } => {
+            println!("watch_quality_state {}", continuous_quality_summary(&state));
+        }
+        ContinuousIndexEvent::QualityStarted { state } => {
+            println!(
+                "watch_quality_started {}",
+                continuous_quality_summary(&state)
+            );
+        }
+        ContinuousIndexEvent::QualityProgress { progress } => {
+            println!(
+                "watch_quality_progress phase={} completed={} total={} message={}",
+                progress.phase, progress.completed, progress.total, progress.message
+            );
+        }
+        ContinuousIndexEvent::QualityCompleted { summary } => {
+            println!(
+                "watch_quality_completed generation_id={} active_layer={} quality_status={} activation_reason={} claimed_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} remaining_pending_jobs={}",
+                summary.generation_id,
+                summary.active_layer,
+                summary.quality_status,
+                summary.activation_reason,
+                summary.claimed_jobs,
+                summary.succeeded_jobs,
+                summary.failed_jobs,
+                summary.skipped_stale_jobs,
+                summary.remaining_pending_jobs
+            );
+        }
+        ContinuousIndexEvent::QualityFailed { state, error } => {
+            if let Some(state) = state {
+                println!(
+                    "watch_quality_failed {} error={}",
+                    continuous_quality_summary(&state),
+                    error
+                );
+            } else {
+                println!("watch_quality_failed error={error}");
+            }
+        }
     }
+}
+
+fn continuous_quality_summary(state: &symdex_index::ContinuousQualityState) -> String {
+    format!(
+        "generation_id={} active_layer={} quality_status={} activation_reason={} embeddable_chunks={} quality_embedded_chunks={} pending_jobs={} running_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} skipped_excluded_jobs={}",
+        state.generation_id,
+        state.active_layer,
+        state.quality_status,
+        state.activation_reason.as_deref().unwrap_or("<none>"),
+        state.embeddable_chunks,
+        state.quality_embedded_chunks,
+        state.pending_jobs,
+        state.running_jobs,
+        state.succeeded_jobs,
+        state.failed_jobs,
+        state.skipped_stale_jobs,
+        state.skipped_excluded_jobs
+    )
 }
 
 fn continuous_change_summary(changes: &WatchChangeSet) -> String {
