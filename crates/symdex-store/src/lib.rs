@@ -1114,6 +1114,113 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn quality_embedding_job_id(
+        repository_id: &str,
+        generation_id: &str,
+        chunk_id: &str,
+    ) -> String {
+        stable_id(&[
+            "quality-embedding-job",
+            repository_id,
+            generation_id,
+            chunk_id,
+        ])
+    }
+
+    pub fn mark_superseded_quality_jobs_stale(
+        &self,
+        repository_id: &str,
+        current_generation_id: &str,
+        updated_at: &str,
+    ) -> Result<usize> {
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE quality_embedding_jobs
+                 SET status = 'skipped_stale', updated_at = ?3
+                 WHERE repository_id = ?1
+                   AND generation_id != ?2
+                   AND status IN ('pending', 'running')",
+                params![repository_id, current_generation_id, updated_at],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(updated)
+    }
+
+    pub fn queue_quality_embedding_jobs(
+        &mut self,
+        generation: &SemanticGenerationRecord,
+        quality_model: &str,
+        jobs: &[QualityEmbeddingJobRecord],
+        queued_at: &str,
+    ) -> Result<QualityQueueSummary> {
+        for job in jobs {
+            if job.repository_id != generation.repository_id || job.generation_id != generation.id {
+                return Err(StoreError::UnexpectedResponse(
+                    "quality job does not belong to generation".to_owned(),
+                ));
+            }
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let skipped_stale_jobs = mark_superseded_quality_jobs_stale_in_transaction(
+            &transaction,
+            &generation.repository_id,
+            &generation.id,
+            queued_at,
+        )?;
+        upsert_quality_embedding_jobs_in_transaction(&transaction, jobs)?;
+        let updated_generation = quality_generation_with_status(
+            generation,
+            quality_model,
+            SemanticLayerStatus::QualityPending,
+            queued_at,
+        );
+        upsert_semantic_generation_in_transaction(&transaction, &updated_generation)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+
+        Ok(QualityQueueSummary {
+            repository_id: generation.repository_id.clone(),
+            generation_id: generation.id.clone(),
+            quality_model: quality_model.to_owned(),
+            quality_status: SemanticLayerStatus::QualityPending,
+            queued_jobs: jobs.len(),
+            skipped_stale_jobs,
+        })
+    }
+
+    pub fn mark_quality_generation_blocked(
+        &mut self,
+        generation: &SemanticGenerationRecord,
+        quality_model: &str,
+        blocked_at: &str,
+    ) -> Result<QualityQueueSummary> {
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let skipped_stale_jobs = mark_superseded_quality_jobs_stale_in_transaction(
+            &transaction,
+            &generation.repository_id,
+            &generation.id,
+            blocked_at,
+        )?;
+        let updated_generation = quality_generation_with_status(
+            generation,
+            quality_model,
+            SemanticLayerStatus::QualityBlocked,
+            blocked_at,
+        );
+        upsert_semantic_generation_in_transaction(&transaction, &updated_generation)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+
+        Ok(QualityQueueSummary {
+            repository_id: generation.repository_id.clone(),
+            generation_id: generation.id.clone(),
+            quality_model: quality_model.to_owned(),
+            quality_status: SemanticLayerStatus::QualityBlocked,
+            queued_jobs: 0,
+            skipped_stale_jobs,
+        })
+    }
+
     pub fn quality_jobs_by_status(
         &self,
         repository_id: &str,
@@ -2731,6 +2838,16 @@ pub struct QualityEmbeddingJobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityQueueSummary {
+    pub repository_id: String,
+    pub generation_id: String,
+    pub quality_model: String,
+    pub quality_status: SemanticLayerStatus,
+    pub queued_jobs: usize,
+    pub skipped_stale_jobs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingIndexMetadata {
     pub embedding_model: String,
     pub embedding_dimension: Option<usize>,
@@ -3211,6 +3328,143 @@ fn usize_count(value: i64, label: &str) -> Result<usize> {
     value
         .try_into()
         .map_err(|_| StoreError::UnexpectedResponse(format!("negative {label}")))
+}
+
+fn quality_generation_with_status(
+    generation: &SemanticGenerationRecord,
+    quality_model: &str,
+    quality_status: SemanticLayerStatus,
+    updated_at: &str,
+) -> SemanticGenerationRecord {
+    let mut generation = generation.clone();
+    generation.quality_model = Some(quality_model.to_owned());
+    generation.quality_dimension = None;
+    generation.quality_status = quality_status.as_str().to_owned();
+    generation.quality_started_at = None;
+    generation.quality_completed_at = None;
+    generation.active_layer = SemanticLayer::Fast.as_str().to_owned();
+    generation.updated_at = updated_at.to_owned();
+    generation
+}
+
+fn mark_superseded_quality_jobs_stale_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    repository_id: &str,
+    current_generation_id: &str,
+    updated_at: &str,
+) -> Result<usize> {
+    transaction
+        .execute(
+            "UPDATE quality_embedding_jobs
+             SET status = 'skipped_stale', updated_at = ?3
+             WHERE repository_id = ?1
+               AND generation_id != ?2
+               AND status IN ('pending', 'running')",
+            params![repository_id, current_generation_id, updated_at],
+        )
+        .map_err(StoreError::Sqlite)
+}
+
+fn upsert_quality_embedding_jobs_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    jobs: &[QualityEmbeddingJobRecord],
+) -> Result<()> {
+    let mut statement = transaction
+        .prepare(
+            "INSERT INTO quality_embedding_jobs (
+               id, repository_id, generation_id, chunk_id, file_id, path,
+               content_hash, text_hash, status, attempts, error_summary,
+               created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(repository_id, generation_id, chunk_id) DO UPDATE SET
+               id = excluded.id,
+               file_id = excluded.file_id,
+               path = excluded.path,
+               content_hash = excluded.content_hash,
+               text_hash = excluded.text_hash,
+               status = excluded.status,
+               attempts = excluded.attempts,
+               error_summary = excluded.error_summary,
+               updated_at = excluded.updated_at",
+        )
+        .map_err(StoreError::Sqlite)?;
+    for job in jobs {
+        statement
+            .execute(params![
+                job.id,
+                job.repository_id,
+                job.generation_id,
+                job.chunk_id,
+                job.file_id,
+                job.path,
+                job.content_hash,
+                job.text_hash,
+                job.status,
+                job.attempts as i64,
+                job.error_summary,
+                job.created_at,
+                job.updated_at,
+            ])
+            .map_err(StoreError::Sqlite)?;
+    }
+    Ok(())
+}
+
+fn upsert_semantic_generation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    generation: &SemanticGenerationRecord,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO semantic_generations (
+               id, repository_id, fast_model, fast_dimension, fast_completed_at,
+               quality_model, quality_dimension, quality_status, quality_started_at,
+               quality_completed_at, active_layer, files_seen, embeddable_chunks,
+               fast_embedded_chunks, quality_embedded_chunks, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+               repository_id = excluded.repository_id,
+               fast_model = excluded.fast_model,
+               fast_dimension = excluded.fast_dimension,
+               fast_completed_at = excluded.fast_completed_at,
+               quality_model = excluded.quality_model,
+               quality_dimension = excluded.quality_dimension,
+               quality_status = excluded.quality_status,
+               quality_started_at = excluded.quality_started_at,
+               quality_completed_at = excluded.quality_completed_at,
+               active_layer = excluded.active_layer,
+               files_seen = excluded.files_seen,
+               embeddable_chunks = excluded.embeddable_chunks,
+               fast_embedded_chunks = excluded.fast_embedded_chunks,
+               quality_embedded_chunks = excluded.quality_embedded_chunks,
+               created_at = excluded.created_at,
+               updated_at = excluded.updated_at",
+            params![
+                generation.id,
+                generation.repository_id,
+                generation.fast_model,
+                generation.fast_dimension as i64,
+                generation.fast_completed_at,
+                generation.quality_model,
+                generation
+                    .quality_dimension
+                    .map(|dimension| dimension as i64),
+                generation.quality_status,
+                generation.quality_started_at,
+                generation.quality_completed_at,
+                generation.active_layer,
+                generation.files_seen as i64,
+                generation.embeddable_chunks as i64,
+                generation.fast_embedded_chunks as i64,
+                generation.quality_embedded_chunks as i64,
+                generation.created_at,
+                generation.updated_at,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4495,6 +4749,206 @@ mod tests {
         let status = store.repository_status("repo").expect("status should load");
         assert_eq!(status.files_indexed, 1);
         assert_eq!(status.chunks_indexed, 1);
+    }
+
+    #[test]
+    fn quality_queue_upserts_jobs_and_marks_generation_pending() {
+        let db = TestDb::new("quality-queue-pending");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        let generation = sample_semantic_generation();
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        let mut job = sample_quality_embedding_job();
+        job.id = SqliteStore::quality_embedding_job_id("repo", "generation-1", "chunk-1");
+
+        let first = store
+            .queue_quality_embedding_jobs(
+                &generation,
+                "nomic-embed-text-v2-moe",
+                &[job.clone()],
+                "200",
+            )
+            .expect("quality jobs should queue");
+        job.updated_at = "201".to_owned();
+        let second = store
+            .queue_quality_embedding_jobs(&generation, "nomic-embed-text-v2-moe", &[job], "201")
+            .expect("quality jobs should upsert idempotently");
+
+        assert_eq!(first.queued_jobs, 1);
+        assert_eq!(second.queued_jobs, 1);
+        assert_eq!(second.skipped_stale_jobs, 0);
+        let jobs = store
+            .quality_jobs_by_status("repo", "generation-1", "pending")
+            .expect("pending jobs should load");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].updated_at, "201");
+        let generation = store
+            .latest_semantic_generation("repo")
+            .expect("generation should load")
+            .expect("generation should exist");
+        assert_eq!(generation.quality_status, "quality_pending");
+        assert_eq!(
+            generation.quality_model.as_deref(),
+            Some("nomic-embed-text-v2-moe")
+        );
+        assert_eq!(generation.quality_dimension, None);
+        assert_eq!(generation.active_layer, "fast");
+    }
+
+    #[test]
+    fn quality_queue_marks_only_superseded_pending_and_running_jobs_stale() {
+        let db = TestDb::new("quality-queue-stale-scope");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[
+                    sample_chunk("chunk-1"),
+                    sample_chunk("chunk-2"),
+                    sample_chunk("chunk-3"),
+                    sample_chunk("chunk-4"),
+                    sample_chunk("chunk-5"),
+                ],
+                &[],
+            )
+            .expect("file facts should persist");
+        let current_generation = sample_semantic_generation();
+        let old_generation = SemanticGenerationRecord {
+            id: "generation-old".to_owned(),
+            fast_completed_at: "050".to_owned(),
+            created_at: "050".to_owned(),
+            updated_at: "050".to_owned(),
+            ..sample_semantic_generation()
+        };
+        store
+            .upsert_semantic_generation(&old_generation)
+            .expect("old generation should persist");
+        store
+            .upsert_semantic_generation(&current_generation)
+            .expect("current generation should persist");
+        for (chunk_id, status) in [
+            ("chunk-1", "pending"),
+            ("chunk-2", "running"),
+            ("chunk-3", "succeeded"),
+            ("chunk-4", "failed"),
+            ("chunk-5", "skipped_excluded"),
+        ] {
+            store
+                .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                    "generation-old",
+                    chunk_id,
+                    status,
+                ))
+                .expect("old job should persist");
+        }
+
+        let skipped = store
+            .mark_superseded_quality_jobs_stale("repo", "generation-1", "300")
+            .expect("superseded jobs should be marked stale");
+
+        assert_eq!(skipped, 2);
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-old", "skipped_stale")
+                .expect("stale jobs should load")
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-old", "succeeded")
+                .expect("succeeded jobs should remain")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-old", "failed")
+                .expect("failed jobs should remain")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-old", "skipped_excluded")
+                .expect("excluded jobs should remain")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn blocked_quality_generation_records_status_without_pending_jobs() {
+        let db = TestDb::new("quality-queue-blocked");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        let generation = sample_semantic_generation();
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+
+        let summary = store
+            .mark_quality_generation_blocked(&generation, "nomic-embed-text-v2-moe", "400")
+            .expect("generation should be marked blocked");
+
+        assert_eq!(summary.quality_status, SemanticLayerStatus::QualityBlocked);
+        assert_eq!(summary.queued_jobs, 0);
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "pending")
+                .expect("pending jobs should load")
+                .len(),
+            0
+        );
+        let generation = store
+            .latest_semantic_generation("repo")
+            .expect("generation should load")
+            .expect("generation should exist");
+        assert_eq!(generation.quality_status, "quality_blocked");
+        assert_eq!(
+            generation.quality_model.as_deref(),
+            Some("nomic-embed-text-v2-moe")
+        );
+        assert_eq!(generation.quality_dimension, None);
+        assert_eq!(generation.active_layer, "fast");
     }
 
     #[test]
@@ -6427,6 +6881,21 @@ mod tests {
             error_summary: None,
             created_at: "102".to_owned(),
             updated_at: "102".to_owned(),
+        }
+    }
+
+    fn sample_quality_embedding_job_for(
+        generation_id: &str,
+        chunk_id: &str,
+        status: &str,
+    ) -> QualityEmbeddingJobRecord {
+        QualityEmbeddingJobRecord {
+            id: SqliteStore::quality_embedding_job_id("repo", generation_id, chunk_id),
+            generation_id: generation_id.to_owned(),
+            chunk_id: chunk_id.to_owned(),
+            text_hash: format!("text-{chunk_id}"),
+            status: status.to_owned(),
+            ..sample_quality_embedding_job()
         }
     }
 

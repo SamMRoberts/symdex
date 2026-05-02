@@ -108,6 +108,11 @@ Acceptance:
 
 Goal: queue quality jobs after fast indexing without running the quality worker.
 
+Status: implemented for the manual/continuous shared fast indexing path.
+Blocked quality readiness creates no pending job rows, superseded stale marking
+updates only old `pending` and `running` jobs, and `quality_dimension` remains
+unset until a future worker records real quality embeddings.
+
 Tasks:
 
 - After fast indexing completes, enqueue jobs for current embeddable chunks.

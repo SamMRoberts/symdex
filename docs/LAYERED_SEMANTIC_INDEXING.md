@@ -234,7 +234,15 @@ A quality job is stale when any of these are true:
 - Its chunk no longer exists.
 - The chunk now has an `excluded_reason`.
 
-Stale jobs should transition to `skipped_stale` and must not activate quality.
+Stale pending or running jobs should transition to `skipped_stale` and must not
+activate quality. Terminal job history such as `succeeded`, `failed`,
+`skipped_stale`, and `skipped_excluded` is preserved when a new fast generation
+supersedes older quality work.
+
+If quality indexing is enabled but the configured quality model or local service
+is unavailable during queue readiness checks, mark the latest semantic
+generation `quality_blocked` and do not create pending quality job rows. A later
+retry can re-check readiness and enqueue jobs for the latest fast generation.
 
 ## Schema direction
 

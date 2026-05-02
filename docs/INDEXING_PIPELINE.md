@@ -146,10 +146,14 @@ The SQLite schema also includes additive layered semantic tables for
 After a successful fast Qdrant upsert, semantic indexing still writes legacy
 chunk embedding provenance for compatibility, then records a deterministic fast
 semantic generation and current fast `chunk_embeddings` manifest in SQLite.
+When quality indexing is enabled and the quality model is locally available,
+semantic indexing then marks superseded pending/running quality jobs stale and
+queues metadata-only `quality_embedding_jobs` rows for the latest fast
+generation. If the quality model or service is unavailable, the latest
+generation is marked `quality_blocked` and no pending quality jobs are created.
 Semantic search consults SQLite readiness metadata from the latest semantic
 generation and compact `chunk_embeddings` summaries before choosing the active
-model and Qdrant collection. Quality job creation and quality workers are later
-layered-indexing slices.
+model and Qdrant collection. Quality workers are a later layered-indexing slice.
 
 ## Qdrant Collections
 

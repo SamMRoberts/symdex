@@ -12,11 +12,12 @@ use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, ParseDiagnostic,
     RepoRoot, ResolutionStatus, Symbol, SymbolKind, discover_indexable_files, index_source_file,
 };
-use symdex_embed::{EmbedConfig, LayeredEmbedConfig, OllamaClient};
+use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
-    RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, TestRecord, VectorPoint,
-    current_timestamp, qdrant_collection_name, qdrant_point_id,
+    QualityEmbeddingJobRecord, QualityQueueSummary, RepositoryRecord, SqliteStore, StoreConfig,
+    SymbolRecord, TestRecord, VectorPoint, current_timestamp, qdrant_collection_name,
+    qdrant_point_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,7 +394,8 @@ fn run_index_internal(
         "semantic"
     };
     let index_run_id = SqliteStore::new_index_run_id(root.id(), run_kind);
-    let embed_config = LayeredEmbedConfig::from_env().fast_embed_config();
+    let layered_embed_config = LayeredEmbedConfig::from_env();
+    let embed_config = layered_embed_config.fast_embed_config();
     let embedding_model = if options.offline {
         "offline".to_owned()
     } else {
@@ -546,7 +548,7 @@ fn run_index_internal(
             &root,
             &store_config,
             &collection,
-            &embed_config,
+            &layered_embed_config,
             &index_run_id,
             &mut on_progress,
         ) {
@@ -1248,10 +1250,11 @@ fn persist_semantic_index(
     root: &RepoRoot,
     store_config: &StoreConfig,
     collection: &IndexCollection,
-    embed_config: &EmbedConfig,
+    layered_embed_config: &LayeredEmbedConfig,
     index_run_id: &str,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
+    let embed_config = layered_embed_config.fast_embed_config();
     let chunk_texts = chunk_texts(&collection.reports);
     if chunk_texts.is_empty() {
         on_progress(IndexProgress::new(
@@ -1346,7 +1349,7 @@ fn persist_semantic_index(
         )
         .map_err(|error| error.to_string())?;
     let recorded_at = current_timestamp();
-    sqlite
+    let generation = sqlite
         .record_fast_semantic_generation(
             root.id(),
             &embed_config.model,
@@ -1356,6 +1359,14 @@ fn persist_semantic_index(
             &recorded_at,
         )
         .map_err(|error| error.to_string())?;
+    queue_quality_jobs_after_fast_indexing(
+        sqlite,
+        root.id(),
+        collection,
+        layered_embed_config,
+        &generation,
+        on_progress,
+    )?;
     on_progress(IndexProgress::new(
         "qdrant",
         5,
@@ -1368,6 +1379,136 @@ fn persist_semantic_index(
         qdrant_collection,
         chunks_embedded: points.len(),
     })
+}
+
+fn queue_quality_jobs_after_fast_indexing(
+    sqlite: &mut SqliteStore,
+    repository_id: &str,
+    collection: &IndexCollection,
+    layered_embed_config: &LayeredEmbedConfig,
+    generation: &symdex_store::SemanticGenerationRecord,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<(), String> {
+    if !layered_embed_config.quality_enabled {
+        on_progress(IndexProgress::new(
+            "quality_queue",
+            1,
+            1,
+            "Quality indexing disabled; no jobs queued",
+        ));
+        return Ok(());
+    }
+
+    let queued_at = current_timestamp();
+    let quality_config = layered_embed_config.quality_embed_config();
+    let quality_client = match OllamaClient::new(quality_config.clone()) {
+        Ok(client) => client,
+        Err(error) => {
+            let summary = sqlite
+                .mark_quality_generation_blocked(generation, &quality_config.model, &queued_at)
+                .map_err(|error| error.to_string())?;
+            on_progress(blocked_quality_queue_progress(&summary, &error.to_string()));
+            return Ok(());
+        }
+    };
+
+    match quality_client.model_available() {
+        Ok(true) => {
+            let jobs = quality_embedding_jobs(
+                repository_id,
+                &generation.id,
+                &collection.reports,
+                &queued_at,
+            );
+            if jobs.is_empty() {
+                on_progress(IndexProgress::new(
+                    "quality_queue",
+                    1,
+                    1,
+                    "Quality queue skipped because no embeddable chunks are current",
+                ));
+                return Ok(());
+            }
+            let summary = sqlite
+                .queue_quality_embedding_jobs(generation, &quality_config.model, &jobs, &queued_at)
+                .map_err(|error| error.to_string())?;
+            on_progress(IndexProgress::new(
+                "quality_queue",
+                1,
+                1,
+                format!(
+                    "Queued {} quality jobs for {}; marked {} old jobs stale",
+                    summary.queued_jobs, summary.quality_model, summary.skipped_stale_jobs
+                ),
+            ));
+            Ok(())
+        }
+        Ok(false) => {
+            let summary = sqlite
+                .mark_quality_generation_blocked(generation, &quality_config.model, &queued_at)
+                .map_err(|error| error.to_string())?;
+            on_progress(blocked_quality_queue_progress(
+                &summary,
+                "quality model is not available",
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            let summary = sqlite
+                .mark_quality_generation_blocked(generation, &quality_config.model, &queued_at)
+                .map_err(|error| error.to_string())?;
+            on_progress(blocked_quality_queue_progress(&summary, &error.to_string()));
+            Ok(())
+        }
+    }
+}
+
+fn blocked_quality_queue_progress(summary: &QualityQueueSummary, reason: &str) -> IndexProgress {
+    IndexProgress::new(
+        "quality_queue",
+        1,
+        1,
+        format!(
+            "Quality queue blocked for {}; marked {} old jobs stale ({})",
+            summary.quality_model, summary.skipped_stale_jobs, reason
+        ),
+    )
+}
+
+fn quality_embedding_jobs(
+    repository_id: &str,
+    generation_id: &str,
+    reports: &[IndexReport],
+    queued_at: &str,
+) -> Vec<QualityEmbeddingJobRecord> {
+    reports
+        .iter()
+        .flat_map(|report| {
+            report
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.excluded_reason.is_none())
+                .map(|chunk| QualityEmbeddingJobRecord {
+                    id: SqliteStore::quality_embedding_job_id(
+                        repository_id,
+                        generation_id,
+                        &chunk.id,
+                    ),
+                    repository_id: repository_id.to_owned(),
+                    generation_id: generation_id.to_owned(),
+                    chunk_id: chunk.id.clone(),
+                    file_id: report.file.id.clone(),
+                    path: chunk.relative_path.clone(),
+                    content_hash: report.file.content_hash.clone(),
+                    text_hash: chunk.text_hash.clone(),
+                    status: "pending".to_owned(),
+                    attempts: 0,
+                    error_summary: None,
+                    created_at: queued_at.to_owned(),
+                    updated_at: queued_at.to_owned(),
+                })
+        })
+        .collect()
 }
 
 fn delete_stale_qdrant_points(
@@ -1702,7 +1843,8 @@ mod tests {
         IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
         RustAnalyzerReadiness, WatchSnapshot, apply_embedding_size_limits, chunk_record,
         chunk_texts, collect_index_reports, detect_watch_changes, diff_watch_snapshots,
-        plan_rust_analyzer_enrichment, resolve_cross_file_rust_calls, watch_snapshot,
+        plan_rust_analyzer_enrichment, quality_embedding_jobs, resolve_cross_file_rust_calls,
+        watch_snapshot,
     };
 
     #[test]
@@ -1736,6 +1878,40 @@ mod tests {
             secret_record.excluded_reason.as_deref(),
             Some("likely_access_token")
         );
+    }
+
+    #[test]
+    fn quality_embedding_jobs_skip_excluded_chunks() {
+        let file = sample_file();
+        let source = "pub fn public() {}\npub fn secret() {}\n".to_owned();
+        let public = sample_chunk("public", 0, 18, None);
+        let secret = sample_chunk("secret", 18, source.len(), Some("likely_access_token"));
+        let report = IndexReport {
+            file: file.clone(),
+            chunks: vec![public.clone(), secret],
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source,
+        };
+
+        let reports = [report];
+        let jobs = quality_embedding_jobs("repo", "generation-1", &reports, "500");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].repository_id, "repo");
+        assert_eq!(jobs[0].generation_id, "generation-1");
+        assert_eq!(jobs[0].chunk_id, public.id);
+        assert_eq!(jobs[0].file_id, file.id);
+        assert_eq!(jobs[0].path, "src/lib.rs");
+        assert_eq!(jobs[0].content_hash, file.content_hash);
+        assert_eq!(jobs[0].text_hash, public.text_hash);
+        assert_eq!(jobs[0].status, "pending");
+        assert_eq!(jobs[0].attempts, 0);
+        assert_eq!(jobs[0].error_summary, None);
+        assert_eq!(jobs[0].created_at, "500");
+        assert_eq!(jobs[0].updated_at, "500");
     }
 
     #[test]
