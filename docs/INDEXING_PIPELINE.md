@@ -141,6 +141,13 @@ vectors, semantic indexing rejects a same-repository, same-model dimension
 change so an existing Qdrant collection is not reused with incompatible vector
 sizes. Different model names map to different Qdrant collection names.
 
+The SQLite schema also includes additive layered semantic tables for
+`semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
+These tables support future fast/quality generation tracking and deferred
+quality work queues. The current indexing runtime still writes legacy chunk
+embedding provenance and `index_runs`; fast-layer generation writes, active
+layer routing, and quality workers are later layered-indexing slices.
+
 ## Qdrant Collections
 
 Current implementation creates Qdrant collections through the REST API on the

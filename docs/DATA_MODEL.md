@@ -6,12 +6,17 @@ Initial schema names are stable enough for early implementation but may change b
 
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
-while the current write path persists repositories, files, chunks, symbols, and
-calls.
+while the current indexing write path persists repositories, files, chunks,
+symbols, calls, tests, and legacy chunk embedding provenance. Layered semantic
+tables are present for generation manifests and quality work metadata, but the
+current indexing path continues to use legacy chunk embedding columns until
+fast-layer generation tracking is wired in.
 
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
 caller/callee traversal, and index-run metadata checks.
+Layered semantic indexes cover latest generation lookup, per-layer embedding
+manifests, and quality job status scans.
 
 ### `repositories`
 
@@ -182,6 +187,89 @@ TypeScript named callbacks. It is absent for metadata-only callback-style tests,
 such as inline Jest, Vitest, or Mocha callbacks. The `tests` table supports
 exact/suffix failing-test name lookup for debug context packs and direct
 test-to-symbol call lookup for impact summaries.
+
+### `semantic_generations`
+
+```sql
+CREATE TABLE semantic_generations (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  fast_model TEXT NOT NULL,
+  fast_dimension INTEGER NOT NULL,
+  fast_completed_at TEXT NOT NULL,
+  quality_model TEXT,
+  quality_dimension INTEGER,
+  quality_status TEXT NOT NULL,
+  quality_started_at TEXT,
+  quality_completed_at TEXT,
+  active_layer TEXT NOT NULL,
+  files_seen INTEGER NOT NULL,
+  embeddable_chunks INTEGER NOT NULL,
+  fast_embedded_chunks INTEGER NOT NULL,
+  quality_embedded_chunks INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+This table tracks metadata for a semantic generation. `active_layer` is `fast`
+or `quality`. `quality_status` uses the layered semantic status vocabulary:
+`missing`, `fast_ready`, `quality_pending`, `quality_ready`, `quality_stale`,
+`quality_blocked`, or `quality_failed`. Rows do not contain source text.
+
+### `chunk_embeddings`
+
+```sql
+CREATE TABLE chunk_embeddings (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  semantic_layer TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  embedding_dimension INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  qdrant_collection TEXT NOT NULL,
+  qdrant_point_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  embedded_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'current',
+  UNIQUE(chunk_id, semantic_layer, embedding_model, embedding_dimension)
+);
+```
+
+This table is the planned per-layer vector manifest. It keeps fast and quality
+metadata separate by `semantic_layer`, model, dimension, generation, collection,
+and point ID so the two layers do not share one Qdrant collection. `status` is
+metadata-only and currently supports `current`, `stale`, `blocked`, and
+`failed`.
+
+### `quality_embedding_jobs`
+
+```sql
+CREATE TABLE quality_embedding_jobs (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error_summary TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repository_id, generation_id, chunk_id)
+);
+```
+
+Quality jobs are long-lived metadata rows for deferred quality embedding work.
+They include enough hashes and path metadata to detect stale work before
+embedding, but never include source text. Current status values are `pending`,
+`running`, `succeeded`, `failed`, `skipped_stale`, and `skipped_excluded`.
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for

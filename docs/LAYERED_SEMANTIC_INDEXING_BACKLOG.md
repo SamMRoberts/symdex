@@ -28,12 +28,12 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q3 — SQLite storage model
 
-- [ ] Add `chunk_embeddings` migration.
-- [ ] Add `semantic_generations` migration.
-- [ ] Add `quality_embedding_jobs` migration.
-- [ ] Add indexes for generation lookup, job status, and per-layer manifests.
-- [ ] Keep legacy chunk embedding columns working during migration.
-- [ ] Add migration and store tests.
+- [x] Add `chunk_embeddings` migration.
+- [x] Add `semantic_generations` migration.
+- [x] Add `quality_embedding_jobs` migration.
+- [x] Add indexes for generation lookup, job status, and per-layer manifests.
+- [x] Keep legacy chunk embedding columns working during migration.
+- [x] Add migration and store tests.
 
 ## Phase Q4 — Fast-layer generation tracking
 
