@@ -27,6 +27,7 @@ SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
+SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_RUST_ANALYZER=0
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
@@ -36,6 +37,11 @@ the configured rust-analyzer binary. The check runs `rust-analyzer --version`
 only. Indexing uses the same opt-in flag to report a metadata-only enrichment
 plan for changed Rust files, but does not run rust-analyzer project analysis by
 default.
+
+`SYMDEX_EMBED_TRUNCATE` defaults to `true`, matching Ollama's embedding API
+behavior for oversized local inputs. Set it to `false` only when you want
+semantic indexing to fail instead of truncating chunks that exceed the embedding
+model context window.
 
 ## Expected commands
 

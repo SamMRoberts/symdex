@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct EmbedConfig {
     pub ollama_url: String,
     pub model: String,
+    pub truncate: bool,
 }
 
 impl EmbedConfig {
@@ -19,6 +20,10 @@ impl EmbedConfig {
                 .unwrap_or_else(|| "http://localhost:11434".to_owned()),
             model: env_value("SYMDEX_EMBED_MODEL", "symdex_EMBED_MODEL")
                 .unwrap_or_else(|| "nomic-embed-text".to_owned()),
+            truncate: env_value("SYMDEX_EMBED_TRUNCATE", "symdex_EMBED_TRUNCATE")
+                .as_deref()
+                .map(env_bool)
+                .unwrap_or(true),
         }
     }
 }
@@ -71,7 +76,7 @@ impl OllamaClient {
         let request = EmbedRequest {
             model: self.config.model.clone(),
             input: inputs,
-            truncate: false,
+            truncate: self.config.truncate,
         };
         let response: EmbedResponse = self
             .http
@@ -217,11 +222,18 @@ fn env_value(upper: &str, legacy: &str) -> Option<String> {
     env::var(upper).ok().or_else(|| env::var(legacy).ok())
 }
 
+fn env_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         EmbedConfig, EmbedRequest, EmbedResponse, ModelInfo, OllamaClient,
-        embedding_batch_from_response, model_available_in,
+        embedding_batch_from_response, env_bool, model_available_in,
     };
 
     #[test]
@@ -235,19 +247,29 @@ mod tests {
     }
 
     #[test]
-    fn embed_request_uses_current_api_shape() {
+    fn embed_request_uses_current_api_shape_with_truncation_enabled() {
         let inputs = vec!["first".to_owned(), "second".to_owned()];
         let request = EmbedRequest {
             model: "nomic-embed-text".to_owned(),
             input: &inputs,
-            truncate: false,
+            truncate: true,
         };
 
         let json = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(json["model"], "nomic-embed-text");
         assert_eq!(json["input"][0], "first");
-        assert_eq!(json["truncate"], false);
+        assert_eq!(json["truncate"], true);
+    }
+
+    #[test]
+    fn embed_truncate_env_accepts_explicit_truthy_values() {
+        assert!(env_bool("1"));
+        assert!(env_bool("true"));
+        assert!(env_bool("yes"));
+        assert!(env_bool("on"));
+        assert!(!env_bool("0"));
+        assert!(!env_bool("false"));
     }
 
     #[test]

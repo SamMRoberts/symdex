@@ -105,9 +105,11 @@ to Ollama and do not get Qdrant point IDs.
 
 Use Ollama with `nomic-embed-text`.
 
-Current implementation uses Ollama `POST /api/embed` with `truncate: false` for
-batch embeddings and `GET /api/tags` for local model availability. Vector
-dimension probing embeds a tiny diagnostic string through the same local model.
+Current implementation uses Ollama `POST /api/embed` for batch embeddings and
+`GET /api/tags` for local model availability. `SYMDEX_EMBED_TRUNCATE` defaults
+to `true`, so oversized local inputs are truncated by Ollama instead of failing
+the entire semantic indexing run with a 400 response. Vector dimension probing
+embeds a tiny diagnostic string through the same local model.
 
 Store:
 
