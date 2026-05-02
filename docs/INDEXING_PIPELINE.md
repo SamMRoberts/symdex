@@ -108,8 +108,12 @@ Use Ollama with `nomic-embed-text`.
 Current implementation uses Ollama `POST /api/embed` for batch embeddings and
 `GET /api/tags` for local model availability. `SYMDEX_EMBED_TRUNCATE` defaults
 to `true`, so oversized local inputs are truncated by Ollama instead of failing
-the entire semantic indexing run with a 400 response. Vector dimension probing
-embeds a tiny diagnostic string through the same local model.
+the entire semantic indexing run with a 400 response. `SYMDEX_EMBED_BATCH_SIZE`
+defaults to `16`, so full-repository semantic indexing is split into smaller
+Ollama requests while preserving embedding order. `SYMDEX_EMBED_MAX_CHUNK_BYTES`
+defaults to `32768`; larger chunks are kept as metadata-only structural evidence
+with `chunk_too_large_for_embedding` and are omitted from Ollama/Qdrant. Vector
+dimension probing embeds a tiny diagnostic string through the same local model.
 
 Store:
 

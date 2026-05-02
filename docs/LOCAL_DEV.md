@@ -28,6 +28,8 @@ SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
 SYMDEX_EMBED_TRUNCATE=true
+SYMDEX_EMBED_BATCH_SIZE=16
+SYMDEX_EMBED_MAX_CHUNK_BYTES=32768
 SYMDEX_RUST_ANALYZER=0
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
@@ -42,6 +44,14 @@ default.
 behavior for oversized local inputs. Set it to `false` only when you want
 semantic indexing to fail instead of truncating chunks that exceed the embedding
 model context window.
+
+`SYMDEX_EMBED_BATCH_SIZE` defaults to `16`. Symdex splits semantic indexing
+requests into batches before calling Ollama `/api/embed`, which avoids oversized
+request payloads while preserving result order.
+
+`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
+persisted as metadata-only structural evidence with
+`chunk_too_large_for_embedding` and are not sent to Ollama.
 
 ## Expected commands
 

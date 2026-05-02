@@ -11,6 +11,8 @@ pub struct EmbedConfig {
     pub ollama_url: String,
     pub model: String,
     pub truncate: bool,
+    pub batch_size: usize,
+    pub max_chunk_bytes: usize,
 }
 
 impl EmbedConfig {
@@ -24,6 +26,17 @@ impl EmbedConfig {
                 .as_deref()
                 .map(env_bool)
                 .unwrap_or(true),
+            batch_size: env_value("SYMDEX_EMBED_BATCH_SIZE", "symdex_EMBED_BATCH_SIZE")
+                .as_deref()
+                .and_then(env_usize)
+                .unwrap_or(16),
+            max_chunk_bytes: env_value(
+                "SYMDEX_EMBED_MAX_CHUNK_BYTES",
+                "symdex_EMBED_MAX_CHUNK_BYTES",
+            )
+            .as_deref()
+            .and_then(env_usize)
+            .unwrap_or(32 * 1024),
         }
     }
 }
@@ -73,13 +86,34 @@ impl OllamaClient {
             });
         }
 
+        let mut model = None;
+        let mut embeddings = Vec::with_capacity(inputs.len());
+        let mut prompt_eval_count = None;
+        for batch in inputs.chunks(self.config.batch_size.max(1)) {
+            let response = self.embed_batch_request(batch)?;
+            let batch = embedding_batch_from_response(response, batch.len())?;
+            if model.is_none() {
+                model = Some(batch.model.clone());
+            }
+            prompt_eval_count = merge_prompt_eval_count(prompt_eval_count, batch.prompt_eval_count);
+            embeddings.extend(batch.embeddings);
+        }
+
+        embedding_batch_from_parts(
+            model.unwrap_or_else(|| self.config.model.clone()),
+            embeddings,
+            prompt_eval_count,
+            inputs.len(),
+        )
+    }
+
+    fn embed_batch_request(&self, inputs: &[String]) -> Result<EmbedResponse> {
         let request = EmbedRequest {
             model: self.config.model.clone(),
             input: inputs,
             truncate: self.config.truncate,
         };
-        let response: EmbedResponse = self
-            .http
+        self.http
             .post(self.endpoint("/api/embed"))
             .json(&request)
             .send()
@@ -87,9 +121,7 @@ impl OllamaClient {
             .error_for_status()
             .map_err(EmbedError::HttpStatus)?
             .json()
-            .map_err(EmbedError::Decode)?;
-
-        embedding_batch_from_response(response, inputs.len())
+            .map_err(EmbedError::Decode)
     }
 
     pub fn probe_dimension(&self) -> Result<usize> {
@@ -122,16 +154,29 @@ fn embedding_batch_from_response(
     response: EmbedResponse,
     expected_count: usize,
 ) -> Result<EmbeddingBatch> {
-    if response.embeddings.len() != expected_count {
+    embedding_batch_from_parts(
+        response.model,
+        response.embeddings,
+        response.prompt_eval_count,
+        expected_count,
+    )
+}
+
+fn embedding_batch_from_parts(
+    model: String,
+    embeddings: Vec<Vec<f32>>,
+    prompt_eval_count: Option<u64>,
+    expected_count: usize,
+) -> Result<EmbeddingBatch> {
+    if embeddings.len() != expected_count {
         return Err(EmbedError::EmbeddingCount {
             expected: expected_count,
-            actual: response.embeddings.len(),
+            actual: embeddings.len(),
         });
     }
 
-    let dimension = response.embeddings.first().map(Vec::len).unwrap_or(0);
-    if response
-        .embeddings
+    let dimension = embeddings.first().map(Vec::len).unwrap_or(0);
+    if embeddings
         .iter()
         .any(|embedding| embedding.len() != dimension)
     {
@@ -139,10 +184,19 @@ fn embedding_batch_from_response(
     }
 
     Ok(EmbeddingBatch {
-        model: response.model,
-        embeddings: response.embeddings,
-        prompt_eval_count: response.prompt_eval_count,
+        model,
+        embeddings,
+        prompt_eval_count,
     })
+}
+
+fn merge_prompt_eval_count(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,11 +283,20 @@ fn env_bool(value: &str) -> bool {
     )
 }
 
+fn env_usize(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         EmbedConfig, EmbedRequest, EmbedResponse, ModelInfo, OllamaClient,
-        embedding_batch_from_response, env_bool, model_available_in,
+        embedding_batch_from_parts, embedding_batch_from_response, env_bool, env_usize,
+        model_available_in,
     };
 
     #[test]
@@ -273,6 +336,14 @@ mod tests {
     }
 
     #[test]
+    fn embed_batch_size_env_accepts_positive_integers() {
+        assert_eq!(env_usize("1"), Some(1));
+        assert_eq!(env_usize("16"), Some(16));
+        assert_eq!(env_usize("0"), None);
+        assert_eq!(env_usize("nope"), None);
+    }
+
+    #[test]
     fn embed_response_reports_dimension() {
         let response = EmbedResponse {
             model: "nomic-embed-text".to_owned(),
@@ -285,6 +356,21 @@ mod tests {
         assert_eq!(batch.dimension(), Some(3));
         assert_eq!(batch.embeddings.len(), 2);
         assert_eq!(batch.prompt_eval_count, Some(12));
+    }
+
+    #[test]
+    fn embed_batch_parts_preserve_count_order_and_prompt_total() {
+        let batch = embedding_batch_from_parts(
+            "nomic-embed-text".to_owned(),
+            vec![vec![0.1, 0.2], vec![0.3, 0.4], vec![0.5, 0.6]],
+            Some(9),
+            3,
+        )
+        .expect("combined embeddings should validate");
+
+        assert_eq!(batch.embeddings[0], vec![0.1, 0.2]);
+        assert_eq!(batch.embeddings[2], vec![0.5, 0.6]);
+        assert_eq!(batch.prompt_eval_count, Some(9));
     }
 
     #[test]

@@ -393,10 +393,11 @@ fn run_index_internal(
         "semantic"
     };
     let index_run_id = SqliteStore::new_index_run_id(root.id(), run_kind);
+    let embed_config = EmbedConfig::from_env();
     let embedding_model = if options.offline {
         "offline".to_owned()
     } else {
-        EmbedConfig::from_env().model
+        embed_config.model.clone()
     };
     let run_scope = RunScope {
         index_run_id: &index_run_id,
@@ -453,6 +454,7 @@ fn run_index_internal(
         }
     };
     resolve_cross_file_rust_calls(&mut collection, &persisted_rust_symbols);
+    apply_embedding_size_limits(&mut collection.reports, embed_config.max_chunk_bytes);
     let files = file_summaries(&collection.reports);
     let rust_analyzer =
         rust_analyzer_enrichment_summary(&collection, &RustAnalyzerEnrichmentConfig::from_env());
@@ -1442,6 +1444,20 @@ fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
         .collect()
 }
 
+fn apply_embedding_size_limits(reports: &mut [IndexReport], max_chunk_bytes: usize) -> usize {
+    let mut excluded = 0;
+    for report in reports {
+        for chunk in &mut report.chunks {
+            let chunk_bytes = chunk.byte_range.end.saturating_sub(chunk.byte_range.start);
+            if chunk.excluded_reason.is_none() && chunk_bytes > max_chunk_bytes {
+                chunk.excluded_reason = Some("chunk_too_large_for_embedding".to_owned());
+                excluded += 1;
+            }
+        }
+    }
+    excluded
+}
+
 fn vector_point(
     repository_id: &str,
     chunk: &ChunkText<'_>,
@@ -1671,9 +1687,9 @@ mod tests {
 
     use crate::{
         IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
-        RustAnalyzerReadiness, WatchSnapshot, chunk_record, chunk_texts, collect_index_reports,
-        detect_watch_changes, diff_watch_snapshots, plan_rust_analyzer_enrichment,
-        resolve_cross_file_rust_calls, watch_snapshot,
+        RustAnalyzerReadiness, WatchSnapshot, apply_embedding_size_limits, chunk_record,
+        chunk_texts, collect_index_reports, detect_watch_changes, diff_watch_snapshots,
+        plan_rust_analyzer_enrichment, resolve_cross_file_rust_calls, watch_snapshot,
     };
 
     #[test]
@@ -1707,6 +1723,35 @@ mod tests {
             secret_record.excluded_reason.as_deref(),
             Some("likely_access_token")
         );
+    }
+
+    #[test]
+    fn embedding_size_limits_exclude_oversized_chunks_before_embedding() {
+        let file = sample_file();
+        let source = "a".repeat(128);
+        let small = sample_chunk("small", 0, 16, None);
+        let large = sample_chunk("large", 16, 128, None);
+        let mut reports = vec![IndexReport {
+            file,
+            chunks: vec![small.clone(), large.clone()],
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source,
+        }];
+
+        let excluded = apply_embedding_size_limits(&mut reports, 64);
+        let chunks = chunk_texts(&reports);
+
+        assert_eq!(excluded, 1);
+        assert_eq!(reports[0].chunks[0].excluded_reason, None);
+        assert_eq!(
+            reports[0].chunks[1].excluded_reason.as_deref(),
+            Some("chunk_too_large_for_embedding")
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk.id, small.id);
     }
 
     #[test]
