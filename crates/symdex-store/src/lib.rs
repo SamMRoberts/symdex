@@ -3330,7 +3330,7 @@ mod tests {
     #[test]
     fn collection_name_is_deterministic_and_safe() {
         assert_eq!(
-            qdrant_collection_name("Repo-ID_123", "nomic-embed-text:latest"),
+            qdrant_collection_name("Repo-ID_123", "nomic-embed-text-v2-moe:latest"),
             "symdex_repo_id_123_nomic_embed_text_latest"
         );
     }
@@ -3710,7 +3710,7 @@ mod tests {
             .expect("repository should persist");
 
         let mut vector = sample_chunk("chunk-vector");
-        vector.embedding_model = Some("nomic-embed-text".to_owned());
+        vector.embedding_model = Some("nomic-embed-text-v2-moe".to_owned());
         vector.embedding_dimension = Some(768);
         store
             .replace_file_facts(
@@ -3730,7 +3730,7 @@ mod tests {
         assert_eq!(manifest[0].path, "src/lib.rs");
         assert_eq!(
             manifest[0].embedding_model.as_deref(),
-            Some("nomic-embed-text")
+            Some("nomic-embed-text-v2-moe")
         );
         assert_eq!(manifest[0].embedding_dimension, Some(768));
     }
@@ -3768,10 +3768,10 @@ mod tests {
             )
             .expect("facts should persist");
         store
-            .record_chunk_embedding_provenance(&["chunk-1".to_owned()], "nomic-embed-text", 768)
+            .record_chunk_embedding_provenance(&["chunk-1".to_owned()], "nomic-embed-text-v2-moe", 768)
             .expect("chunk provenance should update");
         store
-            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text-v2-moe", 768))
             .expect("index run should persist");
 
         let file_provenance: (String, String) = store
@@ -3805,7 +3805,7 @@ mod tests {
             .expect("chunk provenance should load");
         assert_eq!(chunk_provenance.0, "run");
         assert_eq!(chunk_provenance.1, "parser");
-        assert_eq!(chunk_provenance.2, "nomic-embed-text");
+        assert_eq!(chunk_provenance.2, "nomic-embed-text-v2-moe");
         assert_eq!(chunk_provenance.3, 768);
         assert!(chunk_provenance.4.is_some());
 
@@ -4188,17 +4188,17 @@ mod tests {
             .expect("repository should persist");
 
         store
-            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text-v2-moe", 768))
             .expect("index run should persist");
 
         let status = store.repository_status("repo").expect("status should load");
-        assert_eq!(status.embedding_model.as_deref(), Some("nomic-embed-text"));
+        assert_eq!(status.embedding_model.as_deref(), Some("nomic-embed-text-v2-moe"));
         assert_eq!(status.embedding_dimension, Some(768));
         store
-            .ensure_embedding_compatible("repo", "nomic-embed-text", 768)
+            .ensure_embedding_compatible("repo", "nomic-embed-text-v2-moe", 768)
             .expect("same dimension should be compatible");
         let error = store
-            .ensure_embedding_compatible("repo", "nomic-embed-text", 1024)
+            .ensure_embedding_compatible("repo", "nomic-embed-text-v2-moe", 1024)
             .expect_err("changed dimension should be rejected");
         assert!(matches!(
             error,
@@ -4239,11 +4239,11 @@ mod tests {
             )
             .expect("facts should persist");
         store
-            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text-v2-moe", 768))
             .expect("index run should persist");
 
         let summary = store
-            .storage_explorer_summary("repo", "nomic-embed-text")
+            .storage_explorer_summary("repo", "nomic-embed-text-v2-moe")
             .expect("storage summary should build");
 
         assert_eq!(summary.sqlite.repositories, 1);
@@ -4251,7 +4251,7 @@ mod tests {
         assert_eq!(summary.sqlite.chunks, 3);
         assert_eq!(summary.sqlite.symbols, 1);
         assert_eq!(summary.sqlite.index_runs, 1);
-        assert_eq!(summary.qdrant.embedding_model, "nomic-embed-text");
+        assert_eq!(summary.qdrant.embedding_model, "nomic-embed-text-v2-moe");
         assert_eq!(summary.qdrant.embedding_dimension, Some(768));
         assert_eq!(summary.qdrant.embeddable_chunks, 2);
         assert_eq!(summary.qdrant.vector_backed_chunks, 1);
@@ -4290,16 +4290,16 @@ mod tests {
             )
             .expect("facts should persist");
         store
-            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text-v2-moe", 768))
             .expect("index run should persist");
 
         let summary = store
-            .embedding_coverage_summary("repo", "nomic-embed-text")
+            .embedding_coverage_summary("repo", "nomic-embed-text-v2-moe")
             .expect("embedding coverage should load");
 
         assert_eq!(summary.repository_id, "repo");
-        assert_eq!(summary.configured_embedding_model, "nomic-embed-text");
-        assert_eq!(summary.embedding_model, "nomic-embed-text");
+        assert_eq!(summary.configured_embedding_model, "nomic-embed-text-v2-moe");
+        assert_eq!(summary.embedding_model, "nomic-embed-text-v2-moe");
         assert_eq!(summary.embedding_dimension, Some(768));
         assert_eq!(summary.total_chunks, 3);
         assert_eq!(summary.embeddable_chunks, 2);
@@ -4336,7 +4336,7 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z",
                 finished_at: Some("2026-01-01T00:00:10Z"),
                 status: "success",
-                model: "nomic-embed-text",
+                model: "nomic-embed-text-v2-moe",
                 dimension: Some(768),
                 files_seen: 4,
                 files_indexed: 3,
@@ -4351,7 +4351,7 @@ mod tests {
                 started_at: "2026-01-02T00:00:00Z",
                 finished_at: Some("2026-01-02T00:00:04Z"),
                 status: "failed",
-                model: "nomic-embed-text",
+                model: "nomic-embed-text-v2-moe",
                 dimension: Some(768),
                 files_seen: 5,
                 files_indexed: 2,
@@ -4392,7 +4392,7 @@ mod tests {
             })
             .expect("repository should persist");
 
-        let mut run = sample_index_run("nomic-embed-text", 768);
+        let mut run = sample_index_run("nomic-embed-text-v2-moe", 768);
         run.id = "run-lifecycle".to_owned();
         run.status = "running".to_owned();
         run.files_seen = 0;
@@ -4472,15 +4472,15 @@ mod tests {
             )
             .expect("facts should persist");
         store
-            .record_index_run(&sample_index_run("nomic-embed-text", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text-v2-moe", 768))
             .expect("index run should persist");
 
         let summary = store
-            .semantic_neighborhood_summary("repo", "nomic-embed-text")
+            .semantic_neighborhood_summary("repo", "nomic-embed-text-v2-moe")
             .expect("semantic neighborhood should load");
 
         assert_eq!(summary.repository_id, "repo");
-        assert_eq!(summary.embedding_model, "nomic-embed-text");
+        assert_eq!(summary.embedding_model, "nomic-embed-text-v2-moe");
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].path, "src/lib.rs");
         assert_eq!(summary.rows[0].symbol_name.as_deref(), Some("crate::add"));
@@ -4554,7 +4554,7 @@ mod tests {
         );
 
         let summary = store
-            .cross_store_health_summary("repo", "nomic-embed-text")
+            .cross_store_health_summary("repo", "nomic-embed-text-v2-moe")
             .expect("health summary should load");
 
         assert_eq!(summary.repository_id, "repo");
@@ -4602,7 +4602,7 @@ mod tests {
             .expect("facts should persist");
 
         let summary = store
-            .cross_store_health_summary("repo", "nomic-embed-text")
+            .cross_store_health_summary("repo", "nomic-embed-text-v2-moe")
             .expect("health summary should load");
 
         assert!(summary.rows.iter().any(
@@ -4876,7 +4876,7 @@ mod tests {
             parser_version: Some("parser".to_owned()),
             content_hash: Some("content-hash".to_owned()),
             index_run_id: Some("run".to_owned()),
-            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_model: Some("nomic-embed-text-v2-moe".to_owned()),
             embedding_dimension: Some(768),
             indexed_at: Some("123".to_owned()),
         }

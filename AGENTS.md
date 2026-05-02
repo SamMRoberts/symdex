@@ -3,7 +3,7 @@
 ## Mission
 Build symdex: a local-first codebase intelligence system for AI coding agents.
 It indexes repositories semantically and structurally so agents can reason from evidence.
-Primary stack: Rust, tree-sitter, SQLite, Qdrant, Ollama, nomic-embed-text, MCP server, TUI.
+Primary stack: Rust, tree-sitter, SQLite, Qdrant, Ollama, nomic-embed-text-v2-moe, MCP server, TUI.
 Optimize for privacy, correctness, deterministic behavior, and compact agent context.
 
 ## First Reads
@@ -24,7 +24,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
 - Qdrant stores dense vectors plus filterable payload fields.
-- Ollama generates local embeddings with `nomic-embed-text`.
+- Ollama generates local embeddings with `nomic-embed-text-v2-moe`.
 - tree-sitter extracts syntax-aware chunks and symbol boundaries.
 - The system must work offline after dependencies and models are installed.
 - Rust remains the stable baseline and first fully validated language.

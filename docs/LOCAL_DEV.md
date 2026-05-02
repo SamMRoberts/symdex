@@ -7,13 +7,13 @@
 - `cargo-audit` installed for local dependency audits
 - Qdrant running locally
 - Ollama running locally
-- `nomic-embed-text` pulled into Ollama
+- `nomic-embed-text-v2-moe` pulled into Ollama
 
 ## Local setup commands
 
 ```bash
 cargo install cargo-audit --locked
-ollama pull nomic-embed-text
+ollama pull nomic-embed-text-v2-moe
 docker pull qdrant/qdrant
 docker run -p 6333:6333 -p 6334:6334 \
   -v "$(pwd)/qdrant_storage:/qdrant/storage:z" \
@@ -26,7 +26,7 @@ docker run -p 6333:6333 -p 6334:6334 \
 SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
-SYMDEX_EMBED_MODEL=nomic-embed-text
+SYMDEX_EMBED_MODEL=nomic-embed-text-v2-moe
 SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_EMBED_BATCH_SIZE=16
 SYMDEX_EMBED_MAX_CHUNK_BYTES=32768

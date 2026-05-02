@@ -195,7 +195,7 @@ impl App {
             sqlite_path: ".symdex/symdex.sqlite".to_owned(),
             qdrant_url: "http://localhost:6333".to_owned(),
             ollama_url: "http://localhost:11434".to_owned(),
-            embed_model: "nomic-embed-text".to_owned(),
+            embed_model: "nomic-embed-text-v2-moe".to_owned(),
             status,
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
@@ -2278,7 +2278,7 @@ fn storage_summary_from_status(
     let embedding_model = status
         .embedding_model
         .as_deref()
-        .unwrap_or("nomic-embed-text")
+        .unwrap_or("nomic-embed-text-v2-moe")
         .to_owned();
     StorageExplorerSummary {
         repository_id: repository_id.to_owned(),
@@ -2382,7 +2382,7 @@ fn embedding_coverage_summary_from_status(
     let embedding_model = status
         .embedding_model
         .as_deref()
-        .unwrap_or("nomic-embed-text")
+        .unwrap_or("nomic-embed-text-v2-moe")
         .to_owned();
     let vector_backed_chunks = if status.embedding_model.is_some() {
         status.chunks_indexed
@@ -2393,7 +2393,7 @@ fn embedding_coverage_summary_from_status(
     EmbeddingCoverageSummary {
         repository_id: repository_id.to_owned(),
         collection_name: qdrant_collection_name(repository_id, &embedding_model),
-        configured_embedding_model: "nomic-embed-text".to_owned(),
+        configured_embedding_model: "nomic-embed-text-v2-moe".to_owned(),
         embedding_model,
         embedding_dimension: status.embedding_dimension,
         total_chunks: status.chunks_indexed,
@@ -2474,7 +2474,7 @@ fn semantic_neighborhood_summary_from_status(
     let embedding_model = status
         .embedding_model
         .as_deref()
-        .unwrap_or("nomic-embed-text")
+        .unwrap_or("nomic-embed-text-v2-moe")
         .to_owned();
     let rows = if status.embedding_model.is_some() && status.chunks_indexed > 0 {
         vec![SemanticNeighborhoodRow {
@@ -2523,7 +2523,7 @@ fn cross_store_health_summary_from_status(
     let embedding_model = status
         .embedding_model
         .as_deref()
-        .unwrap_or("nomic-embed-text")
+        .unwrap_or("nomic-embed-text-v2-moe")
         .to_owned();
     let mut rows = Vec::new();
     if status.embedding_model.is_none() && status.chunks_indexed > 0 {
@@ -5635,7 +5635,7 @@ mod tests {
             symbols_indexed: 4,
             calls_indexed: 5,
             last_indexed_at: Some("123".to_owned()),
-            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_model: Some("nomic-embed-text-v2-moe".to_owned()),
             embedding_dimension: Some(768),
         };
         let app = App::from_status("/tmp/repo", "repo", status);
@@ -5659,7 +5659,7 @@ mod tests {
         assert!(rendered.contains("ready"));
         assert!(rendered.contains("Operational Focus"));
         assert!(rendered.contains("Mode Snapshot"));
-        assert!(rendered.contains("nomic-embed-text"));
+        assert!(rendered.contains("nomic-embed-text-v2-moe"));
         assert_eq!(cell_fg_for_text(buffer, "ready", None), Some(Color::Green));
     }
 
@@ -7536,7 +7536,7 @@ mod tests {
             symbols_indexed: 4,
             calls_indexed: 5,
             last_indexed_at: Some("123".to_owned()),
-            embedding_model: Some("nomic-embed-text".to_owned()),
+            embedding_model: Some("nomic-embed-text-v2-moe".to_owned()),
             embedding_dimension: Some(768),
         }
     }
@@ -7554,7 +7554,7 @@ mod tests {
             },
             qdrant: QdrantStorageProjection {
                 collection_name: "symdex_repo_nomic_embed_text".to_owned(),
-                embedding_model: "nomic-embed-text".to_owned(),
+                embedding_model: "nomic-embed-text-v2-moe".to_owned(),
                 embedding_dimension: Some(768),
                 embeddable_chunks: 3,
                 vector_backed_chunks: 2,
@@ -7726,8 +7726,8 @@ mod tests {
         EmbeddingCoverageSummary {
             repository_id: "repo".to_owned(),
             collection_name: "symdex_repo_nomic_embed_text".to_owned(),
-            configured_embedding_model: "nomic-embed-text".to_owned(),
-            embedding_model: "nomic-embed-text".to_owned(),
+            configured_embedding_model: "nomic-embed-text-v2-moe".to_owned(),
+            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
             embedding_dimension: Some(768),
             total_chunks: 3,
             embeddable_chunks: 2,
@@ -7763,7 +7763,7 @@ mod tests {
                     started_at: "2026-01-02T00:00:00Z".to_owned(),
                     finished_at: Some("2026-01-02T00:00:04Z".to_owned()),
                     status: "failed".to_owned(),
-                    embedding_model: "nomic-embed-text".to_owned(),
+                    embedding_model: "nomic-embed-text-v2-moe".to_owned(),
                     embedding_dimension: Some(768),
                     files_seen: 5,
                     files_indexed: 2,
@@ -7775,7 +7775,7 @@ mod tests {
                     started_at: "2026-01-01T00:00:00Z".to_owned(),
                     finished_at: Some("2026-01-01T00:00:10Z".to_owned()),
                     status: "success".to_owned(),
-                    embedding_model: "nomic-embed-text".to_owned(),
+                    embedding_model: "nomic-embed-text-v2-moe".to_owned(),
                     embedding_dimension: Some(768),
                     files_seen: 4,
                     files_indexed: 3,
@@ -7819,7 +7819,7 @@ mod tests {
         SemanticNeighborhoodSummary {
             repository_id: "repo".to_owned(),
             collection_name: "symdex_repo_nomic_embed_text".to_owned(),
-            embedding_model: "nomic-embed-text".to_owned(),
+            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
             rows: vec![
                 SemanticNeighborhoodRow {
                     qdrant_point_id: "point-add".to_owned(),
@@ -7872,7 +7872,7 @@ mod tests {
                 StorageHealthRow {
                     status: StorageHealthStatus::Error,
                     label: "model_drift".to_owned(),
-                    detail: "Configured model nomic-embed-text differs from latest indexed model different-model.".to_owned(),
+                    detail: "Configured model nomic-embed-text-v2-moe differs from latest indexed model different-model.".to_owned(),
                 },
                 StorageHealthRow {
                     status: StorageHealthStatus::Error,
@@ -7889,7 +7889,7 @@ mod tests {
             sqlite_path: ".symdex/symdex.sqlite".to_owned(),
             qdrant_url: "http://localhost:6333".to_owned(),
             ollama_url: "http://localhost:11434".to_owned(),
-            embed_model: "nomic-embed-text".to_owned(),
+            embed_model: "nomic-embed-text-v2-moe".to_owned(),
             checks: vec![
                 DiagnosticCheck {
                     label: "sqlite_parent".to_owned(),
