@@ -160,7 +160,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
-  `symdex_debug_context`, and `symdex_index_status`.
+  `symdex_debug_context`, and `symdex_index_status`. Planned next MCP work is a
+  unified `symdex_context_pack` mode followed by a read-only
+  `symdex_staleness_check` wrapper over the existing CLI staleness logic.
 
 `doctor` checks whether Qdrant is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector

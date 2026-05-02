@@ -2,16 +2,17 @@
 
 symdex is a local-first codebase intelligence system for AI coding agents.
 
-It indexes Rust repositories structurally and semantically so agents can reason
-from compact local evidence: paths, line ranges, symbols, calls, scores,
-diagnostics, and context packs. Source text stays local and is not shown by
-default in agent-facing outputs or the TUI.
+It indexes Rust, C#, JavaScript, and TypeScript repositories structurally and
+semantically so agents can reason from compact local evidence: paths, line
+ranges, symbols, calls, scores, diagnostics, freshness, provenance, and context
+packs. Source text stays local and is not shown by default in agent-facing
+outputs or the TUI.
 
-Current implementation status: Rust workspace with tree-sitter Rust indexing,
-deterministic hashing, path normalization, SQLite storage, Qdrant vector
-storage, local Ollama embeddings, structural and semantic CLI queries, continuous
-indexing, a native terminal UI, compact context packs, and a read-only MCP stdio
-server.
+Current implementation status: Rust workspace with tree-sitter indexing for
+Rust, C#, JavaScript, and TypeScript, deterministic hashing, path normalization,
+SQLite storage, Qdrant vector storage, local Ollama embeddings, structural and
+semantic CLI queries, continuous indexing, a native terminal UI, debug context
+packs, compact context packs, and a read-only MCP stdio server.
 
 ## Try it
 
@@ -24,6 +25,7 @@ cargo run -p symdex-cli -- symbol tests/fixtures/rust_basic add
 cargo run -p symdex-cli -- callers tests/fixtures/rust_basic add
 cargo run -p symdex-cli -- impact tests/fixtures/rust_basic add
 cargo run -p symdex-cli -- context-pack tests/fixtures/rust_basic add
+cargo run -p symdex-cli -- staleness tests/fixtures/rust_basic
 cargo run -p symdex-cli -- tui tests/fixtures/rust_basic
 cargo run -p symdex-cli -- serve-mcp
 ```
@@ -95,3 +97,8 @@ MCP tools:
 - `symdex_impact`
 - `symdex_context_pack`
 - `symdex_index_status`
+- `symdex_debug_context`
+
+The next planned MCP additions are a unified context-pack mode and a read-only
+`symdex_staleness_check` tool, followed by `.gitignore` glob correctness and
+broader test/runtime mapping work.

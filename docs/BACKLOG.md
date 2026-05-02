@@ -178,7 +178,115 @@
   incremental indexing, continuous indexing, and MCP evidence for C#,
   JavaScript, and TypeScript.
 
-## Suggested next steps, prioritized
+## Analysis-driven next steps
+
+These items come from `ANALYSIS_REPORT.md`. They are ordered by immediate
+debugging value for coding agents, implementation fit with the current
+architecture, and compatibility with the local-first evidence contract.
+
+### A1 — Unified context pack
+
+- [ ] Add a `unified` mode to `symdex context-pack` and
+  `symdex_context_pack`.
+- [ ] Run structural context-pack retrieval and semantic search in one
+  `symdex-query` orchestration path.
+- [ ] Merge and deduplicate results by chunk, symbol, and file evidence.
+- [ ] Annotate each returned item with evidence source: `structural`,
+  `semantic`, or `both`.
+- [ ] Preserve `symdex.context_pack.v1` compatibility or document a versioned
+  context-pack schema bump before changing output shape.
+- [ ] Add CLI JSON, MCP, and query-layer tests covering structural-only,
+  semantic-only, overlapping, stale, and missing-vector evidence.
+
+### A2 — MCP staleness check
+
+- [ ] Add read-only `symdex_staleness_check` to MCP.
+- [ ] Reuse the existing CLI staleness logic rather than duplicating file hash
+  comparison in `symdex-mcp`.
+- [ ] Accept `repo` plus optional `symbol` or `paths` scope.
+- [ ] Return `fresh`, `stale`, `deleted`, `missing`, or `unknown` per scoped
+  file, including indexed and current hashes for stale files.
+- [ ] Mirror the same evidence envelope, repo-boundary checks, and compact
+  output rules as other MCP tools.
+- [ ] Add MCP contract tests for path validation, symbol scope, explicit paths,
+  and stale/deleted/missing states.
+
+### A3 — `.gitignore` glob and negation correctness
+
+- [ ] Replace simple ignore matching with ordered glob-aware matching.
+- [ ] Support `*`, `**`, `?`, character classes, directory rules, basename
+  rules, nested `.gitignore` scope, and `!` negation.
+- [ ] Preserve built-in excludes and symlink escape rejection.
+- [ ] Keep manual indexing and continuous indexing on the same discovery path.
+- [ ] Add fixture tests for generated-file excludes, negated includes, nested
+  rules, and unchanged incremental-index skips.
+
+### A4 — Multi-language test discovery
+
+- [ ] Extend the existing language-neutral `tests` table write path beyond
+  Rust.
+- [ ] Discover C# NUnit, xUnit, and MSTest tests conservatively from
+  tree-sitter syntax.
+- [ ] Discover JavaScript and TypeScript Jest, Vitest, and Mocha
+  `test`/`it`/`describe` shapes conservatively.
+- [ ] Link discovered tests to symbols when syntax evidence is clear; otherwise
+  preserve metadata without overclaiming call coverage.
+- [ ] Surface non-Rust `tests_likely` in impact and debug-context outputs only
+  when indexed test facts and call evidence justify it.
+- [ ] Add fixture-backed tests for each framework family.
+
+### A5 — C# and Node stack trace parsing
+
+- [ ] Extend debug-context runtime parsing for C# frames shaped like
+  `at Namespace.Type.Method(...) in path.cs:line N`.
+- [ ] Extend runtime parsing for Node/V8 frames shaped like
+  `at name (path.js:line:column)` and async TS/JS variants.
+- [ ] Preserve unmapped frames with explicit status.
+- [ ] Join parsed frames through the existing file, symbol, call, freshness,
+  trust, and provenance pipeline.
+- [ ] Add parser tests for mapped frames, unmapped frames, relative paths,
+  absolute paths inside the repo, and malformed lines.
+
+### A6 — Write-capable reindex design
+
+- [ ] Write a design doc before implementing any write-capable MCP tool.
+- [ ] Define `symdex_request_reindex` as a scoped repo-root operation with
+  optional paths and explicit `semantic: true` opt-in.
+- [ ] Keep offline structural reindexing as the default behavior.
+- [ ] Return index run IDs so later evidence can be correlated to the reindex.
+- [ ] Define trust, authorization, confirmation, concurrency, and failure
+  behavior before code changes.
+
+### A7 — Pre-edit change explanation design
+
+- [ ] Write a design doc for `symdex_explain_change` before implementation.
+- [ ] Accept proposed change targets as `{ path, start_line, end_line,
+  description }`.
+- [ ] Map line ranges to intersecting symbols, run impact analysis for those
+  symbols, deduplicate the evidence, and return a compact safety report.
+- [ ] Include likely tests, direct and transitive relationships, freshness,
+  trust, and reason tags.
+- [ ] Keep the tool read-only and metadata-only.
+
+### A8 — Semantic neighborhood MCP tool
+
+- [ ] Add `symdex_semantic_neighborhood` after unified context-pack work
+  clarifies shared query primitives.
+- [ ] Accept `repo` plus `chunk_id` or `symbol`, then query Qdrant for nearest
+  vector neighbors.
+- [ ] Return path, line range, symbol, chunk kind, score, freshness, trust, and
+  provenance without source text.
+
+### A9 — Operational and multi-repo polish
+
+- [ ] Add structured logging and local metrics for continuous indexing,
+  indexing runs, and MCP calls.
+- [ ] Add a per-repo config file model while keeping environment variables as
+  overrides.
+- [ ] Plan cross-repo context as an explicit opt-in future architecture, never
+  as an implicit search default.
+
+## Existing hardening backlog
 
 ### P0 — Production hardening foundation
 

@@ -310,6 +310,11 @@ The context pack is intentionally compact and does not return source text. It is
 currently structural only; semantic hits can be combined by calling
 `symdex_search` separately.
 
+Planned next step: add a `mode: "unified"` option that combines structural
+context-pack evidence with semantic search evidence in one call. Unified rows
+should identify whether they came from `structural`, `semantic`, or `both`
+evidence paths while preserving compact metadata-only output.
+
 ### `symdex_debug_context`
 
 Build a compact debugging evidence pack from runtime failure input.
@@ -376,6 +381,10 @@ evidence, maps failing test names to indexed Rust tests when available, keeps
 unmatched runtime test names as fallbacks, adds freshness, trust, and
 provenance, and returns source-free metadata only.
 
+Planned parser expansion: keep the Rust parser behavior and add conservative C#
+and Node/V8 stack frame patterns. Unmapped frames must remain visible with an
+explicit status instead of being dropped.
+
 ### `symdex_index_status`
 
 Return local SQLite index counts.
@@ -410,3 +419,84 @@ Do not add mutation tools until a dedicated design doc exists. Candidate future 
 - request reindex
 - clear index
 - persist context pack
+
+## Planned MCP tools
+
+These tools are not implemented yet. They are documented here so future work
+keeps the same local-only, compact, metadata-first contract.
+
+### `symdex_staleness_check`
+
+Read-only tool for explicit index freshness checks.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "optional::symbol",
+  "paths": ["optional/path.rs"]
+}
+```
+
+Rules:
+
+- Accept either `symbol`, `paths`, both when they are compatible, or neither for
+  a repository-wide report.
+- Reuse the same staleness logic as `symdex staleness`.
+- Enforce repository root boundaries and fail closed on ambiguous paths.
+- Return freshness states `fresh`, `stale`, `deleted`, `missing`, or `unknown`.
+- Include indexed and current hashes for stale files.
+- Do not return source text.
+
+### `symdex_semantic_neighborhood`
+
+Read-only tool for finding vector-nearest chunks to an indexed chunk or symbol.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "symbol": "optional::symbol",
+  "chunk_id": "optional-chunk-id",
+  "limit": 8
+}
+```
+
+Rules:
+
+- Require exactly one of `symbol` or `chunk_id`.
+- Look up the existing vector point and query local Qdrant for nearest
+  neighbors.
+- Return path, line range, symbol, chunk kind, score, freshness, trust, reason
+  tags, and provenance.
+- Do not embed source text into the response or return vectors.
+
+### `symdex_request_reindex`
+
+Potential future write-capable tool. Do not implement until a design doc is
+approved.
+
+Required design decisions before code:
+
+- caller trust and confirmation model
+- repo and path scoping
+- offline structural default behavior
+- explicit `semantic: true` opt-in for Qdrant/Ollama work
+- concurrency with manual and continuous indexing
+- index run ID reporting and failure semantics
+
+### `symdex_explain_change`
+
+Potential future read-only pre-edit safety tool. Do not implement until a design
+doc is approved.
+
+Expected shape:
+
+- Input is a repo plus proposed change targets containing path, line range, and
+  short description.
+- The tool maps changed ranges to indexed symbols, runs impact analysis,
+  deduplicates evidence, and returns likely affected symbols, files, tests, and
+  call paths.
+- Output stays metadata-only with freshness, trust, reason tags, and provenance.

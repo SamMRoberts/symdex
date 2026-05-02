@@ -9,6 +9,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 ## First Reads
 - Read this file before changing code, docs, tests, or configuration.
 - Read `docs/README.md` next; it maps tasks to the right deeper docs.
+- For planning new implementation work, read `docs/ANALYSIS_REPORT.md` and
+  `docs/BACKLOG.md` before choosing the next slice.
 - Do not load every doc by default. Load only what is relevant.
 - If behavior changes, update the relevant doc in the same change.
 - If requirements conflict, prioritize privacy, correctness, tests, simplicity, then performance.
@@ -51,6 +53,11 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 
 ## Development Workflow
 - Identify the relevant doc section before implementing.
+- When work comes from the analysis report, preserve the recommended order
+  unless the user explicitly asks for a different slice:
+  unified context pack, MCP staleness check, `.gitignore` glob correctness,
+  multi-language test discovery, C#/Node stack parsing, then design docs for
+  write-capable reindexing and pre-edit change explanation.
 - Keep changes small and tied to one objective.
 - Prefer test-first changes when behavior changes.
 - Implement the smallest useful path.
