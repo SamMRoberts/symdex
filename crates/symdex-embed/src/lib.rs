@@ -6,6 +6,24 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+pub const DEFAULT_FAST_EMBED_MODEL: &str = "nomic-embed-text";
+pub const DEFAULT_QUALITY_EMBED_MODEL: &str = "nomic-embed-text-v2-moe";
+pub const DEFAULT_EMBED_TRUNCATE: bool = true;
+pub const DEFAULT_EMBED_BATCH_SIZE: usize = 16;
+pub const DEFAULT_QUALITY_EMBED_BATCH_SIZE: usize = 16;
+pub const DEFAULT_QUALITY_EMBED_WORKERS: usize = 1;
+pub const DEFAULT_EMBED_MAX_CHUNK_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbedConfigValues<'a> {
+    pub ollama_url: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub truncate: Option<&'a str>,
+    pub batch_size: Option<&'a str>,
+    pub max_chunk_bytes: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbedConfig {
     pub ollama_url: String,
@@ -17,26 +35,157 @@ pub struct EmbedConfig {
 
 impl EmbedConfig {
     pub fn from_env() -> Self {
+        let ollama_url = env_value("SYMDEX_OLLAMA_URL", "symdex_OLLAMA_URL");
+        let model = env_value("SYMDEX_EMBED_MODEL", "symdex_EMBED_MODEL");
+        let truncate = env_value("SYMDEX_EMBED_TRUNCATE", "symdex_EMBED_TRUNCATE");
+        let batch_size = env_value("SYMDEX_EMBED_BATCH_SIZE", "symdex_EMBED_BATCH_SIZE");
+        let max_chunk_bytes = env_value(
+            "SYMDEX_EMBED_MAX_CHUNK_BYTES",
+            "symdex_EMBED_MAX_CHUNK_BYTES",
+        );
+
+        Self::from_values(EmbedConfigValues {
+            ollama_url: ollama_url.as_deref(),
+            model: model.as_deref(),
+            truncate: truncate.as_deref(),
+            batch_size: batch_size.as_deref(),
+            max_chunk_bytes: max_chunk_bytes.as_deref(),
+        })
+    }
+
+    pub fn from_values(values: EmbedConfigValues<'_>) -> Self {
         Self {
-            ollama_url: env_value("SYMDEX_OLLAMA_URL", "symdex_OLLAMA_URL")
-                .unwrap_or_else(|| "http://localhost:11434".to_owned()),
-            model: env_value("SYMDEX_EMBED_MODEL", "symdex_EMBED_MODEL")
-                .unwrap_or_else(|| "nomic-embed-text".to_owned()),
-            truncate: env_value("SYMDEX_EMBED_TRUNCATE", "symdex_EMBED_TRUNCATE")
-                .as_deref()
+            ollama_url: values.ollama_url.unwrap_or(DEFAULT_OLLAMA_URL).to_owned(),
+            model: values.model.unwrap_or(DEFAULT_FAST_EMBED_MODEL).to_owned(),
+            truncate: values
+                .truncate
                 .map(env_bool)
-                .unwrap_or(true),
-            batch_size: env_value("SYMDEX_EMBED_BATCH_SIZE", "symdex_EMBED_BATCH_SIZE")
-                .as_deref()
+                .unwrap_or(DEFAULT_EMBED_TRUNCATE),
+            batch_size: values
+                .batch_size
                 .and_then(env_usize)
-                .unwrap_or(16),
-            max_chunk_bytes: env_value(
-                "SYMDEX_EMBED_MAX_CHUNK_BYTES",
-                "symdex_EMBED_MAX_CHUNK_BYTES",
-            )
-            .as_deref()
-            .and_then(env_usize)
-            .unwrap_or(32 * 1024),
+                .unwrap_or(DEFAULT_EMBED_BATCH_SIZE),
+            max_chunk_bytes: values
+                .max_chunk_bytes
+                .and_then(env_usize)
+                .unwrap_or(DEFAULT_EMBED_MAX_CHUNK_BYTES),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayeredEmbedConfig {
+    pub ollama_url: String,
+    pub fast_model: String,
+    pub quality_model: String,
+    pub quality_enabled: bool,
+    pub truncate: bool,
+    pub batch_size: usize,
+    pub quality_batch_size: usize,
+    pub quality_workers: usize,
+    pub max_chunk_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayeredEmbedConfigValues<'a> {
+    pub ollama_url: Option<&'a str>,
+    pub legacy_model: Option<&'a str>,
+    pub fast_model: Option<&'a str>,
+    pub quality_model: Option<&'a str>,
+    pub quality_enabled: Option<&'a str>,
+    pub truncate: Option<&'a str>,
+    pub batch_size: Option<&'a str>,
+    pub quality_batch_size: Option<&'a str>,
+    pub quality_workers: Option<&'a str>,
+    pub max_chunk_bytes: Option<&'a str>,
+}
+
+impl LayeredEmbedConfig {
+    pub fn from_env() -> Self {
+        let ollama_url = env_value("SYMDEX_OLLAMA_URL", "symdex_OLLAMA_URL");
+        let legacy_model = env_value("SYMDEX_EMBED_MODEL", "symdex_EMBED_MODEL");
+        let fast_model = env_value("SYMDEX_FAST_EMBED_MODEL", "symdex_FAST_EMBED_MODEL");
+        let quality_model = env_value("SYMDEX_QUALITY_EMBED_MODEL", "symdex_QUALITY_EMBED_MODEL");
+        let quality_enabled = env_value("SYMDEX_QUALITY_INDEX", "symdex_QUALITY_INDEX");
+        let truncate = env_value("SYMDEX_EMBED_TRUNCATE", "symdex_EMBED_TRUNCATE");
+        let batch_size = env_value("SYMDEX_EMBED_BATCH_SIZE", "symdex_EMBED_BATCH_SIZE");
+        let quality_batch_size =
+            env_value("SYMDEX_QUALITY_BATCH_SIZE", "symdex_QUALITY_BATCH_SIZE");
+        let quality_workers = env_value("SYMDEX_QUALITY_WORKERS", "symdex_QUALITY_WORKERS");
+        let max_chunk_bytes = env_value(
+            "SYMDEX_EMBED_MAX_CHUNK_BYTES",
+            "symdex_EMBED_MAX_CHUNK_BYTES",
+        );
+
+        Self::from_values(LayeredEmbedConfigValues {
+            ollama_url: ollama_url.as_deref(),
+            legacy_model: legacy_model.as_deref(),
+            fast_model: fast_model.as_deref(),
+            quality_model: quality_model.as_deref(),
+            quality_enabled: quality_enabled.as_deref(),
+            truncate: truncate.as_deref(),
+            batch_size: batch_size.as_deref(),
+            quality_batch_size: quality_batch_size.as_deref(),
+            quality_workers: quality_workers.as_deref(),
+            max_chunk_bytes: max_chunk_bytes.as_deref(),
+        })
+    }
+
+    pub fn from_values(values: LayeredEmbedConfigValues<'_>) -> Self {
+        let fast_model = values
+            .fast_model
+            .or(values.legacy_model)
+            .unwrap_or(DEFAULT_FAST_EMBED_MODEL)
+            .to_owned();
+
+        Self {
+            ollama_url: values.ollama_url.unwrap_or(DEFAULT_OLLAMA_URL).to_owned(),
+            fast_model,
+            quality_model: values
+                .quality_model
+                .unwrap_or(DEFAULT_QUALITY_EMBED_MODEL)
+                .to_owned(),
+            quality_enabled: values.quality_enabled.map(env_bool).unwrap_or(true),
+            truncate: values
+                .truncate
+                .map(env_bool)
+                .unwrap_or(DEFAULT_EMBED_TRUNCATE),
+            batch_size: values
+                .batch_size
+                .and_then(env_usize)
+                .unwrap_or(DEFAULT_EMBED_BATCH_SIZE),
+            quality_batch_size: values
+                .quality_batch_size
+                .and_then(env_usize)
+                .unwrap_or(DEFAULT_QUALITY_EMBED_BATCH_SIZE),
+            quality_workers: values
+                .quality_workers
+                .and_then(env_usize)
+                .unwrap_or(DEFAULT_QUALITY_EMBED_WORKERS),
+            max_chunk_bytes: values
+                .max_chunk_bytes
+                .and_then(env_usize)
+                .unwrap_or(DEFAULT_EMBED_MAX_CHUNK_BYTES),
+        }
+    }
+
+    pub fn fast_embed_config(&self) -> EmbedConfig {
+        EmbedConfig {
+            ollama_url: self.ollama_url.clone(),
+            model: self.fast_model.clone(),
+            truncate: self.truncate,
+            batch_size: self.batch_size,
+            max_chunk_bytes: self.max_chunk_bytes,
+        }
+    }
+
+    pub fn quality_embed_config(&self) -> EmbedConfig {
+        EmbedConfig {
+            ollama_url: self.ollama_url.clone(),
+            model: self.quality_model.clone(),
+            truncate: self.truncate,
+            batch_size: self.quality_batch_size,
+            max_chunk_bytes: self.max_chunk_bytes,
         }
     }
 }
@@ -294,10 +443,146 @@ fn env_usize(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        EmbedConfig, EmbedRequest, EmbedResponse, ModelInfo, OllamaClient,
-        embedding_batch_from_parts, embedding_batch_from_response, env_bool, env_usize,
-        model_available_in,
+        DEFAULT_EMBED_BATCH_SIZE, DEFAULT_EMBED_MAX_CHUNK_BYTES, DEFAULT_EMBED_TRUNCATE,
+        DEFAULT_FAST_EMBED_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_QUALITY_EMBED_BATCH_SIZE,
+        DEFAULT_QUALITY_EMBED_MODEL, DEFAULT_QUALITY_EMBED_WORKERS, EmbedConfig, EmbedConfigValues,
+        EmbedRequest, EmbedResponse, LayeredEmbedConfig, LayeredEmbedConfigValues, ModelInfo,
+        OllamaClient, embedding_batch_from_parts, embedding_batch_from_response, env_bool,
+        env_usize, model_available_in,
     };
+
+    #[test]
+    fn embed_config_from_values_uses_existing_defaults() {
+        let config = EmbedConfig::from_values(EmbedConfigValues::default());
+
+        assert_eq!(config.ollama_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(config.model, DEFAULT_FAST_EMBED_MODEL);
+        assert_eq!(config.truncate, DEFAULT_EMBED_TRUNCATE);
+        assert_eq!(config.batch_size, DEFAULT_EMBED_BATCH_SIZE);
+        assert_eq!(config.max_chunk_bytes, DEFAULT_EMBED_MAX_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn embed_config_from_values_accepts_existing_overrides() {
+        let config = EmbedConfig::from_values(EmbedConfigValues {
+            ollama_url: Some("http://127.0.0.1:11434"),
+            model: Some("custom-fast"),
+            truncate: Some("false"),
+            batch_size: Some("4"),
+            max_chunk_bytes: Some("1024"),
+        });
+
+        assert_eq!(config.ollama_url, "http://127.0.0.1:11434");
+        assert_eq!(config.model, "custom-fast");
+        assert!(!config.truncate);
+        assert_eq!(config.batch_size, 4);
+        assert_eq!(config.max_chunk_bytes, 1024);
+    }
+
+    #[test]
+    fn layered_embed_config_uses_layer_defaults() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues::default());
+
+        assert_eq!(config.ollama_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(config.fast_model, DEFAULT_FAST_EMBED_MODEL);
+        assert_eq!(config.quality_model, DEFAULT_QUALITY_EMBED_MODEL);
+        assert!(config.quality_enabled);
+        assert_eq!(config.truncate, DEFAULT_EMBED_TRUNCATE);
+        assert_eq!(config.batch_size, DEFAULT_EMBED_BATCH_SIZE);
+        assert_eq!(config.quality_batch_size, DEFAULT_QUALITY_EMBED_BATCH_SIZE);
+        assert_eq!(config.quality_workers, DEFAULT_QUALITY_EMBED_WORKERS);
+        assert_eq!(config.max_chunk_bytes, DEFAULT_EMBED_MAX_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn layered_embed_config_prefers_fast_model_over_legacy_model() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            legacy_model: Some("legacy-fast"),
+            fast_model: Some("layer-fast"),
+            ..LayeredEmbedConfigValues::default()
+        });
+
+        assert_eq!(config.fast_model, "layer-fast");
+        assert_eq!(config.quality_model, DEFAULT_QUALITY_EMBED_MODEL);
+    }
+
+    #[test]
+    fn layered_embed_config_uses_legacy_model_only_for_fast_fallback() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            legacy_model: Some("legacy-fast"),
+            ..LayeredEmbedConfigValues::default()
+        });
+
+        assert_eq!(config.fast_model, "legacy-fast");
+        assert_eq!(config.quality_model, DEFAULT_QUALITY_EMBED_MODEL);
+    }
+
+    #[test]
+    fn layered_embed_config_accepts_quality_model_override() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            legacy_model: Some("legacy-fast"),
+            quality_model: Some("quality-custom"),
+            ..LayeredEmbedConfigValues::default()
+        });
+
+        assert_eq!(config.fast_model, "legacy-fast");
+        assert_eq!(config.quality_model, "quality-custom");
+    }
+
+    #[test]
+    fn layered_embed_config_parses_quality_controls() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            quality_enabled: Some("0"),
+            quality_batch_size: Some("8"),
+            quality_workers: Some("2"),
+            ..LayeredEmbedConfigValues::default()
+        });
+
+        assert!(!config.quality_enabled);
+        assert_eq!(config.quality_batch_size, 8);
+        assert_eq!(config.quality_workers, 2);
+    }
+
+    #[test]
+    fn layered_embed_config_falls_back_for_invalid_quality_numeric_values() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            quality_batch_size: Some("0"),
+            quality_workers: Some("nope"),
+            ..LayeredEmbedConfigValues::default()
+        });
+
+        assert_eq!(config.quality_batch_size, DEFAULT_QUALITY_EMBED_BATCH_SIZE);
+        assert_eq!(config.quality_workers, DEFAULT_QUALITY_EMBED_WORKERS);
+    }
+
+    #[test]
+    fn layered_embed_config_derives_fast_and_quality_embed_configs() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            ollama_url: Some("http://127.0.0.1:11434"),
+            fast_model: Some("layer-fast"),
+            quality_model: Some("layer-quality"),
+            truncate: Some("false"),
+            batch_size: Some("12"),
+            quality_batch_size: Some("6"),
+            max_chunk_bytes: Some("4096"),
+            ..LayeredEmbedConfigValues::default()
+        });
+
+        let fast = config.fast_embed_config();
+        let quality = config.quality_embed_config();
+
+        assert_eq!(fast.ollama_url, "http://127.0.0.1:11434");
+        assert_eq!(fast.model, "layer-fast");
+        assert!(!fast.truncate);
+        assert_eq!(fast.batch_size, 12);
+        assert_eq!(fast.max_chunk_bytes, 4096);
+
+        assert_eq!(quality.ollama_url, "http://127.0.0.1:11434");
+        assert_eq!(quality.model, "layer-quality");
+        assert!(!quality.truncate);
+        assert_eq!(quality.batch_size, 6);
+        assert_eq!(quality.max_chunk_bytes, 4096);
+    }
 
     #[test]
     fn model_available_matches_plain_and_latest_names() {

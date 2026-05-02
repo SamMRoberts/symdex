@@ -400,8 +400,12 @@ SYMDEX_QUALITY_WORKERS=1
 ```
 
 Keep existing `SYMDEX_EMBED_MODEL` behavior as a compatibility path until the
-layer-specific configuration is implemented. Avoid breaking existing single-
-model workflows in the first migration.
+layered runtime paths are fully implemented. The compatibility variable remains
+the current single-model setting and the fallback for the fast model when
+`SYMDEX_FAST_EMBED_MODEL` is unset. The quality model is configured separately
+through `SYMDEX_QUALITY_EMBED_MODEL` and defaults to
+`nomic-embed-text-v2-moe`. Avoid breaking existing single-model workflows during
+the migration.
 
 ## CLI and TUI surface
 
@@ -424,7 +428,7 @@ The TUI should show:
 - active layer: fast or quality
 - fast model/dimension/collection
 - quality model/dimension/collection
-- quality status: pending, current, stale, blocked, failed
+- quality status: pending, ready/current, stale, blocked, failed
 - quality job counts by status
 - latest quality error summary
 - fallback-to-fast indicator when quality is not active

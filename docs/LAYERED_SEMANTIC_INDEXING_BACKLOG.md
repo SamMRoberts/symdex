@@ -16,14 +16,15 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q2 — Domain and configuration foundation
 
-- [ ] Add semantic layer domain types: `fast`, `quality`, and active-layer mode.
-- [ ] Add semantic generation status values for missing, pending, ready, stale,
-  blocked, and failed states.
-- [ ] Add layer-specific model configuration with defaults:
+- [x] Add semantic layer domain types: `fast`, `quality`, and active-layer mode.
+- [x] Add semantic generation status values for `missing`, `fast_ready`,
+  `quality_pending`, `quality_ready`, `quality_stale`, `quality_blocked`, and
+  `quality_failed` states.
+- [x] Add layer-specific model configuration with defaults:
   - fast: `nomic-embed-text`
   - quality: `nomic-embed-text-v2-moe`
-- [ ] Preserve current `SYMDEX_EMBED_MODEL` behavior for compatibility.
-- [ ] Add tests for config defaults, env overrides, and status transitions.
+- [x] Preserve current `SYMDEX_EMBED_MODEL` behavior for compatibility.
+- [x] Add tests for config defaults, env overrides, and status transitions.
 
 ## Phase Q3 — SQLite storage model
 

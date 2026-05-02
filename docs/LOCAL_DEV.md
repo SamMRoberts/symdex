@@ -27,6 +27,11 @@ SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
+SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
+SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
+SYMDEX_QUALITY_INDEX=1
+SYMDEX_QUALITY_BATCH_SIZE=16
+SYMDEX_QUALITY_WORKERS=1
 SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_EMBED_BATCH_SIZE=16
 SYMDEX_EMBED_MAX_CHUNK_BYTES=32768
@@ -48,6 +53,16 @@ model context window.
 `SYMDEX_EMBED_BATCH_SIZE` defaults to `16`. Symdex splits semantic indexing
 requests into batches before calling Ollama `/api/embed`, which avoids oversized
 request payloads while preserving result order.
+
+Layered semantic indexing helpers also recognize `SYMDEX_FAST_EMBED_MODEL`,
+`SYMDEX_QUALITY_EMBED_MODEL`, `SYMDEX_QUALITY_INDEX`,
+`SYMDEX_QUALITY_BATCH_SIZE`, and `SYMDEX_QUALITY_WORKERS`. The fast model
+defaults to `nomic-embed-text`; the quality model defaults to
+`nomic-embed-text-v2-moe`. `SYMDEX_EMBED_MODEL` remains the compatibility
+setting for the current single-model path and is used as the fast-model fallback
+when `SYMDEX_FAST_EMBED_MODEL` is unset. Quality indexing configuration does not
+start background quality work until the later layered-indexing worker and
+routing slices are implemented.
 
 `SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
 persisted as metadata-only structural evidence with

@@ -1,4 +1,108 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticLayer {
+    Fast,
+    Quality,
+}
+
+impl SemanticLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Quality => "quality",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticLayerMode {
+    Auto,
+    Fast,
+    Quality,
+}
+
+impl SemanticLayerMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+            Self::Quality => "quality",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticLayerStatus {
+    Missing,
+    FastReady,
+    QualityPending,
+    QualityReady,
+    QualityStale,
+    QualityBlocked,
+    QualityFailed,
+}
+
+impl SemanticLayerStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::FastReady => "fast_ready",
+            Self::QualityPending => "quality_pending",
+            Self::QualityReady => "quality_ready",
+            Self::QualityStale => "quality_stale",
+            Self::QualityBlocked => "quality_blocked",
+            Self::QualityFailed => "quality_failed",
+        }
+    }
+
+    pub fn default_search_layer(self) -> Option<SemanticLayer> {
+        match self {
+            Self::Missing => None,
+            Self::QualityReady => Some(SemanticLayer::Quality),
+            Self::FastReady
+            | Self::QualityPending
+            | Self::QualityStale
+            | Self::QualityBlocked
+            | Self::QualityFailed => Some(SemanticLayer::Fast),
+        }
+    }
+
+    pub fn quality_is_current(self) -> bool {
+        self == Self::QualityReady
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+
+        matches!(
+            (self, next),
+            (Self::Missing, Self::FastReady)
+                | (
+                    Self::FastReady,
+                    Self::QualityPending | Self::QualityBlocked | Self::QualityFailed,
+                )
+                | (
+                    Self::QualityPending,
+                    Self::QualityReady
+                        | Self::QualityStale
+                        | Self::QualityBlocked
+                        | Self::QualityFailed,
+                )
+                | (Self::QualityReady, Self::QualityStale)
+                | (
+                    Self::QualityStale,
+                    Self::QualityPending | Self::QualityBlocked | Self::QualityFailed,
+                )
+                | (
+                    Self::QualityBlocked | Self::QualityFailed,
+                    Self::QualityPending
+                )
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     CSharp,
     JavaScript,
@@ -194,3 +298,127 @@ pub struct SourceFileIndex {
 }
 
 pub type RustFileIndex = SourceFileIndex;
+
+#[cfg(test)]
+mod tests {
+    use crate::{SemanticLayer, SemanticLayerMode, SemanticLayerStatus};
+
+    #[test]
+    fn semantic_layer_names_match_storage_vocabulary() {
+        assert_eq!(SemanticLayer::Fast.as_str(), "fast");
+        assert_eq!(SemanticLayer::Quality.as_str(), "quality");
+    }
+
+    #[test]
+    fn semantic_layer_mode_names_match_cli_vocabulary() {
+        assert_eq!(SemanticLayerMode::Auto.as_str(), "auto");
+        assert_eq!(SemanticLayerMode::Fast.as_str(), "fast");
+        assert_eq!(SemanticLayerMode::Quality.as_str(), "quality");
+    }
+
+    #[test]
+    fn semantic_layer_status_names_match_design_lifecycle() {
+        assert_eq!(SemanticLayerStatus::Missing.as_str(), "missing");
+        assert_eq!(SemanticLayerStatus::FastReady.as_str(), "fast_ready");
+        assert_eq!(
+            SemanticLayerStatus::QualityPending.as_str(),
+            "quality_pending"
+        );
+        assert_eq!(SemanticLayerStatus::QualityReady.as_str(), "quality_ready");
+        assert_eq!(SemanticLayerStatus::QualityStale.as_str(), "quality_stale");
+        assert_eq!(
+            SemanticLayerStatus::QualityBlocked.as_str(),
+            "quality_blocked"
+        );
+        assert_eq!(
+            SemanticLayerStatus::QualityFailed.as_str(),
+            "quality_failed"
+        );
+    }
+
+    #[test]
+    fn semantic_layer_status_maps_to_default_search_layer() {
+        assert_eq!(SemanticLayerStatus::Missing.default_search_layer(), None);
+        assert_eq!(
+            SemanticLayerStatus::QualityReady.default_search_layer(),
+            Some(SemanticLayer::Quality)
+        );
+
+        for status in [
+            SemanticLayerStatus::FastReady,
+            SemanticLayerStatus::QualityPending,
+            SemanticLayerStatus::QualityStale,
+            SemanticLayerStatus::QualityBlocked,
+            SemanticLayerStatus::QualityFailed,
+        ] {
+            assert_eq!(status.default_search_layer(), Some(SemanticLayer::Fast));
+        }
+    }
+
+    #[test]
+    fn semantic_layer_status_reports_current_quality_only_when_ready() {
+        assert!(SemanticLayerStatus::QualityReady.quality_is_current());
+
+        for status in [
+            SemanticLayerStatus::Missing,
+            SemanticLayerStatus::FastReady,
+            SemanticLayerStatus::QualityPending,
+            SemanticLayerStatus::QualityStale,
+            SemanticLayerStatus::QualityBlocked,
+            SemanticLayerStatus::QualityFailed,
+        ] {
+            assert!(!status.quality_is_current());
+        }
+    }
+
+    #[test]
+    fn semantic_layer_status_allows_documented_lifecycle_transitions() {
+        let lifecycle = [
+            SemanticLayerStatus::Missing,
+            SemanticLayerStatus::FastReady,
+            SemanticLayerStatus::QualityPending,
+            SemanticLayerStatus::QualityReady,
+            SemanticLayerStatus::QualityStale,
+            SemanticLayerStatus::QualityPending,
+            SemanticLayerStatus::QualityReady,
+        ];
+
+        for pair in lifecycle.windows(2) {
+            assert!(pair[0].can_transition_to(pair[1]));
+        }
+    }
+
+    #[test]
+    fn semantic_layer_status_allows_quality_failure_retry_transitions() {
+        assert!(
+            SemanticLayerStatus::FastReady.can_transition_to(SemanticLayerStatus::QualityBlocked)
+        );
+        assert!(
+            SemanticLayerStatus::FastReady.can_transition_to(SemanticLayerStatus::QualityFailed)
+        );
+        assert!(
+            SemanticLayerStatus::QualityPending
+                .can_transition_to(SemanticLayerStatus::QualityBlocked)
+        );
+        assert!(
+            SemanticLayerStatus::QualityPending
+                .can_transition_to(SemanticLayerStatus::QualityFailed)
+        );
+        assert!(
+            SemanticLayerStatus::QualityBlocked
+                .can_transition_to(SemanticLayerStatus::QualityPending)
+        );
+        assert!(
+            SemanticLayerStatus::QualityFailed
+                .can_transition_to(SemanticLayerStatus::QualityPending)
+        );
+    }
+
+    #[test]
+    fn semantic_layer_status_rejects_skipping_fast_readiness() {
+        assert!(!SemanticLayerStatus::Missing.can_transition_to(SemanticLayerStatus::QualityReady));
+        assert!(
+            !SemanticLayerStatus::QualityStale.can_transition_to(SemanticLayerStatus::QualityReady)
+        );
+    }
+}

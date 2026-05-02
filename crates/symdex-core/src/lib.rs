@@ -15,7 +15,8 @@ pub use error::{CoreError, Result};
 pub use hash::{content_hash, stable_id};
 pub use model::{
     ByteRange, CallEdge, ChunkKind, CodeChunk, DiscoveredTest, FileFacts, Language, LineRange,
-    ParseDiagnostic, ResolutionStatus, RustFileIndex, SourceFileIndex, Symbol, SymbolKind,
+    ParseDiagnostic, ResolutionStatus, RustFileIndex, SemanticLayer, SemanticLayerMode,
+    SemanticLayerStatus, SourceFileIndex, Symbol, SymbolKind,
 };
 pub use parser::{extract_chunks, extract_rust_chunks, index_rust_file, index_source_file};
 pub use path::{NormalizedRepoPath, RepoRoot};
