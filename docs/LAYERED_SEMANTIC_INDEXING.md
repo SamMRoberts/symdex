@@ -301,8 +301,9 @@ retry can re-check readiness and enqueue jobs for the latest fast generation.
 
 The existing `chunks.qdrant_point_id`, `chunks.embedding_model`,
 `chunks.embedding_dimension`, and `chunks.embedded_at` fields are sufficient for
-one semantic layer but not for two. Layered indexing should move toward a
-separate embedding manifest table.
+one semantic layer but not for two. They remain nullable compatibility columns
+for existing local databases, but new semantic behavior uses a separate
+embedding manifest table as the authoritative vector projection.
 
 Recommended table:
 
@@ -436,10 +437,11 @@ symdex qdrant-verify <repo> --semantic-layer all
 ```
 
 Expected manifests come from current `chunk_embeddings` rows for the selected
-latest-generation layer. Fast verification keeps the old `chunks.qdrant_point_id`
-path as a migration compatibility fallback when no layered fast manifest is
-available. Quality verification does not use the legacy fast fields, so missing
-or stale quality points are isolated from fast-layer health.
+latest-generation layer. Fast verification requires layered fast manifest
+metadata; older single-model databases that have only legacy chunk vector fields
+must run `symdex index <repo>` to create `chunk_embeddings` before verification.
+Quality verification also uses only layered manifests, so missing or stale
+quality points are isolated from fast-layer health.
 
 Repair rebuilds missing or stale points through existing indexing paths for the
 selected layer instead of writing ad-hoc Qdrant payloads. Fast repair runs the

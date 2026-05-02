@@ -263,7 +263,7 @@ represent the indexed repository.
 - Compare SQLite chunks against Qdrant-backed semantic coverage:
   - total chunks
   - chunks excluded from embedding
-  - chunks with `qdrant_point_id`
+  - chunks with current fast `chunk_embeddings` rows
   - chunks missing vector metadata
   - latest model and dimension
   - Qdrant collection name

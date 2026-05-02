@@ -145,9 +145,10 @@ with `run_kind = watch` in index-run metadata.
 
 The SQLite schema also includes additive layered semantic tables for
 `semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
-After a successful fast Qdrant upsert, semantic indexing still writes legacy
-chunk embedding provenance for compatibility, then records a deterministic fast
-semantic generation and current fast `chunk_embeddings` manifest in SQLite.
+After a successful fast Qdrant upsert, semantic indexing records a deterministic
+fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
+The older chunk-level vector columns remain nullable compatibility schema, but
+new indexing does not use them as the authoritative fast manifest.
 When quality indexing is enabled and the quality model is locally available,
 semantic indexing then marks superseded pending/running quality jobs stale and
 queues metadata-only `quality_embedding_jobs` rows for the latest fast
@@ -177,16 +178,17 @@ Payloads include repository, file, chunk, symbol, path, language, line range,
 chunk kind, and text hash metadata. Payloads intentionally do not include source
 text.
 
-Semantic indexing captures existing Qdrant point IDs from SQLite before changed
-file facts are replaced or deleted-file rows are removed. When the target
-collection exists, stale points for changed and deleted chunks are deleted from
-Qdrant before SQLite mutation so vector cleanup does not lose the old point IDs.
-If stale point deletion fails, semantic indexing fails before replacing SQLite
-facts and records the run failure in `index_runs`.
+Semantic indexing captures existing latest-generation fast `chunk_embeddings`
+point IDs from SQLite before changed-file facts are replaced or deleted-file
+rows are removed. When the target collection exists, stale points for changed
+and deleted chunks are deleted from Qdrant before SQLite mutation so vector
+cleanup does not lose the old point IDs. If stale point deletion fails, semantic
+indexing fails before replacing SQLite facts and records the run failure in
+`index_runs`.
 
 `symdex qdrant-verify <repo>` performs a metadata-only lifecycle check for the
-configured embedding model. It derives the expected point manifest from SQLite
-chunks with `qdrant_point_id`, scrolls Qdrant payloads filtered by
+selected semantic layer. It derives the expected point manifest from
+latest-generation `chunk_embeddings`, scrolls Qdrant payloads filtered by
 `repository_id`, and reports missing collections, missing points, stale payload
 fields, and orphaned points. The verifier requests payloads only, not vectors,
 and never returns source text.
@@ -214,10 +216,11 @@ idle watch ticks, refreshing activation state after each bounded run.
 Qdrant verification and repair are layer-aware maintenance paths. `qdrant-verify`
 and `qdrant-repair` accept `--semantic-layer fast|quality|all`. Verification
 builds expected fast and quality manifests from latest-generation
-`chunk_embeddings` rows for the selected layer, with the legacy
-`chunks.qdrant_point_id` path retained as a fast-layer compatibility fallback.
-Repair routes fast rebuilds through normal semantic indexing and quality rebuilds
-through the quality worker path.
+`chunk_embeddings` rows for the selected layer. Fast verification no longer uses
+legacy `chunks.qdrant_point_id` metadata; legacy-only local databases need a
+fresh `symdex index <repo>` run before layered verification. Repair routes fast
+rebuilds through normal semantic indexing and quality rebuilds through the
+quality worker path.
 
 ## Call extraction
 

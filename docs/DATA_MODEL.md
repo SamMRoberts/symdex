@@ -7,9 +7,10 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, tests, legacy chunk embedding provenance, fast semantic
-generations, and fast `chunk_embeddings` manifests. Quality work metadata is
-present in the schema but remains deferred until later layered-indexing slices.
+symbols, calls, tests, fast semantic generations, and fast/quality
+`chunk_embeddings` manifests. The older chunk-level vector columns remain
+nullable compatibility schema, but layered manifests are the authoritative
+semantic projection.
 
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
@@ -130,14 +131,17 @@ CREATE TABLE chunks (
 ```
 
 `excluded_reason` is set when a chunk is kept as metadata but withheld from
-embedding. Chunks with an exclusion reason do not get a Qdrant point ID in the
-current implementation.
+embedding. The chunk-level `qdrant_point_id`, `embedding_model`,
+`embedding_dimension`, and `embedded_at` columns are retained only as nullable
+compatibility fields for local databases created before layered semantic
+manifests. New indexing leaves them unset and records vector provenance in
+`chunk_embeddings`.
 
 Before semantic indexing replaces changed-file chunk rows or removes deleted
-files, it reads existing non-null `qdrant_point_id` values for those chunks and
-uses them to delete stale Qdrant points. This keeps SQLite as the source of
-truth for vector lifecycle cleanup while avoiding source text in Qdrant payloads
-or cleanup reports.
+files, it reads current fast `chunk_embeddings` point IDs for those paths from
+the latest semantic generation and uses them to delete stale Qdrant points. This
+keeps SQLite as the source of truth for vector lifecycle cleanup while avoiding
+source text in Qdrant payloads or cleanup reports.
 
 ### `calls`
 
@@ -255,16 +259,18 @@ CREATE TABLE chunk_embeddings (
 ```
 
 This table is the per-layer vector manifest. Current semantic indexing writes
-`fast` rows from the legacy chunk provenance after a successful fast Qdrant
-upsert. It keeps fast and quality metadata separate by `semantic_layer`, model,
-dimension, generation, collection, and point ID so the two layers do not share
-one Qdrant collection. `status` is metadata-only and currently supports
-`current`, `stale`, `blocked`, and `failed`.
+`fast` rows directly from the successful fast Qdrant upsert and writes `quality`
+rows from the deferred quality worker. It keeps fast and quality metadata
+separate by `semantic_layer`, model, dimension, generation, collection, and
+point ID so the two layers do not share one Qdrant collection. `status` is
+metadata-only and currently supports `current`, `stale`, `blocked`, and
+`failed`.
 
 Layer-aware Qdrant verification builds expected fast and quality point manifests
-from `current` rows in this table for the latest semantic generation. The older
-`chunks.qdrant_point_id` fields remain a fast-layer compatibility fallback for
-single-model indexes that predate layered manifests.
+from `current` rows in this table for the latest semantic generation. Older
+single-model local databases that predate layered manifests should run
+`symdex index <repo>` to create fast `chunk_embeddings` rows before using
+layer-aware verification.
 
 ### `quality_embedding_jobs`
 
@@ -319,10 +325,9 @@ marked `quality_ready` with `active_layer = quality`. Latest-generation
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
-files, chunks, symbols, and calls. Semantic indexing also fills legacy chunk
-embedding model, dimension, and embedding timestamp metadata after vector
-upsert, then records the fast semantic generation and fast `chunk_embeddings`
-manifest from those compatibility fields.
+files, chunks, symbols, and calls. Semantic indexing records fast and quality
+vector provenance in `chunk_embeddings`; legacy chunk embedding columns are no
+longer authoritative and are left unset by new indexing.
 `parser_version` must include the per-language parser identity and symdex
 indexer/chunker version so mixed-language indexes remain auditable.
 
@@ -397,11 +402,12 @@ closed with a reset/reindex message instead of mixing incompatible points in the
 same Qdrant collection. Different model names use different collection names.
 
 The Qdrant verifier treats SQLite as the expected vector manifest. It compares
-each non-null `chunks.qdrant_point_id` with Qdrant payload rows filtered by
-`repository_id`, checking point ID, chunk ID, path, line range, text hash,
-embedding model, and embedding dimension. Missing collections and missing
-points are errors; stale payload fields and orphaned Qdrant points are warnings.
-The report is metadata-only and does not request vectors or source text.
+latest-generation `chunk_embeddings` rows for the selected semantic layer with
+Qdrant payload rows filtered by `repository_id`, checking point ID, chunk ID,
+path, line range, text hash, embedding model, and embedding dimension. Missing
+collections and missing points are errors; stale payload fields and orphaned
+Qdrant points are warnings. The report is metadata-only and does not request
+vectors or source text.
 
 The Qdrant repair command uses verifier metadata as its repair plan. Orphaned
 point IDs are deleted from Qdrant. Missing or stale expected points, including
@@ -422,8 +428,8 @@ Use SQLite tables to show repository structure:
 - `index_runs`: latest and historical indexing status.
 - `files`: indexed paths, languages, content hashes, and indexed timestamps.
 - `symbols`: symbol names, qualified names, kinds, nesting, and line ranges.
-- `chunks`: chunk kinds, line ranges, text hashes, vector point IDs, and
-  exclusion reasons.
+- `chunks`: chunk kinds, line ranges, text hashes, compatibility vector fields,
+  and exclusion reasons.
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
 
 Use Qdrant metadata to show semantic storage:
@@ -440,7 +446,8 @@ Group by `files.path` and aggregate:
 - symbol count from `symbols`
 - call count from `calls` joined through caller symbols
 - embeddable chunk count from chunks where `excluded_reason IS NULL`
-- vector-backed chunk count from chunks with `qdrant_point_id IS NOT NULL`
+- vector-backed chunk count from current fast `chunk_embeddings` rows for the
+  latest semantic generation
 - excluded chunk count grouped by `excluded_reason`
 
 Use status labels such as `covered`, `metadata-only`, `excluded`, `stale`, and
@@ -450,7 +457,7 @@ Use status labels such as `covered`, `metadata-only`, `excluded`, `stale`, and
 
 For the selected file, show metadata rows from:
 
-- `chunks`: kind, line range, text hash, vector point ID, exclusion reason
+- `chunks`: kind, line range, text hash, layered vector status, exclusion reason
 - `symbols`: kind, qualified name, parent symbol, line range
 - `calls`: call line, callee text, resolved callee symbol, confidence, status
 
@@ -474,9 +481,9 @@ caller symbol, callee text, call line, path, confidence, and resolution status.
 Compare SQLite chunk metadata with Qdrant collection metadata:
 
 - chunks with `excluded_reason` are metadata-only and intentionally unembedded
-- chunks with `qdrant_point_id` should have matching Qdrant points
-- chunks without `qdrant_point_id` and without `excluded_reason` are missing
-  vectors
+- current fast `chunk_embeddings` rows should have matching Qdrant points
+- chunks without a current fast `chunk_embeddings` row and without
+  `excluded_reason` are missing vectors
 - latest successful `index_runs.embedding_model` and `embedding_dimension`
   should match the selected Qdrant collection metadata
 
@@ -486,19 +493,19 @@ as warning or error rows.
 The CLI `qdrant-verify` command implements this live comparison against Qdrant.
 The TUI can use the same status labels when it grows live cross-store actions.
 
-The first TUI implementation uses SQLite metadata and recorded Qdrant point IDs
-to show total, embeddable, vector-backed, missing-vector, and excluded chunk
-counts plus latest model, dimension, collection, run count, exclusion reasons,
-and health notes. It does not require a live Qdrant service for deterministic
-offline rendering.
+The first TUI implementation uses SQLite metadata and latest-generation fast
+`chunk_embeddings` rows to show total, embeddable, vector-backed,
+missing-vector, and excluded chunk counts plus latest model, dimension,
+collection, run count, exclusion reasons, and health notes. It does not require
+a live Qdrant service for deterministic offline rendering.
 
 The cross-store health view consolidates these checks into selectable warning
 rows. It flags missing collection metadata when embeddable chunks have no
 successful semantic run or no vector-backed chunks, missing vectors when
-eligible chunks lack `qdrant_point_id`, excluded chunks when `excluded_reason`
-is present, model drift when the configured model differs from the latest
-indexed model, and dimension drift when successful runs for the same model have
-recorded multiple vector dimensions.
+eligible chunks lack a current fast `chunk_embeddings` row, excluded chunks when
+`excluded_reason` is present, model drift when the configured model differs from
+the latest indexed model, and dimension drift when successful runs for the same
+model have recorded multiple vector dimensions.
 
 ### Index runs timeline
 

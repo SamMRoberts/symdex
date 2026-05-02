@@ -92,11 +92,11 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q10 — Cleanup and compatibility removal
 
-- [ ] Audit old `chunks.qdrant_point_id` compatibility behavior.
-- [ ] Decide whether to keep compatibility fields, migrate them, or deprecate
+- [x] Audit old `chunks.qdrant_point_id` compatibility behavior.
+- [x] Decide whether to keep compatibility fields, migrate them, or deprecate
   them after layered manifests are stable.
-- [ ] Update docs once implementation behavior replaces planned behavior.
-- [ ] Add release notes for local database migration impact.
+- [x] Update docs once implementation behavior replaces planned behavior.
+- [x] Add release notes for local database migration impact.
 
 ## Guardrails
 

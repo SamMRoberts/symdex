@@ -44,8 +44,8 @@ Tasks:
   - embeddings by generation/chunk
   - jobs by repository/generation/status
   - latest generation by repository
-- Keep current `chunks.qdrant_point_id` fields as compatibility data until
-  migration is fully adopted.
+- Keep current `chunks.qdrant_point_id` fields as nullable compatibility schema
+  until migration is fully adopted.
 - Add migration tests.
 
 Acceptance:
@@ -65,7 +65,7 @@ Tasks:
   `semantic_generations` row.
 - Record fast model, dimension, chunk count, and active layer.
 - Record fast `chunk_embeddings` rows for current embeddable chunks.
-- Keep existing `chunks.qdrant_point_id` writes for compatibility.
+- Initially keep existing `chunks.qdrant_point_id` writes for compatibility.
 
 Acceptance:
 
@@ -214,15 +214,17 @@ Tasks:
 
 - Add `--semantic-layer fast|quality|all` to verify/repair commands.
 - Build expected manifests from `chunk_embeddings` for the selected layer.
-- Keep legacy `chunks.qdrant_point_id` compatibility where needed.
+- Build expected manifests from layered metadata and isolate quality health from
+  fast health.
 - Repair missing/stale quality points through the quality worker path, not a
   separate ad-hoc Qdrant write path.
 - Keep orphan cleanup metadata-only.
 
 Implementation note: Slice 9 adds `--semantic-layer fast|quality|all` to
 `qdrant-verify` and `qdrant-repair`. Verification reads current expected points
-from latest-generation `chunk_embeddings` for the selected layer and keeps the
-legacy `chunks.qdrant_point_id` path as a fast-layer compatibility fallback.
+from latest-generation `chunk_embeddings` for the selected layer. Slice Q10
+removed the fast-layer fallback to legacy `chunks.qdrant_point_id`; legacy-only
+local databases must run `symdex index <repo>` to create layered manifests.
 Repair dispatches fast work through normal semantic indexing and quality work
 through the quality worker path.
 

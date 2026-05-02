@@ -163,9 +163,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   for the selected semantic layer and reports missing, stale, or orphaned
   points without returning source text. Use `--semantic-layer fast`,
   `--semantic-layer quality`, or `--semantic-layer all` to verify the fast and
-  quality collections independently. Fast verification falls back to legacy
-  `chunks.qdrant_point_id` metadata for older single-model indexes when no
-  layered fast manifest exists.
+  quality collections independently. Verification expects latest-generation
+  `chunk_embeddings` manifests; older single-model local databases should run
+  `symdex index <repo>` first to create layered fast metadata.
 - `qdrant-repair <repo>`: deletes Qdrant orphan points, then re-runs semantic
   indexing when missing or stale fast vector metadata requires rebuilding
   points. With `--semantic-layer quality`, repair runs the quality worker path

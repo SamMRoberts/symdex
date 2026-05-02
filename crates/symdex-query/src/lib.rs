@@ -1118,29 +1118,26 @@ fn qdrant_verify_fast_target(
     sqlite: &SqliteStore,
     routing: Option<&SemanticRoutingSummary>,
 ) -> Result<QdrantVerifyTarget, String> {
-    let legacy_expected = sqlite
-        .qdrant_expected_points(root.id())
+    let Some(routing) = routing else {
+        return Err(format!(
+            "layered fast semantic metadata is missing for {}; run `symdex index <repo>` to create chunk_embeddings before qdrant verify",
+            root.id()
+        ));
+    };
+    let expected = sqlite
+        .qdrant_expected_points_for_generation_layer(
+            root.id(),
+            &routing.generation_id,
+            SemanticLayer::Fast,
+        )
         .map_err(|error| error.to_string())?;
-    if let Some(routing) = routing {
-        let layered_expected = sqlite
-            .qdrant_expected_points_for_generation_layer(
-                root.id(),
-                &routing.generation_id,
-                SemanticLayer::Fast,
-            )
-            .map_err(|error| error.to_string())?;
-        if !layered_expected.is_empty() || legacy_expected.is_empty() {
-            return Ok(qdrant_target_from_manifest(&routing.fast, layered_expected));
-        }
+    if !routing.fast.is_complete {
+        return Err(format!(
+            "layered fast semantic metadata is incomplete for {}; run `symdex index <repo>` to refresh chunk_embeddings before qdrant verify",
+            root.id()
+        ));
     }
-
-    let embed_config = EmbedConfig::from_env();
-    Ok(QdrantVerifyTarget {
-        semantic_layer: SemanticLayer::Fast,
-        collection_name: qdrant_collection_name(root.id(), &embed_config.model),
-        embedding_model: embed_config.model,
-        expected: legacy_expected,
-    })
+    Ok(qdrant_target_from_manifest(&routing.fast, expected))
 }
 
 fn qdrant_verify_quality_target(

@@ -15,8 +15,9 @@ use symdex_core::{
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
-    CallRecord, ChunkEmbeddingRecord, ChunkRecord, FileRecord, IndexRunRecord, PointPayload,
-    QdrantClient, QualityActivationSummary, QualityEmbeddingJobRecord, QualityGenerationProgress,
+    CallRecord, ChunkEmbeddingRecord, ChunkRecord, FastEmbeddingManifestRecord,
+    FastSemanticGenerationInput, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
+    QualityActivationSummary, QualityEmbeddingJobRecord, QualityGenerationProgress,
     QualityJobCompletion, QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore,
     StoreConfig, SymbolRecord, TestRecord, VectorPoint, current_timestamp, qdrant_collection_name,
     qdrant_point_id,
@@ -1650,26 +1651,28 @@ fn persist_semantic_index(
     qdrant
         .upsert_points(&qdrant_collection, &points)
         .map_err(|error| error.to_string())?;
-    sqlite
-        .record_chunk_embedding_provenance(
-            &chunk_texts
-                .iter()
-                .map(|chunk| chunk.chunk.id.clone())
-                .collect::<Vec<_>>(),
-            &embed_config.model,
-            dimension,
-        )
-        .map_err(|error| error.to_string())?;
+    let fast_embeddings = chunk_texts
+        .iter()
+        .zip(points.iter())
+        .map(|(chunk, point)| FastEmbeddingManifestRecord {
+            file_id: chunk.file.id.clone(),
+            chunk_id: chunk.chunk.id.clone(),
+            content_hash: chunk.file.content_hash.clone(),
+            text_hash: chunk.chunk.text_hash.clone(),
+            qdrant_point_id: point.id.clone(),
+        })
+        .collect::<Vec<_>>();
     let recorded_at = current_timestamp();
     let generation = sqlite
-        .record_fast_semantic_generation(
-            root.id(),
-            &embed_config.model,
-            dimension,
-            &qdrant_collection,
-            collection.files_seen,
-            &recorded_at,
-        )
+        .record_fast_semantic_generation(FastSemanticGenerationInput {
+            repository_id: root.id(),
+            fast_model: &embed_config.model,
+            fast_dimension: dimension,
+            qdrant_collection: &qdrant_collection,
+            upserted_embeddings: &fast_embeddings,
+            files_seen: collection.files_seen,
+            completed_at: &recorded_at,
+        })
         .map_err(|error| error.to_string())?;
     queue_quality_jobs_after_fast_indexing(
         sqlite,
@@ -2183,12 +2186,20 @@ fn delete_stale_qdrant_points(
     let mut point_ids = BTreeSet::new();
     point_ids.extend(
         sqlite
-            .qdrant_point_ids_for_paths(root.id(), &changed_paths)
+            .qdrant_point_ids_for_latest_generation_layer_paths(
+                root.id(),
+                SemanticLayer::Fast,
+                &changed_paths,
+            )
             .map_err(|error| error.to_string())?,
     );
     point_ids.extend(
         sqlite
-            .qdrant_point_ids_for_missing_files(root.id(), &collection.active_paths)
+            .qdrant_point_ids_for_latest_generation_layer_missing_files(
+                root.id(),
+                SemanticLayer::Fast,
+                &collection.active_paths,
+            )
             .map_err(|error| error.to_string())?,
     );
 
@@ -2315,11 +2326,7 @@ fn chunk_record(
         end_line: chunk.line_range.end,
         start_byte: chunk.byte_range.start,
         end_byte: chunk.byte_range.end,
-        qdrant_point_id: if chunk.excluded_reason.is_none() {
-            Some(qdrant_point_id(&chunk.id).map_err(|error| error.to_string())?)
-        } else {
-            None
-        },
+        qdrant_point_id: None,
         excluded_reason: chunk.excluded_reason.clone(),
         index_run_id: index_run_id.to_owned(),
         parser_version: parser_version.to_owned(),
@@ -2534,7 +2541,7 @@ mod tests {
             chunk_record(&public, "run", Language::Rust.parser_version()).expect("public record");
         let secret_record =
             chunk_record(&secret, "run", Language::Rust.parser_version()).expect("secret record");
-        assert!(public_record.qdrant_point_id.is_some());
+        assert!(public_record.qdrant_point_id.is_none());
         assert!(secret_record.qdrant_point_id.is_none());
         assert_eq!(
             secret_record.excluded_reason.as_deref(),
