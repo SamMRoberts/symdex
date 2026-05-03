@@ -2630,8 +2630,8 @@ fn semantic_job_bars(summary: &SemanticStatusSummary) -> Vec<(&'static str, u64)
     let progress = summary.quality_progress.as_ref();
     vec![
         ("fpen", fast_pending as u64),
-        ("ffail", summary.fast.failed_chunks as u64),
-        ("fstal", summary.fast.stale_chunks as u64),
+        ("ffai", summary.fast.failed_chunks as u64),
+        ("fsta", summary.fast.stale_chunks as u64),
         (
             "qpen",
             progress.map(|row| row.pending_jobs).unwrap_or(0) as u64,
@@ -2641,11 +2641,11 @@ fn semantic_job_bars(summary: &SemanticStatusSummary) -> Vec<(&'static str, u64)
             progress.map(|row| row.running_jobs).unwrap_or(0) as u64,
         ),
         (
-            "qfail",
+            "qfai",
             progress.map(|row| row.failed_jobs).unwrap_or(0) as u64,
         ),
         (
-            "qstal",
+            "qsta",
             progress.map(|row| row.skipped_stale_jobs).unwrap_or(0) as u64,
         ),
     ]
