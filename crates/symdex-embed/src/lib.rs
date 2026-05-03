@@ -13,7 +13,7 @@ pub const DEFAULT_EMBED_TRUNCATE: bool = true;
 pub const DEFAULT_EMBED_BATCH_SIZE: usize = 16;
 pub const DEFAULT_QUALITY_EMBED_BATCH_SIZE: usize = 16;
 pub const DEFAULT_QUALITY_EMBED_WORKERS: usize = 1;
-pub const DEFAULT_EMBED_MAX_CHUNK_BYTES: usize = 32 * 1024;
+pub const DEFAULT_EMBED_MAX_CHUNK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbedConfigValues<'a> {
@@ -426,13 +426,24 @@ impl Display for EmbedError {
             Self::HttpClient(error) => write!(f, "failed to create HTTP client: {error}"),
             Self::HttpRequest(error) => write!(f, "Ollama request failed: {error}"),
             Self::HttpStatus { status, url, body } => {
+                let body = body.trim();
+                let guidance = if body
+                    .to_ascii_lowercase()
+                    .contains("exceeds the context length")
+                {
+                    " Reduce SYMDEX_EMBED_MAX_CHUNK_BYTES or re-run indexing with the default limit."
+                } else {
+                    ""
+                };
                 if body.trim().is_empty() {
-                    write!(f, "Ollama returned an error status: {status} for url {url}")
+                    write!(
+                        f,
+                        "Ollama returned an error status: {status} for url {url}{guidance}"
+                    )
                 } else {
                     write!(
                         f,
-                        "Ollama returned an error status: {status} for url {url}: {}",
-                        body.trim()
+                        "Ollama returned an error status: {status} for url {url}: {body}{guidance}"
                     )
                 }
             }
@@ -775,6 +786,21 @@ mod tests {
         };
 
         assert!(!error.should_try_legacy_embed_endpoint());
+    }
+
+    #[test]
+    fn context_length_errors_include_chunk_size_guidance() {
+        let error = EmbedError::HttpStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            url: "http://localhost:11434/api/embed".to_owned(),
+            body: "the input length exceeds the context length".to_owned(),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("Reduce SYMDEX_EMBED_MAX_CHUNK_BYTES")
+        );
     }
 
     #[test]

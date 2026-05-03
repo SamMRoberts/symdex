@@ -28,7 +28,7 @@ SYMDEX_QUALITY_BATCH_SIZE=16
 SYMDEX_QUALITY_WORKERS=1
 SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_EMBED_BATCH_SIZE=16
-SYMDEX_EMBED_MAX_CHUNK_BYTES=32768
+SYMDEX_EMBED_MAX_CHUNK_BYTES=8192
 SYMDEX_RUST_ANALYZER=0
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
@@ -40,9 +40,9 @@ plan for changed Rust files, but does not run rust-analyzer project analysis by
 default.
 
 `SYMDEX_EMBED_TRUNCATE` defaults to `true`, matching Ollama's embedding API
-behavior for oversized local inputs. Set it to `false` only when you want
-semantic indexing to fail instead of truncating chunks that exceed the embedding
-model context window.
+behavior for oversized local inputs. Symdex still excludes large chunks before
+embedding because some Ollama/model combinations return context-length errors
+instead of truncating.
 
 `SYMDEX_EMBED_BATCH_SIZE` defaults to `16`. Symdex splits semantic indexing
 requests into batches before calling Ollama `/api/embed`, which avoids oversized
@@ -63,7 +63,7 @@ cooperative quality catch-up in semantic watch mode when quality indexing is
 enabled, processing bounded quality batches during post-batch and idle watch
 ticks.
 
-`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
+`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `8192`. Chunks larger than this are
 persisted as metadata-only structural evidence with
 `chunk_too_large_for_embedding` and are not sent to Ollama.
 
