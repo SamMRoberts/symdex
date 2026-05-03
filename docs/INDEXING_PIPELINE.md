@@ -14,10 +14,13 @@ repo root
   -> discover tests
   -> build chunks
   -> detect sensitive chunks
-  -> embed allowed chunks with Ollama
-  -> persist facts to SQLite
-  -> upsert vectors to Qdrant
   -> start index run summary
+  -> collect stale vector point IDs from the latest generation
+  -> embed allowed chunks with Ollama
+  -> upsert new vectors to Qdrant
+  -> persist facts to SQLite
+  -> record the fast semantic generation and queue quality work
+  -> delete stale Qdrant points not reused by the new manifest
   -> finish index run summary as success, skipped, partial, or failed
 ```
 
@@ -135,11 +138,14 @@ If model name or vector dimension changes, require full reindex or collection mi
 Current implementation records started and finished index runs in SQLite. Runs
 finish as `success`, `skipped`, `partial`, or `failed`. Offline indexing records
 successful structural runs, semantic indexing records skipped runs when there
-are no chunks to embed, and semantic failures after SQLite persistence are
-recorded as partial runs with metadata-only error summaries. Before upserting
-vectors, semantic indexing rejects a same-repository, same-model dimension
-change so an existing Qdrant collection is not reused with incompatible vector
-sizes. Different model names map to different Qdrant collection names.
+are no chunks to embed, and semantic embedding or Qdrant upsert failures before
+SQLite replacement are recorded as failed runs so the previous semantic
+generation remains intact. Failures after SQLite replacement, such as generation
+finalization or stale-vector cleanup failures, are recorded as partial runs with
+metadata-only error summaries. Before upserting vectors, semantic indexing
+rejects a same-repository, same-model dimension change so an existing Qdrant
+collection is not reused with incompatible vector sizes. Different model names
+map to different Qdrant collection names.
 Continuous watch batches use the same incremental indexing path and are recorded
 with `run_kind = watch` in index-run metadata.
 
@@ -185,11 +191,13 @@ text.
 
 Semantic indexing captures existing latest-generation fast `chunk_embeddings`
 point IDs from SQLite before changed-file facts are replaced or deleted-file
-rows are removed. When the target collection exists, stale points for changed
-and deleted chunks are deleted from Qdrant before SQLite mutation so vector
-cleanup does not lose the old point IDs. If stale point deletion fails, semantic
-indexing fails before replacing SQLite facts and records the run failure in
-`index_runs`.
+rows are removed. It stages fast embeddings and upserts new Qdrant points before
+SQLite mutation, then records the new fast generation after structural facts are
+persisted. Stale points for changed and deleted chunks are deleted only after
+the new manifest is recorded, and point IDs that were just upserted are protected
+from deletion because deterministic IDs can be reused for unchanged chunks.
+This ordering prevents a local Ollama or Qdrant failure from replacing current
+chunks and cascading away the previous complete vector manifest.
 
 `symdex qdrant-verify <repo>` performs a metadata-only lifecycle check for the
 selected semantic layer. It derives the expected point manifest from

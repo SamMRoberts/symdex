@@ -139,9 +139,14 @@ manifests. New indexing leaves them unset and records vector provenance in
 
 Before semantic indexing replaces changed-file chunk rows or removes deleted
 files, it reads current fast `chunk_embeddings` point IDs for those paths from
-the latest semantic generation and uses them to delete stale Qdrant points. This
-keeps SQLite as the source of truth for vector lifecycle cleanup while avoiding
-source text in Qdrant payloads or cleanup reports.
+the latest semantic generation. New fast embeddings are staged and upserted to
+Qdrant before SQLite mutation; after structural facts and the new semantic
+generation are persisted, the previously collected stale point IDs are deleted
+unless the new manifest reused the same deterministic point ID. This keeps
+SQLite as the source of truth for vector lifecycle cleanup while avoiding source
+text in Qdrant payloads or cleanup reports, and it preserves the previous
+complete manifest if local embedding or vector upsert fails before SQLite
+replacement.
 
 ### `calls`
 
