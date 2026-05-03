@@ -805,30 +805,58 @@ fn run_index_internal(
         .flat_map(|report| report.chunks.iter())
         .filter(|chunk| chunk.excluded_reason.is_some())
         .count();
-    if !options.offline
-        && let Err(error) = delete_stale_qdrant_points(
+    let stale_qdrant_point_ids = if options.offline {
+        BTreeSet::new()
+    } else {
+        match stale_qdrant_point_ids(&sqlite, &root, &collection) {
+            Ok(point_ids) => point_ids,
+            Err(error) => {
+                finish_failed_index_run(
+                    &sqlite,
+                    &run_scope,
+                    &parser_version_summary(&collection),
+                    RunCounts {
+                        files_seen: collection.files_seen,
+                        files_indexed: 0,
+                        chunks_embedded: 0,
+                    },
+                    "failed",
+                    &error,
+                )?;
+                return Err(error);
+            }
+        }
+    };
+    let prepared_semantic = if options.offline {
+        None
+    } else {
+        match prepare_semantic_index(
             &sqlite,
             &root,
             &store_config,
             &collection,
-            &embedding_model,
+            &layered_embed_config,
+            &index_run_id,
             &mut on_progress,
-        )
-    {
-        finish_failed_index_run(
-            &sqlite,
-            &run_scope,
-            &parser_version_summary(&collection),
-            RunCounts {
-                files_seen: collection.files_seen,
-                files_indexed: 0,
-                chunks_embedded: 0,
-            },
-            "failed",
-            &error,
-        )?;
-        return Err(error);
-    }
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                finish_failed_index_run(
+                    &sqlite,
+                    &run_scope,
+                    &parser_version_summary(&collection),
+                    RunCounts {
+                        files_seen: collection.files_seen,
+                        files_indexed: 0,
+                        chunks_embedded: 0,
+                    },
+                    "failed",
+                    &error,
+                )?;
+                return Err(error);
+            }
+        }
+    };
     let persistence = match persist_structural_index(
         &mut sqlite,
         &root,
@@ -877,13 +905,13 @@ fn run_index_internal(
             .map_err(|error| error.to_string())?;
         EmbeddingSummary::SkippedOffline
     } else {
-        match persist_semantic_index(
+        match finalize_semantic_index(
             &mut sqlite,
             &root,
             &store_config,
-            &collection,
             &layered_embed_config,
-            &index_run_id,
+            prepared_semantic.expect("semantic indexing should be prepared when not offline"),
+            &stale_qdrant_point_ids,
             &mut on_progress,
         ) {
             Ok(embedding) => {
@@ -1583,15 +1611,39 @@ fn persist_structural_index(
     })
 }
 
-fn persist_semantic_index(
-    sqlite: &mut SqliteStore,
+#[derive(Debug, Clone)]
+enum PreparedSemanticIndex {
+    SkippedNoChunks,
+    Completed(PreparedFastSemanticIndex),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedFastSemanticIndex {
+    model: String,
+    dimension: usize,
+    qdrant_collection: String,
+    fast_embeddings: Vec<FastEmbeddingManifestRecord>,
+    files_seen: usize,
+}
+
+impl PreparedFastSemanticIndex {
+    fn point_ids(&self) -> BTreeSet<String> {
+        self.fast_embeddings
+            .iter()
+            .map(|embedding| embedding.qdrant_point_id.clone())
+            .collect()
+    }
+}
+
+fn prepare_semantic_index(
+    sqlite: &SqliteStore,
     root: &RepoRoot,
     store_config: &StoreConfig,
     collection: &IndexCollection,
     layered_embed_config: &LayeredEmbedConfig,
     index_run_id: &str,
     on_progress: &mut impl FnMut(IndexProgress),
-) -> Result<EmbeddingSummary, String> {
+) -> Result<PreparedSemanticIndex, String> {
     let embed_config = layered_embed_config.fast_embed_config();
     let chunk_texts = chunk_texts(&collection.reports);
     if chunk_texts.is_empty() {
@@ -1601,7 +1653,7 @@ fn persist_semantic_index(
             1,
             "Embedding skipped because no chunks changed",
         ));
-        return Ok(EmbeddingSummary::SkippedNoChunks);
+        return Ok(PreparedSemanticIndex::SkippedNoChunks);
     }
 
     on_progress(IndexProgress::new(
@@ -1687,15 +1739,56 @@ fn persist_semantic_index(
             qdrant_point_id: point.id.clone(),
         })
         .collect::<Vec<_>>();
+    on_progress(IndexProgress::new(
+        "qdrant",
+        5,
+        5,
+        format!("Upserted {} vector points", points.len()),
+    ));
+    Ok(PreparedSemanticIndex::Completed(
+        PreparedFastSemanticIndex {
+            model: embed_config.model.clone(),
+            dimension,
+            qdrant_collection,
+            fast_embeddings,
+            files_seen: collection.files_seen,
+        },
+    ))
+}
+
+fn finalize_semantic_index(
+    sqlite: &mut SqliteStore,
+    root: &RepoRoot,
+    store_config: &StoreConfig,
+    layered_embed_config: &LayeredEmbedConfig,
+    prepared: PreparedSemanticIndex,
+    stale_qdrant_point_ids: &BTreeSet<String>,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<EmbeddingSummary, String> {
+    let prepared = match prepared {
+        PreparedSemanticIndex::SkippedNoChunks => {
+            delete_stale_qdrant_points(
+                root,
+                store_config,
+                &layered_embed_config.fast_embed_config().model,
+                stale_qdrant_point_ids,
+                &BTreeSet::new(),
+                on_progress,
+            )?;
+            return Ok(EmbeddingSummary::SkippedNoChunks);
+        }
+        PreparedSemanticIndex::Completed(prepared) => prepared,
+    };
+
     let recorded_at = current_timestamp();
     let generation = sqlite
         .record_fast_semantic_generation(FastSemanticGenerationInput {
             repository_id: root.id(),
-            fast_model: &embed_config.model,
-            fast_dimension: dimension,
-            qdrant_collection: &qdrant_collection,
-            upserted_embeddings: &fast_embeddings,
-            files_seen: collection.files_seen,
+            fast_model: &prepared.model,
+            fast_dimension: prepared.dimension,
+            qdrant_collection: &prepared.qdrant_collection,
+            upserted_embeddings: &prepared.fast_embeddings,
+            files_seen: prepared.files_seen,
             completed_at: &recorded_at,
         })
         .map_err(|error| error.to_string())?;
@@ -1706,17 +1799,19 @@ fn persist_semantic_index(
         &generation,
         on_progress,
     )?;
-    on_progress(IndexProgress::new(
-        "qdrant",
-        5,
-        5,
-        format!("Upserted {} vector points", points.len()),
-    ));
+    delete_stale_qdrant_points(
+        root,
+        store_config,
+        &prepared.model,
+        stale_qdrant_point_ids,
+        &prepared.point_ids(),
+        on_progress,
+    )?;
     Ok(EmbeddingSummary::Completed {
-        model: embed_config.model.clone(),
-        dimension,
-        qdrant_collection,
-        chunks_embedded: points.len(),
+        model: prepared.model,
+        dimension: prepared.dimension,
+        qdrant_collection: prepared.qdrant_collection,
+        chunks_embedded: prepared.fast_embeddings.len(),
     })
 }
 
@@ -2202,14 +2297,11 @@ fn quality_chunk_embedding_record(
     }
 }
 
-fn delete_stale_qdrant_points(
+fn stale_qdrant_point_ids(
     sqlite: &SqliteStore,
     root: &RepoRoot,
-    store_config: &StoreConfig,
     collection: &IndexCollection,
-    embedding_model: &str,
-    on_progress: &mut impl FnMut(IndexProgress),
-) -> Result<usize, String> {
+) -> Result<BTreeSet<String>, String> {
     let changed_paths = collection
         .reports
         .iter()
@@ -2234,6 +2326,19 @@ fn delete_stale_qdrant_points(
             )
             .map_err(|error| error.to_string())?,
     );
+
+    Ok(point_ids)
+}
+
+fn delete_stale_qdrant_points(
+    root: &RepoRoot,
+    store_config: &StoreConfig,
+    embedding_model: &str,
+    stale_point_ids: &BTreeSet<String>,
+    protected_point_ids: &BTreeSet<String>,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<usize, String> {
+    let point_ids = stale_qdrant_point_ids_to_delete(stale_point_ids, protected_point_ids);
 
     if point_ids.is_empty() {
         on_progress(IndexProgress::new(
@@ -2260,7 +2365,6 @@ fn delete_stale_qdrant_points(
         return Ok(0);
     }
 
-    let point_ids = point_ids.into_iter().collect::<Vec<_>>();
     on_progress(IndexProgress::new(
         "qdrant_cleanup",
         0,
@@ -2277,6 +2381,16 @@ fn delete_stale_qdrant_points(
         format!("Deleted {} stale Qdrant points", point_ids.len()),
     ));
     Ok(point_ids.len())
+}
+
+fn stale_qdrant_point_ids_to_delete(
+    stale_point_ids: &BTreeSet<String>,
+    protected_point_ids: &BTreeSet<String>,
+) -> Vec<String> {
+    stale_point_ids
+        .difference(protected_point_ids)
+        .cloned()
+        .collect()
 }
 
 fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
@@ -2760,6 +2874,19 @@ mod tests {
             &no_catch_up,
             &enabled
         ));
+    }
+
+    #[test]
+    fn deferred_qdrant_cleanup_keeps_newly_upserted_point_ids() {
+        let stale = BTreeSet::from([
+            "deleted-file-point".to_owned(),
+            "unchanged-deterministic-point".to_owned(),
+        ]);
+        let protected = BTreeSet::from(["unchanged-deterministic-point".to_owned()]);
+
+        let to_delete = super::stale_qdrant_point_ids_to_delete(&stale, &protected);
+
+        assert_eq!(to_delete, vec!["deleted-file-point".to_owned()]);
     }
 
     #[test]

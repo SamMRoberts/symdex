@@ -144,6 +144,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   state, quality job progress, and fallback-to-fast status when layered
   indexing is enabled.
 - Prefer tables, split panes, gauges, and compact relationship views over prose-only summaries.
+- Prefer built-in `ratatui` widgets before adding third-party TUI dependencies; third-party widgets must provide a clear metadata-first UX improvement and preserve keyboard-first, 80x24-compatible behavior.
+- Good TUI widget candidates are scrollbars for long selectable panes, tree widgets for symbol/file hierarchy, multiline text input for pasted debug output, and charts only when backed by real local metrics.
+- Avoid image, terminal-emulator, decorative big-text, pie-chart, and mouse/menu-centric widgets unless a future design doc proves they improve local code-intelligence workflows without exposing source text.
 - Cross-store visualizations must make mismatches obvious, such as chunks with no vector point, excluded chunks, missing collections, or model/dimension drift.
 - Do not show source text by default; source previews require a future explicit design.
 - Require confirmation before starting long-running local jobs such as indexing.

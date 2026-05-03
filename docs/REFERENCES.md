@@ -34,6 +34,8 @@ Verified sources for the chosen stack.
 ## Terminal UI
 
 - ratatui docs: https://docs.rs/ratatui
+- ratatui built-in widget showcase: https://ratatui.rs/showcase/widgets/
+- ratatui third-party widget showcase: https://ratatui.rs/showcase/third-party-widgets/
 - crossterm docs: https://docs.rs/crossterm
 
 ## Maintenance rule
