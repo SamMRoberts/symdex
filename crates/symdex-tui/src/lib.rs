@@ -16,7 +16,7 @@ use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, LineGauge, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::widgets::{Cell, Row, Table, TableState};
 use symdex_core::{RepoRoot, SemanticLayer, SemanticLayerStatus};
 use symdex_diagnostics::{
@@ -2324,50 +2324,50 @@ fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if matches!(app.screen, Screen::IndexRunning(_)) {
-        if inner.width >= 78 {
+        if inner.width >= 96 {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(38), Constraint::Length(38)])
+                .constraints([Constraint::Min(34), Constraint::Length(60)])
                 .split(inner);
             let side_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(6), Constraint::Length(3)])
+                .constraints([Constraint::Length(5), Constraint::Length(3)])
                 .split(chunks[1]);
             let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
             frame.render_widget(panel, chunks[0]);
-            render_semantic_readiness_gauges(frame, side_chunks[0], &app.semantic_status);
+            render_semantic_index_status_gauges(frame, side_chunks[0], &app.semantic_status);
             render_index_progress_gauge(frame, side_chunks[1], app.index_progress.as_ref());
         } else {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(5),
-                    Constraint::Length(6),
+                    Constraint::Min(3),
+                    Constraint::Length(5),
                     Constraint::Length(3),
                 ])
                 .split(inner);
             let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
             frame.render_widget(panel, chunks[0]);
-            render_semantic_readiness_gauges(frame, chunks[1], &app.semantic_status);
+            render_semantic_index_status_gauges(frame, chunks[1], &app.semantic_status);
             render_index_progress_gauge(frame, chunks[2], app.index_progress.as_ref());
         }
     } else {
-        if inner.width >= 78 {
+        if inner.width >= 96 {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(38), Constraint::Length(38)])
+                .constraints([Constraint::Min(34), Constraint::Length(60)])
                 .split(inner);
             let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
             frame.render_widget(panel, chunks[0]);
-            render_semantic_readiness_gauges(frame, chunks[1], &app.semantic_status);
+            render_semantic_index_status_gauges(frame, chunks[1], &app.semantic_status);
         } else {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(5), Constraint::Length(6)])
+                .constraints([Constraint::Min(3), Constraint::Length(5)])
                 .split(inner);
             let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
             frame.render_widget(panel, chunks[0]);
-            render_semantic_readiness_gauges(frame, chunks[1], &app.semantic_status);
+            render_semantic_index_status_gauges(frame, chunks[1], &app.semantic_status);
         }
     }
 }
@@ -2385,45 +2385,190 @@ fn render_index_progress_gauge(
     frame.render_widget(gauge, area);
 }
 
-fn render_semantic_readiness_gauges(
+fn render_semantic_index_status_gauges(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     summary: &SemanticStatusSummary,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
-    let fast_percent = layer_readiness_percent(&summary.fast);
-    let quality_percent = layer_readiness_percent(&summary.quality);
-    let fast_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Fast Readiness"),
-        )
-        .gauge_style(high_contrast_gauge_style(StatusTone::Success))
-        .percent(fast_percent)
-        .label(gauge_label_span(layer_readiness_label(
+    let fast_jobs = layer_job_status(&summary.fast);
+    let quality_jobs = quality_job_status(summary);
+    render_status_gauge_pair(
+        frame,
+        chunks[0],
+        StatusGaugeRow::new(
             "fast_ready",
-            &summary.fast,
-            fast_percent,
-        )));
-    let quality_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Quality Readiness"),
-        )
-        .gauge_style(high_contrast_gauge_style(semantic_quality_tone(summary)))
-        .percent(quality_percent)
-        .label(gauge_label_span(layer_readiness_label(
+            summary.fast.current_chunks,
+            summary.fast.expected_chunks,
+            StatusTone::Success,
+        ),
+        StatusGaugeRow::new(
             "quality_ready",
-            &summary.quality,
-            quality_percent,
-        )));
-    frame.render_widget(fast_gauge, chunks[0]);
-    frame.render_widget(quality_gauge, chunks[1]);
+            summary.quality.current_chunks,
+            summary.quality.expected_chunks,
+            semantic_quality_tone(summary),
+        ),
+    );
+    render_status_gauge_pair(
+        frame,
+        chunks[1],
+        StatusGaugeRow::new(
+            "fast pending_jobs",
+            fast_jobs.pending_jobs,
+            fast_jobs.total_jobs,
+            StatusTone::Dim,
+        ),
+        StatusGaugeRow::new(
+            "quality pending_jobs",
+            quality_jobs.pending_jobs,
+            quality_jobs.total_jobs,
+            StatusTone::Warning,
+        ),
+    );
+    render_status_gauge_pair(
+        frame,
+        chunks[2],
+        StatusGaugeRow::new(
+            "fast running_jobs",
+            fast_jobs.running_jobs,
+            fast_jobs.total_jobs,
+            StatusTone::Dim,
+        ),
+        StatusGaugeRow::new(
+            "quality running_jobs",
+            quality_jobs.running_jobs,
+            quality_jobs.total_jobs,
+            StatusTone::Info,
+        ),
+    );
+    render_status_gauge_pair(
+        frame,
+        chunks[3],
+        StatusGaugeRow::new(
+            "fast failed_jobs",
+            fast_jobs.failed_jobs,
+            fast_jobs.total_jobs,
+            StatusTone::Error,
+        ),
+        StatusGaugeRow::new(
+            "quality failed_jobs",
+            quality_jobs.failed_jobs,
+            quality_jobs.total_jobs,
+            StatusTone::Error,
+        ),
+    );
+    render_status_gauge_pair(
+        frame,
+        chunks[4],
+        StatusGaugeRow::new(
+            "fast stale_jobs",
+            fast_jobs.skipped_stale_jobs,
+            fast_jobs.total_jobs,
+            StatusTone::Warning,
+        ),
+        StatusGaugeRow::new(
+            "quality stale_jobs",
+            quality_jobs.skipped_stale_jobs,
+            quality_jobs.total_jobs,
+            StatusTone::Warning,
+        ),
+    );
+}
+
+fn render_status_gauge_pair(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    fast: StatusGaugeRow,
+    quality: StatusGaugeRow,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+    frame.render_widget(status_line_gauge(fast), chunks[0]);
+    frame.render_widget(status_line_gauge(quality), chunks[1]);
+}
+
+fn status_line_gauge(row: StatusGaugeRow) -> LineGauge<'static> {
+    LineGauge::default()
+        .filled_style(tone_style(row.tone).add_modifier(Modifier::BOLD))
+        .unfilled_style(Style::new().fg(Color::DarkGray))
+        .ratio(gauge_ratio(row.count, row.total))
+        .label(Line::from(gauge_label_span(status_gauge_label(
+            row.label, row.count, row.total,
+        ))))
+}
+
+#[derive(Clone, Copy)]
+struct StatusGaugeRow {
+    label: &'static str,
+    count: usize,
+    total: usize,
+    tone: StatusTone,
+}
+
+impl StatusGaugeRow {
+    fn new(label: &'static str, count: usize, total: usize, tone: StatusTone) -> Self {
+        Self {
+            label,
+            count,
+            total,
+            tone,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayerJobStatus {
+    total_jobs: usize,
+    pending_jobs: usize,
+    running_jobs: usize,
+    failed_jobs: usize,
+    skipped_stale_jobs: usize,
+}
+
+fn layer_job_status(layer: &SemanticStatusLayerSummary) -> LayerJobStatus {
+    LayerJobStatus {
+        total_jobs: layer.expected_chunks,
+        pending_jobs: 0,
+        running_jobs: 0,
+        failed_jobs: layer.failed_chunks,
+        skipped_stale_jobs: layer.stale_chunks,
+    }
+}
+
+fn quality_job_status(summary: &SemanticStatusSummary) -> LayerJobStatus {
+    match &summary.quality_progress {
+        Some(progress) => LayerJobStatus {
+            total_jobs: progress.embeddable_chunks,
+            pending_jobs: progress.pending_jobs,
+            running_jobs: progress.running_jobs,
+            failed_jobs: progress.failed_jobs,
+            skipped_stale_jobs: progress.skipped_stale_jobs,
+        },
+        None => layer_job_status(&summary.quality),
+    }
+}
+
+fn gauge_ratio(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    (count as f64 / total as f64).clamp(0.0, 1.0)
+}
+
+fn status_gauge_label(label: &str, count: usize, total: usize) -> String {
+    let percent = count_percent(count, total);
+    format!("{label} {count}/{total} {percent}%")
 }
 
 fn high_contrast_gauge_style(tone: StatusTone) -> Style {
@@ -5453,19 +5598,12 @@ fn progress_label(progress: Option<&IndexProgress>) -> String {
     }
 }
 
-fn layer_readiness_percent(layer: &SemanticStatusLayerSummary) -> u16 {
-    if layer.expected_chunks == 0 {
+fn count_percent(count: usize, total: usize) -> u16 {
+    if total == 0 {
         return 0;
     }
-    let percent = layer.current_chunks.saturating_mul(100) / layer.expected_chunks;
+    let percent = count.saturating_mul(100) / total;
     percent.min(100) as u16
-}
-
-fn layer_readiness_label(label: &str, layer: &SemanticStatusLayerSummary, percent: u16) -> String {
-    format!(
-        "{label} {}/{} {percent}%",
-        layer.current_chunks, layer.expected_chunks
-    )
 }
 
 fn line_range(start: usize, end: usize) -> String {
@@ -6182,7 +6320,7 @@ mod tests {
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
         GraphStatus, IndexMode, ManualIndexRequest, QueryStatus, Screen, StorageExplorerState,
-        StorageMode, UiAction, View, continuous_activity_frame, layer_readiness_percent,
+        StorageMode, UiAction, View, continuous_activity_frame, count_percent,
         parse_call_path_input, progress_percent, reduce_screen, render,
     };
 
@@ -7670,19 +7808,39 @@ mod tests {
         app.view = View::Indexing;
         app.semantic_status.fast.current_chunks = 2;
         app.semantic_status.fast.expected_chunks = 4;
+        app.semantic_status.fast.failed_chunks = 1;
+        app.semantic_status.fast.stale_chunks = 1;
         app.semantic_status.quality.current_chunks = 1;
         app.semantic_status.quality.expected_chunks = 4;
         app.semantic_status.quality_status = SemanticLayerStatus::QualityPending;
+        app.semantic_status.quality_progress = Some(QualityGenerationProgress {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            embeddable_chunks: 4,
+            quality_embedded_chunks: 1,
+            pending_jobs: 2,
+            running_jobs: 1,
+            succeeded_jobs: 1,
+            failed_jobs: 1,
+            skipped_stale_jobs: 1,
+            skipped_excluded_jobs: 0,
+        });
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
         render(&mut terminal, &app).expect("render should succeed");
 
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("Fast Readiness"));
-        assert!(rendered.contains("Quality Readiness"));
         assert!(rendered.contains("fast_ready 2/4 50%"));
         assert!(rendered.contains("quality_ready 1/4 25%"));
+        assert!(rendered.contains("fast pending_jobs 0/4 0%"));
+        assert!(rendered.contains("quality pending_jobs 2/4 50%"));
+        assert!(rendered.contains("fast running_jobs 0/4 0%"));
+        assert!(rendered.contains("quality running_jobs 1/4 25%"));
+        assert!(rendered.contains("fast failed_jobs 1/4 25%"));
+        assert!(rendered.contains("quality failed_jobs 1/4 25%"));
+        assert!(rendered.contains("fast stale_jobs 1/4 25%"));
+        assert!(rendered.contains("quality stale_jobs 1/4 25%"));
         let buffer = terminal.backend().buffer();
         assert_eq!(
             cell_fg_for_text(buffer, "fast_ready 2/4 50%", None),
@@ -7769,19 +7927,10 @@ mod tests {
     }
 
     #[test]
-    fn layer_readiness_percent_uses_ready_chunks_over_expected_chunks() {
-        let app = App::from_status("/tmp/repo", "repo", sample_status());
-        let mut layer = app.semantic_status.fast.clone();
-        layer.expected_chunks = 8;
-        layer.current_chunks = 3;
-
-        assert_eq!(layer_readiness_percent(&layer), 37);
-
-        layer.current_chunks = 10;
-        assert_eq!(layer_readiness_percent(&layer), 100);
-
-        layer.expected_chunks = 0;
-        assert_eq!(layer_readiness_percent(&layer), 0);
+    fn count_percent_clamps_to_total() {
+        assert_eq!(count_percent(3, 8), 37);
+        assert_eq!(count_percent(10, 8), 100);
+        assert_eq!(count_percent(3, 0), 0);
     }
 
     #[test]

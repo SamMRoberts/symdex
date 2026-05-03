@@ -68,8 +68,8 @@ symdex serve-mcp
 - MCP tools return compact JSON evidence that a coding agent can use immediately.
 - TUI provides a local keyboard-first control panel for indexing, storage health, diagnostics, queries, impact, and context packs.
 - TUI makes index health inspectable with local visualizations for coverage,
-  fast and quality semantic readiness progress, file details, symbol outlines,
-  call resolution, embedding coverage, and index runs.
+  fast and quality semantic readiness and job-state progress, file details,
+  symbol outlines, call resolution, embedding coverage, and index runs.
 - TUI storage visualizations are grouped under an always-visible nested storage tab header so users can see the available storage panes while inspecting any one pane.
 - Unresolved or ambiguous relationships are labeled instead of fabricated.
 

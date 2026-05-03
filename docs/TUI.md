@@ -147,7 +147,7 @@ terminal panes.
 - Show SQLite index counts for files, chunks, symbols, and calls.
 - Show latest embedding model and vector dimension when available.
 - Show active semantic layer, quality readiness, fallback state, and compact
-  quality job counts.
+  fast and quality job counts.
 - Show local service status for SQLite path, Ollama, and Qdrant.
 - Use status-colored labels for local service health and index freshness.
 - Use compact table rows for index counts and local service targets instead of
@@ -323,9 +323,13 @@ represent the indexed repository.
   with `Tab` / `Shift+Tab` on the Index tab. Offline and semantic indexing both
   use the selected scope after explicit `y` confirmation. The selected scope
   defaults to incremental.
-- Show fast and quality semantic readiness as progress bars in the Index tab.
-  Each bar should display the percentage and ready/expected chunk counts for
-  `fast_ready` and `quality_ready` coverage.
+- Show fast and quality semantic readiness as compact progress bars in the
+  Index tab. Each bar should display the percentage and ready/expected chunk
+  counts for `fast_ready` and `quality_ready` coverage.
+- Show compact fast and quality job-state gauges for `pending_jobs`,
+  `running_jobs`, `failed_jobs`, and skipped-stale jobs. The TUI may shorten
+  skipped-stale labels to `stale_jobs` when needed for fit, but the values map
+  to `skipped_stale_jobs` in the underlying semantic status model.
 - Offer continuous indexing as a toggleable mode.
 - Continuous indexing is off by default.
 - When continuous indexing is on, modified or newly created eligible files are
