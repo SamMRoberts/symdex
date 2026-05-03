@@ -10,6 +10,7 @@ members = [
     "crates/symdex-sqlite-vec",
     "crates/symdex-store",
     "crates/symdex-tui",
+    "crates/symdex-watch",
 ]
 resolver = "3"
 

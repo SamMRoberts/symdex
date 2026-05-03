@@ -8,8 +8,10 @@ enabled, modified or newly created eligible files are automatically reindexed.
 
 ## Product Contract
 
-- `symdex tui [repo]` starts continuous indexing automatically.
-- Users must be able to toggle it off and back on from the TUI.
+- `symdex tui [repo]` starts or attaches to the single background watcher for
+  the repository.
+- Users must be able to toggle it off and back on from the TUI, CLI, and
+  explicit watcher MCP tools.
 - A CLI launch path should also exist for non-interactive use, such as
   `symdex index --watch <repo>` or an equivalent command.
 - Watch mode must never execute indexed repository code.
@@ -124,19 +126,20 @@ outputs to distinguish these states:
 - `symdex-tui` owns toggle state, rendering, confirmation, and event display.
 - The TUI and CLI must call shared Rust APIs directly. They must not shell out
   to `symdex` subprocesses.
-- The MCP tools remain read-only for the MVP and must not start or stop
-  continuous indexing. The `serve-mcp --watch <repo>` startup option may launch
-  a user-requested watch job beside the read-only MCP server process.
+- MCP evidence tools remain read-only. `symdex_watch_start` is the explicit
+  local-only watcher-start exception; MCP does not expose watcher stop.
 
 Current implementation status:
 
 - `symdex-index` exposes shared watch snapshot, diff, and continuous polling
   APIs.
-- `symdex index --watch <repo>` starts the non-interactive watch loop and uses
-  the shared indexing APIs directly.
-- `symdex serve-mcp --watch <repo>` starts the read-only MCP server and a
-  semantic watch loop in the same process. Watch status is written to stderr so
-  MCP stdout remains protocol-only.
+- `symdex watch start <repo>` starts the persistent background watcher or
+  returns the existing watcher status. `symdex watch status <repo>` reads shared
+  SQLite watcher state. `symdex watch stop <repo>` asks the daemon to stop.
+- `symdex index --watch <repo>` remains a foreground watch loop, but it refuses
+  to run while a background or foreground watcher is already active.
+- `symdex serve-mcp --watch <repo>` starts or attaches the single background
+  watcher before serving MCP. MCP stdout remains protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
 - Watch-driven batches are recorded with `run_kind = watch` in local index-run

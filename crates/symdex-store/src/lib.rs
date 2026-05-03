@@ -555,6 +555,118 @@ impl SqliteStore {
         })
     }
 
+    pub fn watcher_status(&self, repository_id: &str) -> Result<Option<WatcherStatusRecord>> {
+        self.connection
+            .query_row(
+                "SELECT repository_id, root_path, mode, owner_kind, owner_pid, socket_path,
+                        state, started_at, updated_at, heartbeat_at, files_seen, queued_events,
+                        last_indexed_path, last_error, active_layer, quality_status,
+                        quality_pending_jobs, quality_running_jobs, quality_failed_jobs,
+                        quality_stale_jobs
+                   FROM watchers
+                  WHERE repository_id = ?1",
+                params![repository_id],
+                watcher_status_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn upsert_watcher_status(&self, status: &WatcherStatusRecord) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO watchers (
+                   repository_id, root_path, mode, owner_kind, owner_pid, socket_path,
+                   state, started_at, updated_at, heartbeat_at, files_seen, queued_events,
+                   last_indexed_path, last_error, active_layer, quality_status,
+                   quality_pending_jobs, quality_running_jobs, quality_failed_jobs,
+                   quality_stale_jobs
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                 ON CONFLICT(repository_id) DO UPDATE SET
+                   root_path = excluded.root_path,
+                   mode = excluded.mode,
+                   owner_kind = excluded.owner_kind,
+                   owner_pid = excluded.owner_pid,
+                   socket_path = excluded.socket_path,
+                   state = excluded.state,
+                   started_at = excluded.started_at,
+                   updated_at = excluded.updated_at,
+                   heartbeat_at = excluded.heartbeat_at,
+                   files_seen = excluded.files_seen,
+                   queued_events = excluded.queued_events,
+                   last_indexed_path = excluded.last_indexed_path,
+                   last_error = excluded.last_error,
+                   active_layer = excluded.active_layer,
+                   quality_status = excluded.quality_status,
+                   quality_pending_jobs = excluded.quality_pending_jobs,
+                   quality_running_jobs = excluded.quality_running_jobs,
+                   quality_failed_jobs = excluded.quality_failed_jobs,
+                   quality_stale_jobs = excluded.quality_stale_jobs",
+                params![
+                    status.repository_id,
+                    status.root_path,
+                    status.mode,
+                    status.owner_kind,
+                    status.owner_pid.map(i64::from),
+                    status.socket_path,
+                    status.state,
+                    status.started_at.as_deref().unwrap_or(&now),
+                    now,
+                    status.heartbeat_at.as_deref().unwrap_or(&now),
+                    status.files_seen as i64,
+                    status.queued_events as i64,
+                    status.last_indexed_path,
+                    status.last_error,
+                    status.active_layer,
+                    status.quality_status,
+                    status.quality_pending_jobs as i64,
+                    status.quality_running_jobs as i64,
+                    status.quality_failed_jobs as i64,
+                    status.quality_stale_jobs as i64,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn mark_watcher_stopped(&self, repository_id: &str) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "UPDATE watchers
+                    SET state = 'stopped',
+                        updated_at = ?2,
+                        heartbeat_at = ?2,
+                        owner_pid = NULL,
+                        socket_path = NULL,
+                        queued_events = 0
+                  WHERE repository_id = ?1",
+                params![repository_id, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn mark_watcher_failed(&self, repository_id: &str, error: &str) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "UPDATE watchers
+                    SET state = 'failed',
+                        updated_at = ?2,
+                        heartbeat_at = ?2,
+                        last_error = ?3,
+                        owner_pid = NULL,
+                        socket_path = NULL
+                  WHERE repository_id = ?1",
+                params![repository_id, now, error],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
     pub fn ensure_embedding_compatible(
         &self,
         repository_id: &str,
@@ -3492,6 +3604,30 @@ pub struct RepositoryStatus {
     pub embedding_dimension: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WatcherStatusRecord {
+    pub repository_id: String,
+    pub root_path: String,
+    pub mode: String,
+    pub owner_kind: String,
+    pub owner_pid: Option<i32>,
+    pub socket_path: Option<String>,
+    pub state: String,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub files_seen: usize,
+    pub queued_events: usize,
+    pub last_indexed_path: Option<String>,
+    pub last_error: Option<String>,
+    pub active_layer: Option<String>,
+    pub quality_status: Option<String>,
+    pub quality_pending_jobs: usize,
+    pub quality_running_jobs: usize,
+    pub quality_failed_jobs: usize,
+    pub quality_stale_jobs: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRunRecord {
     pub id: String,
@@ -4704,6 +4840,31 @@ fn quality_job_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QualityJo
     })
 }
 
+fn watcher_status_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatcherStatusRecord> {
+    Ok(WatcherStatusRecord {
+        repository_id: row.get(0)?,
+        root_path: row.get(1)?,
+        mode: row.get(2)?,
+        owner_kind: row.get(3)?,
+        owner_pid: row.get::<_, Option<i64>>(4)?.map(|pid| pid as i32),
+        socket_path: row.get(5)?,
+        state: row.get(6)?,
+        started_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        heartbeat_at: row.get(9)?,
+        files_seen: row.get::<_, i64>(10)? as usize,
+        queued_events: row.get::<_, i64>(11)? as usize,
+        last_indexed_path: row.get(12)?,
+        last_error: row.get(13)?,
+        active_layer: row.get(14)?,
+        quality_status: row.get(15)?,
+        quality_pending_jobs: row.get::<_, i64>(16)? as usize,
+        quality_running_jobs: row.get::<_, i64>(17)? as usize,
+        quality_failed_jobs: row.get::<_, i64>(18)? as usize,
+        quality_stale_jobs: row.get::<_, i64>(19)? as usize,
+    })
+}
+
 fn call_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSearchRow> {
     Ok(CallSearchRow {
         callee_text: row.get(0)?,
@@ -5341,6 +5502,30 @@ CREATE TABLE IF NOT EXISTS index_runs (
   run_kind TEXT NOT NULL DEFAULT 'manual'
 );
 
+CREATE TABLE IF NOT EXISTS watchers (
+  repository_id TEXT PRIMARY KEY,
+  root_path TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  owner_kind TEXT NOT NULL,
+  owner_pid INTEGER,
+  socket_path TEXT,
+  state TEXT NOT NULL,
+  started_at TEXT,
+  updated_at TEXT,
+  heartbeat_at TEXT,
+  files_seen INTEGER NOT NULL DEFAULT 0,
+  queued_events INTEGER NOT NULL DEFAULT 0,
+  last_indexed_path TEXT,
+  last_error TEXT,
+  active_layer TEXT,
+  quality_status TEXT,
+  quality_pending_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_running_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_failed_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_stale_jobs INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS files (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL,
@@ -5551,6 +5736,7 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_generation_layer_stat
 CREATE INDEX IF NOT EXISTS idx_vector_points_repository_table ON vector_points(repository_id, vector_store, vector_table);
 CREATE INDEX IF NOT EXISTS idx_vector_points_chunk ON vector_points(chunk_id);
 CREATE INDEX IF NOT EXISTS idx_quality_embedding_jobs_repository_generation_status ON quality_embedding_jobs(repository_id, generation_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heartbeat_at);
 "#;
 
 pub fn current_timestamp() -> String {
@@ -5587,7 +5773,8 @@ mod tests {
         PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
         RepositoryRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
         StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, TestRecord, VectorPoint,
-        validate_vector_table_name, vector_point_id, vector_rowid, vector_table_name,
+        WatcherStatusRecord, validate_vector_table_name, vector_point_id, vector_rowid,
+        vector_table_name,
     };
 
     #[test]
@@ -7988,6 +8175,53 @@ mod tests {
         assert_eq!(finished.2, 4);
         assert_eq!(finished.3, 3);
         assert_eq!(finished.4.as_deref(), Some("vector store unavailable"));
+    }
+
+    #[test]
+    fn sqlite_persists_watcher_status() {
+        let db = TestDb::new("watcher-status");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .upsert_watcher_status(&WatcherStatusRecord {
+                repository_id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+                mode: "semantic".to_owned(),
+                owner_kind: "daemon".to_owned(),
+                owner_pid: Some(123),
+                socket_path: Some("/tmp/repo/.symdex/watch.sock".to_owned()),
+                state: "running".to_owned(),
+                started_at: Some("1".to_owned()),
+                updated_at: Some("1".to_owned()),
+                heartbeat_at: Some("1".to_owned()),
+                files_seen: 3,
+                queued_events: 2,
+                last_indexed_path: Some("src/lib.rs".to_owned()),
+                last_error: None,
+                active_layer: Some("fast".to_owned()),
+                quality_status: Some("quality_pending".to_owned()),
+                quality_pending_jobs: 1,
+                quality_running_jobs: 0,
+                quality_failed_jobs: 0,
+                quality_stale_jobs: 0,
+            })
+            .expect("watcher should persist");
+
+        let status = store
+            .watcher_status("repo")
+            .expect("watcher status should load")
+            .expect("watcher should exist");
+
+        assert_eq!(status.state, "running");
+        assert_eq!(status.files_seen, 3);
+        assert_eq!(status.queued_events, 2);
+        assert_eq!(status.last_indexed_path.as_deref(), Some("src/lib.rs"));
     }
 
     #[test]

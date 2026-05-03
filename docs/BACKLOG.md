@@ -115,7 +115,7 @@
 - [x] Offline continuous indexing path that updates SQLite without Ollama or sqlite-vec.
 - [x] Semantic continuous indexing path that updates sqlite-vec when local services are available.
 - [x] CLI launch path such as `symdex index --watch <repo>`.
-- [x] TUI continuous indexing toggle with explicit on/off labels and first-enable confirmation.
+- [x] TUI continuous indexing toggle with explicit on/off labels over the shared watcher.
 - [x] TUI watch status showing pending debounce state, queued event count, last reindexed file, and latest error.
 - [x] TUI toggle state tests.
 - [x] Tests for event coalescing, ignored paths, created-file indexing, modified-file reindexing, and unchanged-content skips.

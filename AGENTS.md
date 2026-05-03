@@ -113,11 +113,13 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Respect `.gitignore` plus project-level ignore config.
 - Continuous indexing must use the same ignore, path-boundary, hashing, parser, secret-detection, and embedding rules as manual indexing.
 - Continuous indexing must debounce file events and coalesce bursts before reindexing.
-- Continuous indexing starts automatically with the TUI and must remain visibly toggleable.
+- Continuous indexing uses one background watcher per repository. The TUI starts
+  or attaches to that watcher and must remain visibly toggleable.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 
 ## MCP Rules
-- MCP tools are read-only for the MVP.
+- MCP evidence tools are read-only for the MVP. `symdex_watch_start` is the
+  explicit local-only exception for starting the background watcher.
 - Write-capable tools require a future design doc before implementation.
 - Tool names must be stable, descriptive, and versionable.
 - Tool outputs must fit agent context windows.

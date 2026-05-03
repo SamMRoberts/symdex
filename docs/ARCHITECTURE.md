@@ -87,6 +87,7 @@ Indexing orchestration:
 
 - repository indexing workflow shared by CLI and TUI
 - continuous indexing watch orchestration shared by CLI and TUI
+- one-watcher-per-repository control plane shared by CLI, TUI, and MCP
 - file-event debounce and coalescing before reindex work is scheduled
 - structural SQLite persistence
 - optional semantic embedding and sqlite-vec upserts
@@ -159,7 +160,7 @@ Terminal UI:
 - `ratatui` layouts and widgets
 - `crossterm` input and terminal lifecycle
 - view orchestration for dashboard, indexing controls, diagnostics, queries, impact, and context packs
-- continuous indexing toggle, confirmation state, watch status, and watch error display
+- continuous indexing toggle, shared watcher status, and watch error display
 - metadata-only storage visualizations for index coverage, file details, symbol outlines, call resolution, embedding coverage, and index runs
 - active semantic layer and quality-index status display when layered indexing
   is enabled

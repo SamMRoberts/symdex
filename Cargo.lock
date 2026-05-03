@@ -1553,6 +1553,7 @@ dependencies = [
  "symdex-query",
  "symdex-store",
  "symdex-tui",
+ "symdex-watch",
 ]
 
 [[package]]
@@ -1575,6 +1576,7 @@ dependencies = [
  "symdex-embed",
  "symdex-query",
  "symdex-store",
+ "symdex-watch",
 ]
 
 [[package]]
@@ -1604,6 +1606,7 @@ dependencies = [
  "symdex-embed",
  "symdex-query",
  "symdex-store",
+ "symdex-watch",
 ]
 
 [[package]]
@@ -1648,6 +1651,18 @@ dependencies = [
  "symdex-embed",
  "symdex-index",
  "symdex-query",
+ "symdex-store",
+ "symdex-watch",
+]
+
+[[package]]
+name = "symdex-watch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "symdex-core",
+ "symdex-index",
  "symdex-store",
 ]
 

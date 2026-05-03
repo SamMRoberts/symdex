@@ -407,9 +407,10 @@ represent the indexed repository.
 - Show fast and quality pending-job, running-job, and skipped-stale-job
   sparklines in the Index tab, using each job count as a percentage of the
   total expected chunk count.
-- Start continuous indexing automatically when `symdex tui [repo]` launches.
+- Start or attach the single background watcher when `symdex tui [repo]`
+  launches.
 - Offer continuous indexing as a toggleable mode so users can stop and restart
-  the watcher during the TUI session.
+  the repository watcher during the TUI session.
 - When continuous indexing is on, modified or newly created eligible files are
   automatically reindexed after debounce.
 - Continuous indexing must use the same ignore, path-boundary, hashing,

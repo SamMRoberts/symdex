@@ -116,7 +116,7 @@ fn mcp_contract_check() -> DiagnosticCheck {
         label: "mcp_evidence_contract".to_owned(),
         state: DiagnosticState::Ok,
         message: format!(
-            "{EVIDENCE_CONTRACT_SCHEMA} version={EVIDENCE_CONTRACT_VERSION} read_only local_only"
+            "{EVIDENCE_CONTRACT_SCHEMA} version={EVIDENCE_CONTRACT_VERSION} local_only evidence_read_only watcher_start_explicit"
         ),
     }
 }
@@ -134,26 +134,71 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 state: DiagnosticState::Skipped,
                 message: "pass a repository path to check indexed evidence provenance".to_owned(),
             },
+            DiagnosticCheck {
+                label: "watcher_status".to_owned(),
+                state: DiagnosticState::Skipped,
+                message: "pass a repository path to check watcher status".to_owned(),
+            },
         ];
     };
 
     match symdex_query::run_freshness_report(repo, None) {
-        Ok(summary) => vec![
-            index_freshness_check(&summary),
-            provenance_consistency_check(&summary),
-        ],
-        Err(error) => vec![
+        Ok(summary) => {
+            let mut checks = vec![
+                index_freshness_check(&summary),
+                provenance_consistency_check(&summary),
+            ];
+            checks.push(watcher_status_check(repo));
+            checks
+        }
+        Err(error) => {
+            let mut checks = vec![
+                DiagnosticCheck {
+                    label: "index_freshness".to_owned(),
+                    state: DiagnosticState::Error,
+                    message: error.clone(),
+                },
+                DiagnosticCheck {
+                    label: "provenance_consistency".to_owned(),
+                    state: DiagnosticState::Error,
+                    message: error,
+                },
+            ];
+            checks.push(watcher_status_check(repo));
+            checks
+        }
+    }
+}
+
+fn watcher_status_check(repo: &str) -> DiagnosticCheck {
+    match symdex_watch::status(repo) {
+        Ok(status) => {
+            let state = match status.state.as_str() {
+                "running" | "pending" | "indexing" | "starting" => DiagnosticState::Ok,
+                "inactive" | "stopped" => DiagnosticState::Skipped,
+                "stale" => DiagnosticState::Unreachable,
+                "failed" => DiagnosticState::Error,
+                _ => DiagnosticState::Skipped,
+            };
             DiagnosticCheck {
-                label: "index_freshness".to_owned(),
-                state: DiagnosticState::Error,
-                message: error.clone(),
-            },
-            DiagnosticCheck {
-                label: "provenance_consistency".to_owned(),
-                state: DiagnosticState::Error,
-                message: error,
-            },
-        ],
+                label: "watcher_status".to_owned(),
+                state,
+                message: format!(
+                    "state={} owner={} files_seen={} queued={} last={} error={}",
+                    status.state,
+                    status.owner_kind,
+                    status.files_seen,
+                    status.queued_events,
+                    status.last_indexed_path.as_deref().unwrap_or("<none>"),
+                    status.last_error.as_deref().unwrap_or("<none>")
+                ),
+            }
+        }
+        Err(error) => DiagnosticCheck {
+            label: "watcher_status".to_owned(),
+            state: DiagnosticState::Error,
+            message: error,
+        },
     }
 }
 

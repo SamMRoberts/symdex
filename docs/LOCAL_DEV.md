@@ -89,6 +89,9 @@ cargo run -p symdex-cli -- index --incremental .
 cargo run -p symdex-cli -- index-quality .
 cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- index --watch .
+cargo run -p symdex-cli -- watch start .
+cargo run -p symdex-cli -- watch status .
+cargo run -p symdex-cli -- watch stop .
 cargo run -p symdex-cli -- index-status .
 cargo run -p symdex-cli -- semantic-status .
 cargo run -p symdex-cli -- staleness .
@@ -134,13 +137,15 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
   rust-analyzer enrichment readiness and eligible Rust file, symbol, and call
   counts without applying rust-analyzer facts.
-- `index --watch <repo>`: starts continuous indexing. It polls local eligible
-  Rust, C#, JavaScript, and TypeScript files, debounces event bursts, detects
-  created/modified/deleted paths by content-hash snapshots, and reindexes
-  changed content through the incremental indexing path until stopped with
-  `Ctrl+C`. Watch mode is always incremental; use a separate manual
-  `index --full <repo>` when a forced rebuild is needed. Semantic watch batches
-  queue quality jobs when quality indexing is
+- `watch start|status|stop <repo>`: manages the single persistent background
+  watcher for a repository. It polls local eligible Rust, C#, JavaScript, and
+  TypeScript files, debounces event bursts, detects created/modified/deleted
+  paths by content-hash snapshots, and reindexes changed content through the
+  incremental semantic indexing path until explicitly stopped.
+- `index --watch <repo>`: starts the legacy foreground continuous-indexing loop,
+  guarded by the same one-watcher-per-repo state. Watch mode is always
+  incremental; use a separate manual `index --full <repo>` when a forced rebuild
+  is needed. Semantic watch batches queue quality jobs when quality indexing is
   enabled, then process bounded quality catch-up batches between fast watch
   work. Watch output includes metadata-only quality state, progress,
   completion, and failure events.
@@ -235,14 +240,14 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
   outside the Doctor tab to refresh repository/storage status, and `q` or `Esc`
   to quit.
-- `serve-mcp [--watch <repo>]`: runs the read-only MCP server over stdio. With
-  `--watch <repo>`, the server process also starts semantic continuous indexing
-  for that repository and writes watch summaries to stderr so stdout remains
-  MCP protocol-only. The server exposes
+- `serve-mcp [--watch <repo>]`: runs the MCP server over stdio. With
+  `--watch <repo>`, it starts or attaches the repository background watcher
+  before serving tools. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
-  `symdex_debug_context`, `symdex_staleness_check`, and
-  `symdex_index_status`. `symdex_context_pack` accepts `mode: "unified"` for
+  `symdex_debug_context`, `symdex_staleness_check`, `symdex_index_status`,
+  `symdex_watch_status`, and `symdex_watch_start`. `symdex_context_pack` accepts
+  `mode: "unified"` for
   combined structural and semantic context-pack evidence.
 
 `doctor` checks whether sqlite-vec is reachable over REST, whether Ollama is
@@ -279,7 +284,8 @@ The app should not require network access beyond local loopback services during 
 - Ollama is reachable
 - embedding model is available
 - vector dimension can be determined
-- active MCP evidence contract version is local-only and read-only
+- active MCP evidence contract version and watcher-start exception
 - optional rust-analyzer enrichment readiness when `SYMDEX_RUST_ANALYZER=1`
 - configured repo root exists
-- repo-specific index freshness and provenance consistency when a repo is passed
+- repo-specific index freshness, provenance consistency, and watcher status
+  when a repo is passed

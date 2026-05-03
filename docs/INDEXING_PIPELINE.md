@@ -345,8 +345,10 @@ from degrading into broad table scans as repositories grow.
 ## Continuous indexing
 
 Continuous indexing is a local watch mode layered on top of incremental
-indexing. It starts automatically with `symdex tui [repo]` and can be toggled
-on or off during the TUI session.
+indexing. A single background watcher owns watch work for each repository.
+`symdex tui [repo]`, `symdex watch start <repo>`, and `symdex serve-mcp --watch
+<repo>` start or attach that watcher; `symdex watch stop <repo>` or the TUI
+toggle stops it.
 
 Current implementation uses a polling watcher: it discovers eligible Rust, C#,
 JavaScript, and TypeScript files at a fixed interval, compares

@@ -13,3 +13,4 @@ symdex-core = { path = "../symdex-core" }
 symdex-embed = { path = "../symdex-embed" }
 symdex-query = { path = "../symdex-query" }
 symdex-store = { path = "../symdex-store" }
+symdex-watch = { path = "../symdex-watch" }

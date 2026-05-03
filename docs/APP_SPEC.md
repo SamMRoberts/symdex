@@ -44,6 +44,9 @@ It answers questions such as:
 symdex init
 symdex index <repo>
 symdex index --watch <repo>
+symdex watch start <repo>
+symdex watch status <repo>
+symdex watch stop <repo>
 symdex search <repo> "query"
 symdex symbol <repo> <symbol>
 symdex callers <repo> <symbol>
@@ -62,7 +65,9 @@ symdex serve-mcp --watch <repo>
 - C#, JavaScript, and TypeScript indexing use the same local-only contracts as
   Rust for discovery, parsing, chunking, symbols, calls, provenance, and
   continuous indexing.
-- Continuous indexing can be toggled on and off and reindexes modified or newly created eligible files without source execution.
+- Continuous indexing uses one local background watcher per repository, can be
+  toggled on and off, and reindexes modified or newly created eligible files
+  without source execution.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.

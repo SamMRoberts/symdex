@@ -2,7 +2,8 @@
 
 ## Principles
 
-- Tools are read-only for MVP.
+- Evidence tools are read-only for MVP. `symdex_watch_start` is the explicit
+  local-only exception for starting or attaching the background watcher.
 - Return compact evidence, not long prose.
 - Validate repo roots and all paths.
 - Prefer JSON-compatible structured output.
@@ -588,6 +589,30 @@ Output:
   "last_indexed_at": "2026-04-30T12:00:00Z"
 }
 ```
+
+### `symdex_watch_status`
+
+Return metadata-only status for the single background watcher for a repository.
+This is read-only.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo"
+}
+```
+
+Output includes watcher state, owner metadata, heartbeat, files seen, queued
+event count, last indexed path, latest error, active semantic layer, and quality
+job counts. It never returns source text, vectors, or embeddings.
+
+### `symdex_watch_start`
+
+Start or attach the single local background watcher for a repository. This is
+the explicit local-only write-capable exception to the read-only evidence-tool
+policy. It is idempotent and returns the same metadata shape as
+`symdex_watch_status`.
 
 ## Future write-capable tools
 

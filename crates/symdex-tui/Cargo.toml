@@ -17,3 +17,4 @@ symdex-embed = { path = "../symdex-embed" }
 symdex-index = { path = "../symdex-index" }
 symdex-query = { path = "../symdex-query" }
 symdex-store = { path = "../symdex-store" }
+symdex-watch = { path = "../symdex-watch" }

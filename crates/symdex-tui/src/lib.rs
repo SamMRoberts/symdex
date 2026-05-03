@@ -4,7 +4,7 @@ mod navigation;
 mod terminal;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -27,9 +27,8 @@ use symdex_diagnostics::{
 };
 use symdex_embed::EmbedConfig;
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, EmbeddingSummary,
-    IndexOptions, IndexProgress, IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary,
-    run_continuous_index_until, run_index_with_progress,
+    ContinuousIndexEvent, ContinuousQualityState, EmbeddingSummary, IndexOptions, IndexProgress,
+    IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary, run_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
@@ -49,6 +48,7 @@ use symdex_store::{
     StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
     VectorStorageProjection, vector_table_name,
 };
+use symdex_watch::WatcherStatus;
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
 
@@ -1054,46 +1054,35 @@ impl App {
     }
 
     fn start_continuous_index(&mut self) {
-        let repo = self.repo_input.clone();
-        let active = Arc::new(AtomicBool::new(true));
-        let worker_active = Arc::clone(&active);
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let result = run_continuous_index_until(
-                &ContinuousIndexOptions::new(repo, false),
-                |event| {
-                    let _ = sender.send(ContinuousIndexMessage::Event(Box::new(event)));
-                },
-                || worker_active.load(Ordering::SeqCst),
-            );
-            match result {
-                Ok(()) => {
-                    let _ = sender.send(ContinuousIndexMessage::Stopped);
-                }
-                Err(error) => {
-                    let _ = sender.send(ContinuousIndexMessage::Failed(error));
-                }
+        match symdex_watch::start_daemon(&self.repo_input) {
+            Ok(status) => {
+                self.apply_watcher_status(&status);
+                self.message = "Continuous indexing watcher attached.".to_owned();
             }
-        });
-        self.continuous = ContinuousIndexState {
-            enabled: true,
-            status: ContinuousIndexStatus::Starting,
-            ..ContinuousIndexState::default()
-        };
-        self.continuous_receiver = Some(receiver);
-        self.continuous_stop = Some(active);
+            Err(error) => {
+                self.continuous.enabled = false;
+                self.continuous.status = ContinuousIndexStatus::Failed;
+                self.continuous.latest_error = Some(error);
+                self.message = "Continuous indexing failed.".to_owned();
+            }
+        }
         self.screen = reduce_screen(self.screen, UiAction::Confirm);
-        self.message = "Continuous indexing started.".to_owned();
     }
 
     fn stop_continuous_index(&mut self) {
-        if let Some(active) = &self.continuous_stop {
-            active.store(false, Ordering::SeqCst);
+        match symdex_watch::stop_daemon(&self.repo_input) {
+            Ok(status) => {
+                self.apply_watcher_status(&status);
+                self.message = "Continuous indexing stopped.".to_owned();
+            }
+            Err(error) => {
+                self.continuous.status = ContinuousIndexStatus::Failed;
+                self.continuous.latest_error = Some(error);
+                self.message = "Continuous indexing stop failed.".to_owned();
+            }
         }
-        self.continuous = ContinuousIndexState::default();
         self.continuous_receiver = None;
         self.continuous_stop = None;
-        self.message = "Continuous indexing stopped.".to_owned();
     }
 
     fn start_diagnostics(&mut self) {
@@ -1115,6 +1104,34 @@ impl App {
         self.diagnostics_details_expanded = false;
         self.diagnostics_receiver = Some(receiver);
         self.message = "Doctor diagnostics started.".to_owned();
+    }
+
+    fn apply_watcher_status(&mut self, status: &WatcherStatus) {
+        self.continuous.enabled = matches!(
+            status.state.as_str(),
+            "starting" | "running" | "pending" | "indexing" | "failed" | "stale"
+        );
+        self.continuous.status = match status.state.as_str() {
+            "starting" => ContinuousIndexStatus::Starting,
+            "running" => ContinuousIndexStatus::Watching,
+            "pending" => ContinuousIndexStatus::Pending,
+            "indexing" => ContinuousIndexStatus::Indexing,
+            "failed" | "stale" => ContinuousIndexStatus::Failed,
+            _ => ContinuousIndexStatus::Off,
+        };
+        self.continuous.files_seen = status.files_seen;
+        self.continuous.queued_events = status.queued_events;
+        self.continuous.last_reindexed_file = status.last_indexed_path.clone();
+        self.continuous.latest_error = status.last_error.clone();
+        if status.state == "stale" && self.continuous.latest_error.is_none() {
+            self.continuous.latest_error = Some("watcher heartbeat stale".to_owned());
+        }
+        self.continuous.active_layer = status.active_layer.clone();
+        self.continuous.quality_status = status.quality_status.clone();
+        self.continuous.quality_pending_jobs = status.quality_pending_jobs;
+        self.continuous.quality_running_jobs = status.quality_running_jobs;
+        self.continuous.quality_failed_jobs = status.quality_failed_jobs;
+        self.continuous.quality_stale_jobs = status.quality_stale_jobs;
     }
 
     fn start_query(&mut self) {
@@ -1243,6 +1260,9 @@ impl App {
 
     fn poll_continuous_index(&mut self) {
         let Some(receiver) = &self.continuous_receiver else {
+            if let Ok(status) = symdex_watch::status(&self.repo_input) {
+                self.apply_watcher_status(&status);
+            }
             return;
         };
         match receiver.try_recv() {
@@ -6335,6 +6355,7 @@ enum IndexJobMessage {
     Finished(Result<Box<IndexSummary>, String>),
 }
 
+#[allow(dead_code)]
 enum ContinuousIndexMessage {
     Event(Box<ContinuousIndexEvent>),
     Failed(String),
@@ -7823,7 +7844,9 @@ mod tests {
 
     #[test]
     fn continuous_indexing_toggle_stops_when_enabled() {
-        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let repo = std::env::temp_dir().join(format!("symdex-tui-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).expect("temp repo should be created");
+        let mut app = App::from_status(repo.display().to_string(), "repo", sample_status());
         app.continuous.enabled = true;
         app.continuous.status = ContinuousIndexStatus::Watching;
         app.continuous.queued_events = 2;
