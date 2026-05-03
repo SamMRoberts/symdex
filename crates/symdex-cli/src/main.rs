@@ -8,9 +8,10 @@ use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexSummary,
-    QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
-    run_continuous_index, run_index, run_quality_index, run_quality_index_with_progress,
+    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexScope,
+    IndexSummary, QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary,
+    WatchChangeSet, run_continuous_index, run_index, run_quality_index,
+    run_quality_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
@@ -49,7 +50,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "index" => {
             require_text_output(command, output)?;
-            let index_args = parse_index_args(&args[1..]);
+            let index_args = parse_index_args(&args[1..])?;
             index(&index_args)
         }
         "index-quality" => {
@@ -234,6 +235,7 @@ fn index(args: &IndexArgs) -> Result<(), String> {
     let summary = run_index(&IndexOptions {
         repo: args.repo.clone(),
         offline: args.offline,
+        scope: args.scope,
     })?;
     print_index_summary(&summary);
     Ok(())
@@ -478,6 +480,7 @@ fn repair_qdrant_summary(repo: &str, summary: &QdrantVerifySummary) -> Result<()
             let index_summary = run_index(&IndexOptions {
                 repo: repo.to_owned(),
                 offline: false,
+                scope: IndexScope::Full,
             })?;
             print_index_summary(&index_summary);
         }
@@ -1142,23 +1145,74 @@ fn print_diagnostic_check(check: &DiagnosticCheck) {
     }
 }
 
-fn parse_index_args(args: &[String]) -> IndexArgs {
+fn parse_index_args(args: &[String]) -> Result<IndexArgs, String> {
     let mut repo = ".".to_owned();
     let mut offline = false;
     let mut watch = false;
-    for arg in args {
+    let mut scope = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
         if arg == "--offline" {
             offline = true;
         } else if arg == "--watch" {
             watch = true;
+        } else if arg == "--full" {
+            set_index_scope(&mut scope, IndexScope::Full)?;
+        } else if arg == "--incremental" {
+            set_index_scope(&mut scope, IndexScope::Incremental)?;
+        } else if arg == "--scope" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err("--scope requires a value: full or incremental".to_owned());
+            };
+            set_index_scope(&mut scope, parse_index_scope(value)?)?;
+        } else if let Some(value) = arg.strip_prefix("--scope=") {
+            set_index_scope(&mut scope, parse_index_scope(value)?)?;
+        } else if arg.starts_with("--") {
+            return Err(format!("unsupported index option `{arg}`"));
         } else {
             repo = arg.clone();
         }
+        index += 1;
     }
-    IndexArgs {
+
+    let scope = scope.unwrap_or(if watch || offline {
+        IndexScope::Incremental
+    } else {
+        IndexScope::Full
+    });
+    if watch && scope == IndexScope::Full {
+        return Err(
+            "--watch uses incremental indexing; --full is not supported with --watch".to_owned(),
+        );
+    }
+
+    Ok(IndexArgs {
         repo,
         offline,
         watch,
+        scope,
+    })
+}
+
+fn set_index_scope(current: &mut Option<IndexScope>, next: IndexScope) -> Result<(), String> {
+    if let Some(current) = current
+        && *current != next
+    {
+        return Err("--full and --incremental are mutually exclusive".to_owned());
+    }
+    *current = Some(next);
+    Ok(())
+}
+
+fn parse_index_scope(value: &str) -> Result<IndexScope, String> {
+    match value {
+        "full" => Ok(IndexScope::Full),
+        "incremental" => Ok(IndexScope::Incremental),
+        other => Err(format!(
+            "unsupported index scope `{other}`; expected `full` or `incremental`"
+        )),
     }
 }
 
@@ -1227,10 +1281,12 @@ fn parse_qdrant_maintenance_args(args: &[String]) -> Result<QdrantMaintenanceArg
     })
 }
 
+#[derive(Debug)]
 struct IndexArgs {
     repo: String,
     offline: bool,
     watch: bool,
+    scope: IndexScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1374,7 +1430,7 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--full|--incremental] [--offline] [--watch] <repo>  Index code with explicit full or incremental scope\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1383,10 +1439,11 @@ fn print_help() {
 mod tests {
     use super::{
         ContextPackMode, OutputMode, QdrantVerifySemanticLayer, parse_cli_invocation,
-        parse_context_pack_args, parse_qdrant_maintenance_args, require_text_output,
-        semantic_status_json,
+        parse_context_pack_args, parse_index_args, parse_qdrant_maintenance_args,
+        require_text_output, semantic_status_json,
     };
     use symdex_core::{SemanticLayer, SemanticLayerStatus};
+    use symdex_index::IndexScope;
     use symdex_query::{SemanticStatusLayerSummary, SemanticStatusSummary};
     use symdex_store::QualityGenerationProgress;
 
@@ -1423,6 +1480,60 @@ mod tests {
             .expect_err("unknown output should fail");
 
         assert!(error.contains("unsupported output format"));
+    }
+
+    #[test]
+    fn index_args_parse_explicit_full_scope() {
+        let args = parse_index_args(&["--full".to_owned(), "repo".to_owned()])
+            .expect("index args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.scope, IndexScope::Full);
+        assert!(!args.offline);
+        assert!(!args.watch);
+    }
+
+    #[test]
+    fn index_args_parse_offline_incremental_scope() {
+        let args = parse_index_args(&[
+            "--offline".to_owned(),
+            "--incremental".to_owned(),
+            "repo".to_owned(),
+        ])
+        .expect("index args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.scope, IndexScope::Incremental);
+        assert!(args.offline);
+    }
+
+    #[test]
+    fn index_args_preserve_legacy_defaults() {
+        let semantic = parse_index_args(&["repo".to_owned()]).expect("args should parse");
+        let offline = parse_index_args(&["--offline".to_owned(), "repo".to_owned()])
+            .expect("args should parse");
+        let watch = parse_index_args(&["--watch".to_owned(), "repo".to_owned()])
+            .expect("args should parse");
+
+        assert_eq!(semantic.scope, IndexScope::Full);
+        assert_eq!(offline.scope, IndexScope::Incremental);
+        assert_eq!(watch.scope, IndexScope::Incremental);
+    }
+
+    #[test]
+    fn index_args_reject_conflicting_scopes() {
+        let error = parse_index_args(&["--full".to_owned(), "--incremental".to_owned()])
+            .expect_err("conflicting scopes should fail");
+
+        assert!(error.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn index_args_reject_full_watch() {
+        let error = parse_index_args(&["--watch".to_owned(), "--full".to_owned()])
+            .expect_err("full watch should fail");
+
+        assert!(error.contains("--watch uses incremental indexing"));
     }
 
     #[test]

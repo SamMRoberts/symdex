@@ -33,12 +33,15 @@ cargo run -p symdex-cli -- serve-mcp
 With Ollama and Qdrant running locally, `index <repo>` embeds Rust chunks and
 upserts vectors, and `search <repo> <query>` returns ranked path and line-range
 evidence. Use `index --offline <repo>` for SQLite-backed structural indexing
-without service calls.
+without service calls. Add `--full` to force all eligible files through the
+indexer, or `--incremental` to skip unchanged files by content hash.
 
 ## Commands
 
 ```bash
 cargo run -p symdex-cli -- index <repo>
+cargo run -p symdex-cli -- index --full <repo>
+cargo run -p symdex-cli -- index --incremental <repo>
 cargo run -p symdex-cli -- index --watch <repo>
 cargo run -p symdex-cli -- search <repo> "retry logic"
 cargo run -p symdex-cli -- symbol <repo> <symbol>
@@ -64,9 +67,11 @@ non-interactive watch process with `Ctrl+C`.
 - `[` / `]` move between primary tabs: Index, Storage, Doctor, Query, Calls,
   and Impact.
 - `Tab` / `Shift+Tab` switch modes inside the active view, such as storage
-  panes, query modes, callers/callees, or impact/context-pack.
+  panes, query modes, callers/callees, impact/context-pack, or full/incremental
+  scope on the Index tab.
 - `o` starts offline indexing confirmation, `s` starts semantic indexing
-  confirmation, and `c` toggles continuous indexing confirmation.
+  confirmation, and `c` toggles continuous indexing confirmation. Manual offline
+  and semantic indexing use the selected full/incremental scope.
 - Continuous indexing shows an animated activity indicator while enabled.
 - The footer separates shortcut hints from status messages into distinct
   terminal containers.

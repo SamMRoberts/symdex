@@ -26,6 +26,26 @@ use symdex_store::{
 pub struct IndexOptions {
     pub repo: String,
     pub offline: bool,
+    pub scope: IndexScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexScope {
+    Full,
+    Incremental,
+}
+
+impl IndexScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+
+    fn skips_unchanged(self) -> bool {
+        matches!(self, Self::Incremental)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,6 +543,7 @@ pub fn run_continuous_index_until(
         match run_watch_incremental_index(&IndexOptions {
             repo: options.repo.clone(),
             offline: options.offline,
+            scope: IndexScope::Incremental,
         }) {
             Ok(summary) => {
                 snapshot = watch_snapshot(&root).unwrap_or(debounced_snapshot);
@@ -668,7 +689,12 @@ pub fn run_index_with_progress(
     options: &IndexOptions,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<IndexSummary, String> {
-    run_index_internal(options, options.offline, None, &mut on_progress)
+    run_index_internal(
+        options,
+        options.scope.skips_unchanged(),
+        None,
+        &mut on_progress,
+    )
 }
 
 fn run_index_internal(
@@ -2469,13 +2495,22 @@ mod tests {
     };
 
     use crate::{
-        ContinuousIndexOptions, IndexCollection, IndexReport, RustAnalyzerEnrichmentConfig,
-        RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness, WatchSnapshot,
-        apply_embedding_size_limits, chunk_record, chunk_texts, collect_index_reports,
-        detect_watch_changes, diff_watch_snapshots, index_run_kind, plan_rust_analyzer_enrichment,
-        prepare_quality_job, quality_chunk_embedding_record, quality_vector_point,
-        resolve_cross_file_rust_calls, should_run_continuous_quality_catch_up, watch_snapshot,
+        ContinuousIndexOptions, IndexCollection, IndexReport, IndexScope,
+        RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness,
+        WatchSnapshot, apply_embedding_size_limits, chunk_record, chunk_texts,
+        collect_index_reports, detect_watch_changes, diff_watch_snapshots, index_run_kind,
+        plan_rust_analyzer_enrichment, prepare_quality_job, quality_chunk_embedding_record,
+        quality_vector_point, resolve_cross_file_rust_calls,
+        should_run_continuous_quality_catch_up, watch_snapshot,
     };
+
+    #[test]
+    fn index_scope_controls_unchanged_file_skipping() {
+        assert!(!IndexScope::Full.skips_unchanged());
+        assert!(IndexScope::Incremental.skips_unchanged());
+        assert_eq!(IndexScope::Full.label(), "full");
+        assert_eq!(IndexScope::Incremental.label(), "incremental");
+    }
 
     #[test]
     fn chunk_texts_skip_secret_excluded_chunks() {

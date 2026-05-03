@@ -86,6 +86,8 @@ cargo run -p symdex-cli -- init
 cargo run -p symdex-cli -- doctor
 cargo run -p symdex-cli -- doctor .
 cargo run -p symdex-cli -- index .
+cargo run -p symdex-cli -- index --full .
+cargo run -p symdex-cli -- index --incremental .
 cargo run -p symdex-cli -- index-quality .
 cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- index --watch .
@@ -123,9 +125,11 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   applies built-in excludes and scoped glob-aware `.gitignore` rules with
   negation, hashes file contents, extracts tree-sitter function and method chunks where supported,
   embeds chunk text with local Ollama, creates the Qdrant collection if needed,
-  and upserts semantic vectors. Use
-  `index --offline <repo>` for SQLite-backed discovery and chunking without
-  service calls; unchanged files are skipped by content hash. Chunks flagged as
+  and upserts semantic vectors. Use `index --full <repo>` to force all eligible
+  files through parsing and embedding, or `index --incremental <repo>` to skip
+  unchanged files by content hash. Use `index --offline <repo>` for
+  SQLite-backed discovery and chunking without service calls; offline still
+  accepts `--full` or `--incremental`. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/Qdrant embedding.
   When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
@@ -135,7 +139,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   Rust, C#, JavaScript, and TypeScript files, debounces event bursts, detects
   created/modified/deleted paths by content-hash snapshots, and reindexes
   changed content through the incremental indexing path until stopped with
-  `Ctrl+C`. Semantic watch batches queue quality jobs when quality indexing is
+  `Ctrl+C`. Watch mode is always incremental; use a separate manual
+  `index --full <repo>` when a forced rebuild is needed. Semantic watch batches
+  queue quality jobs when quality indexing is
   enabled, then process bounded quality catch-up batches between fast watch
   work. Watch output includes metadata-only quality state, progress,
   completion, and failure events.
@@ -213,7 +219,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
   opens an Overview tab backed by SQLite metadata and local service
   configuration, then uses a compact repository summary beside or above the
-  active workflow on other tabs. Use `o` to confirm offline indexing, `s` to
+  active workflow on other tabs. Use `Tab` / `Shift+Tab` on the Index tab to
+  select full or incremental scope, `o` to confirm offline indexing, `s` to
   confirm semantic indexing, `c` to toggle continuous indexing, `[` / `]` to
   move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
   tabs, and `Tab` / `Shift+Tab` to toggle view-local modes including impact,

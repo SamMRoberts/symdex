@@ -176,9 +176,14 @@ source text or Qdrant vectors.
 ## Manual indexing behavior
 
 `semantic index` terminology below means the current non-offline indexing path.
+Manual indexing has an explicit scope: `--full` forces every eligible file
+through the fast semantic path, while `--incremental` skips unchanged files by
+content hash. The plain semantic default remains full scope for compatibility.
 
 ```text
 symdex index <repo>
+symdex index --full <repo>
+symdex index --incremental <repo>
 ```
 
 Required behavior:
@@ -201,7 +206,9 @@ explicit. The default path should preserve fast availability. A one-shot
 `symdex index <repo>` command queues quality work but does not keep a background
 process alive after it exits; use `symdex index-quality <repo>` to drain queued
 quality jobs manually with progress output, or run `symdex index --watch <repo>`
-for cooperative quality catch-up while watch mode is active.
+for cooperative quality catch-up while watch mode is active. Watch mode remains
+incremental; run a separate `symdex index --full <repo>` when a forced rebuild is
+needed.
 
 ## Continuous indexing behavior
 

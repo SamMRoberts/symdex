@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-pub(crate) use navigation::{IndexMode, Screen, UiAction, reduce_screen};
+pub(crate) use navigation::{IndexMode, ManualIndexRequest, Screen, UiAction, reduce_screen};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -23,7 +23,7 @@ use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run
 use symdex_embed::EmbedConfig;
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, EmbeddingSummary,
-    IndexOptions, IndexProgress, IndexSummary, RustAnalyzerEnrichmentSummary,
+    IndexOptions, IndexProgress, IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary,
     run_continuous_index_until, run_index_with_progress,
 };
 use symdex_query::{
@@ -72,6 +72,7 @@ pub struct App {
     message: String,
     view: View,
     screen: Screen,
+    index_scope: IndexScope,
     last_index_summary: Option<IndexSummary>,
     index_progress: Option<IndexProgress>,
     animation_tick: usize,
@@ -143,6 +144,7 @@ impl App {
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
+            index_scope: IndexScope::Full,
             last_index_summary: None,
             index_progress: None,
             animation_tick: 0,
@@ -206,6 +208,7 @@ impl App {
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
+            index_scope: IndexScope::Full,
             last_index_summary: None,
             index_progress: None,
             animation_tick: 0,
@@ -240,6 +243,11 @@ impl App {
 
     fn index_lines(&self) -> Vec<Line<'_>> {
         let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Scope: ", Style::new().add_modifier(Modifier::BOLD)),
+                status_span(self.index_scope.label(), StatusTone::Info),
+                Span::raw(" press Tab"),
+            ]),
             Line::from(vec![
                 Span::styled("Offline index: ", Style::new().add_modifier(Modifier::BOLD)),
                 Span::raw("press o"),
@@ -302,13 +310,13 @@ impl App {
                     Span::raw(" No indexing job is pending."),
                 ]));
             }
-            Screen::ConfirmIndex(mode) => {
+            Screen::ConfirmIndex(request) => {
                 lines.push(Line::from(vec![
                     status_span("confirm", StatusTone::Warning),
                     Span::raw(" "),
                     Span::raw(format!(
                         "Run {} indexing for this repository?",
-                        mode.label()
+                        request.label()
                     )),
                 ]));
                 lines.push(Line::from("Press y to start, n or Esc to cancel."));
@@ -323,29 +331,29 @@ impl App {
                 ));
                 lines.push(Line::from("Press y to start, n or Esc to cancel."));
             }
-            Screen::IndexRunning(mode) => {
+            Screen::IndexRunning(request) => {
                 lines.push(Line::from(vec![
                     status_span("running", StatusTone::Info),
                     Span::raw(" "),
-                    Span::raw(format!("{} indexing", mode.label())),
+                    Span::raw(format!("{} indexing", request.label())),
                 ]));
                 lines.push(Line::from("The TUI will update when the job finishes."));
             }
-            Screen::IndexCompleted(mode) => {
+            Screen::IndexCompleted(request) => {
                 lines.push(Line::from(vec![
                     status_span("complete", StatusTone::Success),
                     Span::raw(" "),
-                    Span::raw(format!("{} indexing", mode.label())),
+                    Span::raw(format!("{} indexing", request.label())),
                 ]));
                 if let Some(summary) = &self.last_index_summary {
                     lines.extend(summary_lines(summary));
                 }
             }
-            Screen::IndexFailed(mode) => {
+            Screen::IndexFailed(request) => {
                 lines.push(Line::from(vec![
                     status_span("failed", StatusTone::Error),
                     Span::raw(" "),
-                    Span::raw(format!("{} indexing", mode.label())),
+                    Span::raw(format!("{} indexing", request.label())),
                 ]));
                 lines.push(Line::from(
                     self.last_error
@@ -736,14 +744,14 @@ impl App {
                 self.start_diagnostics();
             }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
-                self.screen =
-                    reduce_screen(self.screen, UiAction::RequestIndex(IndexMode::Offline));
-                self.message = "Confirm offline indexing before starting.".to_owned();
+                let request = self.selected_index_request(IndexMode::Offline);
+                self.screen = reduce_screen(self.screen, UiAction::RequestIndex(request));
+                self.message = format!("Confirm {} indexing before starting.", request.label());
             }
             KeyCode::Char('s') if self.screen.accepts_new_index_request() => {
-                self.screen =
-                    reduce_screen(self.screen, UiAction::RequestIndex(IndexMode::Semantic));
-                self.message = "Confirm semantic indexing before starting.".to_owned();
+                let request = self.selected_index_request(IndexMode::Semantic);
+                self.screen = reduce_screen(self.screen, UiAction::RequestIndex(request));
+                self.message = format!("Confirm {} indexing before starting.", request.label());
             }
             KeyCode::Char('c') if self.continuous.enabled => {
                 self.stop_continuous_index();
@@ -757,8 +765,8 @@ impl App {
                 self.message = "Confirm continuous indexing before starting.".to_owned();
             }
             KeyCode::Char('y') => {
-                if let Screen::ConfirmIndex(mode) = self.screen {
-                    self.start_index_job(mode);
+                if let Screen::ConfirmIndex(request) = self.screen {
+                    self.start_index_job(request);
                 } else if matches!(self.screen, Screen::ConfirmContinuous) {
                     self.start_continuous_index();
                 }
@@ -800,6 +808,13 @@ impl App {
             format!("[{}]", continuous_activity_frame(self.animation_tick)),
             tone_style(self.continuous.status_tone()).add_modifier(Modifier::BOLD),
         ))
+    }
+
+    fn selected_index_request(&self, mode: IndexMode) -> ManualIndexRequest {
+        ManualIndexRequest {
+            mode,
+            scope: self.index_scope,
+        }
     }
 
     fn select_primary_tab(&mut self, reverse: bool) {
@@ -844,7 +859,11 @@ impl App {
                 self.message = "Overview has no alternate mode.".to_owned();
             }
             View::Indexing => {
-                self.message = "No alternate indexing mode is selected with Tab.".to_owned();
+                self.index_scope = match self.index_scope {
+                    IndexScope::Full => IndexScope::Incremental,
+                    IndexScope::Incremental => IndexScope::Full,
+                };
+                self.message = format!("Index scope set to {}.", self.index_scope.label());
             }
             View::Diagnostics => {
                 self.message = "No alternate doctor mode is selected with Tab.".to_owned();
@@ -978,7 +997,7 @@ impl App {
         false
     }
 
-    fn start_index_job(&mut self, mode: IndexMode) {
+    fn start_index_job(&mut self, request: ManualIndexRequest) {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -986,7 +1005,8 @@ impl App {
             let result = run_index_with_progress(
                 &IndexOptions {
                     repo,
-                    offline: matches!(mode, IndexMode::Offline),
+                    offline: matches!(request.mode, IndexMode::Offline),
+                    scope: request.scope,
                 },
                 move |progress| {
                     let _ = progress_sender.send(IndexJobMessage::Progress(progress));
@@ -1000,11 +1020,11 @@ impl App {
             phase: "start",
             completed: 0,
             total: 1,
-            message: format!("Starting {} indexing", mode.label()),
+            message: format!("Starting {} indexing", request.label()),
         });
         self.last_error = None;
         self.screen = reduce_screen(self.screen, UiAction::Confirm);
-        self.message = format!("{} indexing started.", mode.label());
+        self.message = format!("{} indexing started.", request.label());
     }
 
     fn start_continuous_index(&mut self) {
@@ -1149,10 +1169,13 @@ impl App {
             }
             Ok(IndexJobMessage::Finished(Ok(summary))) => {
                 self.index_receiver = None;
-                let mode = self.screen.index_mode().unwrap_or(IndexMode::Offline);
+                let request = self.screen.index_request().unwrap_or(ManualIndexRequest {
+                    mode: IndexMode::Offline,
+                    scope: self.index_scope,
+                });
                 self.message = format!(
                     "{} indexing completed: {} files indexed, {} chunks indexed.",
-                    mode.label(),
+                    request.label(),
                     summary.sqlite_files_indexed,
                     summary.sqlite_chunks_indexed
                 );
@@ -5992,6 +6015,7 @@ mod tests {
     use ratatui::style::Color;
     use symdex_core::{SemanticLayer, SemanticLayerStatus};
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
+    use symdex_index::IndexScope;
     use symdex_query::{
         CallDirection, CallGraphSummary, CallPathSummary, DebugContextLimits, DebugContextPack,
         DebugFrameCallPath, DebugFrameMatch, EvidenceTrust, FileFreshnessRow, FreshnessSummary,
@@ -6013,9 +6037,9 @@ mod tests {
 
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
-        GraphStatus, IndexMode, QueryStatus, Screen, StorageExplorerState, StorageMode, UiAction,
-        View, continuous_activity_frame, parse_call_path_input, progress_percent, reduce_screen,
-        render,
+        GraphStatus, IndexMode, ManualIndexRequest, QueryStatus, Screen, StorageExplorerState,
+        StorageMode, UiAction, View, continuous_activity_frame, parse_call_path_input,
+        progress_percent, reduce_screen, render,
     };
 
     #[test]
@@ -6127,6 +6151,19 @@ mod tests {
         assert_eq!(app.view, View::Query);
         assert_eq!(app.query.mode, QueryMode::Semantic);
         assert_eq!(app.message, "Query mode set to semantic.");
+    }
+
+    #[test]
+    fn tab_toggles_index_scope_on_indexing_view() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Indexing;
+        app.index_scope = IndexScope::Full;
+
+        assert!(!app.handle_key(KeyCode::Tab));
+
+        assert_eq!(app.view, View::Indexing);
+        assert_eq!(app.index_scope, IndexScope::Incremental);
+        assert_eq!(app.message, "Index scope set to incremental.");
     }
 
     #[test]
@@ -7245,8 +7282,11 @@ mod tests {
     fn renders_index_confirmation_panel_with_warning_style() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
-        app.screen = Screen::ConfirmIndex(IndexMode::Semantic);
-        let backend = TestBackend::new(100, 24);
+        app.screen = Screen::ConfirmIndex(ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Full,
+        });
+        let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
         render(&mut terminal, &app).expect("render should succeed");
@@ -7254,7 +7294,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Confirm Indexing"));
-        assert!(rendered.contains("Run semantic indexing"));
+        assert!(rendered.contains("Run semantic full indexing"));
         assert!(rendered.contains("Press y to start"));
         assert_eq!(
             cell_fg_for_text(buffer, "Confirm Indexing", None),
@@ -7497,7 +7537,10 @@ mod tests {
     fn renders_running_index_progress_gauge() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
-        app.screen = Screen::IndexRunning(IndexMode::Semantic);
+        app.screen = Screen::IndexRunning(ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Incremental,
+        });
         app.index_progress = Some(symdex_index::IndexProgress {
             phase: "parse",
             completed: 2,
@@ -8017,22 +8060,24 @@ mod tests {
 
     #[test]
     fn reducer_requires_confirmation_before_indexing() {
-        let screen = reduce_screen(
-            Screen::Dashboard,
-            UiAction::RequestIndex(IndexMode::Offline),
-        );
-        assert_eq!(screen, Screen::ConfirmIndex(IndexMode::Offline));
+        let request = ManualIndexRequest {
+            mode: IndexMode::Offline,
+            scope: IndexScope::Incremental,
+        };
+        let screen = reduce_screen(Screen::Dashboard, UiAction::RequestIndex(request));
+        assert_eq!(screen, Screen::ConfirmIndex(request));
 
         let screen = reduce_screen(screen, UiAction::Confirm);
-        assert_eq!(screen, Screen::IndexRunning(IndexMode::Offline));
+        assert_eq!(screen, Screen::IndexRunning(request));
     }
 
     #[test]
     fn reducer_cancels_pending_index_without_running() {
-        let screen = reduce_screen(
-            Screen::Dashboard,
-            UiAction::RequestIndex(IndexMode::Semantic),
-        );
+        let request = ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Full,
+        };
+        let screen = reduce_screen(Screen::Dashboard, UiAction::RequestIndex(request));
         let screen = reduce_screen(screen, UiAction::Cancel);
 
         assert_eq!(screen, Screen::Dashboard);
@@ -8040,13 +8085,14 @@ mod tests {
 
     #[test]
     fn reducer_tracks_index_completion_and_dismissal() {
-        let screen = reduce_screen(
-            Screen::Dashboard,
-            UiAction::RequestIndex(IndexMode::Offline),
-        );
+        let request = ManualIndexRequest {
+            mode: IndexMode::Offline,
+            scope: IndexScope::Incremental,
+        };
+        let screen = reduce_screen(Screen::Dashboard, UiAction::RequestIndex(request));
         let screen = reduce_screen(screen, UiAction::Confirm);
         let screen = reduce_screen(screen, UiAction::JobSucceeded);
-        assert_eq!(screen, Screen::IndexCompleted(IndexMode::Offline));
+        assert_eq!(screen, Screen::IndexCompleted(request));
 
         let screen = reduce_screen(screen, UiAction::Dismiss);
         assert_eq!(screen, Screen::Dashboard);

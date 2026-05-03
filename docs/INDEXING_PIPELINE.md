@@ -309,11 +309,15 @@ A file can be skipped only when:
 
 Changed files should replace their SQLite facts and Qdrant points atomically where practical.
 
-Current implementation skips unchanged files by path plus content hash for
-`symdex index --offline`, persists changed file/chunk facts to SQLite, and
-removes SQLite rows for deleted files. Semantic `symdex index` currently parses
-and embeds all discovered chunks so Qdrant can be rebuilt even when SQLite
-already has matching structural facts. Same-model dimension changes fail closed;
+Current implementation exposes scope independently from semantic/offline mode:
+`symdex index --full <repo>` reparses every eligible file and rebuilds eligible
+semantic vectors when not offline, while `symdex index --incremental <repo>`
+skips unchanged files by path plus content hash. Plain `symdex index <repo>`
+keeps the legacy semantic default of full scope, and plain
+`symdex index --offline <repo>` keeps the legacy structural default of
+incremental scope; either command can be made explicit with `--full` or
+`--incremental`. Incremental runs persist changed file/chunk facts to SQLite and
+remove SQLite rows for deleted files. Same-model dimension changes fail closed;
 automated collection migration/reset remains future hardening.
 
 Files indexed from tree-sitter error trees are included in normal structural and

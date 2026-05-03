@@ -319,6 +319,9 @@ represent the indexed repository.
 ### Indexing Controls
 
 - Offer offline indexing with `o` and semantic indexing with `s`.
+- Offer full and incremental manual indexing as separate scope choices, toggled
+  with `Tab` / `Shift+Tab` on the Index tab. Offline and semantic indexing both
+  use the selected scope after explicit `y` confirmation.
 - Offer continuous indexing as a toggleable mode.
 - Continuous indexing is off by default.
 - When continuous indexing is on, modified or newly created eligible files are

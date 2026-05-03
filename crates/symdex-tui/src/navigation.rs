@@ -1,3 +1,5 @@
+use symdex_index::IndexScope;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexMode {
     Offline,
@@ -14,13 +16,25 @@ impl IndexMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManualIndexRequest {
+    pub(crate) mode: IndexMode,
+    pub(crate) scope: IndexScope,
+}
+
+impl ManualIndexRequest {
+    pub(crate) fn label(self) -> String {
+        format!("{} {}", self.mode.label(), self.scope.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Screen {
     Dashboard,
-    ConfirmIndex(IndexMode),
+    ConfirmIndex(ManualIndexRequest),
     ConfirmContinuous,
-    IndexRunning(IndexMode),
-    IndexCompleted(IndexMode),
-    IndexFailed(IndexMode),
+    IndexRunning(ManualIndexRequest),
+    IndexCompleted(ManualIndexRequest),
+    IndexFailed(ManualIndexRequest),
 }
 
 impl Screen {
@@ -35,12 +49,12 @@ impl Screen {
         matches!(self, Self::IndexCompleted(_) | Self::IndexFailed(_))
     }
 
-    pub(crate) fn index_mode(self) -> Option<IndexMode> {
+    pub(crate) fn index_request(self) -> Option<ManualIndexRequest> {
         match self {
-            Self::ConfirmIndex(mode)
-            | Self::IndexRunning(mode)
-            | Self::IndexCompleted(mode)
-            | Self::IndexFailed(mode) => Some(mode),
+            Self::ConfirmIndex(request)
+            | Self::IndexRunning(request)
+            | Self::IndexCompleted(request)
+            | Self::IndexFailed(request) => Some(request),
             Self::Dashboard | Self::ConfirmContinuous => None,
         }
     }
@@ -48,7 +62,7 @@ impl Screen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiAction {
-    RequestIndex(IndexMode),
+    RequestIndex(ManualIndexRequest),
     RequestContinuous,
     Confirm,
     Cancel,
@@ -59,19 +73,19 @@ pub(crate) enum UiAction {
 
 pub(crate) fn reduce_screen(screen: Screen, action: UiAction) -> Screen {
     match (screen, action) {
-        (screen, UiAction::RequestIndex(mode)) if screen.accepts_new_index_request() => {
-            Screen::ConfirmIndex(mode)
+        (screen, UiAction::RequestIndex(request)) if screen.accepts_new_index_request() => {
+            Screen::ConfirmIndex(request)
         }
         (screen, UiAction::RequestContinuous) if screen.accepts_new_index_request() => {
             Screen::ConfirmContinuous
         }
-        (Screen::ConfirmIndex(mode), UiAction::Confirm) => Screen::IndexRunning(mode),
+        (Screen::ConfirmIndex(request), UiAction::Confirm) => Screen::IndexRunning(request),
         (Screen::ConfirmContinuous, UiAction::Confirm) => Screen::Dashboard,
         (Screen::ConfirmIndex(_) | Screen::ConfirmContinuous, UiAction::Cancel) => {
             Screen::Dashboard
         }
-        (Screen::IndexRunning(mode), UiAction::JobSucceeded) => Screen::IndexCompleted(mode),
-        (Screen::IndexRunning(mode), UiAction::JobFailed) => Screen::IndexFailed(mode),
+        (Screen::IndexRunning(request), UiAction::JobSucceeded) => Screen::IndexCompleted(request),
+        (Screen::IndexRunning(request), UiAction::JobFailed) => Screen::IndexFailed(request),
         (screen, UiAction::Dismiss) if screen.is_terminal_job_state() => Screen::Dashboard,
         (screen, _) => screen,
     }
