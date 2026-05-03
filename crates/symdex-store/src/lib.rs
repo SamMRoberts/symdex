@@ -1207,10 +1207,100 @@ impl SqliteStore {
         })
     }
 
+    pub fn carry_forward_quality_embeddings_for_fast_generation(
+        &mut self,
+        repository_id: &str,
+        generation_id: &str,
+        quality_model: &str,
+    ) -> Result<QualityCarryForwardSummary> {
+        use std::collections::BTreeSet;
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let embeddings = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT fast.file_id, fast.chunk_id, fast.content_hash, fast.text_hash,
+                            quality.embedding_dimension, quality.qdrant_collection,
+                            quality.qdrant_point_id, quality.embedded_at
+                     FROM chunk_embeddings AS fast
+                     JOIN chunk_embeddings AS quality
+                       ON quality.repository_id = fast.repository_id
+                      AND quality.chunk_id = fast.chunk_id
+                      AND quality.semantic_layer = 'quality'
+                      AND quality.embedding_model = ?3
+                      AND quality.content_hash = fast.content_hash
+                      AND quality.text_hash = fast.text_hash
+                      AND quality.status = 'current'
+                     WHERE fast.repository_id = ?1
+                       AND fast.generation_id = ?2
+                       AND fast.semantic_layer = 'fast'
+                       AND fast.status = 'current'
+                     ORDER BY fast.chunk_id",
+                )
+                .map_err(StoreError::Sqlite)?;
+            let rows = statement
+                .query_map(
+                    params![repository_id, generation_id, quality_model],
+                    |row| {
+                        let chunk_id = row.get::<_, String>(1)?;
+                        let dimension = row.get::<_, i64>(4)? as usize;
+                        Ok(ChunkEmbeddingRecord {
+                            id: chunk_embedding_id(
+                                repository_id,
+                                generation_id,
+                                &chunk_id,
+                                SemanticLayer::Quality.as_str(),
+                                quality_model,
+                                dimension,
+                            ),
+                            repository_id: repository_id.to_owned(),
+                            file_id: row.get(0)?,
+                            chunk_id,
+                            semantic_layer: SemanticLayer::Quality.as_str().to_owned(),
+                            embedding_model: quality_model.to_owned(),
+                            embedding_dimension: dimension,
+                            content_hash: row.get(2)?,
+                            text_hash: row.get(3)?,
+                            qdrant_collection: row.get(5)?,
+                            qdrant_point_id: row.get(6)?,
+                            generation_id: generation_id.to_owned(),
+                            embedded_at: row.get(7)?,
+                            status: "current".to_owned(),
+                        })
+                    },
+                )
+                .map_err(StoreError::Sqlite)?;
+            collect_rows(rows)?
+        };
+
+        let dimensions = embeddings
+            .iter()
+            .map(|embedding| embedding.embedding_dimension)
+            .collect::<BTreeSet<_>>();
+        let quality_dimension = if dimensions.len() == 1 {
+            dimensions.first().copied()
+        } else {
+            None
+        };
+        for embedding in &embeddings {
+            upsert_chunk_embedding_in_transaction(&transaction, embedding)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+
+        Ok(QualityCarryForwardSummary {
+            repository_id: repository_id.to_owned(),
+            generation_id: generation_id.to_owned(),
+            quality_model: quality_model.to_owned(),
+            carried_embeddings: embeddings.len(),
+            quality_dimension,
+        })
+    }
+
     pub fn quality_embedding_jobs_for_fast_generation(
         &self,
         repository_id: &str,
         generation_id: &str,
+        quality_model: &str,
         queued_at: &str,
     ) -> Result<Vec<QualityEmbeddingJobRecord>> {
         let mut statement = self
@@ -1222,32 +1312,45 @@ impl SqliteStore {
                  JOIN files
                    ON files.id = embeddings.file_id
                   AND files.repository_id = embeddings.repository_id
+                 LEFT JOIN chunk_embeddings AS quality
+                   ON quality.repository_id = embeddings.repository_id
+                  AND quality.generation_id = embeddings.generation_id
+                  AND quality.chunk_id = embeddings.chunk_id
+                  AND quality.semantic_layer = 'quality'
+                  AND quality.embedding_model = ?3
+                  AND quality.content_hash = embeddings.content_hash
+                  AND quality.text_hash = embeddings.text_hash
+                  AND quality.status = 'current'
                  WHERE embeddings.repository_id = ?1
                    AND embeddings.generation_id = ?2
                    AND embeddings.semantic_layer = 'fast'
                    AND embeddings.status = 'current'
+                   AND quality.chunk_id IS NULL
                  ORDER BY files.path, embeddings.chunk_id",
             )
             .map_err(StoreError::Sqlite)?;
         let rows = statement
-            .query_map(params![repository_id, generation_id], |row| {
-                let chunk_id = row.get::<_, String>(1)?;
-                Ok(QualityEmbeddingJobRecord {
-                    id: Self::quality_embedding_job_id(repository_id, generation_id, &chunk_id),
-                    repository_id: repository_id.to_owned(),
-                    generation_id: generation_id.to_owned(),
-                    file_id: row.get(0)?,
-                    chunk_id,
-                    path: row.get(2)?,
-                    content_hash: row.get(3)?,
-                    text_hash: row.get(4)?,
-                    status: "pending".to_owned(),
-                    attempts: 0,
-                    error_summary: None,
-                    created_at: queued_at.to_owned(),
-                    updated_at: queued_at.to_owned(),
-                })
-            })
+            .query_map(
+                params![repository_id, generation_id, quality_model],
+                |row| {
+                    let chunk_id = row.get::<_, String>(1)?;
+                    Ok(QualityEmbeddingJobRecord {
+                        id: Self::quality_embedding_job_id(repository_id, generation_id, &chunk_id),
+                        repository_id: repository_id.to_owned(),
+                        generation_id: generation_id.to_owned(),
+                        file_id: row.get(0)?,
+                        chunk_id,
+                        path: row.get(2)?,
+                        content_hash: row.get(3)?,
+                        text_hash: row.get(4)?,
+                        status: "pending".to_owned(),
+                        attempts: 0,
+                        error_summary: None,
+                        created_at: queued_at.to_owned(),
+                        updated_at: queued_at.to_owned(),
+                    })
+                },
+            )
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }
@@ -3551,6 +3654,15 @@ pub struct QualityQueueSummary {
     pub quality_status: SemanticLayerStatus,
     pub queued_jobs: usize,
     pub skipped_stale_jobs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityCarryForwardSummary {
+    pub repository_id: String,
+    pub generation_id: String,
+    pub quality_model: String,
+    pub carried_embeddings: usize,
+    pub quality_dimension: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6074,7 +6186,12 @@ mod tests {
             .expect("second fast embedding should persist");
 
         let jobs = store
-            .quality_embedding_jobs_for_fast_generation("repo", "generation-1", "500")
+            .quality_embedding_jobs_for_fast_generation(
+                "repo",
+                "generation-1",
+                "nomic-embed-text-v2-moe",
+                "500",
+            )
             .expect("quality jobs should load");
 
         assert_eq!(jobs.len(), 2);
@@ -6082,6 +6199,83 @@ mod tests {
         assert_eq!(jobs[1].chunk_id, "chunk-2");
         assert!(jobs.iter().all(|job| job.status == "pending"));
         assert!(jobs.iter().all(|job| job.created_at == "500"));
+    }
+
+    #[test]
+    fn quality_jobs_for_fast_generation_skip_carried_forward_quality_embeddings() {
+        let db = TestDb::new("quality-jobs-skip-carried-forward");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("old generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
+            .expect("old quality embedding should persist");
+        let mut generation = sample_semantic_generation();
+        generation.id = "generation-2".to_owned();
+        generation.fast_completed_at = "200".to_owned();
+        generation.created_at = "200".to_owned();
+        generation.updated_at = "200".to_owned();
+        generation.embeddable_chunks = 2;
+        generation.fast_embedded_chunks = 2;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("new generation should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-generation-2-chunk-1".to_owned(),
+                generation_id: "generation-2".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("first fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-generation-2-chunk-2".to_owned(),
+                generation_id: "generation-2".to_owned(),
+                chunk_id: "chunk-2".to_owned(),
+                text_hash: "text-chunk-2".to_owned(),
+                qdrant_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("second fast embedding should persist");
+
+        let carried = store
+            .carry_forward_quality_embeddings_for_fast_generation(
+                "repo",
+                "generation-2",
+                "nomic-embed-text-v2-moe",
+            )
+            .expect("quality embeddings should carry forward");
+        let jobs = store
+            .quality_embedding_jobs_for_fast_generation(
+                "repo",
+                "generation-2",
+                "nomic-embed-text-v2-moe",
+                "500",
+            )
+            .expect("quality jobs should load");
+        let progress = store
+            .quality_generation_progress("repo", "generation-2")
+            .expect("progress should load");
+
+        assert_eq!(carried.carried_embeddings, 1);
+        assert_eq!(carried.quality_dimension, Some(768));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].chunk_id, "chunk-2");
+        assert_eq!(progress.embeddable_chunks, 2);
+        assert_eq!(progress.quality_embedded_chunks, 1);
+        assert_eq!(
+            store
+                .chunk_embeddings_for_generation("repo", "generation-2", "quality")
+                .expect("carried quality rows should load")
+                .len(),
+            1
+        );
     }
 
     #[test]

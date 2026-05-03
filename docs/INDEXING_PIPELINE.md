@@ -151,9 +151,14 @@ The older chunk-level vector columns remain nullable compatibility schema, but
 new indexing does not use them as the authoritative fast manifest.
 When quality indexing is enabled and the quality model is locally available,
 semantic indexing then marks superseded pending/running quality jobs stale and
-queues metadata-only `quality_embedding_jobs` rows for the latest fast
-generation. If the quality model or service is unavailable, the latest
-generation is marked `quality_blocked` and no pending quality jobs are created.
+first carries forward current quality `chunk_embeddings` rows whose chunk ID,
+content hash, text hash, and quality model still match the latest fast manifest.
+It then queues metadata-only `quality_embedding_jobs` rows only for changed or
+newly embeddable chunks missing reusable quality coverage. This keeps the latest
+generation complete without forcing a full quality rebuild after every
+incremental fast index. If the quality model or service is unavailable, the
+latest generation is marked `quality_blocked` and no pending quality jobs are
+created.
 Semantic search consults SQLite readiness metadata from the latest semantic
 generation and compact `chunk_embeddings` summaries before choosing the active
 model and Qdrant collection. The manual quality worker is available through

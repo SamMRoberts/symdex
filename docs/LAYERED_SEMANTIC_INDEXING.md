@@ -196,9 +196,10 @@ Required behavior:
 6. Record a new fast semantic generation.
 7. Mark any previous active quality generation stale if the structural snapshot
    changed.
-8. Queue quality jobs for every current embeddable chunk in the latest fast
-  manifest when quality indexing is enabled, including unchanged chunks carried
-  forward from earlier fast runs.
+8. Carry forward reusable quality manifest rows for unchanged chunks whose
+  content hash, text hash, chunk ID, and quality model still match the latest
+  fast manifest, then queue quality jobs only for changed or newly embeddable
+  chunks that do not already have current quality coverage.
 9. Return without waiting for quality completion.
 
 Manual indexing may offer a flag to wait for quality work, but this must be

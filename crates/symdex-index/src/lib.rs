@@ -1752,14 +1752,55 @@ fn queue_quality_jobs_after_fast_indexing(
 
     match quality_client.model_available() {
         Ok(true) => {
+            let carried = sqlite
+                .carry_forward_quality_embeddings_for_fast_generation(
+                    repository_id,
+                    &generation.id,
+                    &quality_config.model,
+                )
+                .map_err(|error| error.to_string())?;
             let jobs = sqlite
                 .quality_embedding_jobs_for_fast_generation(
                     repository_id,
                     &generation.id,
+                    &quality_config.model,
                     &queued_at,
                 )
                 .map_err(|error| error.to_string())?;
             if jobs.is_empty() {
+                if carried.carried_embeddings > 0 {
+                    let summary = sqlite
+                        .queue_quality_embedding_jobs(
+                            generation,
+                            &quality_config.model,
+                            &[],
+                            &queued_at,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let activation = sqlite
+                        .refresh_quality_activation(
+                            repository_id,
+                            &generation.id,
+                            carried.quality_dimension,
+                            &queued_at,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    on_progress(IndexProgress::new(
+                        "quality_queue",
+                        1,
+                        1,
+                        format!(
+                            "Reused {} quality embeddings for {}; queued {} jobs, marked {} old jobs stale; status={} active_layer={}",
+                            carried.carried_embeddings,
+                            summary.quality_model,
+                            summary.queued_jobs,
+                            summary.skipped_stale_jobs,
+                            activation.quality_status.as_str(),
+                            activation.active_layer.as_str()
+                        ),
+                    ));
+                    return Ok(());
+                }
                 on_progress(IndexProgress::new(
                     "quality_queue",
                     1,
@@ -1776,8 +1817,11 @@ fn queue_quality_jobs_after_fast_indexing(
                 1,
                 1,
                 format!(
-                    "Queued {} quality jobs for {}; marked {} old jobs stale",
-                    summary.queued_jobs, summary.quality_model, summary.skipped_stale_jobs
+                    "Queued {} quality jobs for {}; reused {} quality embeddings, marked {} old jobs stale",
+                    summary.queued_jobs,
+                    summary.quality_model,
+                    carried.carried_embeddings,
+                    summary.skipped_stale_jobs
                 ),
             ));
             Ok(())
