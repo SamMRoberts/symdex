@@ -17,10 +17,9 @@ use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkEmbeddingRecord, ChunkRecord, FastEmbeddingManifestRecord,
     FastSemanticGenerationInput, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
-    QualityActivationSummary, QualityEmbeddingJobRecord, QualityGenerationProgress,
-    QualityJobCompletion, QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore,
-    StoreConfig, SymbolRecord, TestRecord, VectorPoint, current_timestamp, qdrant_collection_name,
-    qdrant_point_id,
+    QualityActivationSummary, QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow,
+    QualityQueueSummary, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, TestRecord,
+    VectorPoint, current_timestamp, qdrant_collection_name, qdrant_point_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1677,7 +1676,6 @@ fn persist_semantic_index(
     queue_quality_jobs_after_fast_indexing(
         sqlite,
         root.id(),
-        collection,
         layered_embed_config,
         &generation,
         on_progress,
@@ -1699,7 +1697,6 @@ fn persist_semantic_index(
 fn queue_quality_jobs_after_fast_indexing(
     sqlite: &mut SqliteStore,
     repository_id: &str,
-    collection: &IndexCollection,
     layered_embed_config: &LayeredEmbedConfig,
     generation: &symdex_store::SemanticGenerationRecord,
     on_progress: &mut impl FnMut(IndexProgress),
@@ -1729,12 +1726,13 @@ fn queue_quality_jobs_after_fast_indexing(
 
     match quality_client.model_available() {
         Ok(true) => {
-            let jobs = quality_embedding_jobs(
-                repository_id,
-                &generation.id,
-                &collection.reports,
-                &queued_at,
-            );
+            let jobs = sqlite
+                .quality_embedding_jobs_for_fast_generation(
+                    repository_id,
+                    &generation.id,
+                    &queued_at,
+                )
+                .map_err(|error| error.to_string())?;
             if jobs.is_empty() {
                 on_progress(IndexProgress::new(
                     "quality_queue",
@@ -1788,42 +1786,6 @@ fn blocked_quality_queue_progress(summary: &QualityQueueSummary, reason: &str) -
             summary.quality_model, summary.skipped_stale_jobs, reason
         ),
     )
-}
-
-fn quality_embedding_jobs(
-    repository_id: &str,
-    generation_id: &str,
-    reports: &[IndexReport],
-    queued_at: &str,
-) -> Vec<QualityEmbeddingJobRecord> {
-    reports
-        .iter()
-        .flat_map(|report| {
-            report
-                .chunks
-                .iter()
-                .filter(|chunk| chunk.excluded_reason.is_none())
-                .map(|chunk| QualityEmbeddingJobRecord {
-                    id: SqliteStore::quality_embedding_job_id(
-                        repository_id,
-                        generation_id,
-                        &chunk.id,
-                    ),
-                    repository_id: repository_id.to_owned(),
-                    generation_id: generation_id.to_owned(),
-                    chunk_id: chunk.id.clone(),
-                    file_id: report.file.id.clone(),
-                    path: chunk.relative_path.clone(),
-                    content_hash: report.file.content_hash.clone(),
-                    text_hash: chunk.text_hash.clone(),
-                    status: "pending".to_owned(),
-                    attempts: 0,
-                    error_summary: None,
-                    created_at: queued_at.to_owned(),
-                    updated_at: queued_at.to_owned(),
-                })
-        })
-        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -2511,9 +2473,8 @@ mod tests {
         RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness, WatchSnapshot,
         apply_embedding_size_limits, chunk_record, chunk_texts, collect_index_reports,
         detect_watch_changes, diff_watch_snapshots, index_run_kind, plan_rust_analyzer_enrichment,
-        prepare_quality_job, quality_chunk_embedding_record, quality_embedding_jobs,
-        quality_vector_point, resolve_cross_file_rust_calls,
-        should_run_continuous_quality_catch_up, watch_snapshot,
+        prepare_quality_job, quality_chunk_embedding_record, quality_vector_point,
+        resolve_cross_file_rust_calls, should_run_continuous_quality_catch_up, watch_snapshot,
     };
 
     #[test]
@@ -2547,40 +2508,6 @@ mod tests {
             secret_record.excluded_reason.as_deref(),
             Some("likely_access_token")
         );
-    }
-
-    #[test]
-    fn quality_embedding_jobs_skip_excluded_chunks() {
-        let file = sample_file();
-        let source = "pub fn public() {}\npub fn secret() {}\n".to_owned();
-        let public = sample_chunk("public", 0, 18, None);
-        let secret = sample_chunk("secret", 18, source.len(), Some("likely_access_token"));
-        let report = IndexReport {
-            file: file.clone(),
-            chunks: vec![public.clone(), secret],
-            symbols: Vec::new(),
-            calls: Vec::new(),
-            tests: Vec::new(),
-            parse_diagnostics: Vec::new(),
-            source,
-        };
-
-        let reports = [report];
-        let jobs = quality_embedding_jobs("repo", "generation-1", &reports, "500");
-
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].repository_id, "repo");
-        assert_eq!(jobs[0].generation_id, "generation-1");
-        assert_eq!(jobs[0].chunk_id, public.id);
-        assert_eq!(jobs[0].file_id, file.id);
-        assert_eq!(jobs[0].path, "src/lib.rs");
-        assert_eq!(jobs[0].content_hash, file.content_hash);
-        assert_eq!(jobs[0].text_hash, public.text_hash);
-        assert_eq!(jobs[0].status, "pending");
-        assert_eq!(jobs[0].attempts, 0);
-        assert_eq!(jobs[0].error_summary, None);
-        assert_eq!(jobs[0].created_at, "500");
-        assert_eq!(jobs[0].updated_at, "500");
     }
 
     #[test]

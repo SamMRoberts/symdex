@@ -10,7 +10,7 @@ use symdex_diagnostics::{
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexSummary,
     QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
-    run_continuous_index, run_index, run_quality_index,
+    run_continuous_index, run_index, run_quality_index, run_quality_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
@@ -240,9 +240,17 @@ fn index(args: &IndexArgs) -> Result<(), String> {
 }
 
 fn index_quality(repo: &str) -> Result<(), String> {
-    let summary = run_quality_index(&QualityIndexOptions {
-        repo: repo.to_owned(),
-    })?;
+    let summary = run_quality_index_with_progress(
+        &QualityIndexOptions {
+            repo: repo.to_owned(),
+        },
+        |progress| {
+            println!(
+                "quality_progress phase={} completed={} total={} message={}",
+                progress.phase, progress.completed, progress.total, progress.message
+            );
+        },
+    )?;
     print_quality_index_summary(&summary);
     Ok(())
 }

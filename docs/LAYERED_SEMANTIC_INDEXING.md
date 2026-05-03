@@ -136,7 +136,9 @@ surfaces. It reports the repository ID, latest semantic generation ID, default
 active search layer, quality status, fallback-to-fast reason, fast and quality
 model/collection metadata, per-layer coverage counts, quality job counts, and
 the latest quality job error when one is recorded. This summary is metadata-only
-and does not return source text or vectors.
+and does not return source text or vectors. Quality embedded progress is counted
+from current quality `chunk_embeddings` manifest rows so stale generation
+metadata cannot make a pending quality layer appear partially complete.
 
 The CLI command is:
 
@@ -189,12 +191,17 @@ Required behavior:
 6. Record a new fast semantic generation.
 7. Mark any previous active quality generation stale if the structural snapshot
    changed.
-8. Queue quality jobs for current embeddable chunks when quality indexing is
-   enabled.
+8. Queue quality jobs for every current embeddable chunk in the latest fast
+  manifest when quality indexing is enabled, including unchanged chunks carried
+  forward from earlier fast runs.
 9. Return without waiting for quality completion.
 
 Manual indexing may offer a flag to wait for quality work, but this must be
-explicit. The default path should preserve fast availability.
+explicit. The default path should preserve fast availability. A one-shot
+`symdex index <repo>` command queues quality work but does not keep a background
+process alive after it exits; use `symdex index-quality <repo>` to drain queued
+quality jobs manually with progress output, or run `symdex index --watch <repo>`
+for cooperative quality catch-up while watch mode is active.
 
 ## Continuous indexing behavior
 

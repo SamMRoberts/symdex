@@ -1207,6 +1207,51 @@ impl SqliteStore {
         })
     }
 
+    pub fn quality_embedding_jobs_for_fast_generation(
+        &self,
+        repository_id: &str,
+        generation_id: &str,
+        queued_at: &str,
+    ) -> Result<Vec<QualityEmbeddingJobRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT embeddings.file_id, embeddings.chunk_id, files.path,
+                        embeddings.content_hash, embeddings.text_hash
+                 FROM chunk_embeddings AS embeddings
+                 JOIN files
+                   ON files.id = embeddings.file_id
+                  AND files.repository_id = embeddings.repository_id
+                 WHERE embeddings.repository_id = ?1
+                   AND embeddings.generation_id = ?2
+                   AND embeddings.semantic_layer = 'fast'
+                   AND embeddings.status = 'current'
+                 ORDER BY files.path, embeddings.chunk_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, generation_id], |row| {
+                let chunk_id = row.get::<_, String>(1)?;
+                Ok(QualityEmbeddingJobRecord {
+                    id: Self::quality_embedding_job_id(repository_id, generation_id, &chunk_id),
+                    repository_id: repository_id.to_owned(),
+                    generation_id: generation_id.to_owned(),
+                    file_id: row.get(0)?,
+                    chunk_id,
+                    path: row.get(2)?,
+                    content_hash: row.get(3)?,
+                    text_hash: row.get(4)?,
+                    status: "pending".to_owned(),
+                    attempts: 0,
+                    error_summary: None,
+                    created_at: queued_at.to_owned(),
+                    updated_at: queued_at.to_owned(),
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn mark_quality_generation_blocked(
         &mut self,
         generation: &SemanticGenerationRecord,
@@ -1418,15 +1463,28 @@ impl SqliteStore {
         repository_id: &str,
         generation_id: &str,
     ) -> Result<QualityGenerationProgress> {
-        let (embeddable_chunks, quality_embedded_chunks) = self
+        let embeddable_chunks = self
             .connection
             .query_row(
-                "SELECT embeddable_chunks, quality_embedded_chunks
+                "SELECT embeddable_chunks
                  FROM semantic_generations
                  WHERE repository_id = ?1
                    AND id = ?2",
                 params![repository_id, generation_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        let quality_embedded_chunks = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM chunk_embeddings
+                 WHERE repository_id = ?1
+                   AND generation_id = ?2
+                   AND semantic_layer = 'quality'
+                   AND status = 'current'",
+                params![repository_id, generation_id],
+                |row| row.get::<_, i64>(0),
             )
             .map_err(StoreError::Sqlite)?;
         let mut progress = QualityGenerationProgress {
@@ -5955,6 +6013,75 @@ mod tests {
         assert_eq!(generation.quality_dimension, Some(768));
         assert_eq!(generation.quality_embedded_chunks, 1);
         assert_eq!(generation.active_layer, "fast");
+    }
+
+    #[test]
+    fn quality_generation_progress_counts_current_quality_manifest_rows() {
+        let db = TestDb::new("quality-progress-manifest-count");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(&mut store, &[sample_chunk("chunk-1")]);
+        let mut generation = sample_semantic_generation();
+        generation.quality_embedded_chunks = 1;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-1",
+                "pending",
+            ))
+            .expect("pending job should persist");
+
+        let progress = store
+            .quality_generation_progress("repo", "generation-1")
+            .expect("progress should load");
+
+        assert_eq!(progress.quality_embedded_chunks, 0);
+        assert_eq!(progress.pending_jobs, 1);
+    }
+
+    #[test]
+    fn quality_jobs_for_fast_generation_cover_full_fast_manifest() {
+        let db = TestDb::new("quality-jobs-full-fast-manifest");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        let mut generation = sample_semantic_generation();
+        generation.embeddable_chunks = 2;
+        generation.fast_embedded_chunks = 2;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-embedding-1".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("first fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-embedding-2".to_owned(),
+                chunk_id: "chunk-2".to_owned(),
+                text_hash: "text-chunk-2".to_owned(),
+                qdrant_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("second fast embedding should persist");
+
+        let jobs = store
+            .quality_embedding_jobs_for_fast_generation("repo", "generation-1", "500")
+            .expect("quality jobs should load");
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].chunk_id, "chunk-1");
+        assert_eq!(jobs[1].chunk_id, "chunk-2");
+        assert!(jobs.iter().all(|job| job.status == "pending"));
+        assert!(jobs.iter().all(|job| job.created_at == "500"));
     }
 
     #[test]
