@@ -26,7 +26,8 @@ index without each agent rebuilding or inventing its own evidence model.
 - Repository roots are explicit inputs and must be valid directory roots.
 - Paths are normalized relative to the repository root before use.
 - MCP tools must not start indexing, continuous indexing, reset, delete, or
-  mutate repository data.
+  mutate repository data. The `symdex serve-mcp --watch <repo>` startup option
+  may run a user-requested watcher beside the read-only MCP server.
 - The local service choices remain under user control:
   - SQLite path from `SYMDEX_DB_PATH`
   - sqlite-vec URL from `SYMDEX_DB_PATH`
@@ -34,7 +35,8 @@ index without each agent rebuilding or inventing its own evidence model.
 
 ## Read-Only Access Pattern
 
-1. One user process indexes a repository with the CLI or TUI.
+1. One user process indexes a repository with the CLI or TUI, or starts
+   `symdex serve-mcp --watch <repo>` for automatic semantic watch indexing.
 2. One or more local agents connect to `symdex serve-mcp`.
 3. Agents call read-only tools with an explicit `repo` root.
 4. Tool responses include compact evidence under `data` plus contract metadata.

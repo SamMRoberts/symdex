@@ -124,8 +124,9 @@ outputs to distinguish these states:
 - `symdex-tui` owns toggle state, rendering, confirmation, and event display.
 - The TUI and CLI must call shared Rust APIs directly. They must not shell out
   to `symdex` subprocesses.
-- The MCP server remains read-only for the MVP and must not start or stop
-  continuous indexing.
+- The MCP tools remain read-only for the MVP and must not start or stop
+  continuous indexing. The `serve-mcp --watch <repo>` startup option may launch
+  a user-requested watch job beside the read-only MCP server process.
 
 Current implementation status:
 
@@ -133,6 +134,9 @@ Current implementation status:
   APIs.
 - `symdex index --watch <repo>` starts the non-interactive watch loop and uses
   the shared indexing APIs directly.
+- `symdex serve-mcp --watch <repo>` starts the read-only MCP server and a
+  semantic watch loop in the same process. Watch status is written to stderr so
+  MCP stdout remains protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
 - Watch-driven batches are recorded with `run_kind = watch` in local index-run
@@ -142,11 +146,11 @@ Current implementation status:
   idle ticks. Each catch-up tick uses the same hash-verifying quality worker
   path as `symdex index-quality <repo>` and is bounded by
   `SYMDEX_QUALITY_BATCH_SIZE` before returning to watch polling.
-- The TUI Indexing view exposes a `c` toggle with first-enable confirmation,
-  explicit `on` / `off` labels, pending debounce state, queued event count,
-  last reindexed file, active semantic layer, quality status, quality job
-  counts, latest watch and quality errors, and an animated activity indicator
-  while continuous indexing is on.
+- The TUI starts continuous indexing on launch and exposes a `c` toggle to stop
+  or confirm restarting watch mode, with explicit `on` / `off` labels, pending
+  debounce state, queued event count, last reindexed file, active semantic
+  layer, quality status, quality job counts, latest watch and quality errors,
+  and an animated activity indicator while continuous indexing is on.
 - CLI watch output prints metadata-only quality state, progress, completion,
   and failure events alongside fast watch events.
 

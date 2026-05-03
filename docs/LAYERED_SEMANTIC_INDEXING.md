@@ -212,7 +212,9 @@ process alive after it exits; use `symdex index-quality <repo>` to drain queued
 quality jobs manually with progress output, or run `symdex index --watch <repo>`
 for cooperative quality catch-up while watch mode is active. Watch mode remains
 incremental; run a separate `symdex index --full <repo>` when a forced rebuild is
-needed.
+needed. Agent MCP workflows can also use `symdex serve-mcp --watch <repo>` to
+run semantic watch indexing beside the read-only MCP server without changing MCP
+tool contracts.
 
 ## Continuous indexing behavior
 

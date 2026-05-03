@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::io::Write;
+use std::thread;
 
 use serde_json::json;
 use symdex_core::RepoRoot;
@@ -10,7 +12,7 @@ use symdex_diagnostics::{
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexScope,
     IndexSummary, QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary,
-    WatchChangeSet, run_continuous_index, run_index, run_quality_index,
+    WatchChangeSet, run_continuous_index, run_continuous_index_until, run_index, run_quality_index,
     run_quality_index_with_progress,
 };
 use symdex_query::{
@@ -150,7 +152,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "serve-mcp" => {
             require_text_output(command, output)?;
-            serve_mcp()
+            let serve_args = parse_serve_mcp_args(&args[1..])?;
+            serve_mcp(&serve_args)
         }
         "help" | "--help" | "-h" => {
             print_help();
@@ -1279,6 +1282,39 @@ fn parse_context_pack_args(args: &[String]) -> Result<ContextPackArgs, String> {
     })
 }
 
+fn parse_serve_mcp_args(args: &[String]) -> Result<ServeMcpArgs, String> {
+    let mut watch_repo = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--watch" {
+            if watch_repo.is_some() {
+                return Err("serve-mcp accepts at most one --watch repository".to_owned());
+            }
+            index += 1;
+            let Some(repo) = args.get(index) else {
+                return Err("serve-mcp --watch requires a repository path".to_owned());
+            };
+            if repo.starts_with("--") {
+                return Err("serve-mcp --watch requires a repository path".to_owned());
+            }
+            watch_repo = Some(repo.clone());
+        } else if arg == "--offline" {
+            return Err(
+                "serve-mcp --watch runs semantic indexing; use `symdex index --offline --watch <repo>` for offline watch mode"
+                    .to_owned(),
+            );
+        } else if arg.starts_with("--") {
+            return Err(format!("unsupported serve-mcp option `{arg}`"));
+        } else {
+            return Err(format!("unexpected serve-mcp argument `{arg}`"));
+        }
+        index += 1;
+    }
+
+    Ok(ServeMcpArgs { watch_repo })
+}
+
 fn parse_vector_maintenance_args(args: &[String]) -> Result<VectorMaintenanceArgs, String> {
     let mut positional = Vec::new();
     let mut semantic_layer = VectorVerifySemanticLayer::Fast;
@@ -1318,6 +1354,11 @@ struct IndexArgs {
     offline: bool,
     watch: bool,
     scope: IndexScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServeMcpArgs {
+    watch_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1447,8 +1488,107 @@ fn chunks_embedded(embedding: &EmbeddingSummary) -> usize {
     }
 }
 
-fn serve_mcp() -> Result<(), String> {
+fn serve_mcp(args: &ServeMcpArgs) -> Result<(), String> {
+    if let Some(repo) = &args.watch_repo {
+        start_mcp_watch(repo)?;
+    }
     symdex_mcp::serve_stdio()
+}
+
+fn start_mcp_watch(repo: &str) -> Result<(), String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let repo = root.path().display().to_string();
+    eprintln!("mcp_watch_starting repo={repo}");
+    thread::spawn(move || {
+        let result = run_continuous_index_until(
+            &ContinuousIndexOptions::new(repo, false),
+            |event| {
+                let _ = write_mcp_watch_event(std::io::stderr(), event);
+            },
+            || true,
+        );
+        if let Err(error) = result {
+            eprintln!("mcp_watch_failed error={error}");
+        }
+    });
+    Ok(())
+}
+
+fn write_mcp_watch_event(
+    mut writer: impl Write,
+    event: ContinuousIndexEvent,
+) -> std::io::Result<()> {
+    if let Some(summary) = mcp_watch_event_summary(event) {
+        writeln!(writer, "{summary}")?;
+    }
+    Ok(())
+}
+
+fn mcp_watch_event_summary(event: ContinuousIndexEvent) -> Option<String> {
+    match event {
+        ContinuousIndexEvent::Started {
+            repository_id,
+            files_seen,
+        } => Some(format!(
+            "mcp_watch_started repository_id={repository_id} files_seen={files_seen}"
+        )),
+        ContinuousIndexEvent::Idle { .. } => None,
+        ContinuousIndexEvent::ChangesPending { changes } => Some(format!(
+            "mcp_watch_pending {}",
+            continuous_change_summary(&changes)
+        )),
+        ContinuousIndexEvent::ChangesDetected { changes } => Some(format!(
+            "mcp_watch_changes {}",
+            continuous_change_summary(&changes)
+        )),
+        ContinuousIndexEvent::BatchCompleted { changes, summary } => Some(format!(
+            "mcp_watch_indexed {} files_indexed={} chunks_indexed={} chunks_embedded={}",
+            continuous_change_summary(&changes),
+            summary.sqlite_files_indexed,
+            summary.sqlite_chunks_indexed,
+            chunks_embedded(&summary.embedding)
+        )),
+        ContinuousIndexEvent::BatchFailed { changes, error } => Some(format!(
+            "mcp_watch_failed {} error={}",
+            continuous_change_summary(&changes),
+            error
+        )),
+        ContinuousIndexEvent::QualityState { state } => Some(format!(
+            "mcp_watch_quality_state {}",
+            continuous_quality_summary(&state)
+        )),
+        ContinuousIndexEvent::QualityStarted { state } => Some(format!(
+            "mcp_watch_quality_started {}",
+            continuous_quality_summary(&state)
+        )),
+        ContinuousIndexEvent::QualityProgress { progress } => Some(format!(
+            "mcp_watch_quality_progress phase={} completed={} total={} message={}",
+            progress.phase, progress.completed, progress.total, progress.message
+        )),
+        ContinuousIndexEvent::QualityCompleted { summary } => Some(format!(
+            "mcp_watch_quality_completed generation_id={} active_layer={} quality_status={} activation_reason={} claimed_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} remaining_pending_jobs={}",
+            summary.generation_id,
+            summary.active_layer,
+            summary.quality_status,
+            summary.activation_reason,
+            summary.claimed_jobs,
+            summary.succeeded_jobs,
+            summary.failed_jobs,
+            summary.skipped_stale_jobs,
+            summary.remaining_pending_jobs
+        )),
+        ContinuousIndexEvent::QualityFailed { state, error } => {
+            if let Some(state) = state {
+                Some(format!(
+                    "mcp_watch_quality_failed {} error={}",
+                    continuous_quality_summary(&state),
+                    error
+                ))
+            } else {
+                Some(format!("mcp_watch_quality_failed error={error}"))
+            }
+        }
+    }
 }
 
 fn tui(repo: &str) -> Result<(), String> {
@@ -1465,7 +1605,7 @@ fn print_help() {
     println!(
         "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--full|--incremental] [--offline] [--watch] <repo>  Index code with explicit full or incremental scope\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    vector-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against sqlite-vec rows
     qdrant-verify <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-verify\n    vector-repair <repo> [--semantic-layer fast|quality|all]  Repair sqlite-vec orphaned, missing, and stale vector metadata
-    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-repair\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-repair\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp [--watch <repo>]  Run the read-only MCP server over stdio, optionally with semantic watch indexing\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1474,11 +1614,12 @@ fn print_help() {
 mod tests {
     use super::{
         ContextPackMode, OutputMode, VectorVerifySemanticLayer, parse_cli_invocation,
-        parse_context_pack_args, parse_index_args, parse_vector_maintenance_args,
-        require_text_output, semantic_status_json,
+        parse_context_pack_args, parse_index_args, parse_serve_mcp_args,
+        parse_vector_maintenance_args, require_text_output, semantic_status_json, start_mcp_watch,
+        write_mcp_watch_event,
     };
     use symdex_core::{SemanticLayer, SemanticLayerStatus};
-    use symdex_index::IndexScope;
+    use symdex_index::{ContinuousIndexEvent, IndexScope};
     use symdex_query::{SemanticStatusLayerSummary, SemanticStatusSummary};
     use symdex_store::QualityGenerationProgress;
 
@@ -1569,6 +1710,68 @@ mod tests {
             .expect_err("full watch should fail");
 
         assert!(error.contains("--watch uses incremental indexing"));
+    }
+
+    #[test]
+    fn serve_mcp_args_parse_without_watch() {
+        let args = parse_serve_mcp_args(&[]).expect("serve args should parse");
+
+        assert_eq!(args.watch_repo, None);
+    }
+
+    #[test]
+    fn serve_mcp_args_parse_watch_repo() {
+        let args = parse_serve_mcp_args(&["--watch".to_owned(), "repo".to_owned()])
+            .expect("serve args should parse");
+
+        assert_eq!(args.watch_repo.as_deref(), Some("repo"));
+    }
+
+    #[test]
+    fn serve_mcp_args_reject_missing_watch_repo() {
+        let error =
+            parse_serve_mcp_args(&["--watch".to_owned()]).expect_err("missing repo should fail");
+
+        assert!(error.contains("--watch requires a repository path"));
+    }
+
+    #[test]
+    fn serve_mcp_args_reject_offline_watch() {
+        let error = parse_serve_mcp_args(&[
+            "--watch".to_owned(),
+            "repo".to_owned(),
+            "--offline".to_owned(),
+        ])
+        .expect_err("offline serve watch should fail");
+
+        assert!(error.contains("semantic indexing"));
+    }
+
+    #[test]
+    fn mcp_watch_events_write_to_provided_log_stream() {
+        let mut output = Vec::new();
+        write_mcp_watch_event(
+            &mut output,
+            ContinuousIndexEvent::Started {
+                repository_id: "repo-id".to_owned(),
+                files_seen: 3,
+            },
+        )
+        .expect("watch event should write");
+
+        let output = String::from_utf8(output).expect("output should be utf8");
+        assert_eq!(
+            output,
+            "mcp_watch_started repository_id=repo-id files_seen=3\n"
+        );
+    }
+
+    #[test]
+    fn mcp_watch_start_fails_for_invalid_repo_before_serving() {
+        let error = start_mcp_watch("target/symdex-missing-mcp-watch-repo")
+            .expect_err("missing repo should fail");
+
+        assert!(error.contains("does not exist") || error.contains("No such file"));
     }
 
     #[test]

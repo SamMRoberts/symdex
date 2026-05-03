@@ -53,6 +53,7 @@ symdex context-pack <repo> <symbol>
 symdex tui [repo]
 symdex doctor [repo]
 symdex serve-mcp
+symdex serve-mcp --watch <repo>
 ```
 
 ## Success criteria

@@ -103,6 +103,7 @@ cargo run -p symdex-cli -- debug-context . panic.log
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- tui .
 cargo run -p symdex-cli -- serve-mcp
+cargo run -p symdex-cli -- serve-mcp --watch .
 ```
 
 Implemented CLI commands currently include:
@@ -234,7 +235,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
   outside the Doctor tab to refresh repository/storage status, and `q` or `Esc`
   to quit.
-- `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
+- `serve-mcp [--watch <repo>]`: runs the read-only MCP server over stdio. With
+  `--watch <repo>`, the server process also starts semantic continuous indexing
+  for that repository and writes watch summaries to stderr so stdout remains
+  MCP protocol-only. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
   `symdex_debug_context`, `symdex_staleness_check`, and
