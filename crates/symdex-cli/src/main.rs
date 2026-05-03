@@ -351,6 +351,14 @@ fn print_semantic_status_summary(summary: &SemanticStatusSummary) {
         println!("quality_progress:");
         println!("  embeddable_chunks: {}", progress.embeddable_chunks);
         println!(
+            "  quality_eligible_chunks: {}",
+            progress.quality_eligible_chunks
+        );
+        println!(
+            "  quality_ineligible_chunks: {}",
+            progress.quality_ineligible_chunks
+        );
+        println!(
             "  quality_embedded_chunks: {}",
             progress.quality_embedded_chunks
         );
@@ -406,6 +414,8 @@ fn semantic_status_json(summary: &SemanticStatusSummary) -> serde_json::Value {
             "repository_id": progress.repository_id.as_str(),
             "generation_id": progress.generation_id.as_str(),
             "embeddable_chunks": progress.embeddable_chunks,
+            "quality_eligible_chunks": progress.quality_eligible_chunks,
+            "quality_ineligible_chunks": progress.quality_ineligible_chunks,
             "quality_embedded_chunks": progress.quality_embedded_chunks,
             "pending_jobs": progress.pending_jobs,
             "running_jobs": progress.running_jobs,
@@ -1120,10 +1130,13 @@ fn print_quality_index_summary(summary: &QualityIndexSummary) {
     println!("succeeded_jobs: {}", summary.succeeded_jobs);
     println!("failed_jobs: {}", summary.failed_jobs);
     println!("skipped_stale_jobs: {}", summary.skipped_stale_jobs);
+    println!("skipped_excluded_jobs: {}", summary.skipped_excluded_jobs);
     println!("remaining_pending_jobs: {}", summary.remaining_pending_jobs);
     println!(
-        "progress: embeddable_chunks={} quality_embedded_chunks={} pending={} running={} succeeded={} failed={} skipped_stale={} skipped_excluded={}",
+        "progress: embeddable_chunks={} quality_eligible_chunks={} quality_ineligible_chunks={} quality_embedded_chunks={} pending={} running={} succeeded={} failed={} skipped_stale={} skipped_excluded={}",
         summary.progress.embeddable_chunks,
+        summary.progress.quality_eligible_chunks,
+        summary.progress.quality_ineligible_chunks,
         summary.progress.quality_embedded_chunks,
         summary.progress.pending_jobs,
         summary.progress.running_jobs,
@@ -1395,12 +1408,14 @@ fn print_continuous_index_event(event: ContinuousIndexEvent) {
 
 fn continuous_quality_summary(state: &symdex_index::ContinuousQualityState) -> String {
     format!(
-        "generation_id={} active_layer={} quality_status={} activation_reason={} embeddable_chunks={} quality_embedded_chunks={} pending_jobs={} running_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} skipped_excluded_jobs={}",
+        "generation_id={} active_layer={} quality_status={} activation_reason={} embeddable_chunks={} quality_eligible_chunks={} quality_ineligible_chunks={} quality_embedded_chunks={} pending_jobs={} running_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} skipped_excluded_jobs={}",
         state.generation_id,
         state.active_layer,
         state.quality_status,
         state.activation_reason.as_deref().unwrap_or("<none>"),
         state.embeddable_chunks,
+        state.quality_eligible_chunks,
+        state.quality_ineligible_chunks,
         state.quality_embedded_chunks,
         state.pending_jobs,
         state.running_jobs,
@@ -1648,6 +1663,8 @@ mod tests {
                 repository_id: "repo".to_owned(),
                 generation_id: "generation-1".to_owned(),
                 embeddable_chunks: 1,
+                quality_eligible_chunks: 1,
+                quality_ineligible_chunks: 0,
                 quality_embedded_chunks: 0,
                 pending_jobs: 1,
                 running_jobs: 0,

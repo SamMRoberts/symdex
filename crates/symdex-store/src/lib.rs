@@ -910,7 +910,10 @@ impl SqliteStore {
             SemanticLayer::Fast,
             &generation.fast_model,
             generation.fast_dimension,
+            generation.embeddable_chunks,
         )?;
+        let quality_expected_chunks =
+            self.quality_expected_chunks(&generation.repository_id, &generation.id)?;
 
         let quality = match (&generation.quality_model, generation.quality_dimension) {
             (Some(model), Some(dimension)) => Some(self.semantic_layer_manifest_summary(
@@ -918,13 +921,14 @@ impl SqliteStore {
                 SemanticLayer::Quality,
                 model,
                 dimension,
+                quality_expected_chunks,
             )?),
             _ => self
                 .semantic_layer_manifest_aggregate(&generation, SemanticLayer::Quality)?
                 .map(|aggregate| {
                     SemanticLayerManifestSummary::from_aggregate(
                         SemanticLayer::Quality,
-                        generation.embeddable_chunks,
+                        quality_expected_chunks,
                         aggregate,
                     )
                 })
@@ -950,23 +954,25 @@ impl SqliteStore {
         semantic_layer: SemanticLayer,
         embedding_model: &str,
         embedding_dimension: usize,
+        expected_chunks: usize,
     ) -> Result<SemanticLayerManifestSummary> {
         let Some(aggregate) = self.semantic_layer_manifest_aggregate(generation, semantic_layer)?
         else {
             return Ok(SemanticLayerManifestSummary::empty(
                 semantic_layer,
-                generation.embeddable_chunks,
+                expected_chunks,
                 embedding_model.to_owned(),
                 embedding_dimension,
                 vector_table_name(&generation.repository_id, embedding_model),
             ));
         };
 
-        SemanticLayerManifestSummary::from_aggregate(
-            semantic_layer,
-            generation.embeddable_chunks,
-            aggregate,
-        )
+        SemanticLayerManifestSummary::from_aggregate(semantic_layer, expected_chunks, aggregate)
+    }
+
+    fn quality_expected_chunks(&self, repository_id: &str, generation_id: &str) -> Result<usize> {
+        let progress = self.quality_generation_progress(repository_id, generation_id)?;
+        Ok(progress.quality_eligible_chunks)
     }
 
     fn semantic_layer_manifest_aggregate(
@@ -1569,6 +1575,16 @@ impl SqliteStore {
                     )
                     .map_err(StoreError::Sqlite)?;
             }
+            QualityJobCompletion::SkippedExcluded { reason } => {
+                transaction
+                    .execute(
+                        "UPDATE quality_embedding_jobs
+                         SET status = 'skipped_excluded', error_summary = ?2, updated_at = ?3
+                         WHERE id = ?1",
+                        params![job_id, reason, completed_at],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+            }
         }
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(())
@@ -1603,14 +1619,16 @@ impl SqliteStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(StoreError::Sqlite)?;
+        let embeddable_chunks = usize_count(embeddable_chunks, "embeddable chunk count")?;
+        let quality_embedded_chunks =
+            usize_count(quality_embedded_chunks, "quality embedded chunk count")?;
         let mut progress = QualityGenerationProgress {
             repository_id: repository_id.to_owned(),
             generation_id: generation_id.to_owned(),
-            embeddable_chunks: usize_count(embeddable_chunks, "embeddable chunk count")?,
-            quality_embedded_chunks: usize_count(
-                quality_embedded_chunks,
-                "quality embedded chunk count",
-            )?,
+            embeddable_chunks,
+            quality_eligible_chunks: embeddable_chunks,
+            quality_ineligible_chunks: 0,
+            quality_embedded_chunks,
             pending_jobs: 0,
             running_jobs: 0,
             succeeded_jobs: 0,
@@ -1646,6 +1664,10 @@ impl SqliteStore {
                 _ => {}
             }
         }
+        progress.quality_ineligible_chunks = progress.skipped_excluded_jobs;
+        progress.quality_eligible_chunks = progress
+            .embeddable_chunks
+            .saturating_sub(progress.quality_ineligible_chunks);
 
         Ok(progress)
     }
@@ -1908,7 +1930,9 @@ impl SqliteStore {
                 QualityActivationReason::QualityJobsStale,
                 None,
             )
-        } else if quality_embedded_chunks == generation.embeddable_chunks {
+        } else if quality_embedded_chunks + counts.skipped_excluded_jobs
+            == generation.embeddable_chunks
+        {
             (
                 SemanticLayerStatus::QualityReady,
                 SemanticLayer::Quality,
@@ -1972,6 +1996,10 @@ impl SqliteStore {
             repository_id: repository_id.to_owned(),
             generation_id: generation_id.to_owned(),
             embeddable_chunks: generation.embeddable_chunks,
+            quality_eligible_chunks: generation
+                .embeddable_chunks
+                .saturating_sub(counts.skipped_excluded_jobs),
+            quality_ineligible_chunks: counts.skipped_excluded_jobs,
             quality_embedded_chunks,
             pending_jobs: counts.pending_jobs,
             running_jobs: counts.running_jobs,
@@ -3706,6 +3734,9 @@ pub enum QualityJobCompletion {
         error_summary: String,
     },
     SkippedStale,
+    SkippedExcluded {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3713,6 +3744,8 @@ pub struct QualityGenerationProgress {
     pub repository_id: String,
     pub generation_id: String,
     pub embeddable_chunks: usize,
+    pub quality_eligible_chunks: usize,
+    pub quality_ineligible_chunks: usize,
     pub quality_embedded_chunks: usize,
     pub pending_jobs: usize,
     pub running_jobs: usize,
@@ -6410,6 +6443,53 @@ mod tests {
             QualityActivationReason::QualityCoverageIncomplete
         );
         assert_eq!(summary.progress.quality_embedded_chunks, 1);
+    }
+
+    #[test]
+    fn quality_activation_treats_skipped_excluded_jobs_as_complete_coverage() {
+        let db = TestDb::new("quality-activation-excluded-coverage");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        let mut generation = sample_semantic_generation();
+        generation.embeddable_chunks = 2;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
+            .expect("quality embedding should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-2",
+                "skipped_excluded",
+            ))
+            .expect("excluded job should persist");
+
+        let summary = store
+            .refresh_quality_activation("repo", "generation-1", Some(768), "700")
+            .expect("activation should refresh");
+
+        assert_eq!(summary.quality_status, SemanticLayerStatus::QualityReady);
+        assert_eq!(summary.active_layer, SemanticLayer::Quality);
+        assert_eq!(summary.reason, QualityActivationReason::QualityComplete);
+        assert_eq!(summary.progress.embeddable_chunks, 2);
+        assert_eq!(summary.progress.quality_eligible_chunks, 1);
+        assert_eq!(summary.progress.quality_ineligible_chunks, 1);
+        assert_eq!(summary.progress.quality_embedded_chunks, 1);
+
+        let routing = store
+            .semantic_routing_summary("repo")
+            .expect("routing summary should load")
+            .expect("routing summary should exist");
+        let quality = routing.quality.expect("quality manifest should exist");
+        assert_eq!(quality.expected_chunks, 1);
+        assert_eq!(quality.current_chunks, 1);
+        assert!(quality.is_complete);
     }
 
     #[test]

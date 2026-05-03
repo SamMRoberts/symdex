@@ -160,7 +160,10 @@ The quality layer may become active only when all of the following are true:
 - The quality embedding model is `mxbai-embed-large` unless explicitly
   overridden by configuration.
 - The quality vector dimension is known and stable for that model/collection.
-- Every current embeddable chunk has a current quality embedding row.
+- Every quality-eligible chunk has a current quality embedding row.
+- Quality-ineligible chunks are explicitly accounted for by terminal
+  `skipped_excluded` jobs, such as chunks over the quality model's context
+  limit.
 - No current quality jobs for the generation are pending or running.
 - The latest generation has no `failed` or `skipped_stale` quality jobs.
 - A `quality_blocked` generation stays blocked until a later queue retry can
@@ -295,7 +298,6 @@ A quality job is stale when any of these are true:
 - Its file content hash no longer matches the current `files.content_hash`.
 - Its chunk text hash no longer matches the current `chunks.text_hash`.
 - Its chunk no longer exists.
-- The chunk now has an `excluded_reason`.
 
 Stale pending or running jobs should transition to `skipped_stale` and must not
 activate quality. Terminal job history such as `succeeded`, `failed`,
@@ -305,6 +307,8 @@ supersedes older quality work.
 If `skipped_stale` exists on the latest generation, activation keeps
 `quality_status = quality_pending` and `active_layer = fast`. A later fast
 generation and quality queue pass must produce a clean, complete manifest before
+quality can become active. `skipped_excluded` jobs on the latest generation count
+as intentional quality-layer ineligibility, not stale coverage.
 quality can become active.
 
 If quality indexing is enabled but the configured quality model or local service

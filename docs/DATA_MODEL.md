@@ -234,11 +234,13 @@ not contain source text.
 The manual quality worker refreshes activation state from SQLite manifests and
 job counts. A latest generation becomes `quality_ready` with
 `active_layer = quality` only when the current quality manifest covers every
-embeddable chunk, the quality model and dimension are known, and no pending,
-running, failed, or `skipped_stale` jobs remain. Partial coverage remains
-`quality_pending`; terminal failures become `quality_failed`; blocked
-generations remain `quality_blocked`; and latest-generation `skipped_stale`
-jobs keep default routing on fast until a later generation can complete cleanly.
+quality-eligible chunk, the remaining fast-embeddable chunks are explicitly
+accounted for as `skipped_excluded`, the quality model and dimension are known,
+and no pending, running, failed, or `skipped_stale` jobs remain. Partial
+eligible coverage remains `quality_pending`; terminal failures become
+`quality_failed`; blocked generations remain `quality_blocked`; and
+latest-generation `skipped_stale` jobs keep default routing on fast until a
+later generation can complete cleanly.
 `quality_completed_at` is set only by successful activation.
 
 ### `chunk_embeddings`
@@ -317,8 +319,10 @@ marks them `running`, increments `attempts`, and then revalidates current file
 and chunk metadata before embedding. Successful jobs transactionally write a
 quality-layer `chunk_embeddings` row and move to `succeeded`. Service or vector
 write failures move to `failed` with a compact metadata-only error summary.
-Stale jobs, including chunks that now have an `excluded_reason`, move to
-`skipped_stale` and are not embedded.
+Stale jobs move to `skipped_stale` and are not embedded. Chunks that are current
+but not eligible for the quality layer, such as chunks over the quality model's
+size limit or chunks that now have an `excluded_reason`, move to
+`skipped_excluded`.
 
 After worker progress, `semantic_generations.quality_embedded_chunks` is
 refreshed from current quality manifest rows. The first successful quality
@@ -327,6 +331,7 @@ running jobs remain for the latest generation, `quality_status` becomes
 `quality_failed`; otherwise a complete, clean latest generation is atomically
 marked `quality_ready` with `active_layer = quality`. Latest-generation
 `skipped_stale` jobs are treated as incomplete work, not successful coverage.
+`skipped_excluded` jobs reduce the quality layer's eligible chunk count.
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for

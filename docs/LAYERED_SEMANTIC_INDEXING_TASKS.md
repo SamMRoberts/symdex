@@ -156,7 +156,8 @@ Tasks:
 Acceptance:
 
 - Worker can complete quality embeddings for a stable repo.
-- Worker skips stale jobs after file changes.
+- Worker skips stale jobs after file changes and excluded jobs for chunks outside
+  quality eligibility.
 - Fast search remains active until activation rules pass.
 
 ## Slice 7 — Quality activation and fallback
@@ -165,7 +166,7 @@ Goal: default search shifts to quality only when quality is complete/current.
 
 Tasks:
 
-- Count current embeddable chunks for the latest fast generation.
+- Count quality-eligible chunks for the latest fast generation.
 - Count current quality embeddings for the same generation.
 - Verify no pending/running jobs remain for that generation.
 - Defer layer-aware sqlite-vec manifest verification to Slice 9 verify/repair work.

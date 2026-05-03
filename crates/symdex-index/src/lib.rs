@@ -166,6 +166,7 @@ pub struct QualityIndexSummary {
     pub succeeded_jobs: usize,
     pub failed_jobs: usize,
     pub skipped_stale_jobs: usize,
+    pub skipped_excluded_jobs: usize,
     pub remaining_pending_jobs: usize,
     pub quality_status: String,
     pub active_layer: String,
@@ -181,6 +182,8 @@ pub struct ContinuousQualityState {
     pub quality_status: String,
     pub activation_reason: Option<String>,
     pub embeddable_chunks: usize,
+    pub quality_eligible_chunks: usize,
+    pub quality_ineligible_chunks: usize,
     pub quality_embedded_chunks: usize,
     pub pending_jobs: usize,
     pub running_jobs: usize,
@@ -475,6 +478,7 @@ fn run_quality_index_limited_with_progress(
         succeeded_jobs: stats.succeeded_jobs,
         failed_jobs: stats.failed_jobs,
         skipped_stale_jobs: stats.skipped_stale_jobs,
+        skipped_excluded_jobs: stats.skipped_excluded_jobs,
         remaining_pending_jobs: activation.progress.pending_jobs,
         quality_status: activation.quality_status.as_str().to_owned(),
         active_layer: activation.active_layer.as_str().to_owned(),
@@ -643,6 +647,8 @@ fn continuous_quality_state(
         quality_status: routing.quality_status.as_str().to_owned(),
         activation_reason: activation_reason.map(str::to_owned),
         embeddable_chunks: progress.embeddable_chunks,
+        quality_eligible_chunks: progress.quality_eligible_chunks,
+        quality_ineligible_chunks: progress.quality_ineligible_chunks,
         quality_embedded_chunks: progress.quality_embedded_chunks,
         pending_jobs: progress.pending_jobs,
         running_jobs: progress.running_jobs,
@@ -1961,6 +1967,7 @@ struct QualityWorkerStats {
     succeeded_jobs: usize,
     failed_jobs: usize,
     skipped_stale_jobs: usize,
+    skipped_excluded_jobs: usize,
 }
 
 fn quality_activation_progress_message(
@@ -1968,10 +1975,11 @@ fn quality_activation_progress_message(
     activation: &QualityActivationSummary,
 ) -> String {
     format!(
-        "Quality worker completed: {} succeeded, {} failed, {} stale; status={} active_layer={} reason={}",
+        "Quality worker completed: {} succeeded, {} failed, {} stale, {} excluded; status={} active_layer={} reason={}",
         stats.succeeded_jobs,
         stats.failed_jobs,
         stats.skipped_stale_jobs,
+        stats.skipped_excluded_jobs,
         activation.quality_status.as_str(),
         activation.active_layer.as_str(),
         activation.reason.as_str()
@@ -2002,8 +2010,8 @@ fn process_quality_job(
         context.quality_max_chunk_bytes,
         &row,
     ) {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => {
+        Ok(QualityJobPreparation::Ready(prepared)) => *prepared,
+        Ok(QualityJobPreparation::Stale) => {
             sqlite
                 .complete_quality_embedding_job(
                     &row.job.id,
@@ -2012,6 +2020,17 @@ fn process_quality_job(
                 )
                 .map_err(|error| error.to_string())?;
             stats.skipped_stale_jobs += 1;
+            return Ok(());
+        }
+        Ok(QualityJobPreparation::Excluded { reason }) => {
+            sqlite
+                .complete_quality_embedding_job(
+                    &row.job.id,
+                    QualityJobCompletion::SkippedExcluded { reason },
+                    &completed_at,
+                )
+                .map_err(|error| error.to_string())?;
+            stats.skipped_excluded_jobs += 1;
             return Ok(());
         }
         Err(error) => {
@@ -2183,9 +2202,17 @@ fn complete_failed_quality_job(
     Ok(())
 }
 
+#[derive(Debug)]
 struct PreparedQualityJob {
     row: QualityJobSourceRow,
     text: String,
+}
+
+#[derive(Debug)]
+enum QualityJobPreparation {
+    Ready(Box<PreparedQualityJob>),
+    Stale,
+    Excluded { reason: String },
 }
 
 fn prepare_quality_job(
@@ -2193,25 +2220,31 @@ fn prepare_quality_job(
     latest_generation_id: &str,
     max_chunk_bytes: usize,
     row: &QualityJobSourceRow,
-) -> Result<Option<PreparedQualityJob>, String> {
+) -> Result<QualityJobPreparation, String> {
     if row.job.generation_id != latest_generation_id {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
     }
     if row.current_file_id.as_deref() != Some(row.job.file_id.as_str())
         || row.current_content_hash.as_deref() != Some(row.job.content_hash.as_str())
         || row.current_text_hash.as_deref() != Some(row.job.text_hash.as_str())
-        || row.excluded_reason.is_some()
     {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
+    }
+    if let Some(reason) = &row.excluded_reason {
+        return Ok(QualityJobPreparation::Excluded {
+            reason: reason.clone(),
+        });
     }
     let (Some(start_byte), Some(end_byte)) = (row.start_byte, row.end_byte) else {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
     };
     if start_byte >= end_byte {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
     }
     if end_byte.saturating_sub(start_byte) > max_chunk_bytes {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Excluded {
+            reason: "quality_chunk_too_large_for_embedding".to_owned(),
+        });
     }
     let normalized = NormalizedRepoPath::new(&row.job.path).map_err(|error| error.to_string())?;
     let path = root.path().join(normalized.as_str());
@@ -2221,21 +2254,21 @@ fn prepare_quality_job(
         .normalize_existing_path(&path)
         .map_err(|error| error.to_string())?;
     if normalized_existing.as_str() != row.job.path {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
     }
     if content_hash(source.as_bytes()) != row.job.content_hash {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
     }
     let Some(text) = source.get(start_byte..end_byte).map(str::to_owned) else {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
     };
     if content_hash(text.as_bytes()) != row.job.text_hash {
-        return Ok(None);
+        return Ok(QualityJobPreparation::Stale);
     }
-    Ok(Some(PreparedQualityJob {
+    Ok(QualityJobPreparation::Ready(Box::new(PreparedQualityJob {
         row: row.clone(),
         text,
-    }))
+    })))
 }
 
 fn quality_vector_point(
@@ -2662,7 +2695,7 @@ mod tests {
     };
 
     use crate::{
-        ContinuousIndexOptions, IndexCollection, IndexReport, IndexScope,
+        ContinuousIndexOptions, IndexCollection, IndexReport, IndexScope, QualityJobPreparation,
         RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness,
         WatchSnapshot, apply_embedding_size_limits, chunk_record, chunk_texts,
         collect_index_reports, detect_watch_changes, diff_watch_snapshots, index_run_kind,
@@ -2720,9 +2753,12 @@ mod tests {
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
         let row = sample_quality_source_row(source, 0, source.len(), None);
 
-        let prepared = prepare_quality_job(&root, "generation-1", source.len(), &row)
+        let prepared = match prepare_quality_job(&root, "generation-1", source.len(), &row)
             .expect("prepare should not fail")
-            .expect("job should be current");
+        {
+            QualityJobPreparation::Ready(prepared) => prepared,
+            other => panic!("job should be current, got {other:?}"),
+        };
 
         assert_eq!(prepared.text, source);
         assert_eq!(prepared.row.job.id, "quality-job-1");
@@ -2738,16 +2774,16 @@ mod tests {
         let mut stale_hash = sample_quality_source_row(source, 0, source.len(), None);
         stale_hash.job.text_hash = "stale-text".to_owned();
 
-        assert!(
+        assert!(matches!(
             prepare_quality_job(&root, "generation-1", source.len(), &excluded)
-                .expect("excluded should not fail")
-                .is_none()
-        );
-        assert!(
+                .expect("excluded should not fail"),
+            QualityJobPreparation::Excluded { .. }
+        ));
+        assert!(matches!(
             prepare_quality_job(&root, "generation-1", source.len(), &stale_hash)
-                .expect("stale should not fail")
-                .is_none()
-        );
+                .expect("stale should not fail"),
+            QualityJobPreparation::Stale
+        ));
     }
 
     #[test]
@@ -2758,11 +2794,12 @@ mod tests {
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
         let row = sample_quality_source_row(source, 0, source.len(), None);
 
-        assert!(
+        assert!(matches!(
             prepare_quality_job(&root, "generation-1", 8, &row)
-                .expect("oversized quality job should not fail")
-                .is_none()
-        );
+                .expect("oversized quality job should not fail"),
+            QualityJobPreparation::Excluded { reason }
+                if reason == "quality_chunk_too_large_for_embedding"
+        ));
     }
 
     #[test]

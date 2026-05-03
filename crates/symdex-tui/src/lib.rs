@@ -1402,6 +1402,8 @@ impl App {
             repository_id: state.repository_id.clone(),
             generation_id: state.generation_id.clone(),
             embeddable_chunks: state.embeddable_chunks,
+            quality_eligible_chunks: state.quality_eligible_chunks,
+            quality_ineligible_chunks: state.quality_ineligible_chunks,
             quality_embedded_chunks: state.quality_embedded_chunks,
             pending_jobs: state.pending_jobs,
             running_jobs: state.running_jobs,
@@ -1415,7 +1417,7 @@ impl App {
         self.semantic_status.quality_status = quality_status;
         self.semantic_status.quality.current_chunks = state.quality_embedded_chunks;
         self.semantic_status.quality.total_chunks = state.quality_embedded_chunks;
-        self.semantic_status.quality.expected_chunks = state.embeddable_chunks;
+        self.semantic_status.quality.expected_chunks = quality_progress.quality_eligible_chunks;
         self.semantic_status.quality.is_complete = quality_progress_is_complete(&quality_progress);
         self.semantic_status.quality_progress = Some(quality_progress);
         self.semantic_status.fallback_reason = semantic_fallback_reason_for_status(
@@ -1441,7 +1443,7 @@ impl App {
         self.semantic_status.quality.vector_table = summary.vector_table.clone();
         self.semantic_status.quality.current_chunks = summary.progress.quality_embedded_chunks;
         self.semantic_status.quality.total_chunks = summary.progress.quality_embedded_chunks;
-        self.semantic_status.quality.expected_chunks = summary.progress.embeddable_chunks;
+        self.semantic_status.quality.expected_chunks = summary.progress.quality_eligible_chunks;
         self.semantic_status.quality.is_complete = quality_progress_is_complete(&summary.progress);
         self.semantic_status.quality_progress = Some(summary.progress.clone());
         self.semantic_status.latest_quality_error = None;
@@ -2949,7 +2951,7 @@ fn semantic_fallback_state(summary: &SemanticStatusSummary) -> &'static str {
 }
 
 fn quality_progress_is_complete(progress: &QualityGenerationProgress) -> bool {
-    progress.embeddable_chunks == progress.quality_embedded_chunks
+    progress.quality_eligible_chunks == progress.quality_embedded_chunks
         && progress.pending_jobs == 0
         && progress.running_jobs == 0
         && progress.failed_jobs == 0
@@ -7882,6 +7884,8 @@ mod tests {
             quality_status: "quality_pending".to_owned(),
             activation_reason: None,
             embeddable_chunks: 2,
+            quality_eligible_chunks: 2,
+            quality_ineligible_chunks: 0,
             quality_embedded_chunks: 1,
             pending_jobs: 1,
             running_jobs: 0,
@@ -7922,6 +7926,7 @@ mod tests {
                 succeeded_jobs: 1,
                 failed_jobs: 0,
                 skipped_stale_jobs: 0,
+                skipped_excluded_jobs: 0,
                 remaining_pending_jobs: 0,
                 quality_status: "quality_ready".to_owned(),
                 active_layer: "quality".to_owned(),
@@ -7930,6 +7935,8 @@ mod tests {
                     repository_id: "repo".to_owned(),
                     generation_id: "generation-1".to_owned(),
                     embeddable_chunks: 2,
+                    quality_eligible_chunks: 2,
+                    quality_ineligible_chunks: 0,
                     quality_embedded_chunks: 2,
                     pending_jobs: 0,
                     running_jobs: 0,
@@ -8035,6 +8042,8 @@ mod tests {
             repository_id: "repo".to_owned(),
             generation_id: "generation-1".to_owned(),
             embeddable_chunks: 4,
+            quality_eligible_chunks: 4,
+            quality_ineligible_chunks: 0,
             quality_embedded_chunks: 1,
             pending_jobs: 2,
             running_jobs: 1,

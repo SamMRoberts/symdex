@@ -4468,6 +4468,8 @@ mod tests {
             repository_id: "repo".to_owned(),
             generation_id: "generation-1".to_owned(),
             embeddable_chunks: 1,
+            quality_eligible_chunks: 1,
+            quality_ineligible_chunks: 0,
             quality_embedded_chunks,
             pending_jobs,
             running_jobs,
