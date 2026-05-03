@@ -98,11 +98,11 @@ terminal panes.
 
 ### Ratatui widget evaluation
 
-The current TUI already uses the right stable baseline from `ratatui`: `Block`,
-`Paragraph`, `List`, `Table`, `Tabs`, `Gauge`, and `Sparkline`. Keep these as
-the default building blocks because they are built in, compact, easy to test
-with the ratatui test backend, and already match symdex's local metadata-first
-model.
+The current TUI uses the right stable baseline from `ratatui`: `Block`,
+`Paragraph`, `List`, `Table`, `Tabs`, `Gauge`, `Scrollbar`, and `BarChart`.
+Keep these as the default building blocks because they are built in, compact,
+easy to test with the ratatui test backend, and already match symdex's local
+metadata-first model.
 
 Built-in widget decisions:
 
@@ -114,9 +114,9 @@ Built-in widget decisions:
 | `Table` | Keep using | Best default for evidence, storage, diagnostics, calls, impact, and context-pack metadata. |
 | `Tabs` | Keep using | Major views, storage subviews, and mode selectors. |
 | `Gauge` | Keep using | Manual indexing progress and fast/quality semantic readiness where real counts exist. |
-| `Sparkline` | Keep using sparingly | Quality/fast job activity only when derived from real counts; avoid decorative use. |
-| `Scrollbar` | Add next | Long selectable tables and detail panes need visible position without reducing evidence density. |
-| `BarChart` | Add after scrollbar | Useful for real bucketed metrics: call resolution buckets, index-run outcomes, freshness status counts, embedding coverage, and quality job states. |
+| `Sparkline` | Avoid unless a future series metric needs it | Current job-state summaries are clearer as count-backed bar charts. |
+| `Scrollbar` | Use now | Long selectable tables and metadata line panes need visible position without reducing evidence density. |
+| `BarChart` | Use now | Useful for real bucketed metrics: call resolution buckets, index-run outcomes, freshness status counts, embedding coverage, and quality job states. |
 | `Chart` | Defer | Potentially useful for index-run duration/throughput over time, but only after store/query APIs expose stable time-series metrics. |
 | `Canvas` | Defer | Could visualize call paths or graph topology, but table evidence is clearer and more accessible for the MVP. |
 | `Calendar` | Avoid for now | Index activity is better shown as timeline rows or bar charts; calendar layout spends too much space at 80x24. |
@@ -151,6 +151,28 @@ Recommended implementation order:
    drill-down, preserving table fallbacks for narrow terminals.
 5. Revisit `Chart`, `Canvas`, `tui-nodes`, and `tui-logger` only after their
    backing data contracts exist and their accessibility tradeoffs are tested.
+
+Phase 10.5 implementation status:
+
+- Built-in `Scrollbar` indicators are used for selectable table panes and long
+  line-list metadata panes. They use ASCII thumb/track symbols for terminal
+  compatibility and keep row selection as the scrolling driver.
+- Built-in `BarChart` summaries are used only where real local counts already
+  exist: call-resolution buckets, embedding coverage, index-run outcomes,
+  freshness states, and fast/quality job state counts. Compact layouts keep the
+  detail pane visible and defer charts when height is constrained.
+- `ratatui-textarea` remains deferred. Debug-context input is the strongest fit,
+  but the current single-line query/call/context inputs remain faster and safer
+  until multiline debug-context editing needs paste/cursor behavior beyond the
+  existing string input state.
+- `tui-tree-widget` remains deferred. The current symbol outline table already
+  exposes path, symbol kind, line range, child count, and status-safe metadata;
+  a tree widget should wait until collapse/expand state and file hierarchy
+  navigation are needed enough to justify an additional dependency.
+- Image, embedded-terminal, decorative big-text, pie-chart, graph/canvas, and
+  mouse/menu-centric widgets remain avoided until a design proves they improve
+  evidence review without reducing 80x24 metadata density or weakening the
+  local read-only TUI boundary.
 
 ### Interaction Feedback
 
