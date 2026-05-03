@@ -37,8 +37,8 @@ Pure domain logic:
 - shared evidence contract schema/version constants used by CLI, TUI,
   diagnostics, and MCP
 
-This crate should not depend on Qdrant, Ollama, MCP, or CLI frameworks.
-Per-language parser details must not leak into CLI, TUI, MCP, store, Qdrant, or
+This crate should not depend on sqlite-vec, Ollama, MCP, or CLI frameworks.
+Per-language parser details must not leak into CLI, TUI, MCP, store, sqlite-vec, or
 Ollama layers. Those layers should consume stable language slugs, parser
 versions, chunks, symbols, calls, and provenance metadata.
 
@@ -48,23 +48,23 @@ Persistence adapters:
 
 - SQLite schema migrations
 - file/symbol/chunk/call persistence
-- Qdrant collection management
+- sqlite-vec collection management
 - vector upserts and searches
 - repository index metadata
 - semantic generation state for layered fast/quality indexing
 - per-layer embedding manifests
 - deferred quality embedding job persistence
 
-The crate keeps Qdrant REST client code and Qdrant request/response DTOs in
-`src/qdrant.rs`, re-exporting only the stable adapter types and helpers through
+The crate keeps sqlite-vec registration and vector table operations in
+`src/vector.rs`, re-exporting only the stable adapter types and helpers through
 `lib.rs`. SQLite schema, row mapping, and storage summaries remain in `lib.rs`
 until they are split into dedicated modules.
 
 Keep database DTOs separate from domain types.
 
 For layered semantic indexing, this crate should treat SQLite as the source of
-truth for active layer selection, quality readiness, generation IDs, and Qdrant
-expected manifests. Qdrant remains a metadata-only projection of embeddable
+truth for active layer selection, quality readiness, generation IDs, and sqlite-vec
+expected manifests. sqlite-vec remains a metadata-only projection of embeddable
 chunks.
 
 ### `symdex-diagnostics`
@@ -74,7 +74,7 @@ Local diagnostics:
 - current workspace and configured local service endpoints
 - SQLite parent path checks
 - Ollama model and embedding dimension checks
-- Qdrant health checks
+- sqlite-vec health checks
 - optional rust-analyzer enrichment readiness checks when explicitly enabled
 - fast and quality embedding model readiness when layered indexing is enabled
 
@@ -89,7 +89,7 @@ Indexing orchestration:
 - continuous indexing watch orchestration shared by CLI and TUI
 - file-event debounce and coalescing before reindex work is scheduled
 - structural SQLite persistence
-- optional semantic embedding and Qdrant upserts
+- optional semantic embedding and sqlite-vec upserts
 - compact indexing summaries without source text
 - fast semantic generation creation using `nomic-embed-text`
 - quality semantic job queueing and worker orchestration using
@@ -110,10 +110,10 @@ Query orchestration:
 - impact summaries and context-pack retrieval
 - semantic query embedding
 - active semantic layer routing
-- Qdrant vector search
+- sqlite-vec vector search
 - compact query result summaries without source text
 - storage-visualization summaries that combine SQLite structural metadata with
-  Qdrant semantic coverage metadata
+  sqlite-vec semantic coverage metadata
 
 Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
 
@@ -187,7 +187,7 @@ MCP server:
 ## Boundary rules
 
 - Core emits facts; store persists facts; CLI, TUI, and MCP present facts.
-- SQLite decides semantic-layer readiness; Qdrant does not decide routing.
+- SQLite decides semantic-layer readiness; sqlite-vec does not decide routing.
 - Fast semantic indexing is the availability path. Quality semantic indexing is
   deferred precision work.
 - Never let MCP invoke indexing side effects until a write-capable design is approved.
@@ -197,7 +197,7 @@ MCP server:
   update fast vectors and queue quality work.
 - Keep TUI rendering and event types out of core, store, embed, and MCP crates.
 - Keep storage visualization queries outside `symdex-tui` when they require
-  nontrivial SQLite/Qdrant aggregation; expose typed summaries from shared
+  nontrivial SQLite/sqlite-vec aggregation; expose typed summaries from shared
   library crates instead.
 - Prefer stable serialized structs for MCP outputs.
 - MCP successful tool calls must include the current cross-agent evidence

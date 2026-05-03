@@ -5,7 +5,7 @@ index without each agent rebuilding or inventing its own evidence model.
 
 ## Contract
 
-- The shared index is local SQLite plus local Qdrant.
+- The shared index is local SQLite plus local sqlite-vec.
 - The supported agent-facing protocol is read-only MCP over stdio.
 - Successful MCP tool results use the stable envelope
   `symdex.mcp.evidence.v1`.
@@ -29,7 +29,7 @@ index without each agent rebuilding or inventing its own evidence model.
   mutate repository data.
 - The local service choices remain under user control:
   - SQLite path from `SYMDEX_DB_PATH`
-  - Qdrant URL from `SYMDEX_QDRANT_URL`
+  - sqlite-vec URL from `SYMDEX_DB_PATH`
   - Ollama URL and model from embed configuration
 
 ## Read-Only Access Pattern
@@ -40,7 +40,7 @@ index without each agent rebuilding or inventing its own evidence model.
 4. Tool responses include compact evidence under `data` plus contract metadata.
 5. Agents inspect `freshness` and `provenance` before trusting evidence.
 
-The MCP server may read SQLite and Qdrant, embed semantic search queries through
+The MCP server may read SQLite and sqlite-vec, embed semantic search queries through
 local Ollama, and compute freshness from current file hashes. It must not
 execute indexed repository code or expose source text by default.
 
@@ -49,7 +49,7 @@ execute indexed repository code or expose source text by default.
 `symdex doctor [repo]` makes these facts visible:
 
 - SQLite database path and parent directory health.
-- Qdrant endpoint health.
+- sqlite-vec extension health.
 - Ollama endpoint, model, and vector dimension health.
 - Index freshness and provenance consistency.
 - Whether an agent is receiving stale, missing, deleted, unknown, or fresh

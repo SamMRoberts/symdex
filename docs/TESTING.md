@@ -4,7 +4,7 @@
 
 1. Unit tests for parsing, chunking, hashing, path normalization, and secret detection.
 2. Integration tests for SQLite migrations and query behavior.
-3. Integration tests for Qdrant adapter behind an opt-in feature or environment flag.
+3. Integration tests for sqlite-vec adapter behind an opt-in feature or environment flag.
 4. Integration tests for Ollama adapter behind an opt-in feature or environment flag.
 5. MCP contract tests for input validation and output shape.
 6. TUI state and render tests using `ratatui` test backends.
@@ -49,7 +49,7 @@ Fixtures should be tiny and purpose-built.
 - TUI render snapshots or buffer assertions for key screens
 - TUI selectable table panes render from full result sets and scroll selected
   rows beyond the initially visible viewport.
-- TUI storage visualization state and render coverage for SQLite/Qdrant
+- TUI storage visualization state and render coverage for SQLite/sqlite-vec
   metadata, selected-row drill-down, empty stores, missing vectors, excluded
   chunks, and model/dimension drift
 - Evidence freshness coverage for fresh, stale, deleted, missing, and unknown
@@ -118,7 +118,7 @@ for symbols, calls, chunks, files, and index runs.
 Continuous indexing tests should use synthetic filesystem events where possible
 for debounce and coalescing behavior, plus tiny fixture repositories for
 end-to-end created-file and modified-file reindex behavior. Offline continuous
-indexing should be testable without Qdrant or Ollama; semantic continuous
+indexing should be testable without sqlite-vec or Ollama; semantic continuous
 indexing should use mocked adapters or the existing opt-in local service test
 flags.
 
@@ -145,10 +145,10 @@ cargo audit
 The CI workflow runs the same production hardening baseline on pull requests and
 pushes to `main`, and installs `cargo-audit` before running the dependency
 audit. Service-dependent checks remain opt-in so ordinary CI does not require
-local Qdrant or Ollama services.
+local sqlite-vec or Ollama services.
 
-Qdrant verifier unit tests keep the comparison logic deterministic by building
-SQLite expected-point manifests and Qdrant payload rows in memory. Live Qdrant
+sqlite-vec verifier unit tests keep the comparison logic deterministic by building
+SQLite expected-point manifests and sqlite-vec payload rows in memory. Live sqlite-vec
 scroll behavior remains part of the service-dependent adapter checks. Repair
 uses the verifier's captured point IDs for orphan deletion and the existing
 semantic index path for vector rebuilds, so focused tests cover the repair plan
@@ -157,7 +157,7 @@ classification while live end-to-end repair remains service-dependent.
 Service-dependent checks:
 
 ```bash
-SYMDEX_TEST_QDRANT=1 cargo test -p symdex-store qdrant
+SYMDEX_TEST_SQLITE_VEC=1 cargo test -p symdex-store sqlite_vec
 SYMDEX_TEST_OLLAMA=1 cargo test -p symdex-embed ollama
 ```
 
@@ -217,7 +217,7 @@ fallbacks, common Rust runtime output shapes, and impact likely-test evidence
 from direct indexed test calls.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
-structural data and mocked or adapter-level Qdrant metadata for semantic
+structural data and mocked or adapter-level sqlite-vec metadata for semantic
 coverage checks. Tests should assert labels and counts instead of source text.
 
 ## Agent expectation

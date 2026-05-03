@@ -44,10 +44,10 @@ use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
     CrossStoreHealthSummary, EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance,
     FileCoverageStatus, FileDetailSummary, IndexCoverageSummary, IndexRunTimelineRow,
-    IndexRunsTimelineSummary, QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
-    SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore,
-    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
-    SymbolOutlineSummary, qdrant_collection_name,
+    IndexRunsTimelineSummary, QualityGenerationProgress, RepositoryStatus, SemanticNeighborhoodRow,
+    SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore, StorageExplorerSummary,
+    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
+    VectorStorageProjection, vector_table_name,
 };
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
@@ -69,7 +69,7 @@ pub struct App {
     repo_root: String,
     repository_id: String,
     sqlite_path: String,
-    qdrant_url: String,
+    vector_store_label: String,
     ollama_url: String,
     embed_model: String,
     status: RepositoryStatus,
@@ -141,7 +141,7 @@ impl App {
             repo_root: root.path().display().to_string(),
             repository_id: root.id().to_owned(),
             sqlite_path: store_config.sqlite_path.display().to_string(),
-            qdrant_url: store_config.qdrant_url,
+            vector_store_label: "sqlite_vec".to_owned(),
             ollama_url: embed_config.ollama_url,
             embed_model: embed_config.model,
             status,
@@ -205,7 +205,7 @@ impl App {
             repo_root,
             repository_id,
             sqlite_path: ".symdex/symdex.sqlite".to_owned(),
-            qdrant_url: "http://localhost:6333".to_owned(),
+            vector_store_label: "sqlite_vec".to_owned(),
             ollama_url: "http://localhost:11434".to_owned(),
             embed_model: "nomic-embed-text".to_owned(),
             status,
@@ -1438,7 +1438,7 @@ impl App {
         self.semantic_status.quality_status = quality_status;
         self.semantic_status.quality.embedding_model = summary.quality_model.clone();
         self.semantic_status.quality.embedding_dimension = summary.quality_dimension;
-        self.semantic_status.quality.qdrant_collection = summary.qdrant_collection.clone();
+        self.semantic_status.quality.vector_table = summary.vector_table.clone();
         self.semantic_status.quality.current_chunks = summary.progress.quality_embedded_chunks;
         self.semantic_status.quality.total_chunks = summary.progress.quality_embedded_chunks;
         self.semantic_status.quality.expected_chunks = summary.progress.embeddable_chunks;
@@ -1880,7 +1880,7 @@ fn render_repository_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, a
             Span::styled("services ", metadata_style()),
             status_span("sqlite", StatusTone::Success),
             Span::raw(" local  "),
-            status_span("qdrant", StatusTone::Success),
+            status_span("vector", StatusTone::Success),
             Span::raw(" local  "),
             status_span("ollama", StatusTone::Success),
             Span::raw(" local"),
@@ -1978,9 +1978,9 @@ fn render_overview_focus_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
             Cell::from(app.sqlite_path.clone()),
         ]),
         Row::new(vec![
-            Cell::from("Qdrant"),
+            Cell::from("sqlite-vec"),
             Cell::from(status_span("local", StatusTone::Success)),
-            Cell::from(app.qdrant_url.clone()),
+            Cell::from(app.vector_store_label.clone()),
         ]),
         Row::new(vec![
             Cell::from("Ollama"),
@@ -3025,7 +3025,7 @@ fn semantic_status_summary_from_status(
             semantic_layer: SemanticLayer::Fast,
             embedding_model: fast_model.clone(),
             embedding_dimension: status.embedding_dimension,
-            qdrant_collection: qdrant_collection_name(repository_id, &fast_model),
+            vector_table: vector_table_name(repository_id, &fast_model),
             current_chunks: if status.embedding_model.is_some() {
                 status.chunks_indexed
             } else {
@@ -3047,7 +3047,7 @@ fn semantic_status_summary_from_status(
             semantic_layer: SemanticLayer::Quality,
             embedding_model: "nomic-embed-text-v2-moe".to_owned(),
             embedding_dimension: None,
-            qdrant_collection: qdrant_collection_name(repository_id, "nomic-embed-text-v2-moe"),
+            vector_table: vector_table_name(repository_id, "nomic-embed-text-v2-moe"),
             current_chunks: 0,
             stale_chunks: 0,
             blocked_chunks: 0,
@@ -3082,8 +3082,8 @@ fn storage_summary_from_status(
             calls: status.calls_indexed,
             index_runs: usize::from(status.embedding_model.is_some()),
         },
-        qdrant: QdrantStorageProjection {
-            collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        vector: VectorStorageProjection {
+            collection_name: vector_table_name(repository_id, &embedding_model),
             embedding_model,
             embedding_dimension: status.embedding_dimension,
             embeddable_chunks: status.chunks_indexed,
@@ -3184,7 +3184,7 @@ fn embedding_coverage_summary_from_status(
     let missing_vector_chunks = status.chunks_indexed.saturating_sub(vector_backed_chunks);
     EmbeddingCoverageSummary {
         repository_id: repository_id.to_owned(),
-        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        collection_name: vector_table_name(repository_id, &embedding_model),
         configured_embedding_model: "nomic-embed-text".to_owned(),
         embedding_model,
         embedding_dimension: status.embedding_dimension,
@@ -3271,7 +3271,7 @@ fn semantic_neighborhood_summary_from_status(
         .to_owned();
     let rows = if status.embedding_model.is_some() && status.chunks_indexed > 0 {
         vec![SemanticNeighborhoodRow {
-            qdrant_point_id: "sample-point".to_owned(),
+            vector_point_id: "sample-point".to_owned(),
             path: "<sample>".to_owned(),
             start_line: 1,
             end_line: 1,
@@ -3286,7 +3286,7 @@ fn semantic_neighborhood_summary_from_status(
     };
     SemanticNeighborhoodSummary {
         repository_id: repository_id.to_owned(),
-        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        collection_name: vector_table_name(repository_id, &embedding_model),
         embedding_model,
         health: vec![StorageHealthRow {
             status: if rows.is_empty() {
@@ -3330,12 +3330,12 @@ fn cross_store_health_summary_from_status(
         rows.push(StorageHealthRow {
             status: StorageHealthStatus::Ok,
             label: "cross_store_ok".to_owned(),
-            detail: "Sample SQLite and Qdrant projection metadata are aligned.".to_owned(),
+            detail: "Sample SQLite and sqlite-vec projection metadata are aligned.".to_owned(),
         });
     }
     CrossStoreHealthSummary {
         repository_id: repository_id.to_owned(),
-        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        collection_name: vector_table_name(repository_id, &embedding_model),
         rows,
     }
 }
@@ -3417,8 +3417,8 @@ fn diagnostic_report_lines(report: &DiagnosticReport) -> Vec<Line<'_>> {
             Span::raw(report.sqlite_path.as_str()),
         ]),
         Line::from(vec![
-            Span::styled("Qdrant: ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(report.qdrant_url.as_str()),
+            Span::styled("sqlite-vec: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(report.vector_store.as_str()),
         ]),
         Line::from(vec![
             Span::styled("Ollama: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -3480,7 +3480,7 @@ fn query_result_lines(result: &QueryResult) -> Vec<Line<'_>> {
         QueryResult::Semantic(summary) => {
             let mut lines = vec![
                 Line::from(format!("Semantic results: {}", summary.results.len())),
-                Line::from(format!("Collection: {}", summary.qdrant_collection)),
+                Line::from(format!("Collection: {}", summary.vector_table)),
             ];
             if summary.results.is_empty() {
                 lines.push(Line::from("No semantic matches returned."));
@@ -3787,7 +3787,7 @@ fn index_counts_table(app: &App) -> Table<'_> {
 fn local_services_table(app: &App) -> Table<'_> {
     let rows = vec![
         service_row("SQLite", "local", app.sqlite_path.as_str()),
-        service_row("Qdrant", "local", app.qdrant_url.as_str()),
+        service_row("sqlite-vec", "local", app.vector_store_label.as_str()),
         service_row("Ollama", "local", app.ollama_url.as_str()),
         Row::new(vec![
             Cell::from("Embedding"),
@@ -3896,9 +3896,9 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
     } else {
         ("ok", StatusTone::Success)
     };
-    let qdrant_status = if summary.qdrant.missing_vector_chunks > 0 {
+    let sqlite_vec_status = if summary.vector.missing_vector_chunks > 0 {
         ("missing-vector", StatusTone::Warning)
-    } else if summary.qdrant.vector_backed_chunks > 0 {
+    } else if summary.vector.vector_backed_chunks > 0 {
         ("covered", StatusTone::Success)
     } else {
         ("metadata-only", StatusTone::Warning)
@@ -3952,28 +3952,28 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
             "Historical index run metadata.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "collection",
-            summary.qdrant.collection_name.clone(),
-            qdrant_status,
+            summary.vector.collection_name.clone(),
+            sqlite_vec_status,
             "Expected local vector collection for the selected repository and model.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "model",
-            summary.qdrant.embedding_model.clone(),
+            summary.vector.embedding_model.clone(),
             ("metadata", StatusTone::Info),
             "Embedding model used to derive the collection name.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "dimension",
             summary
-                .qdrant
+                .vector
                 .embedding_dimension
                 .map(|dimension| dimension.to_string())
                 .unwrap_or_else(|| "<unknown>".to_owned()),
-            if summary.qdrant.embedding_dimension.is_some() {
+            if summary.vector.embedding_dimension.is_some() {
                 ("recorded", StatusTone::Success)
             } else {
                 ("unknown", StatusTone::Warning)
@@ -3981,24 +3981,24 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
             "Latest recorded vector dimension for successful semantic indexing.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "embeddable",
-            summary.qdrant.embeddable_chunks.to_string(),
+            summary.vector.embeddable_chunks.to_string(),
             ("metadata", StatusTone::Info),
             "Chunks eligible for semantic embedding.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "vector-backed",
-            summary.qdrant.vector_backed_chunks.to_string(),
-            qdrant_status,
-            "SQLite chunks with Qdrant point IDs.",
+            summary.vector.vector_backed_chunks.to_string(),
+            sqlite_vec_status,
+            "SQLite chunks with sqlite-vec point IDs.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "excluded",
-            summary.qdrant.excluded_chunks.to_string(),
-            if summary.qdrant.excluded_chunks == 0 {
+            summary.vector.excluded_chunks.to_string(),
+            if summary.vector.excluded_chunks == 0 {
                 ("none", StatusTone::Success)
             } else {
                 ("metadata-only", StatusTone::Warning)
@@ -4006,15 +4006,15 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
             "Chunks intentionally excluded from embeddings.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "missing vectors",
-            summary.qdrant.missing_vector_chunks.to_string(),
-            if summary.qdrant.missing_vector_chunks == 0 {
+            summary.vector.missing_vector_chunks.to_string(),
+            if summary.vector.missing_vector_chunks == 0 {
                 ("ok", StatusTone::Success)
             } else {
                 ("warning", StatusTone::Warning)
             },
-            "Embeddable chunks without recorded Qdrant point IDs.",
+            "Embeddable chunks without recorded sqlite-vec point IDs.",
         ),
     ]
 }
@@ -4116,7 +4116,7 @@ fn coverage_detail_panel(summary: &IndexCoverageSummary, selection: usize) -> Pa
         ]),
         Line::from(vec![
             Span::styled(
-                "Qdrant projection: ",
+                "sqlite-vec projection: ",
                 Style::new().add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
@@ -4555,28 +4555,28 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
 
     vec![
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "total chunks",
             summary.total_chunks.to_string(),
             ("indexed", StatusTone::Info),
             "SQLite chunk rows for the selected repository.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "embeddable",
             summary.embeddable_chunks.to_string(),
             ("eligible", StatusTone::Info),
             "Chunks eligible for semantic embedding.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "vector-backed",
             summary.vector_backed_chunks.to_string(),
             vector_status,
-            "Chunks with recorded Qdrant point IDs.",
+            "Chunks with recorded sqlite-vec point IDs.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "missing vectors",
             summary.missing_vector_chunks.to_string(),
             if summary.missing_vector_chunks == 0 {
@@ -4587,7 +4587,7 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
             "Embeddable chunks without vector point metadata.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "excluded",
             summary.excluded_chunks.to_string(),
             if summary.excluded_chunks == 0 {
@@ -4598,14 +4598,14 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
             "Chunks intentionally withheld from embeddings.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "model",
             summary.embedding_model.clone(),
             model_status,
             "Latest indexed embedding model compared with configured model.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "dimension",
             summary
                 .embedding_dimension
@@ -4619,7 +4619,7 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
             "Latest recorded vector dimension.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "run embedded",
             summary
                 .latest_chunks_embedded
@@ -4932,7 +4932,7 @@ fn semantic_neighborhood_detail_panel(
 ) -> Paragraph<'_> {
     let Some(row) = selected_semantic_neighborhood_row(summary, selection) else {
         return Paragraph::new(vec![Line::from(
-            "No vector-backed Qdrant payload metadata recorded.",
+            "No vector-backed sqlite-vec payload metadata recorded.",
         )])
         .wrap(Wrap { trim: true })
         .block(
@@ -4962,7 +4962,7 @@ fn semantic_neighborhood_detail_panel(
         ]),
         Line::from(vec![
             Span::styled("Point: ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(row.qdrant_point_id.as_str()),
+            Span::raw(row.vector_point_id.as_str()),
         ]),
         Line::from(vec![
             Span::styled("Text hash: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -5237,7 +5237,7 @@ fn semantic_table(summary: &SemanticSearchSummary) -> Table<'_> {
     .block(Block::default().borders(Borders::ALL).title(format!(
         "Query Workbench | Semantic results: {} | Collection: {}",
         summary.results.len(),
-        summary.qdrant_collection
+        summary.vector_table
     )))
     .column_spacing(1)
 }
@@ -6495,10 +6495,10 @@ mod tests {
         EvidenceFreshness, EvidenceProvenance, FileCallDetailRow, FileChunkDetailRow,
         FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
         IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
-        QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
-        SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
-        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
-        SymbolOutlineSummary, SymbolSearchRow,
+        QualityGenerationProgress, RepositoryStatus, SemanticNeighborhoodRow,
+        SemanticNeighborhoodSummary, SqliteStorageSummary, StorageExplorerSummary,
+        StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
+        SymbolSearchRow, VectorStorageProjection,
     };
 
     use crate::{
@@ -6721,7 +6721,7 @@ mod tests {
         assert!(rendered.contains("Near"));
         assert!(rendered.contains("Storage Explorer"));
         assert!(rendered.contains("SQLite"));
-        assert!(rendered.contains("Qdrant"));
+        assert!(rendered.contains("sqlite-vec"));
         assert!(rendered.contains("missing-vector"));
         assert!(rendered.contains("Storage Detail"));
         assert!(rendered.contains("Health"));
@@ -7423,7 +7423,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Selected"));
         assert!(rendered.contains("vector-backed"));
-        assert!(rendered.contains("Chunks with recorded Qdrant point IDs."));
+        assert!(rendered.contains("Chunks with recorded sqlite-vec point IDs."));
         assert!(rendered.contains("symdex_repo_nomic_embed_text"));
     }
 
@@ -7483,7 +7483,7 @@ mod tests {
         assert!(rendered.contains("2026-01-02T00:00:00Z"));
         assert!(rendered.contains("failed"));
         assert!(rendered.contains("Index Run Detail"));
-        assert!(rendered.contains("qdrant unavailable"));
+        assert!(rendered.contains("sqlite-vec unavailable"));
         assert!(!rendered.contains("source_text"));
         assert_eq!(cell_fg_for_text(buffer, "failed", None), Some(Color::Red));
     }
@@ -7917,7 +7917,7 @@ mod tests {
                 generation_id: "generation-1".to_owned(),
                 quality_model: "nomic-embed-text-v2-moe".to_owned(),
                 quality_dimension: Some(768),
-                qdrant_collection: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
+                vector_table: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
                 claimed_jobs: 1,
                 succeeded_jobs: 1,
                 failed_jobs: 0,
@@ -8134,7 +8134,7 @@ mod tests {
     #[test]
     fn progress_percent_clamps_to_complete() {
         let progress = symdex_index::IndexProgress {
-            phase: "qdrant",
+            phase: "vector",
             completed: 6,
             total: 5,
             message: "Upserted vector points".to_owned(),
@@ -8181,7 +8181,7 @@ mod tests {
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Doctor Diagnostics"));
         assert!(rendered.contains("sqlite_parent"));
-        assert!(rendered.contains("qdrant_status"));
+        assert!(rendered.contains("sqlite_vec_status"));
         assert!(rendered.contains("unreachable"));
         assert!(rendered.contains("Selected Check Details"));
     }
@@ -8203,7 +8203,7 @@ mod tests {
 
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Selected Check Details"));
-        assert!(rendered.contains("qdrant_status"));
+        assert!(rendered.contains("sqlite_vec_status"));
         assert!(rendered.contains("connection refused"));
         assert!(rendered.contains("Start the local service"));
     }
@@ -8778,7 +8778,7 @@ mod tests {
                 calls: 1,
                 index_runs: 1,
             },
-            qdrant: QdrantStorageProjection {
+            vector: VectorStorageProjection {
                 collection_name: "symdex_repo_nomic_embed_text".to_owned(),
                 embedding_model: "nomic-embed-text".to_owned(),
                 embedding_dimension: Some(768),
@@ -8791,7 +8791,7 @@ mod tests {
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "missing_vectors".to_owned(),
-                    detail: "1 embeddable chunks do not have Qdrant point IDs.".to_owned(),
+                    detail: "1 embeddable chunks do not have sqlite-vec point IDs.".to_owned(),
                 },
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
@@ -8969,7 +8969,7 @@ mod tests {
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "missing_vectors".to_owned(),
-                    detail: "1 embeddable chunk has no recorded Qdrant point ID.".to_owned(),
+                    detail: "1 embeddable chunk has no recorded sqlite-vec point ID.".to_owned(),
                 },
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
@@ -8994,7 +8994,7 @@ mod tests {
                     files_seen: 5,
                     files_indexed: 2,
                     chunks_embedded: 1,
-                    error_summary: Some("qdrant unavailable".to_owned()),
+                    error_summary: Some("sqlite-vec unavailable".to_owned()),
                     run_kind: "watch".to_owned(),
                 },
                 IndexRunTimelineRow {
@@ -9050,7 +9050,7 @@ mod tests {
             embedding_model: "nomic-embed-text".to_owned(),
             rows: vec![
                 SemanticNeighborhoodRow {
-                    qdrant_point_id: "point-add".to_owned(),
+                    vector_point_id: "point-add".to_owned(),
                     path: "src/lib.rs".to_owned(),
                     start_line: 1,
                     end_line: 3,
@@ -9061,7 +9061,7 @@ mod tests {
                     text_hash: "hash-vector".to_owned(),
                 },
                 SemanticNeighborhoodRow {
-                    qdrant_point_id: "point-worker".to_owned(),
+                    vector_point_id: "point-worker".to_owned(),
                     path: "src/worker.rs".to_owned(),
                     start_line: 10,
                     end_line: 18,
@@ -9075,7 +9075,7 @@ mod tests {
             health: vec![StorageHealthRow {
                 status: StorageHealthStatus::Ok,
                 label: "metadata_only".to_owned(),
-                detail: "2 Qdrant payload metadata rows are available without source text."
+                detail: "2 sqlite-vec payload metadata rows are available without source text."
                     .to_owned(),
             }],
         }
@@ -9089,7 +9089,7 @@ mod tests {
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "missing_vectors".to_owned(),
-                    detail: "1 embeddable chunk is missing a recorded Qdrant point ID.".to_owned(),
+                    detail: "1 embeddable chunk is missing a recorded sqlite-vec point ID.".to_owned(),
                 },
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
@@ -9115,7 +9115,7 @@ mod tests {
         DiagnosticReport {
             workspace: "/tmp/repo".to_owned(),
             sqlite_path: ".symdex/symdex.sqlite".to_owned(),
-            qdrant_url: "http://localhost:6333".to_owned(),
+            vector_store: "sqlite_vec".to_owned(),
             ollama_url: "http://localhost:11434".to_owned(),
             embed_model: "nomic-embed-text".to_owned(),
             checks: vec![
@@ -9125,7 +9125,7 @@ mod tests {
                     message: ".symdex".to_owned(),
                 },
                 DiagnosticCheck {
-                    label: "qdrant_status".to_owned(),
+                    label: "sqlite_vec_status".to_owned(),
                     state: DiagnosticState::Unreachable,
                     message: "connection refused".to_owned(),
                 },

@@ -4,12 +4,11 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_query::FreshnessSummary;
-use symdex_store::{EvidenceFreshness, QdrantClient, StoreConfig, sqlite_parent};
+use symdex_store::{EvidenceFreshness, SqliteVectorStore, StoreConfig, sqlite_parent};
 
 const RUST_ANALYZER_ENABLE_ENV: &str = "SYMDEX_RUST_ANALYZER";
 const RUST_ANALYZER_CMD_ENV: &str = "SYMDEX_RUST_ANALYZER_CMD";
@@ -18,7 +17,7 @@ const RUST_ANALYZER_CMD_ENV: &str = "SYMDEX_RUST_ANALYZER_CMD";
 pub struct DiagnosticReport {
     pub workspace: String,
     pub sqlite_path: String,
-    pub qdrant_url: String,
+    pub vector_store: String,
     pub ollama_url: String,
     pub embed_model: String,
     pub checks: Vec<DiagnosticCheck>,
@@ -72,7 +71,7 @@ pub fn run_diagnostics_for_repo(repo: Option<&str>) -> Result<DiagnosticReport, 
     });
     checks.push(sqlite_database_check(&store.sqlite_path));
     checks.extend(ollama_checks(&embed));
-    checks.push(qdrant_check(&store));
+    checks.push(sqlite_vec_check(&store));
     checks.push(rust_analyzer_check(
         &RustAnalyzerDiagnosticsConfig::from_env(),
     ));
@@ -82,7 +81,7 @@ pub fn run_diagnostics_for_repo(repo: Option<&str>) -> Result<DiagnosticReport, 
     Ok(DiagnosticReport {
         workspace: cwd.display().to_string(),
         sqlite_path: store.sqlite_path.display().to_string(),
-        qdrant_url: store.qdrant_url,
+        vector_store: "sqlite_vec".to_owned(),
         ollama_url: embed.ollama_url,
         embed_model: embed.model,
         checks,
@@ -299,12 +298,12 @@ fn ollama_checks(config: &EmbedConfig) -> Vec<DiagnosticCheck> {
     }
 }
 
-fn qdrant_check(config: &StoreConfig) -> DiagnosticCheck {
-    let client = match QdrantClient::with_timeout(config, Duration::from_secs(3)) {
+fn sqlite_vec_check(config: &StoreConfig) -> DiagnosticCheck {
+    let client = match SqliteVectorStore::new(config) {
         Ok(client) => client,
         Err(error) => {
             return DiagnosticCheck {
-                label: "qdrant_status".to_owned(),
+                label: "sqlite_vec_status".to_owned(),
                 state: DiagnosticState::Error,
                 message: error.to_string(),
             };
@@ -312,13 +311,13 @@ fn qdrant_check(config: &StoreConfig) -> DiagnosticCheck {
     };
 
     match client.health_check() {
-        Ok(()) => DiagnosticCheck {
-            label: "qdrant_status".to_owned(),
+        Ok(version) => DiagnosticCheck {
+            label: "sqlite_vec_status".to_owned(),
             state: DiagnosticState::Ok,
-            message: String::new(),
+            message: version,
         },
         Err(error) => DiagnosticCheck {
-            label: "qdrant_status".to_owned(),
+            label: "sqlite_vec_status".to_owned(),
             state: DiagnosticState::Unreachable,
             message: error.to_string(),
         },

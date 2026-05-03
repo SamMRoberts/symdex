@@ -10,7 +10,7 @@ outputs or the TUI.
 
 Current implementation status: Rust workspace with tree-sitter indexing for
 Rust, C#, JavaScript, and TypeScript, deterministic hashing, path normalization,
-SQLite storage, Qdrant vector storage, local Ollama embeddings, structural and
+SQLite storage, sqlite-vec vector storage, local Ollama embeddings, structural and
 semantic CLI queries, continuous indexing, a native terminal UI, debug context
 packs, compact context packs, and a read-only MCP stdio server.
 
@@ -30,11 +30,12 @@ cargo run -p symdex-cli -- tui tests/fixtures/rust_basic
 cargo run -p symdex-cli -- serve-mcp
 ```
 
-With Ollama and Qdrant running locally, `index <repo>` embeds Rust chunks and
-upserts vectors, and `search <repo> <query>` returns ranked path and line-range
-evidence. Use `index --offline <repo>` for SQLite-backed structural indexing
-without service calls. Add `--full` to force all eligible files through the
-indexer, or `--incremental` to skip unchanged files by content hash.
+With Ollama running locally, `index <repo>` embeds chunks and upserts vectors
+into sqlite-vec tables inside the symdex SQLite database. `search <repo>
+<query>` returns ranked path and line-range evidence. Use `index --offline
+<repo>` for SQLite-backed structural indexing without embedding calls. Add
+`--full` to force all eligible files through the indexer, or `--incremental` to
+skip unchanged files by content hash.
 
 ## Commands
 
@@ -83,13 +84,13 @@ non-interactive watch process with `Ctrl+C`.
 
 Semantic indexing and semantic search require:
 
-- Qdrant on `localhost:6333`
 - Ollama on `localhost:11434`
 - the `nomic-embed-text` model installed in Ollama
 
 Structural indexing, SQLite status, symbol queries, call queries, impact, context
 packs, diagnostics, and offline TUI workflows remain local and usable without
-Qdrant or Ollama.
+Ollama. sqlite-vec is embedded in the Rust binary and uses the configured
+`SYMDEX_DB_PATH`.
 
 ## MCP
 

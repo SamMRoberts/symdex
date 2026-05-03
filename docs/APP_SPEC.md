@@ -35,7 +35,7 @@ It answers questions such as:
 4. User can optionally enable continuous indexing so modified or newly created eligible files are automatically reindexed.
 5. User asks semantic or structural questions through CLI, TUI, or MCP.
 6. User can inspect local status, diagnostics, indexing controls, queries, and context packs in the TUI.
-7. User can visualize SQLite structural data and Qdrant semantic coverage in the TUI without exposing source text.
+7. User can visualize SQLite structural data and sqlite-vec semantic coverage in the TUI without exposing source text.
 8. Agent receives compact ranked evidence with file paths and line ranges.
 
 ## Primary commands

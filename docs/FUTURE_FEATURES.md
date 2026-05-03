@@ -120,7 +120,7 @@ Requirements:
 - Do not add hosted indexing, cloud embeddings, telemetry, or remote metadata
   sync without a future explicit design doc.
 - Make local service choices visible in diagnostics and provenance.
-- Keep offline structural workflows usable without Qdrant or Ollama.
+- Keep offline structural workflows usable without sqlite-vec or Ollama.
 
 ### Cross-Agent Reuse
 
@@ -176,7 +176,7 @@ Requirements:
 - Allow optional path-scoped reindexing; CLI and TUI already expose explicit
   full and incremental manual index scopes.
 - Default to offline structural reindexing.
-- Require explicit `semantic: true` before using Ollama or Qdrant.
+- Require explicit `semantic: true` before using Ollama or sqlite-vec.
 - Do not execute indexed repository code.
 - Return index run IDs and status so follow-up evidence can cite the new run.
 - Define caller trust, confirmation, concurrency, and failure semantics before
@@ -190,7 +190,7 @@ symbol" as reusable metadata-only evidence.
 Requirements:
 
 - Start from an existing indexed chunk or symbol, not from arbitrary source text.
-- Query local Qdrant for nearest vector neighbors.
+- Query local sqlite-vec for nearest vector neighbors.
 - Return path, line range, symbol, chunk kind, score, freshness, trust, reason
   tags, and provenance.
 - Do not return vectors or source text.

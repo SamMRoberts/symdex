@@ -17,10 +17,10 @@ repo root
   -> start index run summary
   -> collect stale vector point IDs from the latest generation
   -> embed allowed chunks with Ollama
-  -> upsert new vectors to Qdrant
+  -> upsert new vectors to sqlite-vec
   -> persist facts to SQLite
   -> record the fast semantic generation and queue quality work
-  -> delete stale Qdrant points not reused by the new manifest
+  -> delete stale sqlite-vec points not reused by the new manifest
   -> finish index run summary as success, skipped, partial, or failed
 ```
 
@@ -47,15 +47,15 @@ Rust, C#, JavaScript, and TypeScript are implemented language targets. C#, JS,
 and TS support starts conservatively with syntax-aware function/method chunks,
 symbols, and call-like references; it does not claim whole-language type
 inference. Future languages must be added through the same discovery, parsing,
-chunking, symbol, call, hashing, secret-detection, embedding, SQLite, Qdrant,
+chunking, symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec,
 manual indexing, and continuous indexing contracts.
 
 Current implementation applies built-in directory excludes and scoped
 `.gitignore` rules from the repository root and nested directories. Rules are
 ordered and glob-aware, including `*`, `**`, `?`, character classes, directory
 rules, basename rules, nested scope, and `!` negation. Built-in excludes such as
-`.git`, `target`, `node_modules`, and `qdrant_storage` are hard excludes and
-cannot be re-included by `.gitignore` negation. Repository roots must be
+`.git`, `target`, `node_modules`, and local vector-store cache directories are
+hard excludes and cannot be re-included by `.gitignore` negation. Repository roots must be
 directories, discovered symlinked files and directories are skipped, and
 canonicalized symlink escapes are rejected by path normalization.
 
@@ -108,7 +108,7 @@ Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token
 prefixes, and credentialed database connection strings set `excluded_reason` on
 the chunk. Excluded chunks are persisted to SQLite as metadata, but are not sent
-to Ollama and do not get Qdrant point IDs.
+to Ollama and do not get sqlite-vec point IDs.
 
 ## Embeddings
 
@@ -121,7 +121,7 @@ the entire semantic indexing run with a 400 response. `SYMDEX_EMBED_BATCH_SIZE`
 defaults to `16`, so full-repository semantic indexing is split into smaller
 Ollama requests while preserving embedding order. `SYMDEX_EMBED_MAX_CHUNK_BYTES`
 defaults to `32768`; larger chunks are kept as metadata-only structural evidence
-with `chunk_too_large_for_embedding` and are omitted from Ollama/Qdrant. Vector
+with `chunk_too_large_for_embedding` and are omitted from Ollama/sqlite-vec. Vector
 dimension probing embeds a tiny diagnostic string through the same local model.
 
 Store:
@@ -131,27 +131,27 @@ Store:
 - vector dimension
 - content hash
 - embedding timestamp
-- Qdrant point ID
+- sqlite-vec point ID
 
 If model name or vector dimension changes, require full reindex or collection migration.
 
 Current implementation records started and finished index runs in SQLite. Runs
 finish as `success`, `skipped`, `partial`, or `failed`. Offline indexing records
 successful structural runs, semantic indexing records skipped runs when there
-are no chunks to embed, and semantic embedding or Qdrant upsert failures before
+are no chunks to embed, and semantic embedding or sqlite-vec upsert failures before
 SQLite replacement are recorded as failed runs so the previous semantic
 generation remains intact. Failures after SQLite replacement, such as generation
 finalization or stale-vector cleanup failures, are recorded as partial runs with
 metadata-only error summaries. Before upserting vectors, semantic indexing
-rejects a same-repository, same-model dimension change so an existing Qdrant
+rejects a same-repository, same-model dimension change so an existing sqlite-vec
 collection is not reused with incompatible vector sizes. Different model names
-map to different Qdrant collection names.
+map to different sqlite-vec collection names.
 Continuous watch batches use the same incremental indexing path and are recorded
 with `run_kind = watch` in index-run metadata.
 
 The SQLite schema also includes additive layered semantic tables for
 `semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
-After a successful fast Qdrant upsert, semantic indexing records a deterministic
+After a successful fast sqlite-vec upsert, semantic indexing records a deterministic
 fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
 The older chunk-level vector columns remain nullable compatibility schema, but
 new indexing does not use them as the authoritative fast manifest.
@@ -167,54 +167,51 @@ latest generation is marked `quality_blocked` and no pending quality jobs are
 created.
 Semantic search consults SQLite readiness metadata from the latest semantic
 generation and compact `chunk_embeddings` summaries before choosing the active
-model and Qdrant collection. The manual quality worker is available through
+model and sqlite-vec collection. The manual quality worker is available through
 `symdex index-quality <repo>`; it drains pending latest-generation jobs in
 bounded batches, revalidates hashes from disk before embedding, writes quality
-Qdrant points and quality `chunk_embeddings` rows, then refreshes activation
+sqlite-vec points and quality `chunk_embeddings` rows, then refreshes activation
 state in SQLite. Activation switches default routing to quality only when the
 latest fast generation has complete current quality coverage, a known quality
 dimension, and no pending, running, failed, or stale quality jobs. Partial,
 stale, blocked, or failed quality state leaves `active_layer = fast`.
 
-## Qdrant Collections
+## sqlite-vec Tables
 
-Current implementation creates Qdrant collections through the REST API on the
-configured `SYMDEX_QDRANT_URL`, defaulting to `http://localhost:6333`. Collection
-creation uses dense vectors with cosine distance and validates generated
-collection names before sending requests.
+Current implementation creates sqlite-vec `vec0` virtual tables inside the
+configured SQLite database. Table creation uses dense vectors with cosine
+distance and validates generated table names before creating virtual tables.
 
-Vector upserts use Qdrant `PUT /collections/:collection_name/points?wait=true`.
-Point IDs are deterministic UUID strings derived from chunk stable hashes.
-Payloads include repository, file, chunk, symbol, path, language, line range,
-chunk kind, and text hash metadata. Payloads intentionally do not include source
-text.
+Vector upserts write sqlite-vec rows plus metadata-only `vector_points` rows in
+SQLite. Point IDs are deterministic strings derived from chunk stable hashes.
+Metadata includes repository, file, chunk, symbol, path, language, line range,
+chunk kind, and text hash. Metadata intentionally does not include source text.
 
 Semantic indexing captures existing latest-generation fast `chunk_embeddings`
 point IDs from SQLite before changed-file facts are replaced or deleted-file
-rows are removed. It stages fast embeddings and upserts new Qdrant points before
+rows are removed. It stages fast embeddings and upserts new sqlite-vec points before
 SQLite mutation, then records the new fast generation after structural facts are
 persisted. Stale points for changed and deleted chunks are deleted only after
 the new manifest is recorded, and point IDs that were just upserted are protected
 from deletion because deterministic IDs can be reused for unchanged chunks.
-This ordering prevents a local Ollama or Qdrant failure from replacing current
+This ordering prevents a local Ollama or sqlite-vec failure from replacing current
 chunks and cascading away the previous complete vector manifest.
 
-`symdex qdrant-verify <repo>` performs a metadata-only lifecycle check for the
+`symdex vector-verify <repo>` performs a metadata-only lifecycle check for the
 selected semantic layer. It derives the expected point manifest from
-latest-generation `chunk_embeddings`, scrolls Qdrant payloads filtered by
-`repository_id`, and reports missing collections, missing points, stale payload
-fields, and orphaned points. The verifier requests payloads only, not vectors,
-and never returns source text.
+latest-generation `chunk_embeddings`, reads sqlite-vec metadata filtered by
+`repository_id`, and reports missing tables, missing points, stale payload
+fields, and orphaned points. The verifier uses metadata only and never returns
+source text.
 
-`symdex qdrant-repair <repo>` starts from that verification report. Orphaned
-Qdrant points are deleted directly because SQLite has no matching chunk for
+`symdex vector-repair <repo>` starts from that verification report. Orphaned
+sqlite-vec points are deleted directly because SQLite has no matching chunk for
 them. Missing collections, missing points, stale payload fields, and payload
 model or dimension drift are repaired by running the normal semantic indexing
 path, preserving the same parser, hashing, secret-detection, embedding,
 provenance, and index-run lifecycle behavior as `symdex index <repo>`.
 
-Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
-with the embedded query vector, `with_payload: true`, and `with_vector: false`.
+Semantic search uses sqlite-vec KNN queries with the embedded query vector.
 The embedded query model and target collection come from active-layer routing:
 auto search uses quality only when the active generation is `quality_ready` and
 the quality manifest is complete, otherwise it uses the fast layer. Forced
@@ -226,11 +223,11 @@ quality jobs and emit completion before catch-up begins. Quality catch-up then
 processes bounded batches through the normal quality worker during post-batch or
 idle watch ticks, refreshing activation state after each bounded run.
 
-Qdrant verification and repair are layer-aware maintenance paths. `qdrant-verify`
-and `qdrant-repair` accept `--semantic-layer fast|quality|all`. Verification
+sqlite-vec verification and repair are layer-aware maintenance paths. `vector-verify`
+and `vector-repair` accept `--semantic-layer fast|quality|all`. Verification
 builds expected fast and quality manifests from latest-generation
 `chunk_embeddings` rows for the selected layer. Fast verification no longer uses
-legacy `chunks.qdrant_point_id` metadata; legacy-only local databases need a
+legacy `chunks.vector_point_id` metadata; legacy-only local databases need a
 fresh `symdex index <repo>` run before layered verification. Repair routes fast
 rebuilds through normal semantic indexing and quality rebuilds through the
 quality worker path.
@@ -320,7 +317,7 @@ A file can be skipped only when:
 - parser/chunker version is unchanged
 - embedding model and dimension are unchanged
 
-Changed files should replace their SQLite facts and Qdrant points atomically where practical.
+Changed files should replace their SQLite facts and sqlite-vec points atomically where practical.
 
 Current implementation exposes scope independently from semantic/offline mode:
 `symdex index --full <repo>` reparses every eligible file and rebuilds eligible
@@ -361,13 +358,13 @@ When enabled:
 - debounce and coalesce bursts of filesystem events before indexing
 - hash candidate files and skip unchanged content
 - reindex changed or new files through the same parser, chunker, symbol, call,
-  secret-detection, SQLite, Ollama, and Qdrant paths as manual indexing
+  secret-detection, SQLite, Ollama, and sqlite-vec paths as manual indexing
 - record compact index run summaries for watch-driven batches when semantic
   indexing runs
 
 Continuous indexing must not execute repository code. It must not bypass model
 or dimension checks. Offline watch mode should update SQLite structural facts
-without Qdrant or Ollama; semantic watch mode requires local Ollama and Qdrant
+without sqlite-vec or Ollama; semantic watch mode requires local Ollama and sqlite-vec
 just like manual semantic indexing.
 
 If a manual index job is running, continuous indexing should queue or coalesce

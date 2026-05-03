@@ -7,6 +7,7 @@ members = [
     "crates/symdex-index",
     "crates/symdex-mcp",
     "crates/symdex-query",
+    "crates/symdex-sqlite-vec",
     "crates/symdex-store",
     "crates/symdex-tui",
 ]

@@ -175,7 +175,7 @@ fn tool_search(arguments: &Value) -> Result<Value, String> {
 fn semantic_search_summary_json(root: &RepoRoot, summary: SemanticSearchSummary) -> Value {
     let repository_id = summary.repository_id;
     let query = summary.query;
-    let qdrant_collection = summary.qdrant_collection;
+    let vector_table = summary.vector_table;
     let requested_layer = summary.requested_layer;
     let semantic_layer = summary.semantic_layer;
     let embedding_model = summary.embedding_model;
@@ -188,7 +188,8 @@ fn semantic_search_summary_json(root: &RepoRoot, summary: SemanticSearchSummary)
         "semantic_layer": semantic_layer.as_str(),
         "requested_layer": requested_layer.as_str(),
         "embedding_model": embedding_model,
-        "qdrant_collection": qdrant_collection,
+        "vector_store": "sqlite_vec",
+        "vector_table": vector_table,
         "generation_id": generation_id,
         "quality_status": quality_status.as_str(),
         "fallback_reason": fallback_reason,
@@ -849,7 +850,7 @@ fn evidence_contract_json() -> Value {
         "local_only": true,
         "read_only": true,
         "source_text": "omitted_by_default",
-        "index_access": "shared_local_sqlite_and_qdrant",
+        "index_access": "shared_local_sqlite_and_sqlite_vec",
         "path_policy": "repository_root_required",
         "freshness": "included_when_available",
         "provenance": "included_when_available",
@@ -863,7 +864,7 @@ fn tool_definitions() -> Vec<Value> {
         tool_definition(
             TOOL_SEARCH,
             "Semantic Search",
-            "Search indexed chunks by semantic similarity. Requires local Ollama and Qdrant.",
+            "Search indexed chunks by semantic similarity. Requires local Ollama and sqlite-vec.",
             &["repo", "query"],
             vec![
                 ("repo", "string", "Repository root path"),
@@ -1465,7 +1466,7 @@ mod tests {
         let fixture = StalenessFixture::new();
         let summary = SemanticSearchSummary {
             repository_id: fixture.root.id().to_owned(),
-            qdrant_collection: "symdex_repo_fast_model".to_owned(),
+            vector_table: "symdex_repo_fast_model".to_owned(),
             requested_layer: SemanticLayerMode::Auto,
             semantic_layer: SemanticLayer::Fast,
             embedding_model: "fast-model".to_owned(),
@@ -1524,7 +1525,6 @@ mod tests {
         fs::create_dir_all(&dir).expect("temp store directory should be created");
         StoreConfig {
             sqlite_path: dir.join("symdex.sqlite"),
-            qdrant_url: "http://localhost:6333".to_owned(),
         }
     }
 
@@ -1561,7 +1561,6 @@ mod tests {
             let root = RepoRoot::open(&root_path).expect("repo should open");
             let store_config = StoreConfig {
                 sqlite_path: base.join("symdex.sqlite"),
-                qdrant_url: "http://localhost:6333".to_owned(),
             };
             let mut store = SqliteStore::open(&store_config).expect("store should open");
             store.migrate().expect("store should migrate");

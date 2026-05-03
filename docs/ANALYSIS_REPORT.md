@@ -19,7 +19,7 @@ The workspace layout is excellent. Nine crates with explicit dependency rules, n
 circular dependencies, and a clear inward dependency flow:
 `core → store/embed → index/query → cli/tui/mcp`. The contracts are enforced at
 compile time — MCP cannot start indexing, TUI cannot shell out, core knows
-nothing about Qdrant. This is production-quality crate discipline that most
+nothing about sqlite-vec. This is production-quality crate discipline that most
 greenfield projects never achieve.
 
 The `symdex-core` crate is notably clean: pure domain logic with no I/O
@@ -86,7 +86,7 @@ Rust tests adds immediate value for CI failures.
 
 ### 6. Security and Privacy Model
 
-No remote calls by default. No source text in embeddings, Qdrant payloads, logs,
+No remote calls by default. No source text in embeddings, sqlite-vec payloads, logs,
 or MCP responses. Path boundary enforcement in both discovery and MCP input
 validation. Secret detection before embedding. Symlink escape rejection. Treating
 indexed source text as untrusted data (not instructions) in the MCP section of
@@ -97,7 +97,7 @@ TUI inspection.
 ### 7. TUI Design
 
 The nested-tab storage visualization architecture is sophisticated: SQLite as
-structural source of truth, Qdrant as semantic projection, cross-store health
+structural source of truth, sqlite-vec as semantic projection, cross-store health
 view surfacing mismatches. The two-container footer (shortcut hints above, status
 messages below) is the right separation. The confirmation flow for long-running
 jobs and the animated continuous-indexing indicator solve real UX problems. Using
@@ -106,7 +106,7 @@ TUI code.
 
 ### 8. Test Coverage Philosophy
 
-The test pyramid is well-structured. Keeping Qdrant and Ollama checks behind
+The test pyramid is well-structured. Keeping sqlite-vec and Ollama checks behind
 opt-in environment flags means CI is fast and reproducible without service
 dependencies. The fixture-based approach for language parsers is correct: tiny,
 purpose-built fixtures that test specific behaviors rather than large
@@ -184,7 +184,7 @@ index fresh enough to trust before I start editing?" has no direct tool to call.
 ### 6. Config Model Is Environment-Variable Only
 
 Configuration is entirely via environment variables (`SYMDEX_DB_PATH`,
-`SYMDEX_QDRANT_URL`, `SYMDEX_OLLAMA_URL`, `SYMDEX_EMBED_MODEL`). This is fine
+`SYMDEX_DB_PATH`, `SYMDEX_OLLAMA_URL`, `SYMDEX_EMBED_MODEL`). This is fine
 for single-repo local use, but multi-repo workflows — which cross-agent reuse
 requires — need per-repo config or a config file so different repos can have
 different embedding models or SQLite paths without re-setting env vars. The
@@ -253,7 +253,7 @@ is a thin wrapper following the same pattern as `symdex_index_status`.
 **What:** A single write-capable MCP tool that accepts a `repo` and optionally a
 list of `paths` (or `force: true` for a full reindex), triggers offline
 structural reindexing, and returns an `index_run_id` plus a status. It must not
-trigger semantic (Qdrant/Ollama) indexing without explicit `semantic: true` from
+trigger semantic (sqlite-vec/Ollama) indexing without explicit `semantic: true` from
 a trusted caller.
 
 **Why:** The current design is read-only MCP by rule. But the most common agent
@@ -362,7 +362,7 @@ hand-rolled simple rule matching without changing any downstream contracts.
 ### Priority 8 — `symdex_semantic_neighborhood` MCP Tool
 
 **What:** A new MCP tool that accepts a `repo`, a `chunk_id` or `symbol`, and a
-`limit`, and returns the N nearest semantic neighbors from Qdrant — the code
+`limit`, and returns the N nearest semantic neighbors from sqlite-vec — the code
 chunks most similar to the given function/method, ranked by vector similarity.
 Output includes path, line range, symbol name, chunk kind, score, freshness, and
 provenance. No source text.
@@ -371,12 +371,12 @@ provenance. No source text.
 agents need "what code is similar to *this specific function*?" when they are
 trying to understand whether a pattern is duplicated elsewhere, find related
 implementations to compare against, or locate the origin of a pattern they want
-to refactor. The TUI already has a semantic neighborhood view using Qdrant
+to refactor. The TUI already has a semantic neighborhood view using sqlite-vec
 metadata — this is the MCP-exposed equivalent.
 
-**Fit:** The Qdrant query infrastructure and the `qdrant_collection_name`
+**Fit:** The sqlite-vec query infrastructure and the `vector_table_name`
 function already exist. This tool adds a new query path where the vector comes
-from an existing Qdrant point (looked up by `chunk_id`) rather than from
+from an existing sqlite-vec point (looked up by `chunk_id`) rather than from
 embedding a text query.
 
 ### Priority 9 — Cross-Repo Context (Future Architecture)
@@ -396,7 +396,7 @@ plan for this now rather than needing a structural refactor later.
 - Keep repository isolation as the default
 - A multi-repo query adds a "search across all indexed repos" mode to
   `symdex_search` and `symdex_find_symbol`
-- The `repository_id` filtering in Qdrant payloads already makes this possible
+- The `repository_id` filtering in sqlite-vec payloads already makes this possible
   at the query level — removing the filter enables cross-repo search
 - Privacy: multi-repo queries require explicit opt-in; never mix results across
   repos silently

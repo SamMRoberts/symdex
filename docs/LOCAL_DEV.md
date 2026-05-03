@@ -5,7 +5,6 @@
 - Rust toolchain
 - SQLite available through Rust crate bindings
 - `cargo-audit` installed for local dependency audits
-- Qdrant running locally
 - Ollama running locally
 - `nomic-embed-text` pulled into Ollama
 
@@ -14,17 +13,12 @@
 ```bash
 cargo install cargo-audit --locked
 ollama pull nomic-embed-text
-docker pull qdrant/qdrant
-docker run -p 6333:6333 -p 6334:6334 \
-  -v "$(pwd)/qdrant_storage:/qdrant/storage:z" \
-  qdrant/qdrant
 ```
 
 ## Environment variables
 
 ```bash
 SYMDEX_DB_PATH=.symdex/symdex.sqlite
-SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
 SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
@@ -124,14 +118,14 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
   applies built-in excludes and scoped glob-aware `.gitignore` rules with
   negation, hashes file contents, extracts tree-sitter function and method chunks where supported,
-  embeds chunk text with local Ollama, creates the Qdrant collection if needed,
+  embeds chunk text with local Ollama, creates the sqlite-vec collection if needed,
   and upserts semantic vectors. Use `index --full <repo>` to force all eligible
   files through parsing and embedding, or `index --incremental <repo>` to skip
   unchanged files by content hash. Use `index --offline <repo>` for
   SQLite-backed discovery and chunking without service calls; offline still
   accepts `--full` or `--incremental`. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
-  metadata, and omitted from Ollama/Qdrant embedding.
+  metadata, and omitted from Ollama/sqlite-vec embedding.
   When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
   rust-analyzer enrichment readiness and eligible Rust file, symbol, and call
   counts without applying rust-analyzer facts.
@@ -147,7 +141,7 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   completion, and failure events.
 - `index-quality <repo>`: manually processes queued quality semantic embedding
   jobs for the latest generation. It claims bounded batches, re-reads files
-  from disk, verifies file and chunk hashes, writes quality Qdrant points and
+  from disk, verifies file and chunk hashes, writes quality sqlite-vec points and
   quality `chunk_embeddings` rows, and reports succeeded, failed, and stale
   counts along with `quality_status`, `active_layer`, and
   `activation_reason`. Fast search remains active for partial, stale, blocked,
@@ -165,14 +159,14 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   current eligible files for implemented languages and reports fresh, stale,
   deleted, missing, and unknown evidence states. With a symbol query, the report
   is scoped to files involved in the matching symbols and compact context pack.
-- `qdrant-verify <repo>`: compares SQLite vector metadata with Qdrant payloads
+- `vector-verify <repo>`: compares SQLite vector metadata with sqlite-vec payloads
   for the selected semantic layer and reports missing, stale, or orphaned
   points without returning source text. Use `--semantic-layer fast`,
   `--semantic-layer quality`, or `--semantic-layer all` to verify the fast and
   quality collections independently. Verification expects latest-generation
   `chunk_embeddings` manifests; older single-model local databases should run
   `symdex index <repo>` first to create layered fast metadata.
-- `qdrant-repair <repo>`: deletes Qdrant orphan points, then re-runs semantic
+- `vector-repair <repo>`: deletes sqlite-vec orphan points, then re-runs semantic
   indexing when missing or stale fast vector metadata requires rebuilding
   points. With `--semantic-layer quality`, repair runs the quality worker path
   instead so hash verification, quality job state, and activation refresh remain
@@ -213,7 +207,7 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   matches include trust scores and reason tags, and the pack does not include
   source text.
 - `search <repo> <query>`: embeds the query locally through the active semantic
-  routing path and returns ranked Qdrant matches with scores, paths, line
+  routing path and returns ranked sqlite-vec matches with scores, paths, line
   ranges, symbol names, active layer metadata, fallback reason, and provenance
   metadata. Text output also prints compact reason tags for each match.
 - `tui [repo]`: launches the local terminal UI control panel. The current TUI
@@ -242,7 +236,7 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   `symdex_index_status`. `symdex_context_pack` accepts `mode: "unified"` for
   combined structural and semantic context-pack evidence.
 
-`doctor` checks whether Qdrant is reachable over REST, whether Ollama is
+`doctor` checks whether sqlite-vec is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector
 dimension probing succeeds. These checks report diagnostic status and do not
 mutate repository data.
@@ -259,7 +253,7 @@ pushes to `main`:
 - `cargo audit`
 
 The TUI should surface these same diagnostics. Semantic search and semantic
-indexing views require local Ollama and Qdrant; status, structural queries, and
+indexing views require local Ollama and sqlite-vec; status, structural queries, and
 offline indexing should remain usable without those services.
 
 ## Local-only rule
@@ -272,7 +266,7 @@ The app should not require network access beyond local loopback services during 
 
 - SQLite database path is writable
 - SQLite database file exists after `symdex init`
-- Qdrant is reachable
+- sqlite-vec is reachable
 - Ollama is reachable
 - embedding model is available
 - vector dimension can be determined

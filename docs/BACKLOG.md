@@ -17,7 +17,7 @@
 - [x] tree-sitter Rust parsing.
 - [x] function-level chunk extraction.
 - [x] Ollama embedding client.
-- [x] Qdrant collection creation.
+- [x] sqlite-vec collection creation.
 - [x] semantic search CLI.
 
 ## Phase 2 — SQLite structural index
@@ -95,14 +95,14 @@
 
 ## Phase 9 — TUI storage visualizations
 
-- [x] storage explorer view for SQLite structural data and Qdrant semantic projection.
+- [x] storage explorer view for SQLite structural data and sqlite-vec semantic projection.
 - [x] index coverage view grouped by file with chunk, symbol, call, embedding, and exclusion counts.
 - [x] selected-file detail drawer for chunks, symbols, calls, vector status, and exclusion reasons.
 - [x] symbol outline view using `symbols.parent_symbol_id`.
 - [x] call resolution dashboard grouped by resolution status and confidence bucket.
-- [x] embedding coverage view comparing SQLite chunks with Qdrant vector-backed chunks.
+- [x] embedding coverage view comparing SQLite chunks with sqlite-vec vector-backed chunks.
 - [x] index runs timeline using `index_runs` metadata.
-- [x] semantic neighborhood view using Qdrant metadata only.
+- [x] semantic neighborhood view using sqlite-vec metadata only.
 - [x] cross-store health warnings for missing vectors, missing collections, excluded chunks, and model/dimension drift.
 - [x] TUI state/render tests for the first storage visualization, including 80x24 layout and selected-row drill-down behavior.
 
@@ -111,9 +111,9 @@
 - [x] Shared continuous indexing API in `symdex-index`.
 - [x] Polling filesystem watcher for created and modified eligible files.
 - [x] Debounce and coalesce event bursts before reindexing.
-- [x] Reuse manual indexing ignore, path-boundary, hashing, parser, secret-filtering, SQLite, Ollama, and Qdrant rules.
-- [x] Offline continuous indexing path that updates SQLite without Ollama or Qdrant.
-- [x] Semantic continuous indexing path that updates Qdrant when local services are available.
+- [x] Reuse manual indexing ignore, path-boundary, hashing, parser, secret-filtering, SQLite, Ollama, and sqlite-vec rules.
+- [x] Offline continuous indexing path that updates SQLite without Ollama or sqlite-vec.
+- [x] Semantic continuous indexing path that updates sqlite-vec when local services are available.
 - [x] CLI launch path such as `symdex index --watch <repo>`.
 - [x] TUI continuous indexing toggle with explicit on/off labels and first-enable confirmation.
 - [x] TUI watch status showing pending debounce state, queued event count, last reindexed file, and latest error.
@@ -165,7 +165,7 @@
 - [x] Stable MCP evidence contract envelope advertised in `initialize` and successful tool results.
 - [x] Version stable evidence contracts across CLI, TUI, and MCP.
 - [x] Document local/private indexing guarantees for multi-agent reuse.
-- [x] Read-only cross-agent access patterns for shared SQLite and Qdrant state.
+- [x] Read-only cross-agent access patterns for shared SQLite and sqlite-vec state.
 - [x] Repository root boundary checks for multi-agent requests.
 - [x] Diagnostics for model, vector DB, SQLite path, index freshness, and provenance consistency.
 - [x] Tests for multiple agents reading the same index without write-capable tools.
@@ -181,7 +181,7 @@
 - [x] Extract chunks, symbols, and conservative call edges for each new language
   through the same contracts used by Rust.
 - [x] Reuse existing ignore, path-boundary, hashing, secret-detection, SQLite,
-  Qdrant, manual indexing, continuous indexing, provenance, and MCP evidence
+  sqlite-vec, manual indexing, continuous indexing, provenance, and MCP evidence
   rules.
 - [x] Add fixture-backed tests for discovery, chunking, symbols, calls, secrets,
   incremental indexing, continuous indexing, and MCP evidence for C#,
@@ -281,7 +281,7 @@ architecture, and compatibility with the local-first evidence contract.
 
 - [ ] Add `symdex_semantic_neighborhood` after unified context-pack work
   clarifies shared query primitives.
-- [ ] Accept `repo` plus `chunk_id` or `symbol`, then query Qdrant for nearest
+- [ ] Accept `repo` plus `chunk_id` or `symbol`, then query sqlite-vec for nearest
   vector neighbors.
 - [ ] Return path, line range, symbol, chunk kind, score, freshness, trust, and
   provenance without source text.
@@ -302,9 +302,9 @@ architecture, and compatibility with the local-first evidence contract.
 - [x] Add CI for fmt, clippy, tests, release build, and dependency audit.
 - [x] Add JSON CLI output mirroring MCP contracts.
 - [x] Record failed and partial index runs, not only successful summaries.
-- [x] Implement Qdrant delete, verify, and repair lifecycle for changed or deleted chunks.
-  - [x] Delete stale Qdrant points for changed and deleted chunks before SQLite cleanup.
-  - [x] Verify SQLite/Qdrant vector lifecycle state.
+- [x] Implement sqlite-vec delete, verify, and repair lifecycle for changed or deleted chunks.
+  - [x] Delete stale sqlite-vec points for changed and deleted chunks before SQLite cleanup.
+  - [x] Verify SQLite/sqlite-vec vector lifecycle state.
   - [x] Repair missing, stale, orphaned, or drifted vectors.
 - [x] Split large store and TUI files into modules.
 

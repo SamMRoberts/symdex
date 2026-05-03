@@ -22,7 +22,7 @@ indexing.
   blocked, or explicitly disabled.
 - Keep SQLite as the source of truth for structural facts and semantic-layer
   readiness.
-- Keep Qdrant collections as metadata-only vector projections of embeddable
+- Keep sqlite-vec collections as metadata-only vector projections of embeddable
   chunks.
 - Preserve local-only privacy and existing source-text exclusion rules.
 
@@ -32,7 +32,7 @@ indexing.
 - Do not use partial quality results for default semantic search.
 - Do not make `nomic-embed-text-v2-moe` mandatory for normal indexing.
 - Do not block continuous indexing on quality embedding work.
-- Do not store source text in Qdrant payloads or long-lived quality job rows.
+- Do not store source text in sqlite-vec payloads or long-lived quality job rows.
 - Do not execute indexed repository code.
 
 ## Semantic layers
@@ -63,17 +63,17 @@ SQLite owns:
 - per-layer embedding manifests
 - quality job state
 
-Qdrant owns:
+sqlite-vec owns:
 
 - dense vectors
 - metadata-only payloads
 - one collection per repository/model layer
 
-Qdrant payloads must continue to exclude source text.
+sqlite-vec payloads must continue to exclude source text.
 
 ## Collection naming
 
-Use model-derived Qdrant collection names so incompatible models never share a
+Use model-derived sqlite-vec collection names so incompatible models never share a
 collection:
 
 ```text
@@ -148,7 +148,7 @@ symdex semantic-status <repo>
 
 Default semantic search and MCP `symdex_search` use the same routed query path.
 MCP search responses include active layer, requested layer, embedding model,
-Qdrant collection, generation ID, quality status, and fallback reason in the
+sqlite-vec collection, generation ID, quality status, and fallback reason in the
 structured `data` payload so agents can tell when results are fast fallback
 evidence rather than quality-backed evidence.
 
@@ -169,9 +169,9 @@ The quality layer may become active only when all of the following are true:
 Activation must be atomic from the query layer's perspective: a search should
 see either active `fast` or active `quality`, never an in-between state.
 Current activation is gated by SQLite generation metadata, quality job state,
-and the per-layer `chunk_embeddings` manifest. Layer-aware Qdrant manifest
+and the per-layer `chunk_embeddings` manifest. Layer-aware sqlite-vec manifest
 verification is deferred to the verify/repair slice; activation does not return
-source text or Qdrant vectors.
+source text or sqlite-vec vectors.
 
 ## Manual indexing behavior
 
@@ -192,7 +192,7 @@ Required behavior:
 2. Parse changed files with tree-sitter.
 3. Persist structural facts to SQLite.
 4. Embed current embeddable chunks with the fast model.
-5. Upsert fast vectors into the fast Qdrant collection.
+5. Upsert fast vectors into the fast sqlite-vec collection.
 6. Record a new fast semantic generation.
 7. Mark any previous active quality generation stale if the structural snapshot
    changed.
@@ -221,7 +221,7 @@ When a file changes:
 
 1. Debounce and coalesce filesystem events.
 2. Reindex changed files through normal parser, chunker, symbol, call,
-   secret-detection, SQLite, fast embedding, and fast Qdrant paths.
+   secret-detection, SQLite, fast embedding, and fast sqlite-vec paths.
 3. Record a new fast semantic generation if embeddable content changed.
 4. Switch active semantic layer to `fast` if the previous quality generation is
    no longer current.
@@ -261,7 +261,7 @@ while enabled:
     extract chunk text from stored byte range
     verify chunk text hash still matches the queued job
     embed with nomic-embed-text-v2-moe
-    upsert into quality Qdrant collection
+    upsert into quality sqlite-vec collection
     record chunk_embeddings row for the quality layer
     mark job succeeded
 
@@ -280,7 +280,7 @@ symdex index-quality <repo>
 
 It drains all pending jobs for the latest semantic generation by repeatedly
 claiming bounded batches using `SYMDEX_QUALITY_BATCH_SIZE`. It writes quality
-Qdrant points and quality `chunk_embeddings` rows, records the first successful
+sqlite-vec points and quality `chunk_embeddings` rows, records the first successful
 quality dimension on the generation, refreshes SQLite activation state, and
 reports the resulting `quality_status`, `active_layer`, and activation reason.
 Default search remains on `fast` until the latest generation has complete
@@ -314,7 +314,7 @@ retry can re-check readiness and enqueue jobs for the latest fast generation.
 
 ## Schema direction
 
-The existing `chunks.qdrant_point_id`, `chunks.embedding_model`,
+The existing `chunks.vector_point_id`, `chunks.embedding_model`,
 `chunks.embedding_dimension`, and `chunks.embedded_at` fields are sufficient for
 one semantic layer but not for two. They remain nullable compatibility columns
 for existing local databases, but new semantic behavior uses a separate
@@ -333,8 +333,8 @@ CREATE TABLE chunk_embeddings (
   embedding_dimension INTEGER NOT NULL,
   content_hash TEXT NOT NULL,
   text_hash TEXT NOT NULL,
-  qdrant_collection TEXT NOT NULL,
-  qdrant_point_id TEXT NOT NULL,
+  vector_table TEXT NOT NULL,
+  vector_point_id TEXT NOT NULL,
   generation_id TEXT NOT NULL,
   embedded_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'current',
@@ -425,7 +425,7 @@ Search summaries should expose:
 
 - `semantic_layer`
 - `embedding_model`
-- `qdrant_collection`
+- `vector_table`
 - `quality_status`
 - `generation_id`
 - whether the query fell back to fast because quality was unavailable
@@ -443,12 +443,12 @@ be an explicit diagnostic or experimental mode.
 
 ## Verification and repair
 
-Qdrant verification is layer-aware:
+sqlite-vec verification is layer-aware:
 
 ```text
-symdex qdrant-verify <repo> --semantic-layer fast
-symdex qdrant-verify <repo> --semantic-layer quality
-symdex qdrant-verify <repo> --semantic-layer all
+symdex vector-verify <repo> --semantic-layer fast
+symdex vector-verify <repo> --semantic-layer quality
+symdex vector-verify <repo> --semantic-layer all
 ```
 
 Expected manifests come from current `chunk_embeddings` rows for the selected
@@ -459,7 +459,7 @@ Quality verification also uses only layered manifests, so missing or stale
 quality points are isolated from fast-layer health.
 
 Repair rebuilds missing or stale points through existing indexing paths for the
-selected layer instead of writing ad-hoc Qdrant payloads. Fast repair runs the
+selected layer instead of writing ad-hoc sqlite-vec payloads. Fast repair runs the
 normal semantic index path. Quality repair runs the quality worker path so hash
 verification, quality collection naming, job state, and activation refresh stay
 centralized.
@@ -507,8 +507,8 @@ symdex semantic-status <repo>
 symdex search <repo> <query> --semantic-layer auto
 symdex search <repo> <query> --semantic-layer fast
 symdex search <repo> <query> --semantic-layer quality
-symdex qdrant-verify <repo> --semantic-layer fast
-symdex qdrant-verify <repo> --semantic-layer quality
+symdex vector-verify <repo> --semantic-layer fast
+symdex vector-verify <repo> --semantic-layer quality
 ```
 
 The TUI should show:
@@ -527,7 +527,7 @@ The TUI should show:
 |---|---|
 | quality model missing | mark quality `blocked`; keep fast active |
 | quality embedding fails | mark job `failed`; keep fast active |
-| quality Qdrant collection missing | recreate during quality worker if possible |
+| quality sqlite-vec collection missing | recreate during quality worker if possible |
 | quality dimension drift | fail quality layer closed; keep fast active |
 | file changes during quality job | skip stale job; keep fast active |
 | partial quality index exists | do not use by default |
@@ -535,7 +535,7 @@ The TUI should show:
 
 ## Privacy and safety
 
-- Do not store source text in Qdrant payloads.
+- Do not store source text in sqlite-vec payloads.
 - Do not store source text in quality job rows.
 - Do not log source text from quality jobs.
 - Continue to exclude secret-like chunks from all semantic layers.
@@ -554,11 +554,11 @@ Add tests for:
 - default search falls back to fast when quality is stale, blocked, failed, or partial
 - forced quality search fails when quality is unavailable
 - continuous indexing marks quality stale and returns without waiting for quality
-- layer-aware Qdrant collection naming and manifests
+- layer-aware sqlite-vec collection naming and manifests
 - model dimension drift isolated to the affected layer
 - metadata-only output for semantic layer status
 
-Service-dependent Ollama/Qdrant behavior should remain opt-in. Job selection,
+Service-dependent Ollama/sqlite-vec behavior should remain opt-in. Job selection,
 state transitions, routing, and activation rules should be unit-testable without
 live services.
 

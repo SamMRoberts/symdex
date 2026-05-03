@@ -16,8 +16,8 @@ enabled, modified or newly created eligible files are automatically reindexed.
 - Watch mode must never send source text, embeddings, paths, or metadata to
   remote services.
 - Watch mode must obey the same local service configuration as manual indexing.
-- Offline continuous indexing should remain possible without Ollama or Qdrant.
-- Semantic continuous indexing requires local Ollama and Qdrant, just like
+- Offline continuous indexing should remain possible without Ollama or sqlite-vec.
+- Semantic continuous indexing requires local Ollama and sqlite-vec, just like
   manual semantic indexing.
 - When layered semantic indexing is enabled, continuous indexing must update the
   fast `nomic-embed-text` layer synchronously and queue the quality
@@ -37,7 +37,7 @@ enabled, modified or newly created eligible files are automatically reindexed.
 - Reindex only files whose content hash changed.
 - Created files should be discovered, parsed, persisted to SQLite, and embedded
   when semantic indexing is enabled and chunks are embeddable.
-- Modified files should replace prior SQLite facts and Qdrant points
+- Modified files should replace prior SQLite facts and sqlite-vec points
   atomically where practical.
 - Deleted-file cleanup should continue to be handled by the incremental
   indexing path, even though the first continuous MVP is focused on created and
@@ -56,7 +56,7 @@ file changes
   -> debounce/coalesce
   -> structural SQLite update
   -> fast nomic-embed-text embedding
-  -> fast Qdrant upsert
+  -> fast sqlite-vec upsert
   -> mark quality stale when needed
   -> enqueue quality jobs
   -> return to watching
@@ -69,7 +69,7 @@ quality queue
   -> background worker
   -> verify hashes
   -> embed with nomic-embed-text-v2-moe
-  -> quality Qdrant upsert
+  -> quality sqlite-vec upsert
   -> activate quality only after complete/current
 ```
 
@@ -105,7 +105,7 @@ outputs to distinguish these states:
   coalesce file events instead of running concurrent writes.
 - When layered semantic indexing is enabled, the TUI should show active semantic
   layer, fast readiness, quality status, quality job counts, and fallback-to-fast
-  state without requiring a live Qdrant query for deterministic rendering.
+  state without requiring a live sqlite-vec query for deterministic rendering.
 
 ## Implementation Boundaries
 
@@ -116,7 +116,7 @@ outputs to distinguish these states:
 - `symdex-core` owns path normalization, ignore decisions, parsing, chunking,
   hashing, symbol extraction, and call extraction.
 - `symdex-store` owns SQLite updates, semantic generation state,
-  quality-job persistence, Qdrant point replacement, and index run metadata.
+  quality-job persistence, sqlite-vec point replacement, and index run metadata.
 - `symdex-query` owns active semantic layer routing for search. It must not
   decide to use a partial quality layer unless an explicit future diagnostic
   mode is added.
@@ -173,8 +173,8 @@ Current implementation status:
 - Integration test that a modified eligible implemented-language file replaces
   stale SQLite facts.
 - Integration test that unchanged content after a filesystem event is skipped.
-- Test offline continuous indexing without Qdrant or Ollama.
-- Test semantic continuous indexing with mocked or opt-in local Ollama/Qdrant.
+- Test offline continuous indexing without sqlite-vec or Ollama.
+- Test semantic continuous indexing with mocked or opt-in local Ollama/sqlite-vec.
 - Test that continuous indexing marks quality stale, queues quality jobs, and
   returns without waiting for the quality worker.
 - Test that default semantic search routes to fast while quality is pending or

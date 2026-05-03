@@ -28,7 +28,7 @@ Successful tool call `structuredContent` uses the stable cross-agent envelope:
     "local_only": true,
     "read_only": true,
     "source_text": "omitted_by_default",
-    "index_access": "shared_local_sqlite_and_qdrant",
+    "index_access": "shared_local_sqlite_and_sqlite_vec",
     "path_policy": "repository_root_required",
     "freshness": "included_when_available",
     "provenance": "included_when_available",
@@ -76,7 +76,7 @@ Output:
   "semantic_layer": "fast",
   "requested_layer": "auto",
   "embedding_model": "nomic-embed-text",
-  "qdrant_collection": "symdex_repo_nomic_embed_text",
+  "vector_table": "symdex_repo_nomic_embed_text",
   "generation_id": "repo-semantic-...",
   "quality_status": "quality_pending",
   "fallback_reason": "quality_manifest_incomplete_using_fast_layer",
@@ -353,7 +353,7 @@ Unified output:
       "item_kind": "symbol",
       "evidence_source": "both",
       "relationship": "focus_symbol",
-      "point_id": "qdrant-point-id",
+      "point_id": "vector-point-id",
       "chunk_id": "chunk-123",
       "symbol_id": "sym-123",
       "symbol": "foo::retry::run_with_backoff",
@@ -412,7 +412,7 @@ Unified output:
 }
 ```
 
-If local semantic services or the expected Qdrant collection are unavailable,
+If local semantic services or the expected sqlite-vec collection are unavailable,
 unified mode still returns structural evidence in v2 format and adds a compact
 note such as `semantic_unavailable:local_service_unavailable` or
 `semantic_unavailable:missing_vector_collection`.
@@ -620,7 +620,7 @@ Input:
 Rules:
 
 - Require exactly one of `symbol` or `chunk_id`.
-- Look up the existing vector point and query local Qdrant for nearest
+- Look up the existing vector point and query local sqlite-vec for nearest
   neighbors.
 - Return path, line range, symbol, chunk kind, score, freshness, trust, reason
   tags, and provenance.
@@ -636,7 +636,7 @@ Required design decisions before code:
 - caller trust and confirmation model
 - repo and path scoping
 - offline structural default behavior
-- explicit `semantic: true` opt-in for Qdrant/Ollama work
+- explicit `semantic: true` opt-in for sqlite-vec/Ollama work
 - concurrency with manual and continuous indexing
 - index run ID reporting and failure semantics
 

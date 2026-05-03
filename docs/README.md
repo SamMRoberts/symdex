@@ -12,7 +12,7 @@ Use this folder as the agent-facing project memory.
 | Layered fast/quality semantic indexing | `LAYERED_SEMANTIC_INDEXING.md`, `LAYERED_SEMANTIC_INDEXING_TASKS.md`, `LAYERED_SEMANTIC_INDEXING_BACKLOG.md`, `INDEXING_PIPELINE.md`, `DATA_MODEL.md`, `CONTINUOUS_INDEXING.md` |
 | Language support or parser expansion | `INDEXING_PIPELINE.md`, `ARCHITECTURE.md`, `BACKLOG.md` |
 | Continuous indexing/watch mode | `CONTINUOUS_INDEXING.md` |
-| SQLite schema or Qdrant payloads | `DATA_MODEL.md` |
+| SQLite schema or sqlite-vec payloads | `DATA_MODEL.md` |
 | MCP tool contracts | `MCP_TOOLS.md` |
 | Cross-agent index reuse | `CROSS_AGENT_REUSE.md` |
 | Terminal UI design | `TUI.md` |

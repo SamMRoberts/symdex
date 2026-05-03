@@ -16,10 +16,10 @@ use symdex_core::{
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkEmbeddingRecord, ChunkRecord, FastEmbeddingManifestRecord,
-    FastSemanticGenerationInput, FileRecord, IndexRunRecord, PointPayload, QdrantClient,
+    FastSemanticGenerationInput, FileRecord, IndexRunRecord, PointPayload,
     QualityActivationSummary, QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow,
-    QualityQueueSummary, RepositoryRecord, SqliteStore, StoreConfig, SymbolRecord, TestRecord,
-    VectorPoint, current_timestamp, qdrant_collection_name, qdrant_point_id,
+    QualityQueueSummary, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
+    SymbolRecord, TestRecord, VectorPoint, current_timestamp, vector_point_id, vector_table_name,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +150,7 @@ pub enum EmbeddingSummary {
     Completed {
         model: String,
         dimension: usize,
-        qdrant_collection: String,
+        vector_table: String,
         chunks_embedded: usize,
     },
 }
@@ -161,7 +161,7 @@ pub struct QualityIndexSummary {
     pub generation_id: String,
     pub quality_model: String,
     pub quality_dimension: Option<usize>,
-    pub qdrant_collection: String,
+    pub vector_table: String,
     pub claimed_jobs: usize,
     pub succeeded_jobs: usize,
     pub failed_jobs: usize,
@@ -371,7 +371,7 @@ fn run_quality_index_limited_with_progress(
 
     let quality_config = layered_embed_config.quality_embed_config();
     let quality_model = quality_config.model.clone();
-    let qdrant_collection = qdrant_collection_name(root.id(), &quality_model);
+    let vector_table = vector_table_name(root.id(), &quality_model);
     let embed_client = OllamaClient::new(quality_config).map_err(|error| error.to_string())?;
     if !embed_client
         .model_available()
@@ -384,7 +384,7 @@ fn run_quality_index_limited_with_progress(
         ));
     }
 
-    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
+    let vector = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
     let mut stats = QualityWorkerStats::default();
     let mut quality_dimension = generation.quality_dimension;
     let batch_size = layered_embed_config.quality_batch_size.max(1);
@@ -437,11 +437,11 @@ fn run_quality_index_limited_with_progress(
             process_quality_job(
                 &QualityWorkerContext {
                     root: &root,
-                    qdrant: &qdrant,
+                    vector: &vector,
                     embed_client: &embed_client,
                     latest_generation_id: &generation.id,
                     quality_model: &quality_model,
-                    qdrant_collection: &qdrant_collection,
+                    vector_table: &vector_table,
                 },
                 &mut sqlite,
                 &mut quality_dimension,
@@ -468,7 +468,7 @@ fn run_quality_index_limited_with_progress(
         generation_id: generation.id,
         quality_model,
         quality_dimension,
-        qdrant_collection,
+        vector_table,
         claimed_jobs: stats.claimed_jobs,
         succeeded_jobs: stats.succeeded_jobs,
         failed_jobs: stats.failed_jobs,
@@ -805,10 +805,10 @@ fn run_index_internal(
         .flat_map(|report| report.chunks.iter())
         .filter(|chunk| chunk.excluded_reason.is_some())
         .count();
-    let stale_qdrant_point_ids = if options.offline {
+    let stale_vector_point_ids = if options.offline {
         BTreeSet::new()
     } else {
-        match stale_qdrant_point_ids(&sqlite, &root, &collection) {
+        match stale_vector_point_ids(&sqlite, &root, &collection) {
             Ok(point_ids) => point_ids,
             Err(error) => {
                 finish_failed_index_run(
@@ -911,7 +911,7 @@ fn run_index_internal(
             &store_config,
             &layered_embed_config,
             prepared_semantic.expect("semantic indexing should be prepared when not offline"),
-            &stale_qdrant_point_ids,
+            &stale_vector_point_ids,
             &mut on_progress,
         ) {
             Ok(embedding) => {
@@ -1621,7 +1621,7 @@ enum PreparedSemanticIndex {
 struct PreparedFastSemanticIndex {
     model: String,
     dimension: usize,
-    qdrant_collection: String,
+    vector_table: String,
     fast_embeddings: Vec<FastEmbeddingManifestRecord>,
     files_seen: usize,
 }
@@ -1630,7 +1630,7 @@ impl PreparedFastSemanticIndex {
     fn point_ids(&self) -> BTreeSet<String> {
         self.fast_embeddings
             .iter()
-            .map(|embedding| embedding.qdrant_point_id.clone())
+            .map(|embedding| embedding.vector_point_id.clone())
             .collect()
     }
 }
@@ -1699,13 +1699,13 @@ fn prepare_semantic_index(
         .ensure_embedding_compatible(root.id(), &embed_config.model, dimension)
         .map_err(|error| error.to_string())?;
 
-    let qdrant = QdrantClient::new(store_config).map_err(|error| error.to_string())?;
-    let qdrant_collection = qdrant_collection_name(root.id(), &embed_config.model);
-    qdrant
-        .ensure_collection(&qdrant_collection, dimension)
+    let vector = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    let vector_table = vector_table_name(root.id(), &embed_config.model);
+    vector
+        .ensure_table(&vector_table, dimension)
         .map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
-        "qdrant",
+        "vector",
         4,
         5,
         format!("Upserting {} vector points", chunk_texts.len()),
@@ -1725,8 +1725,8 @@ fn prepare_semantic_index(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    qdrant
-        .upsert_points(&qdrant_collection, &points)
+    vector
+        .upsert_points(&vector_table, &points)
         .map_err(|error| error.to_string())?;
     let fast_embeddings = chunk_texts
         .iter()
@@ -1736,11 +1736,11 @@ fn prepare_semantic_index(
             chunk_id: chunk.chunk.id.clone(),
             content_hash: chunk.file.content_hash.clone(),
             text_hash: chunk.chunk.text_hash.clone(),
-            qdrant_point_id: point.id.clone(),
+            vector_point_id: point.id.clone(),
         })
         .collect::<Vec<_>>();
     on_progress(IndexProgress::new(
-        "qdrant",
+        "vector",
         5,
         5,
         format!("Upserted {} vector points", points.len()),
@@ -1749,7 +1749,7 @@ fn prepare_semantic_index(
         PreparedFastSemanticIndex {
             model: embed_config.model.clone(),
             dimension,
-            qdrant_collection,
+            vector_table,
             fast_embeddings,
             files_seen: collection.files_seen,
         },
@@ -1762,16 +1762,16 @@ fn finalize_semantic_index(
     store_config: &StoreConfig,
     layered_embed_config: &LayeredEmbedConfig,
     prepared: PreparedSemanticIndex,
-    stale_qdrant_point_ids: &BTreeSet<String>,
+    stale_vector_point_ids: &BTreeSet<String>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
     let prepared = match prepared {
         PreparedSemanticIndex::SkippedNoChunks => {
-            delete_stale_qdrant_points(
+            delete_stale_vector_points(
                 root,
                 store_config,
                 &layered_embed_config.fast_embed_config().model,
-                stale_qdrant_point_ids,
+                stale_vector_point_ids,
                 &BTreeSet::new(),
                 on_progress,
             )?;
@@ -1786,7 +1786,7 @@ fn finalize_semantic_index(
             repository_id: root.id(),
             fast_model: &prepared.model,
             fast_dimension: prepared.dimension,
-            qdrant_collection: &prepared.qdrant_collection,
+            vector_table: &prepared.vector_table,
             upserted_embeddings: &prepared.fast_embeddings,
             files_seen: prepared.files_seen,
             completed_at: &recorded_at,
@@ -1799,18 +1799,18 @@ fn finalize_semantic_index(
         &generation,
         on_progress,
     )?;
-    delete_stale_qdrant_points(
+    delete_stale_vector_points(
         root,
         store_config,
         &prepared.model,
-        stale_qdrant_point_ids,
+        stale_vector_point_ids,
         &prepared.point_ids(),
         on_progress,
     )?;
     Ok(EmbeddingSummary::Completed {
         model: prepared.model,
         dimension: prepared.dimension,
-        qdrant_collection: prepared.qdrant_collection,
+        vector_table: prepared.vector_table,
         chunks_embedded: prepared.fast_embeddings.len(),
     })
 }
@@ -1978,11 +1978,11 @@ fn quality_activation_progress_message(
 
 struct QualityWorkerContext<'a> {
     root: &'a RepoRoot,
-    qdrant: &'a QdrantClient,
+    vector: &'a SqliteVectorStore,
     embed_client: &'a OllamaClient,
     latest_generation_id: &'a str,
     quality_model: &'a str,
-    qdrant_collection: &'a str,
+    vector_table: &'a str,
 }
 
 fn process_quality_job(
@@ -2077,10 +2077,7 @@ fn process_quality_job(
         )?;
         return Ok(());
     }
-    if let Err(error) = context
-        .qdrant
-        .ensure_collection(context.qdrant_collection, dimension)
-    {
+    if let Err(error) = context.vector.ensure_table(context.vector_table, dimension) {
         complete_failed_quality_job(
             sqlite,
             &prepared.row.job.id,
@@ -2122,8 +2119,8 @@ fn process_quality_job(
         }
     };
     if let Err(error) = context
-        .qdrant
-        .upsert_points(context.qdrant_collection, std::slice::from_ref(&point))
+        .vector
+        .upsert_points(context.vector_table, std::slice::from_ref(&point))
     {
         complete_failed_quality_job(
             sqlite,
@@ -2140,7 +2137,7 @@ fn process_quality_job(
         &prepared.row,
         context.quality_model,
         dimension,
-        context.qdrant_collection,
+        context.vector_table,
         &point.id,
         &completed_at,
     );
@@ -2238,7 +2235,7 @@ fn quality_vector_point(
     indexed_at: &str,
 ) -> Result<VectorPoint, String> {
     Ok(VectorPoint {
-        id: qdrant_point_id(&row.job.chunk_id).map_err(|error| error.to_string())?,
+        id: vector_point_id(&row.job.chunk_id).map_err(|error| error.to_string())?,
         vector,
         payload: PointPayload {
             repository_id: repository_id.to_owned(),
@@ -2267,8 +2264,8 @@ fn quality_chunk_embedding_record(
     row: &QualityJobSourceRow,
     embedding_model: &str,
     embedding_dimension: usize,
-    qdrant_collection: &str,
-    qdrant_point_id: &str,
+    vector_table: &str,
+    vector_point_id: &str,
     embedded_at: &str,
 ) -> ChunkEmbeddingRecord {
     let semantic_layer = SemanticLayer::Quality.as_str();
@@ -2289,15 +2286,15 @@ fn quality_chunk_embedding_record(
         embedding_dimension,
         content_hash: row.job.content_hash.clone(),
         text_hash: row.job.text_hash.clone(),
-        qdrant_collection: qdrant_collection.to_owned(),
-        qdrant_point_id: qdrant_point_id.to_owned(),
+        vector_table: vector_table.to_owned(),
+        vector_point_id: vector_point_id.to_owned(),
         generation_id: row.job.generation_id.clone(),
         embedded_at: embedded_at.to_owned(),
         status: "current".to_owned(),
     }
 }
 
-fn stale_qdrant_point_ids(
+fn stale_vector_point_ids(
     sqlite: &SqliteStore,
     root: &RepoRoot,
     collection: &IndexCollection,
@@ -2310,7 +2307,7 @@ fn stale_qdrant_point_ids(
     let mut point_ids = BTreeSet::new();
     point_ids.extend(
         sqlite
-            .qdrant_point_ids_for_latest_generation_layer_paths(
+            .vector_point_ids_for_latest_generation_layer_paths(
                 root.id(),
                 SemanticLayer::Fast,
                 &changed_paths,
@@ -2319,7 +2316,7 @@ fn stale_qdrant_point_ids(
     );
     point_ids.extend(
         sqlite
-            .qdrant_point_ids_for_latest_generation_layer_missing_files(
+            .vector_point_ids_for_latest_generation_layer_missing_files(
                 root.id(),
                 SemanticLayer::Fast,
                 &collection.active_paths,
@@ -2330,7 +2327,7 @@ fn stale_qdrant_point_ids(
     Ok(point_ids)
 }
 
-fn delete_stale_qdrant_points(
+fn delete_stale_vector_points(
     root: &RepoRoot,
     store_config: &StoreConfig,
     embedding_model: &str,
@@ -2338,52 +2335,52 @@ fn delete_stale_qdrant_points(
     protected_point_ids: &BTreeSet<String>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<usize, String> {
-    let point_ids = stale_qdrant_point_ids_to_delete(stale_point_ids, protected_point_ids);
+    let point_ids = stale_vector_point_ids_to_delete(stale_point_ids, protected_point_ids);
 
     if point_ids.is_empty() {
         on_progress(IndexProgress::new(
-            "qdrant_cleanup",
+            "vector_cleanup",
             1,
             1,
-            "No stale Qdrant points to delete",
+            "No stale vector points to delete",
         ));
         return Ok(0);
     }
 
-    let qdrant = QdrantClient::new(store_config).map_err(|error| error.to_string())?;
-    let qdrant_collection = qdrant_collection_name(root.id(), embedding_model);
-    if !qdrant
-        .collection_exists(&qdrant_collection)
+    let vector = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    let vector_table = vector_table_name(root.id(), embedding_model);
+    if !vector
+        .table_exists(&vector_table)
         .map_err(|error| error.to_string())?
     {
         on_progress(IndexProgress::new(
-            "qdrant_cleanup",
+            "vector_cleanup",
             1,
             1,
-            format!("Skipped stale point deletion; collection {qdrant_collection} is missing"),
+            format!("Skipped stale point deletion; collection {vector_table} is missing"),
         ));
         return Ok(0);
     }
 
     on_progress(IndexProgress::new(
-        "qdrant_cleanup",
+        "vector_cleanup",
         0,
         point_ids.len(),
-        format!("Deleting {} stale Qdrant points", point_ids.len()),
+        format!("Deleting {} stale vector points", point_ids.len()),
     ));
-    qdrant
-        .delete_points(&qdrant_collection, &point_ids)
+    vector
+        .delete_points(&vector_table, &point_ids)
         .map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
-        "qdrant_cleanup",
+        "vector_cleanup",
         point_ids.len(),
         point_ids.len(),
-        format!("Deleted {} stale Qdrant points", point_ids.len()),
+        format!("Deleted {} stale vector points", point_ids.len()),
     ));
     Ok(point_ids.len())
 }
 
-fn stale_qdrant_point_ids_to_delete(
+fn stale_vector_point_ids_to_delete(
     stale_point_ids: &BTreeSet<String>,
     protected_point_ids: &BTreeSet<String>,
 ) -> Vec<String> {
@@ -2433,7 +2430,7 @@ fn vector_point(
     embedding_dimension: usize,
 ) -> Result<VectorPoint, String> {
     Ok(VectorPoint {
-        id: qdrant_point_id(&chunk.chunk.id).map_err(|error| error.to_string())?,
+        id: vector_point_id(&chunk.chunk.id).map_err(|error| error.to_string())?,
         vector,
         payload: PointPayload {
             repository_id: repository_id.to_owned(),
@@ -2472,7 +2469,7 @@ fn chunk_record(
         end_line: chunk.line_range.end,
         start_byte: chunk.byte_range.start,
         end_byte: chunk.byte_range.end,
-        qdrant_point_id: None,
+        vector_point_id: None,
         excluded_reason: chunk.excluded_reason.clone(),
         index_run_id: index_run_id.to_owned(),
         parser_version: parser_version.to_owned(),
@@ -2695,8 +2692,8 @@ mod tests {
             chunk_record(&public, "run", Language::Rust.parser_version()).expect("public record");
         let secret_record =
             chunk_record(&secret, "run", Language::Rust.parser_version()).expect("secret record");
-        assert!(public_record.qdrant_point_id.is_none());
-        assert!(secret_record.qdrant_point_id.is_none());
+        assert!(public_record.vector_point_id.is_none());
+        assert!(secret_record.vector_point_id.is_none());
         assert_eq!(
             secret_record.excluded_reason.as_deref(),
             Some("likely_access_token")
@@ -2877,14 +2874,14 @@ mod tests {
     }
 
     #[test]
-    fn deferred_qdrant_cleanup_keeps_newly_upserted_point_ids() {
+    fn deferred_vector_cleanup_keeps_newly_upserted_point_ids() {
         let stale = BTreeSet::from([
             "deleted-file-point".to_owned(),
             "unchanged-deterministic-point".to_owned(),
         ]);
         let protected = BTreeSet::from(["unchanged-deterministic-point".to_owned()]);
 
-        let to_delete = super::stale_qdrant_point_ids_to_delete(&stale, &protected);
+        let to_delete = super::stale_vector_point_ids_to_delete(&stale, &protected);
 
         assert_eq!(to_delete, vec!["deleted-file-point".to_owned()]);
     }
@@ -2958,7 +2955,6 @@ mod tests {
         fs::create_dir_all(&db_dir).expect("db directory should be created");
         let mut store = SqliteStore::open(&StoreConfig {
             sqlite_path: db_dir.join("symdex.sqlite"),
-            qdrant_url: "http://localhost:6333".to_owned(),
         })
         .expect("store should open");
         store.migrate().expect("store should migrate");
