@@ -2379,7 +2379,7 @@ fn render_index_progress_gauge(
 ) {
     let gauge = Gauge::default()
         .block(Block::default().borders(Borders::ALL).title("Progress"))
-        .gauge_style(tone_style(StatusTone::Info).add_modifier(Modifier::BOLD))
+        .gauge_style(readable_gauge_style(StatusTone::Info))
         .percent(progress_percent(progress))
         .label(progress_label(progress));
     frame.render_widget(gauge, area);
@@ -2402,7 +2402,7 @@ fn render_semantic_readiness_gauges(
                 .borders(Borders::ALL)
                 .title("Fast Readiness"),
         )
-        .gauge_style(tone_style(StatusTone::Success).add_modifier(Modifier::BOLD))
+        .gauge_style(readable_gauge_style(StatusTone::Success))
         .percent(fast_percent)
         .label(layer_readiness_label(
             "fast_ready",
@@ -2415,7 +2415,7 @@ fn render_semantic_readiness_gauges(
                 .borders(Borders::ALL)
                 .title("Quality Readiness"),
         )
-        .gauge_style(tone_style(semantic_quality_tone(summary)).add_modifier(Modifier::BOLD))
+        .gauge_style(readable_gauge_style(semantic_quality_tone(summary)))
         .percent(quality_percent)
         .label(layer_readiness_label(
             "quality_ready",
@@ -5659,6 +5659,12 @@ fn tone_style(tone: StatusTone) -> Style {
     Style::new().fg(color)
 }
 
+fn readable_gauge_style(tone: StatusTone) -> Style {
+    tone_style(tone)
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
+}
+
 enum DiagnosticsState {
     Idle,
     Running,
@@ -7667,6 +7673,23 @@ mod tests {
         assert!(rendered.contains("Quality Readiness"));
         assert!(rendered.contains("fast_ready 2/4 50%"));
         assert!(rendered.contains("quality_ready 1/4 25%"));
+        let buffer = terminal.backend().buffer();
+        assert_ne!(
+            cell_fg_for_text(buffer, "fast_ready 2/4 50%", None),
+            Some(Color::White)
+        );
+        assert_ne!(
+            cell_bg_for_text(buffer, "fast_ready 2/4 50%", None),
+            Some(Color::Black)
+        );
+        assert_ne!(
+            cell_fg_for_text(buffer, "quality_ready 1/4 25%", None),
+            Some(Color::White)
+        );
+        assert_ne!(
+            cell_bg_for_text(buffer, "quality_ready 1/4 25%", None),
+            Some(Color::Black)
+        );
     }
 
     #[test]
@@ -7709,6 +7732,14 @@ mod tests {
         assert!(rendered.contains("Indexing Running"));
         assert!(rendered.contains("Progress"));
         assert!(rendered.contains("parse 2/4"));
+        assert_ne!(
+            cell_fg_for_text(buffer, "parse 2/4", None),
+            Some(Color::White)
+        );
+        assert_ne!(
+            cell_bg_for_text(buffer, "parse 2/4", None),
+            Some(Color::Black)
+        );
         assert_eq!(
             cell_fg_for_text(buffer, "Indexing Running", None),
             Some(Color::Cyan)
