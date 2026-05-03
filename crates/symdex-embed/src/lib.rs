@@ -210,15 +210,16 @@ impl OllamaClient {
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let response: TagsResponse = self
+        let response = self
             .http
             .get(self.endpoint("/api/tags"))
             .send()
-            .map_err(EmbedError::HttpRequest)?
-            .error_for_status()
-            .map_err(EmbedError::HttpStatus)?
-            .json()
-            .map_err(EmbedError::Decode)?;
+            .map_err(EmbedError::HttpRequest)?;
+        if !response.status().is_success() {
+            return Err(error_from_response(response));
+        }
+
+        let response: TagsResponse = response.json().map_err(EmbedError::Decode)?;
         Ok(response.models)
     }
 
@@ -262,15 +263,48 @@ impl OllamaClient {
             input: inputs,
             truncate: self.config.truncate,
         };
-        self.http
+        let response = self
+            .http
             .post(self.endpoint("/api/embed"))
             .json(&request)
             .send()
-            .map_err(EmbedError::HttpRequest)?
-            .error_for_status()
-            .map_err(EmbedError::HttpStatus)?
-            .json()
-            .map_err(EmbedError::Decode)
+            .map_err(EmbedError::HttpRequest)?;
+        if !response.status().is_success() {
+            let error = error_from_response(response);
+            if error.should_try_legacy_embed_endpoint() {
+                return self.embed_batch_legacy_request(inputs).map_err(|_| error);
+            }
+            return Err(error);
+        }
+
+        response.json().map_err(EmbedError::Decode)
+    }
+
+    fn embed_batch_legacy_request(&self, inputs: &[String]) -> Result<EmbedResponse> {
+        let mut embeddings = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let request = LegacyEmbedRequest {
+                model: self.config.model.clone(),
+                prompt: input,
+            };
+            let response = self
+                .http
+                .post(self.endpoint("/api/embeddings"))
+                .json(&request)
+                .send()
+                .map_err(EmbedError::HttpRequest)?;
+            if !response.status().is_success() {
+                return Err(error_from_response(response));
+            }
+            let response: LegacyEmbedResponse = response.json().map_err(EmbedError::Decode)?;
+            embeddings.push(response.embedding);
+        }
+
+        Ok(EmbedResponse {
+            model: self.config.model.clone(),
+            embeddings,
+            prompt_eval_count: None,
+        })
     }
 
     pub fn probe_dimension(&self) -> Result<usize> {
@@ -372,9 +406,16 @@ pub struct ModelInfo {
 pub enum EmbedError {
     HttpClient(reqwest::Error),
     HttpRequest(reqwest::Error),
-    HttpStatus(reqwest::Error),
+    HttpStatus {
+        status: reqwest::StatusCode,
+        url: String,
+        body: String,
+    },
     Decode(reqwest::Error),
-    EmbeddingCount { expected: usize, actual: usize },
+    EmbeddingCount {
+        expected: usize,
+        actual: usize,
+    },
     InconsistentDimensions,
     MissingEmbeddingDimension,
 }
@@ -384,7 +425,17 @@ impl Display for EmbedError {
         match self {
             Self::HttpClient(error) => write!(f, "failed to create HTTP client: {error}"),
             Self::HttpRequest(error) => write!(f, "Ollama request failed: {error}"),
-            Self::HttpStatus(error) => write!(f, "Ollama returned an error status: {error}"),
+            Self::HttpStatus { status, url, body } => {
+                if body.trim().is_empty() {
+                    write!(f, "Ollama returned an error status: {status} for url {url}")
+                } else {
+                    write!(
+                        f,
+                        "Ollama returned an error status: {status} for url {url}: {}",
+                        body.trim()
+                    )
+                }
+            }
             Self::Decode(error) => write!(f, "failed to decode Ollama response: {error}"),
             Self::EmbeddingCount { expected, actual } => write!(
                 f,
@@ -400,6 +451,19 @@ impl Display for EmbedError {
 
 impl std::error::Error for EmbedError {}
 
+impl EmbedError {
+    fn should_try_legacy_embed_endpoint(&self) -> bool {
+        match self {
+            Self::HttpStatus { status, body, .. } => {
+                *status == reqwest::StatusCode::NOT_FOUND
+                    || (*status == reqwest::StatusCode::BAD_REQUEST
+                        && body.to_ascii_lowercase().contains("input"))
+            }
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, EmbedError>;
 
 #[derive(Debug, Serialize)]
@@ -407,6 +471,12 @@ struct EmbedRequest<'a> {
     model: String,
     input: &'a [String],
     truncate: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LegacyEmbedRequest<'a> {
+    model: String,
+    prompt: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,12 +487,26 @@ struct EmbedResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct LegacyEmbedResponse {
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TagsResponse {
     models: Vec<ModelInfo>,
 }
 
 fn env_value(upper: &str, legacy: &str) -> Option<String> {
     env::var(upper).ok().or_else(|| env::var(legacy).ok())
+}
+
+fn error_from_response(response: reqwest::blocking::Response) -> EmbedError {
+    let status = response.status();
+    let url = response.url().to_string();
+    let body = response
+        .text()
+        .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+    EmbedError::HttpStatus { status, url, body }
 }
 
 fn env_bool(value: &str) -> bool {
@@ -448,9 +532,9 @@ mod tests {
         DEFAULT_EMBED_BATCH_SIZE, DEFAULT_EMBED_MAX_CHUNK_BYTES, DEFAULT_EMBED_TRUNCATE,
         DEFAULT_FAST_EMBED_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_QUALITY_EMBED_BATCH_SIZE,
         DEFAULT_QUALITY_EMBED_MODEL, DEFAULT_QUALITY_EMBED_WORKERS, EmbedConfig, EmbedConfigValues,
-        EmbedRequest, EmbedResponse, LayeredEmbedConfig, LayeredEmbedConfigValues, ModelInfo,
-        OllamaClient, embedding_batch_from_parts, embedding_batch_from_response, env_bool,
-        env_usize, model_available_in,
+        EmbedError, EmbedRequest, EmbedResponse, LayeredEmbedConfig, LayeredEmbedConfigValues,
+        ModelInfo, OllamaClient, embedding_batch_from_parts, embedding_batch_from_response,
+        env_bool, env_usize, model_available_in,
     };
 
     #[test]
@@ -668,6 +752,29 @@ mod tests {
         assert_eq!(json["model"], "nomic-embed-text");
         assert_eq!(json["input"][0], "first");
         assert_eq!(json["truncate"], true);
+    }
+
+    #[test]
+    fn bad_embed_input_status_can_fall_back_to_legacy_endpoint() {
+        let error = EmbedError::HttpStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            url: "http://localhost:11434/api/embed".to_owned(),
+            body: "invalid input type".to_owned(),
+        };
+
+        assert!(error.should_try_legacy_embed_endpoint());
+        assert!(error.to_string().contains("invalid input type"));
+    }
+
+    #[test]
+    fn model_errors_do_not_fall_back_to_legacy_endpoint() {
+        let error = EmbedError::HttpStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            url: "http://localhost:11434/api/embed".to_owned(),
+            body: "model not found".to_owned(),
+        };
+
+        assert!(!error.should_try_legacy_embed_endpoint());
     }
 
     #[test]
