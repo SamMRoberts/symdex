@@ -1,0 +1,15 @@
+{
+	"servers": {
+		"symdex": {
+			"type": "stdio",
+			"command": "/users/samroberts/.symdex/symdex",
+			"args": [
+				"serve-mcp",
+				"--watch",
+				"${workspaceFolder}"
+			],
+			"cwd": "${workspaceFolder}"
+		}
+	},
+	"inputs": []
+}
