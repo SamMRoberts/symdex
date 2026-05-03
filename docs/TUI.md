@@ -326,9 +326,8 @@ represent the indexed repository.
 - Show fast and quality semantic readiness as progress bars in the Index tab.
   Each bar should display the percentage and ready/expected chunk counts for
   `fast_ready` and `quality_ready` coverage.
-- Show fast and quality pending-job sparklines plus a quality running-job
-  sparkline in the Index tab, using each job count as a percentage of the total
-  expected chunk count.
+- Show fast and quality pending-job and running-job sparklines in the Index tab,
+  using each job count as a percentage of the total expected chunk count.
 - Offer continuous indexing as a toggleable mode.
 - Continuous indexing is off by default.
 - When continuous indexing is on, modified or newly created eligible files are

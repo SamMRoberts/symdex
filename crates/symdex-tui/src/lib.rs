@@ -2402,6 +2402,7 @@ fn render_semantic_readiness_gauges(
     let fast_percent = layer_readiness_percent(&summary.fast);
     let quality_percent = layer_readiness_percent(&summary.quality);
     let fast_pending_percent = fast_pending_percent(summary);
+    let fast_running_percent = fast_running_percent(summary);
     let pending_percent = quality_job_percent(summary, QualityJobMetric::Pending);
     let running_percent = quality_job_percent(summary, QualityJobMetric::Running);
     let fast_gauge = Gauge::default()
@@ -2433,13 +2434,7 @@ fn render_semantic_readiness_gauges(
     frame.render_widget(fast_gauge, chunks[0]);
     frame.render_widget(quality_gauge, chunks[1]);
     render_pending_job_sparklines(frame, chunks[2], fast_pending_percent, pending_percent);
-    render_job_sparkline(
-        frame,
-        chunks[3],
-        "Running Jobs",
-        running_percent,
-        StatusTone::Info,
-    );
+    render_running_job_sparklines(frame, chunks[3], fast_running_percent, running_percent);
 }
 
 fn render_pending_job_sparklines(
@@ -2465,6 +2460,26 @@ fn render_pending_job_sparklines(
         "Quality Pend",
         quality_percent,
         StatusTone::Warning,
+    );
+}
+
+fn render_running_job_sparklines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    fast_percent: u16,
+    quality_percent: u16,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_job_sparkline(frame, chunks[0], "Fast Run", fast_percent, StatusTone::Info);
+    render_job_sparkline(
+        frame,
+        chunks[1],
+        "Quality Run",
+        quality_percent,
+        StatusTone::Info,
     );
 }
 
@@ -2499,6 +2514,10 @@ fn fast_pending_percent(summary: &SemanticStatusSummary) -> u16 {
         .expected_chunks
         .saturating_sub(summary.fast.total_chunks);
     layer_count_percent(pending_chunks, summary.fast.expected_chunks)
+}
+
+fn fast_running_percent(summary: &SemanticStatusSummary) -> u16 {
+    layer_count_percent(0, summary.fast.expected_chunks)
 }
 
 #[derive(Clone, Copy)]
@@ -7784,7 +7803,8 @@ mod tests {
         assert!(rendered.contains("quality_ready 1/4 25%"));
         assert!(rendered.contains("Fast Pend 25%"));
         assert!(rendered.contains("Quality Pend 50%"));
-        assert!(rendered.contains("Running Jobs 25%"));
+        assert!(rendered.contains("Fast Run 0%"));
+        assert!(rendered.contains("Quality Run 25%"));
         let buffer = terminal.backend().buffer();
         assert_ne!(
             cell_fg_for_text(buffer, "fast_ready 2/4 50%", None),
