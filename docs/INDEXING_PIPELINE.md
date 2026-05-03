@@ -345,7 +345,8 @@ from degrading into broad table scans as repositories grow.
 ## Continuous indexing
 
 Continuous indexing is a local watch mode layered on top of incremental
-indexing. It can be toggled on or off and is off by default.
+indexing. It starts automatically with `symdex tui [repo]` and can be toggled
+on or off during the TUI session.
 
 Current implementation uses a polling watcher: it discovers eligible Rust, C#,
 JavaScript, and TypeScript files at a fixed interval, compares

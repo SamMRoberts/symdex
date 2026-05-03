@@ -214,14 +214,15 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   routing path and returns ranked sqlite-vec matches with scores, paths, line
   ranges, symbol names, active layer metadata, fallback reason, and provenance
   metadata. Text output also prints compact reason tags for each match.
-- `tui [repo]`: launches the local terminal UI control panel. The current TUI
-  opens an Overview tab backed by SQLite metadata and local service
-  configuration, then uses a compact repository summary beside or above the
-  active workflow on other tabs. Use `Tab` / `Shift+Tab` on the Index tab to
-  select full or incremental scope (default incremental), `o` to confirm
-  offline indexing, `s` to confirm semantic indexing, `c` to toggle continuous
-  indexing, and inspect fast/quality readiness progress bars plus fast/quality
-  pending, running, and skipped-stale job sparklines. Use `[` / `]` to
+- `tui [repo]`: launches the local terminal UI control panel and starts
+  continuous semantic indexing. The current TUI opens an Overview tab backed by
+  SQLite metadata and local service configuration, then uses a compact
+  repository summary beside or above the active workflow on other tabs. Use
+  `Tab` / `Shift+Tab` on the Index tab to select full or incremental scope
+  (default incremental), `o` to confirm offline indexing, `s` to confirm
+  semantic indexing, `c` to stop or restart continuous indexing, and inspect
+  fast/quality readiness progress bars plus fast/quality pending, running, and
+  skipped-stale job sparklines. Use `[` / `]` to
   move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
   tabs, and `Tab` / `Shift+Tab` to toggle view-local
   modes including impact, call-path, context-pack, and debug-context evidence

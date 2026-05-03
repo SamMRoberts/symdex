@@ -113,7 +113,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Respect `.gitignore` plus project-level ignore config.
 - Continuous indexing must use the same ignore, path-boundary, hashing, parser, secret-detection, and embedding rules as manual indexing.
 - Continuous indexing must debounce file events and coalesce bursts before reindexing.
-- Continuous indexing is off by default and must be visibly toggleable when exposed in the TUI.
+- Continuous indexing starts automatically with the TUI and must remain visibly toggleable.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 
 ## MCP Rules

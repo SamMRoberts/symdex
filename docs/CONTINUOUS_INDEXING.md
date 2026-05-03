@@ -8,8 +8,8 @@ enabled, modified or newly created eligible files are automatically reindexed.
 
 ## Product Contract
 
-- Continuous indexing is off by default.
-- Users must be able to toggle it on and off from the TUI.
+- `symdex tui [repo]` starts continuous indexing automatically.
+- Users must be able to toggle it off and back on from the TUI.
 - A CLI launch path should also exist for non-interactive use, such as
   `symdex index --watch <repo>` or an equivalent command.
 - Watch mode must never execute indexed repository code.

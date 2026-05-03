@@ -57,8 +57,9 @@ pub struct TuiOptions {
 }
 
 pub fn run(options: TuiOptions) -> Result<(), String> {
-    let app = App::load(&options.repo)?;
+    let mut app = App::load(&options.repo)?;
     let mut terminal = enter_terminal()?;
+    app.start_continuous_index();
     let result = run_app(&mut terminal, app);
     leave_terminal(&mut terminal)?;
     result

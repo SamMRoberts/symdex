@@ -407,15 +407,16 @@ represent the indexed repository.
 - Show fast and quality pending-job, running-job, and skipped-stale-job
   sparklines in the Index tab, using each job count as a percentage of the
   total expected chunk count.
-- Offer continuous indexing as a toggleable mode.
-- Continuous indexing is off by default.
+- Start continuous indexing automatically when `symdex tui [repo]` launches.
+- Offer continuous indexing as a toggleable mode so users can stop and restart
+  the watcher during the TUI session.
 - When continuous indexing is on, modified or newly created eligible files are
   automatically reindexed after debounce.
 - Continuous indexing must use the same ignore, path-boundary, hashing,
   parsing, secret-detection, and embedding rules as manual indexing.
 - Require explicit `y` confirmation before starting an indexing job.
-- Require explicit confirmation before enabling continuous indexing for the
-  first time in a session because it starts an ongoing local job.
+- Starting the TUI is the explicit opt-in for the ongoing local watch job.
+  Manual toggles back on during the same session still require confirmation.
 - Toggling continuous indexing off should stop the watcher promptly without
   deleting index data.
 - Show running, completed, failed, and cancelled states.
@@ -512,7 +513,8 @@ Current dashboard keys:
 
 - `o`: request offline indexing confirmation
 - `s`: request semantic indexing confirmation
-- `c`: toggle continuous indexing confirmation
+- `c`: stop continuous indexing when it is on, or confirm restarting it when it
+  is off
 - `[`: move to the previous primary tab
 - `]`: move to the next primary tab
 - `Tab`: switch to the next mode in the active view
