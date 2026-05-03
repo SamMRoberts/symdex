@@ -98,11 +98,11 @@ terminal panes.
 
 ### Ratatui widget evaluation
 
-The current TUI already uses the right stable baseline from `ratatui`: `Block`,
-`Paragraph`, `List`, `Table`, `Tabs`, `Gauge`, and `Sparkline`. Keep these as
-the default building blocks because they are built in, compact, easy to test
-with the ratatui test backend, and already match symdex's local metadata-first
-model.
+The current TUI uses the right stable baseline from `ratatui`: `Block`,
+`Paragraph`, `List`, `Table`, `Tabs`, `Gauge`, `Scrollbar`, and `BarChart`.
+Keep these as the default building blocks because they are built in, compact,
+easy to test with the ratatui test backend, and already match symdex's local
+metadata-first model.
 
 Built-in widget decisions:
 
@@ -114,9 +114,9 @@ Built-in widget decisions:
 | `Table` | Keep using | Best default for evidence, storage, diagnostics, calls, impact, and context-pack metadata. |
 | `Tabs` | Keep using | Major views, storage subviews, and mode selectors. |
 | `Gauge` | Keep using | Manual indexing progress and fast/quality semantic readiness where real counts exist. |
-| `Sparkline` | Keep using sparingly | Quality/fast job activity only when derived from real counts; avoid decorative use. |
-| `Scrollbar` | Add next | Long selectable tables and detail panes need visible position without reducing evidence density. |
-| `BarChart` | Add after scrollbar | Useful for real bucketed metrics: call resolution buckets, index-run outcomes, freshness status counts, embedding coverage, and quality job states. |
+| `Sparkline` | Avoid unless a future series metric needs it | Current job-state summaries are clearer as count-backed bar charts. |
+| `Scrollbar` | Use now | Long selectable tables and metadata line panes need visible position without reducing evidence density. |
+| `BarChart` | Use now | Useful for real bucketed metrics: call resolution buckets, index-run outcomes, freshness status counts, embedding coverage, and quality job states. |
 | `Chart` | Defer | Potentially useful for index-run duration/throughput over time, but only after store/query APIs expose stable time-series metrics. |
 | `Canvas` | Defer | Could visualize call paths or graph topology, but table evidence is clearer and more accessible for the MVP. |
 | `Calendar` | Avoid for now | Index activity is better shown as timeline rows or bar charts; calendar layout spends too much space at 80x24. |

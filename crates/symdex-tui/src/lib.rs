@@ -2604,7 +2604,12 @@ fn render_count_barchart(
     bars: Vec<(&'static str, u64)>,
     tone: StatusTone,
 ) {
-    let max = bars.iter().map(|(_, value)| *value).max().unwrap_or(0).max(1);
+    let max = bars
+        .iter()
+        .map(|(_, value)| *value)
+        .max()
+        .unwrap_or(0)
+        .max(1);
     let chart = BarChart::default()
         .block(panel_block(title, StatusTone::Dim))
         .data(bars.as_slice())
