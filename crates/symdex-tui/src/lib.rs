@@ -19,7 +19,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::widgets::{Cell, Row, Table, TableState};
 use symdex_core::{RepoRoot, SemanticLayer, SemanticLayerStatus};
-use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
+use symdex_diagnostics::{
+    DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
+};
 use symdex_embed::EmbedConfig;
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, EmbeddingSummary,
@@ -1071,9 +1073,17 @@ impl App {
     }
 
     fn start_diagnostics(&mut self) {
+        self.start_diagnostics_with(|repo| run_diagnostics_for_repo(Some(&repo)));
+    }
+
+    fn start_diagnostics_with<R>(&mut self, runner: R)
+    where
+        R: FnOnce(String) -> Result<DiagnosticReport, String> + Send + 'static,
+    {
         let (sender, receiver) = mpsc::channel();
+        let repo = self.repo_root.clone();
         thread::spawn(move || {
-            let result = run_diagnostics();
+            let result = runner(repo);
             let _ = sender.send(result);
         });
         self.view = View::Diagnostics;
@@ -7629,6 +7639,36 @@ mod tests {
         assert!(!app.handle_key(KeyCode::Enter));
         assert!(!app.diagnostics_details_expanded);
         assert_eq!(app.message, "Doctor selected-check details collapsed.");
+    }
+
+    #[test]
+    fn doctor_diagnostics_pass_loaded_repo_root() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.start_diagnostics_with(|repo| {
+            if repo == "/tmp/repo" {
+                Ok(sample_diagnostic_report())
+            } else {
+                Err(format!("unexpected repo path: {repo}"))
+            }
+        });
+
+        for _ in 0..1000 {
+            app.poll_diagnostics();
+            if matches!(app.diagnostics, DiagnosticsState::Completed(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        match &app.diagnostics {
+            DiagnosticsState::Completed(report) => {
+                assert_eq!(report.workspace, "/tmp/repo");
+            }
+            DiagnosticsState::Failed(error) => panic!("diagnostics failed: {error}"),
+            DiagnosticsState::Idle | DiagnosticsState::Running => {
+                panic!("diagnostics did not complete")
+            }
+        }
     }
 
     #[test]
