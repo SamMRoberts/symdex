@@ -4,7 +4,9 @@
 			"type": "stdio",
 			"command": "/users/samroberts/.symdex/symdex",
 			"args": [
-				"serve-mcp"
+				"serve-mcp",
+				"--watch",
+				"${workspaceFolder}"
 			],
 			"cwd": "${workspaceFolder}"
 		}
