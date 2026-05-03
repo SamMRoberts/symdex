@@ -2401,6 +2401,7 @@ fn render_semantic_readiness_gauges(
         .split(area);
     let fast_percent = layer_readiness_percent(&summary.fast);
     let quality_percent = layer_readiness_percent(&summary.quality);
+    let fast_pending_percent = fast_pending_percent(summary);
     let pending_percent = quality_job_percent(summary, QualityJobMetric::Pending);
     let running_percent = quality_job_percent(summary, QualityJobMetric::Running);
     let fast_gauge = Gauge::default()
@@ -2431,14 +2432,8 @@ fn render_semantic_readiness_gauges(
         ));
     frame.render_widget(fast_gauge, chunks[0]);
     frame.render_widget(quality_gauge, chunks[1]);
-    render_quality_job_sparkline(
-        frame,
-        chunks[2],
-        "Pending Jobs",
-        pending_percent,
-        StatusTone::Warning,
-    );
-    render_quality_job_sparkline(
+    render_pending_job_sparklines(frame, chunks[2], fast_pending_percent, pending_percent);
+    render_job_sparkline(
         frame,
         chunks[3],
         "Running Jobs",
@@ -2447,7 +2442,33 @@ fn render_semantic_readiness_gauges(
     );
 }
 
-fn render_quality_job_sparkline(
+fn render_pending_job_sparklines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    fast_percent: u16,
+    quality_percent: u16,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_job_sparkline(
+        frame,
+        chunks[0],
+        "Fast Pend",
+        fast_percent,
+        StatusTone::Warning,
+    );
+    render_job_sparkline(
+        frame,
+        chunks[1],
+        "Quality Pend",
+        quality_percent,
+        StatusTone::Warning,
+    );
+}
+
+fn render_job_sparkline(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     title: &'static str,
@@ -2470,6 +2491,14 @@ fn render_quality_job_sparkline(
 fn sparkline_percent_data(percent: u16, width: u16) -> Vec<u64> {
     let width = usize::from(width.max(1));
     vec![u64::from(percent.min(100)); width]
+}
+
+fn fast_pending_percent(summary: &SemanticStatusSummary) -> u16 {
+    let pending_chunks = summary
+        .fast
+        .expected_chunks
+        .saturating_sub(summary.fast.total_chunks);
+    layer_count_percent(pending_chunks, summary.fast.expected_chunks)
 }
 
 #[derive(Clone, Copy)]
@@ -7727,6 +7756,7 @@ mod tests {
         app.view = View::Indexing;
         app.semantic_status.fast.current_chunks = 2;
         app.semantic_status.fast.expected_chunks = 4;
+        app.semantic_status.fast.total_chunks = 3;
         app.semantic_status.quality.current_chunks = 1;
         app.semantic_status.quality.expected_chunks = 4;
         app.semantic_status.quality_status = SemanticLayerStatus::QualityPending;
@@ -7752,7 +7782,8 @@ mod tests {
         assert!(rendered.contains("Quality Readiness"));
         assert!(rendered.contains("fast_ready 2/4 50%"));
         assert!(rendered.contains("quality_ready 1/4 25%"));
-        assert!(rendered.contains("Pending Jobs 50%"));
+        assert!(rendered.contains("Fast Pend 25%"));
+        assert!(rendered.contains("Quality Pend 50%"));
         assert!(rendered.contains("Running Jobs 25%"));
         let buffer = terminal.backend().buffer();
         assert_ne!(
