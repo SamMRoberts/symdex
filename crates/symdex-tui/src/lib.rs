@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 pub(crate) use navigation::{IndexMode, ManualIndexRequest, Screen, UiAction, reduce_screen};
@@ -52,6 +52,10 @@ use symdex_watch::WatcherStatus;
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
 
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WATCHER_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const INDEX_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
 pub struct TuiOptions {
     pub repo: String,
 }
@@ -91,6 +95,8 @@ pub struct App {
     graph: GraphBrowserState,
     evidence: EvidenceViewerState,
     last_error: Option<String>,
+    last_watcher_status_refresh: Option<Instant>,
+    last_index_status_refresh: Option<Instant>,
     index_receiver: Option<Receiver<IndexJobMessage>>,
     continuous_receiver: Option<Receiver<ContinuousIndexMessage>>,
     continuous_stop: Option<Arc<AtomicBool>>,
@@ -136,6 +142,7 @@ impl App {
             .cross_store_health_summary(root.id(), &embed_config.model)
             .map_err(|error| error.to_string())?;
         let semantic_status = run_semantic_status(repo)?;
+        let now = Instant::now();
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -173,6 +180,8 @@ impl App {
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
             last_error: None,
+            last_watcher_status_refresh: Some(now),
+            last_index_status_refresh: Some(now),
             index_receiver: None,
             continuous_receiver: None,
             continuous_stop: None,
@@ -201,6 +210,7 @@ impl App {
             semantic_neighborhood_summary_from_status(&repository_id, &status);
         let cross_store_health = cross_store_health_summary_from_status(&repository_id, &status);
         let semantic_status = semantic_status_summary_from_status(&repository_id, &status);
+        let now = Instant::now();
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -237,6 +247,8 @@ impl App {
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
             last_error: None,
+            last_watcher_status_refresh: Some(now),
+            last_index_status_refresh: Some(now),
             index_receiver: None,
             continuous_receiver: None,
             continuous_stop: None,
@@ -614,6 +626,41 @@ impl App {
         Ok(())
     }
 
+    fn refresh_index_status(&mut self) -> Result<(), String> {
+        let store_config = StoreConfig::from_env();
+        let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+        sqlite.migrate().map_err(|error| error.to_string())?;
+        self.status = sqlite
+            .repository_status(&self.repository_id)
+            .map_err(|error| error.to_string())?;
+        self.refresh_semantic_status()?;
+        self.storage.explorer = match run_storage_explorer(&self.repo_input) {
+            Ok(summary) => StorageStatus::Completed(summary),
+            Err(error) => StorageStatus::Failed(error),
+        };
+        self.storage.coverage = match run_index_coverage(&self.repo_input) {
+            Ok(summary) => CoverageStatus::Completed(summary),
+            Err(error) => CoverageStatus::Failed(error),
+        };
+        self.storage.embeddings = match run_embedding_coverage(&self.repo_input) {
+            Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
+            Err(error) => EmbeddingCoverageStatus::Failed(error),
+        };
+        self.storage.runs = match run_index_runs_timeline(&self.repo_input) {
+            Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
+            Err(error) => IndexRunsTimelineStatus::Failed(error),
+        };
+        self.storage.freshness = match run_freshness_report(&self.repo_input, None) {
+            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
+            Err(error) => FreshnessStatus::Failed(error),
+        };
+        self.storage.health = match run_cross_store_health(&self.repo_input) {
+            Ok(summary) => CrossStoreHealthStatus::Completed(summary),
+            Err(error) => CrossStoreHealthStatus::Failed(error),
+        };
+        Ok(())
+    }
+
     fn refresh_semantic_status(&mut self) -> Result<(), String> {
         self.semantic_status = run_semantic_status(&self.repo_input)?;
         Ok(())
@@ -817,6 +864,8 @@ impl App {
 
         if let Err(error) = self.refresh_status() {
             self.message = format!("Refresh failed: {error}");
+        } else {
+            self.last_index_status_refresh = Some(Instant::now());
         }
     }
 
@@ -824,6 +873,22 @@ impl App {
         if self.continuous.is_on() {
             self.animation_tick = self.animation_tick.wrapping_add(1);
         }
+    }
+
+    fn watcher_status_refresh_due(&self, now: Instant) -> bool {
+        refresh_due(
+            self.last_watcher_status_refresh,
+            now,
+            WATCHER_STATUS_REFRESH_INTERVAL,
+        )
+    }
+
+    fn index_status_refresh_due(&self, now: Instant) -> bool {
+        refresh_due(
+            self.last_index_status_refresh,
+            now,
+            INDEX_STATUS_REFRESH_INTERVAL,
+        )
     }
 
     fn continuous_activity_span(&self) -> Option<Span<'static>> {
@@ -1057,6 +1122,7 @@ impl App {
         match symdex_watch::start_daemon(&self.repo_input) {
             Ok(status) => {
                 self.apply_watcher_status(&status);
+                self.last_watcher_status_refresh = Some(Instant::now());
                 self.message = "Continuous indexing watcher attached.".to_owned();
             }
             Err(error) => {
@@ -1073,6 +1139,7 @@ impl App {
         match symdex_watch::stop_daemon(&self.repo_input) {
             Ok(status) => {
                 self.apply_watcher_status(&status);
+                self.last_watcher_status_refresh = Some(Instant::now());
                 self.message = "Continuous indexing stopped.".to_owned();
             }
             Err(error) => {
@@ -1238,6 +1305,7 @@ impl App {
                     self.message =
                         format!("Indexing completed, but status refresh failed: {error}");
                 } else {
+                    self.last_index_status_refresh = Some(Instant::now());
                     self.message = completed_message;
                 }
             }
@@ -1260,8 +1328,12 @@ impl App {
 
     fn poll_continuous_index(&mut self) {
         let Some(receiver) = &self.continuous_receiver else {
-            if let Ok(status) = symdex_watch::status(&self.repo_input) {
-                self.apply_watcher_status(&status);
+            let now = Instant::now();
+            if self.watcher_status_refresh_due(now) {
+                self.last_watcher_status_refresh = Some(now);
+                if let Ok(status) = symdex_watch::status(&self.repo_input) {
+                    self.apply_watcher_status(&status);
+                }
             }
             return;
         };
@@ -1298,6 +1370,20 @@ impl App {
                     self.message = "Continuous indexing failed.".to_owned();
                 }
             }
+        }
+    }
+
+    fn refresh_index_status_on_interval(&mut self) {
+        if self.index_receiver.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if !self.index_status_refresh_due(now) {
+            return;
+        }
+        self.last_index_status_refresh = Some(now);
+        if let Err(error) = self.refresh_index_status() {
+            self.last_error = Some(error);
         }
     }
 
@@ -1352,6 +1438,7 @@ impl App {
                     self.message =
                         format!("Continuous indexing completed, but refresh failed: {error}");
                 } else {
+                    self.last_index_status_refresh = Some(Instant::now());
                     self.message = format!(
                         "Continuous indexing updated {} file events.",
                         changes.event_count()
@@ -2867,18 +2954,25 @@ fn scroll_viewport_rows(area: Rect) -> usize {
     usize::from(area.height.saturating_sub(3).max(1))
 }
 
+fn refresh_due(last_refresh: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    last_refresh
+        .map(|last_refresh| now.duration_since(last_refresh) >= interval)
+        .unwrap_or(true)
+}
+
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), String> {
     let mut app = app;
     loop {
         app.tick_animation();
         app.poll_index_job();
         app.poll_continuous_index();
+        app.refresh_index_status_on_interval();
         app.poll_diagnostics();
         app.poll_query();
         app.poll_graph();
         app.poll_evidence();
         render(terminal, &app)?;
-        if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
+        if !event::poll(EVENT_POLL_INTERVAL).map_err(|error| error.to_string())? {
             continue;
         }
         let Event::Key(key) = event::read().map_err(|error| error.to_string())? else {
@@ -6498,6 +6592,8 @@ impl ContinuousIndexStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -6527,9 +6623,10 @@ mod tests {
 
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
-        GraphStatus, IndexMode, ManualIndexRequest, QueryStatus, Screen, StorageExplorerState,
-        StorageMode, UiAction, View, continuous_activity_frame, layer_count_percent,
-        layer_readiness_percent, parse_call_path_input, progress_percent, reduce_screen, render,
+        GraphStatus, INDEX_STATUS_REFRESH_INTERVAL, IndexMode, ManualIndexRequest, QueryStatus,
+        Screen, StorageExplorerState, StorageMode, UiAction, View, WATCHER_STATUS_REFRESH_INTERVAL,
+        continuous_activity_frame, layer_count_percent, layer_readiness_percent,
+        parse_call_path_input, progress_percent, reduce_screen, render,
     };
 
     #[test]
@@ -8049,6 +8146,36 @@ mod tests {
             cell_fg_for_text(buffer, "pending", None),
             Some(Color::Yellow)
         );
+    }
+
+    #[test]
+    fn index_status_refresh_uses_interval() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let now = Instant::now();
+
+        app.last_index_status_refresh = None;
+        assert!(app.index_status_refresh_due(now));
+
+        app.last_index_status_refresh = Some(now - INDEX_STATUS_REFRESH_INTERVAL);
+        assert!(app.index_status_refresh_due(now));
+
+        app.last_index_status_refresh = Some(now);
+        assert!(!app.index_status_refresh_due(now));
+    }
+
+    #[test]
+    fn watcher_status_refresh_uses_shorter_interval() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let now = Instant::now();
+
+        app.last_watcher_status_refresh = None;
+        assert!(app.watcher_status_refresh_due(now));
+
+        app.last_watcher_status_refresh = Some(now - WATCHER_STATUS_REFRESH_INTERVAL);
+        assert!(app.watcher_status_refresh_due(now));
+
+        app.last_watcher_status_refresh = Some(now);
+        assert!(!app.watcher_status_refresh_due(now));
     }
 
     #[test]

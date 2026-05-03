@@ -409,6 +409,9 @@ represent the indexed repository.
   total expected chunk count.
 - Start or attach the single background watcher when `symdex tui [repo]`
   launches.
+- Poll shared watcher status and index readiness on a short interval so the
+  Index tab stays current even though the watcher daemon owns continuous
+  indexing outside the TUI process.
 - Offer continuous indexing as a toggleable mode so users can stop and restart
   the repository watcher during the TUI session.
 - When continuous indexing is on, modified or newly created eligible files are

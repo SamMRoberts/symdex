@@ -101,6 +101,9 @@ outputs to distinguish these states:
   already completed index updates intact.
 - The status row should show the latest watch event, latest reindexed file,
   pending debounce state, current indexing state, and any error.
+- Because the shared watcher daemon owns continuous indexing, the TUI should
+  refresh watcher status and semantic/index readiness from shared state on an
+  interval rather than relying only on in-process events.
 - Continuous indexing must not block query, storage, or diagnostics views.
 - Manual indexing should remain available while continuous mode is off.
 - If a manual indexing job is running, continuous indexing should queue or
