@@ -3922,7 +3922,7 @@ mod tests {
             "repo",
             "quality",
             "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
-            "nomic-embed-text-v2-moe".to_owned(),
+            "mxbai-embed-large".to_owned(),
             false,
             vec![expected_point(
                 "point-quality",
@@ -4410,6 +4410,7 @@ mod tests {
             quality_batch_size: 4,
             quality_workers: 1,
             max_chunk_bytes: 32_768,
+            quality_max_chunk_bytes: 512,
         }
     }
 

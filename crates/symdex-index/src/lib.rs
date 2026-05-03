@@ -371,6 +371,7 @@ fn run_quality_index_limited_with_progress(
 
     let quality_config = layered_embed_config.quality_embed_config();
     let quality_model = quality_config.model.clone();
+    let quality_max_chunk_bytes = quality_config.max_chunk_bytes;
     let vector_table = vector_table_name(root.id(), &quality_model);
     let embed_client = OllamaClient::new(quality_config).map_err(|error| error.to_string())?;
     if !embed_client
@@ -441,6 +442,7 @@ fn run_quality_index_limited_with_progress(
                     embed_client: &embed_client,
                     latest_generation_id: &generation.id,
                     quality_model: &quality_model,
+                    quality_max_chunk_bytes,
                     vector_table: &vector_table,
                 },
                 &mut sqlite,
@@ -1982,6 +1984,7 @@ struct QualityWorkerContext<'a> {
     embed_client: &'a OllamaClient,
     latest_generation_id: &'a str,
     quality_model: &'a str,
+    quality_max_chunk_bytes: usize,
     vector_table: &'a str,
 }
 
@@ -1993,7 +1996,12 @@ fn process_quality_job(
     row: QualityJobSourceRow,
 ) -> Result<(), String> {
     let completed_at = current_timestamp();
-    let prepared = match prepare_quality_job(context.root, context.latest_generation_id, &row) {
+    let prepared = match prepare_quality_job(
+        context.root,
+        context.latest_generation_id,
+        context.quality_max_chunk_bytes,
+        &row,
+    ) {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
             sqlite
@@ -2183,6 +2191,7 @@ struct PreparedQualityJob {
 fn prepare_quality_job(
     root: &RepoRoot,
     latest_generation_id: &str,
+    max_chunk_bytes: usize,
     row: &QualityJobSourceRow,
 ) -> Result<Option<PreparedQualityJob>, String> {
     if row.job.generation_id != latest_generation_id {
@@ -2199,6 +2208,9 @@ fn prepare_quality_job(
         return Ok(None);
     };
     if start_byte >= end_byte {
+        return Ok(None);
+    }
+    if end_byte.saturating_sub(start_byte) > max_chunk_bytes {
         return Ok(None);
     }
     let normalized = NormalizedRepoPath::new(&row.job.path).map_err(|error| error.to_string())?;
@@ -2708,7 +2720,7 @@ mod tests {
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
         let row = sample_quality_source_row(source, 0, source.len(), None);
 
-        let prepared = prepare_quality_job(&root, "generation-1", &row)
+        let prepared = prepare_quality_job(&root, "generation-1", source.len(), &row)
             .expect("prepare should not fail")
             .expect("job should be current");
 
@@ -2727,13 +2739,28 @@ mod tests {
         stale_hash.job.text_hash = "stale-text".to_owned();
 
         assert!(
-            prepare_quality_job(&root, "generation-1", &excluded)
+            prepare_quality_job(&root, "generation-1", source.len(), &excluded)
                 .expect("excluded should not fail")
                 .is_none()
         );
         assert!(
-            prepare_quality_job(&root, "generation-1", &stale_hash)
+            prepare_quality_job(&root, "generation-1", source.len(), &stale_hash)
                 .expect("stale should not fail")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prepare_quality_job_skips_chunks_over_quality_size_limit() {
+        let repo = TestRepo::new("quality-prepare-too-large");
+        let source = "pub fn public() {}\n";
+        repo.write("src/lib.rs", source);
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let row = sample_quality_source_row(source, 0, source.len(), None);
+
+        assert!(
+            prepare_quality_job(&root, "generation-1", 8, &row)
+                .expect("oversized quality job should not fail")
                 .is_none()
         );
     }
@@ -2746,7 +2773,7 @@ mod tests {
             "repo",
             &row,
             vec![0.1, 0.2, 0.3],
-            "nomic-embed-text-v2-moe",
+            "mxbai-embed-large",
             3,
             "700",
         )
@@ -2754,7 +2781,7 @@ mod tests {
         let embedding = quality_chunk_embedding_record(
             "repo",
             &row,
-            "nomic-embed-text-v2-moe",
+            "mxbai-embed-large",
             3,
             "symdex_repo_nomic_embed_text_v2_moe",
             &point.id,
@@ -2764,7 +2791,7 @@ mod tests {
         assert_eq!(point.payload.path, "src/lib.rs");
         assert_eq!(
             point.payload.embedding_model.as_deref(),
-            Some("nomic-embed-text-v2-moe")
+            Some("mxbai-embed-large")
         );
         assert_eq!(point.payload.embedding_dimension, Some(3));
         assert_eq!(

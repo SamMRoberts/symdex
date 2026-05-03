@@ -21,7 +21,7 @@ enabled, modified or newly created eligible files are automatically reindexed.
   manual semantic indexing.
 - When layered semantic indexing is enabled, continuous indexing must update the
   fast `nomic-embed-text` layer synchronously and queue the quality
-  `nomic-embed-text-v2-moe` layer as deferred work.
+  `mxbai-embed-large` layer as deferred work.
 - Continuous indexing must not wait for quality indexing before returning to
   watch mode.
 
@@ -68,7 +68,7 @@ The quality layer must be treated as eventual precision work:
 quality queue
   -> background worker
   -> verify hashes
-  -> embed with nomic-embed-text-v2-moe
+  -> embed with mxbai-embed-large
   -> quality sqlite-vec upsert
   -> activate quality only after complete/current
 ```

@@ -22,7 +22,7 @@ This backlog is specific to the `quality-index` branch. It supplements
   `quality_failed` states.
 - [x] Add layer-specific model configuration with defaults:
   - fast: `nomic-embed-text`
-  - quality: `nomic-embed-text-v2-moe`
+  - quality: `mxbai-embed-large`
 - [x] Preserve current `SYMDEX_EMBED_MODEL` behavior for compatibility.
 - [x] Add tests for config defaults, env overrides, and status transitions.
 
@@ -76,7 +76,7 @@ This backlog is specific to the `quality-index` branch. It supplements
 ## Phase Q8 — Continuous indexing integration
 
 - [x] Ensure watch batches update fast synchronously and queue quality work.
-- [x] Ensure watch batches do not wait for `nomic-embed-text-v2-moe`.
+- [x] Ensure watch batches do not wait for `mxbai-embed-large`.
 - [x] Mark quality stale on changed/deleted embeddable chunks.
 - [x] Add optional background quality worker behavior for watch mode.
 - [x] Surface fast/quality state in watch events and TUI state.

@@ -3045,9 +3045,9 @@ fn semantic_status_summary_from_status(
         },
         quality: SemanticStatusLayerSummary {
             semantic_layer: SemanticLayer::Quality,
-            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
+            embedding_model: "mxbai-embed-large".to_owned(),
             embedding_dimension: None,
-            vector_table: vector_table_name(repository_id, "nomic-embed-text-v2-moe"),
+            vector_table: vector_table_name(repository_id, "mxbai-embed-large"),
             current_chunks: 0,
             stale_chunks: 0,
             blocked_chunks: 0,
@@ -7915,7 +7915,7 @@ mod tests {
             summary: Box::new(symdex_index::QualityIndexSummary {
                 repository_id: "repo".to_owned(),
                 generation_id: "generation-1".to_owned(),
-                quality_model: "nomic-embed-text-v2-moe".to_owned(),
+                quality_model: "mxbai-embed-large".to_owned(),
                 quality_dimension: Some(768),
                 vector_table: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
                 claimed_jobs: 1,

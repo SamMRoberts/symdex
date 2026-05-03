@@ -8,12 +8,13 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_FAST_EMBED_MODEL: &str = "nomic-embed-text";
-pub const DEFAULT_QUALITY_EMBED_MODEL: &str = "nomic-embed-text-v2-moe";
+pub const DEFAULT_QUALITY_EMBED_MODEL: &str = "mxbai-embed-large";
 pub const DEFAULT_EMBED_TRUNCATE: bool = true;
 pub const DEFAULT_EMBED_BATCH_SIZE: usize = 16;
 pub const DEFAULT_QUALITY_EMBED_BATCH_SIZE: usize = 16;
 pub const DEFAULT_QUALITY_EMBED_WORKERS: usize = 1;
-pub const DEFAULT_EMBED_MAX_CHUNK_BYTES: usize = 8 * 1024;
+pub const DEFAULT_EMBED_MAX_CHUNK_BYTES: usize = 2 * 1024;
+pub const DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbedConfigValues<'a> {
@@ -84,6 +85,7 @@ pub struct LayeredEmbedConfig {
     pub quality_batch_size: usize,
     pub quality_workers: usize,
     pub max_chunk_bytes: usize,
+    pub quality_max_chunk_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -98,6 +100,7 @@ pub struct LayeredEmbedConfigValues<'a> {
     pub quality_batch_size: Option<&'a str>,
     pub quality_workers: Option<&'a str>,
     pub max_chunk_bytes: Option<&'a str>,
+    pub quality_max_chunk_bytes: Option<&'a str>,
 }
 
 impl LayeredEmbedConfig {
@@ -116,6 +119,10 @@ impl LayeredEmbedConfig {
             "SYMDEX_EMBED_MAX_CHUNK_BYTES",
             "symdex_EMBED_MAX_CHUNK_BYTES",
         );
+        let quality_max_chunk_bytes = env_value(
+            "SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES",
+            "symdex_QUALITY_EMBED_MAX_CHUNK_BYTES",
+        );
 
         Self::from_values(LayeredEmbedConfigValues {
             ollama_url: ollama_url.as_deref(),
@@ -128,6 +135,7 @@ impl LayeredEmbedConfig {
             quality_batch_size: quality_batch_size.as_deref(),
             quality_workers: quality_workers.as_deref(),
             max_chunk_bytes: max_chunk_bytes.as_deref(),
+            quality_max_chunk_bytes: quality_max_chunk_bytes.as_deref(),
         })
     }
 
@@ -166,6 +174,10 @@ impl LayeredEmbedConfig {
                 .max_chunk_bytes
                 .and_then(env_usize)
                 .unwrap_or(DEFAULT_EMBED_MAX_CHUNK_BYTES),
+            quality_max_chunk_bytes: values
+                .quality_max_chunk_bytes
+                .and_then(env_usize)
+                .unwrap_or(DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES),
         }
     }
 
@@ -185,7 +197,7 @@ impl LayeredEmbedConfig {
             model: self.quality_model.clone(),
             truncate: self.truncate,
             batch_size: self.quality_batch_size,
-            max_chunk_bytes: self.max_chunk_bytes,
+            max_chunk_bytes: self.quality_max_chunk_bytes,
         }
     }
 }
@@ -431,7 +443,7 @@ impl Display for EmbedError {
                     .to_ascii_lowercase()
                     .contains("exceeds the context length")
                 {
-                    " Reduce SYMDEX_EMBED_MAX_CHUNK_BYTES or re-run indexing with the default limit."
+                    " Reduce SYMDEX_EMBED_MAX_CHUNK_BYTES, or SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES for quality indexing, then re-run indexing."
                 } else {
                     ""
                 };
@@ -542,10 +554,11 @@ mod tests {
     use crate::{
         DEFAULT_EMBED_BATCH_SIZE, DEFAULT_EMBED_MAX_CHUNK_BYTES, DEFAULT_EMBED_TRUNCATE,
         DEFAULT_FAST_EMBED_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_QUALITY_EMBED_BATCH_SIZE,
-        DEFAULT_QUALITY_EMBED_MODEL, DEFAULT_QUALITY_EMBED_WORKERS, EmbedConfig, EmbedConfigValues,
-        EmbedError, EmbedRequest, EmbedResponse, LayeredEmbedConfig, LayeredEmbedConfigValues,
-        ModelInfo, OllamaClient, embedding_batch_from_parts, embedding_batch_from_response,
-        env_bool, env_usize, model_available_in,
+        DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES, DEFAULT_QUALITY_EMBED_MODEL,
+        DEFAULT_QUALITY_EMBED_WORKERS, EmbedConfig, EmbedConfigValues, EmbedError, EmbedRequest,
+        EmbedResponse, LayeredEmbedConfig, LayeredEmbedConfigValues, ModelInfo, OllamaClient,
+        embedding_batch_from_parts, embedding_batch_from_response, env_bool, env_usize,
+        model_available_in,
     };
 
     #[test]
@@ -589,6 +602,10 @@ mod tests {
         assert_eq!(config.quality_batch_size, DEFAULT_QUALITY_EMBED_BATCH_SIZE);
         assert_eq!(config.quality_workers, DEFAULT_QUALITY_EMBED_WORKERS);
         assert_eq!(config.max_chunk_bytes, DEFAULT_EMBED_MAX_CHUNK_BYTES);
+        assert_eq!(
+            config.quality_max_chunk_bytes,
+            DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES
+        );
     }
 
     #[test]
@@ -662,6 +679,7 @@ mod tests {
             batch_size: Some("12"),
             quality_batch_size: Some("6"),
             max_chunk_bytes: Some("4096"),
+            quality_max_chunk_bytes: Some("512"),
             ..LayeredEmbedConfigValues::default()
         });
 
@@ -678,7 +696,7 @@ mod tests {
         assert_eq!(quality.model, "layer-quality");
         assert!(!quality.truncate);
         assert_eq!(quality.batch_size, 6);
-        assert_eq!(quality.max_chunk_bytes, 4096);
+        assert_eq!(quality.max_chunk_bytes, 512);
     }
 
     #[test]
@@ -702,6 +720,7 @@ mod tests {
                 .env("SYMDEX_QUALITY_BATCH_SIZE", "7")
                 .env("SYMDEX_QUALITY_WORKERS", "3")
                 .env("SYMDEX_EMBED_MAX_CHUNK_BYTES", "2048")
+                .env("SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES", "512")
                 .output()
                 .expect("child test process should run");
 
@@ -737,6 +756,7 @@ mod tests {
         assert_eq!(layered.quality_batch_size, 7);
         assert_eq!(layered.quality_workers, 3);
         assert_eq!(layered.max_chunk_bytes, 2048);
+        assert_eq!(layered.quality_max_chunk_bytes, 512);
     }
 
     #[test]
@@ -799,7 +819,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Reduce SYMDEX_EMBED_MAX_CHUNK_BYTES")
+                .contains("SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES")
         );
     }
 

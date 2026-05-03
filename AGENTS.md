@@ -29,7 +29,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - sqlite-vec stores dense vectors plus filterable payload fields.
 - Ollama generates local embeddings. The default fast semantic layer uses
   `nomic-embed-text`; the deferred quality semantic layer uses
-  `nomic-embed-text-v2-moe` when configured and available.
+  `mxbai-embed-large` when configured and available.
 - Semantic search must use the fast layer until the quality layer is complete
   and current for the latest fast semantic generation, then route to quality.
 - tree-sitter extracts syntax-aware chunks and symbol boundaries.
@@ -104,7 +104,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   readiness. Treat sqlite-vec collections as projections of embeddable chunks.
 - Fast indexing with `nomic-embed-text` must remain the availability path for
   manual and continuous indexing.
-- Quality indexing with `nomic-embed-text-v2-moe` must run as deferred work and
+- Quality indexing with `mxbai-embed-large` must run as deferred work and
   must not block continuous indexing or normal edit loops.
 - Do not route default semantic search to the quality layer until it is complete
   and current for the latest fast semantic generation.

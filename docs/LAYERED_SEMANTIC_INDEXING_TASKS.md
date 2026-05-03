@@ -16,7 +16,7 @@ Tasks:
   `quality_failed`.
 - Add config helpers for:
   - fast model default: `nomic-embed-text`
-  - quality model default: `nomic-embed-text-v2-moe`
+  - quality model default: `mxbai-embed-large`
   - quality enabled flag
   - quality batch size
   - quality worker count
@@ -147,7 +147,7 @@ Tasks:
   - verify file content hash
   - extract chunk text by byte range
   - verify chunk text hash
-  - embed with `nomic-embed-text-v2-moe`
+  - embed with `mxbai-embed-large`
   - upsert quality sqlite-vec point
   - write `chunk_embeddings` row for quality
   - mark job succeeded or failed
@@ -202,7 +202,7 @@ after fast watch batches and during idle watch ticks.
 
 Acceptance:
 
-- Continuous indexing does not wait for `nomic-embed-text-v2-moe`.
+- Continuous indexing does not wait for `mxbai-embed-large`.
 - Default search falls back to fast immediately after watched changes.
 - Quality can catch up after edits stop.
 

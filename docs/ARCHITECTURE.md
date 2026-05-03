@@ -93,7 +93,7 @@ Indexing orchestration:
 - compact indexing summaries without source text
 - fast semantic generation creation using `nomic-embed-text`
 - quality semantic job queueing and worker orchestration using
-  `nomic-embed-text-v2-moe`
+  `mxbai-embed-large`
 
 Call core, store, and embed APIs directly. Do not depend on CLI, TUI, or MCP.
 
@@ -128,7 +128,7 @@ Local embedding adapter:
 
 - Ollama HTTP client
 - `nomic-embed-text` model checks
-- `nomic-embed-text-v2-moe` quality model checks when layered indexing is enabled
+- `mxbai-embed-large` quality model checks when layered indexing is enabled
 - batch embedding requests
 - vector dimension discovery
 - retry behavior for transient local service failures
@@ -193,7 +193,7 @@ MCP server:
 - Never let MCP invoke indexing side effects until a write-capable design is approved.
 - Require TUI confirmation before long-running jobs such as indexing.
 - Continuous indexing is an ongoing local job; TUI and CLI entry points must use shared `symdex-index` APIs and must not spawn `symdex` subprocesses.
-- Continuous indexing must not block on `nomic-embed-text-v2-moe`; it should
+- Continuous indexing must not block on `mxbai-embed-large`; it should
   update fast vectors and queue quality work.
 - Keep TUI rendering and event types out of core, store, embed, and MCP crates.
 - Keep storage visualization queries outside `symdex-tui` when they require

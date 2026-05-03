@@ -22,13 +22,14 @@ SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
 SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
-SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
+SYMDEX_QUALITY_EMBED_MODEL=mxbai-embed-large
 SYMDEX_QUALITY_INDEX=1
 SYMDEX_QUALITY_BATCH_SIZE=16
 SYMDEX_QUALITY_WORKERS=1
 SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_EMBED_BATCH_SIZE=16
-SYMDEX_EMBED_MAX_CHUNK_BYTES=8192
+SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
+SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
 SYMDEX_RUST_ANALYZER=0
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
@@ -50,12 +51,13 @@ request payloads while preserving result order.
 
 Layered semantic indexing helpers also recognize `SYMDEX_FAST_EMBED_MODEL`,
 `SYMDEX_QUALITY_EMBED_MODEL`, `SYMDEX_QUALITY_INDEX`,
-`SYMDEX_QUALITY_BATCH_SIZE`, and `SYMDEX_QUALITY_WORKERS`. The fast model
-defaults to `nomic-embed-text`; the quality model defaults to
-`nomic-embed-text-v2-moe`. `SYMDEX_EMBED_MODEL` remains the compatibility
-setting for the current single-model path and is used as the fast-model fallback
-when `SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality
-jobs when quality indexing is enabled and the quality model is available.
+`SYMDEX_QUALITY_BATCH_SIZE`, `SYMDEX_QUALITY_WORKERS`, and
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES`. The fast model defaults to
+`nomic-embed-text`; the quality model defaults to `mxbai-embed-large`.
+`SYMDEX_EMBED_MODEL` remains the compatibility setting for the current
+single-model path and is used as the fast-model fallback when
+`SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality jobs
+when quality indexing is enabled and the quality model is available.
 `symdex index-quality <repo>` manually drains those queued jobs in bounded
 batches, then reports whether SQLite activation made quality the active layer or
 kept default search on fast. `symdex index --watch <repo>` also performs
@@ -63,9 +65,11 @@ cooperative quality catch-up in semantic watch mode when quality indexing is
 enabled, processing bounded quality batches during post-batch and idle watch
 ticks.
 
-`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `8192`. Chunks larger than this are
-persisted as metadata-only structural evidence with
-`chunk_too_large_for_embedding` and are not sent to Ollama.
+`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `2048` for fast indexing.
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` defaults to `512` for quality indexing.
+Chunks larger than the active layer limit are persisted as metadata-only
+structural evidence with `chunk_too_large_for_embedding` and are not sent to
+Ollama.
 
 ## Expected commands
 

@@ -8,7 +8,7 @@ fast layer is the availability path. The quality layer is the eventual precision
 path.
 
 This design keeps continuous indexing responsive by using `nomic-embed-text` for
-synchronous fast indexing and `nomic-embed-text-v2-moe` for deferred quality
+synchronous fast indexing and `mxbai-embed-large` for deferred quality
 indexing.
 
 ## Goals
@@ -30,7 +30,7 @@ indexing.
 
 - Do not merge raw scores from fast and quality models by default.
 - Do not use partial quality results for default semantic search.
-- Do not make `nomic-embed-text-v2-moe` mandatory for normal indexing.
+- Do not make `mxbai-embed-large` mandatory for normal indexing.
 - Do not block continuous indexing on quality embedding work.
 - Do not store source text in sqlite-vec payloads or long-lived quality job rows.
 - Do not execute indexed repository code.
@@ -40,7 +40,7 @@ indexing.
 | Layer | Model | Timing | Role |
 |---|---|---|---|
 | `fast` | `nomic-embed-text` | synchronous | availability, broad recall, continuous indexing |
-| `quality` | `nomic-embed-text-v2-moe` | deferred/background | higher precision semantic search |
+| `quality` | `mxbai-embed-large` | deferred/background | higher precision semantic search |
 
 The fast layer must be updated during normal semantic indexing. The quality
 layer must be built from the latest SQLite structural facts and verified source
@@ -157,7 +157,7 @@ evidence rather than quality-backed evidence.
 The quality layer may become active only when all of the following are true:
 
 - The quality generation ID matches the latest completed fast generation ID.
-- The quality embedding model is `nomic-embed-text-v2-moe` unless explicitly
+- The quality embedding model is `mxbai-embed-large` unless explicitly
   overridden by configuration.
 - The quality vector dimension is known and stable for that model/collection.
 - Every current embeddable chunk has a current quality embedding row.
@@ -227,7 +227,7 @@ When a file changes:
    no longer current.
 5. Mark stale quality jobs and embeddings for changed/deleted chunks.
 6. Queue replacement quality jobs.
-7. Do not wait for `nomic-embed-text-v2-moe`.
+7. Do not wait for `mxbai-embed-large`.
 
 This keeps continuous indexing latency bounded by the fast layer and structural
 work. Quality indexing may lag behind active edits.
@@ -260,7 +260,7 @@ while enabled:
     verify file content hash still matches the queued job
     extract chunk text from stored byte range
     verify chunk text hash still matches the queued job
-    embed with nomic-embed-text-v2-moe
+    embed with mxbai-embed-large
     upsert into quality sqlite-vec collection
     record chunk_embeddings row for the quality layer
     mark job succeeded
@@ -470,7 +470,7 @@ Recommended defaults:
 
 ```text
 fast model: nomic-embed-text
-quality model: nomic-embed-text-v2-moe
+quality model: mxbai-embed-large
 quality indexing: enabled when model is available, otherwise blocked/degraded
 quality workers: 1
 quality batch size: small, e.g. 8-16 chunks
@@ -481,7 +481,7 @@ Suggested environment variables:
 
 ```text
 SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
-SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
+SYMDEX_QUALITY_EMBED_MODEL=mxbai-embed-large
 SYMDEX_QUALITY_INDEX=1
 SYMDEX_QUALITY_BATCH_SIZE=16
 SYMDEX_QUALITY_WORKERS=1
@@ -492,7 +492,7 @@ layered runtime paths are fully implemented. The compatibility variable remains
 the current single-model setting and the fallback for the fast model when
 `SYMDEX_FAST_EMBED_MODEL` is unset. The quality model is configured separately
 through `SYMDEX_QUALITY_EMBED_MODEL` and defaults to
-`nomic-embed-text-v2-moe`. Avoid breaking existing single-model workflows during
+`mxbai-embed-large`. Avoid breaking existing single-model workflows during
 the migration.
 
 ## CLI and TUI surface

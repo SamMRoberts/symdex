@@ -5857,16 +5857,11 @@ mod tests {
         job.id = SqliteStore::quality_embedding_job_id("repo", "generation-1", "chunk-1");
 
         let first = store
-            .queue_quality_embedding_jobs(
-                &generation,
-                "nomic-embed-text-v2-moe",
-                &[job.clone()],
-                "200",
-            )
+            .queue_quality_embedding_jobs(&generation, "mxbai-embed-large", &[job.clone()], "200")
             .expect("quality jobs should queue");
         job.updated_at = "201".to_owned();
         let second = store
-            .queue_quality_embedding_jobs(&generation, "nomic-embed-text-v2-moe", &[job], "201")
+            .queue_quality_embedding_jobs(&generation, "mxbai-embed-large", &[job], "201")
             .expect("quality jobs should upsert idempotently");
 
         assert_eq!(first.queued_jobs, 1);
@@ -5884,7 +5879,7 @@ mod tests {
         assert_eq!(generation.quality_status, "quality_pending");
         assert_eq!(
             generation.quality_model.as_deref(),
-            Some("nomic-embed-text-v2-moe")
+            Some("mxbai-embed-large")
         );
         assert_eq!(generation.quality_dimension, None);
         assert_eq!(generation.active_layer, "fast");
@@ -6005,7 +6000,7 @@ mod tests {
             .expect("generation should persist");
 
         let summary = store
-            .mark_quality_generation_blocked(&generation, "nomic-embed-text-v2-moe", "400")
+            .mark_quality_generation_blocked(&generation, "mxbai-embed-large", "400")
             .expect("generation should be marked blocked");
 
         assert_eq!(summary.quality_status, SemanticLayerStatus::QualityBlocked);
@@ -6024,7 +6019,7 @@ mod tests {
         assert_eq!(generation.quality_status, "quality_blocked");
         assert_eq!(
             generation.quality_model.as_deref(),
-            Some("nomic-embed-text-v2-moe")
+            Some("mxbai-embed-large")
         );
         assert_eq!(generation.quality_dimension, None);
         assert_eq!(generation.active_layer, "fast");
@@ -6233,7 +6228,7 @@ mod tests {
             .quality_embedding_jobs_for_fast_generation(
                 "repo",
                 "generation-1",
-                "nomic-embed-text-v2-moe",
+                "mxbai-embed-large",
                 "500",
             )
             .expect("quality jobs should load");
@@ -6292,14 +6287,14 @@ mod tests {
             .carry_forward_quality_embeddings_for_fast_generation(
                 "repo",
                 "generation-2",
-                "nomic-embed-text-v2-moe",
+                "mxbai-embed-large",
             )
             .expect("quality embeddings should carry forward");
         let jobs = store
             .quality_embedding_jobs_for_fast_generation(
                 "repo",
                 "generation-2",
-                "nomic-embed-text-v2-moe",
+                "mxbai-embed-large",
                 "500",
             )
             .expect("quality jobs should load");
@@ -6542,14 +6537,14 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                vector_table: "nomic-embed-text-v2-moe",
+                vector_table: "mxbai-embed-large",
                 upserted_embeddings: &fast_manifest,
                 files_seen: 1,
                 completed_at: "100",
             })
             .expect("generation should be recorded");
         let mut quality_generation = generation.clone();
-        quality_generation.quality_model = Some("nomic-embed-text-v2-moe".to_owned());
+        quality_generation.quality_model = Some("mxbai-embed-large".to_owned());
         quality_generation.quality_dimension = Some(768);
         quality_generation.quality_status = "quality_pending".to_owned();
         store
@@ -6570,7 +6565,7 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                vector_table: "nomic-embed-text-v2-moe",
+                vector_table: "mxbai-embed-large",
                 upserted_embeddings: &fast_manifest,
                 files_seen: 1,
                 completed_at: "800",
@@ -6683,7 +6678,7 @@ mod tests {
         let quality = summary.quality.expect("quality summary should exist");
         assert_eq!(summary.active_layer, SemanticLayer::Quality);
         assert_eq!(summary.quality_status, SemanticLayerStatus::QualityReady);
-        assert_eq!(quality.embedding_model, "nomic-embed-text-v2-moe");
+        assert_eq!(quality.embedding_model, "mxbai-embed-large");
         assert_eq!(quality.vector_table, "symdex_repo_nomic_embed_text_v2_moe");
         assert_eq!(quality.current_chunks, 1);
         assert!(quality.is_complete);
@@ -7155,7 +7150,7 @@ mod tests {
         assert_eq!(quality.len(), 1);
         assert_eq!(
             quality[0].embedding_model.as_deref(),
-            Some("nomic-embed-text-v2-moe")
+            Some("mxbai-embed-large")
         );
         assert_eq!(
             quality[0].vector_point_id,
@@ -8534,7 +8529,7 @@ mod tests {
             fast_model: "nomic-embed-text".to_owned(),
             fast_dimension: 768,
             fast_completed_at: "100".to_owned(),
-            quality_model: Some("nomic-embed-text-v2-moe".to_owned()),
+            quality_model: Some("mxbai-embed-large".to_owned()),
             quality_dimension: Some(768),
             quality_status: "quality_pending".to_owned(),
             quality_started_at: None,
@@ -8620,7 +8615,7 @@ mod tests {
         ChunkEmbeddingRecord {
             id: format!("quality-embedding-{status}"),
             semantic_layer: "quality".to_owned(),
-            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
+            embedding_model: "mxbai-embed-large".to_owned(),
             vector_table: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
             vector_point_id: "01234567-89ab-cdef-fedc-ba9876543211".to_owned(),
             status: status.to_owned(),
