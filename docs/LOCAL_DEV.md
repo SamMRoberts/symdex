@@ -222,7 +222,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   active workflow on other tabs. Use `Tab` / `Shift+Tab` on the Index tab to
   select full or incremental scope (default incremental), `o` to confirm
   offline indexing, `s` to confirm semantic indexing, `c` to toggle continuous
-  indexing, and inspect fast/quality readiness progress bars. Use `[` / `]` to
+  indexing, and inspect fast/quality readiness progress bars plus quality
+  pending/running job sparklines. Use `[` / `]` to
   move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
   tabs, and `Tab` / `Shift+Tab` to toggle view-local
   modes including impact, call-path, context-pack, and debug-context evidence
