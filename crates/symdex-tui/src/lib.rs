@@ -146,7 +146,7 @@ impl App {
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
-            index_scope: IndexScope::Full,
+            index_scope: IndexScope::Incremental,
             last_index_summary: None,
             index_progress: None,
             animation_tick: 0,
@@ -210,7 +210,7 @@ impl App {
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
-            index_scope: IndexScope::Full,
+            index_scope: IndexScope::Incremental,
             last_index_summary: None,
             index_progress: None,
             animation_tick: 0,
@@ -6187,13 +6187,14 @@ mod tests {
     fn tab_toggles_index_scope_on_indexing_view() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
-        app.index_scope = IndexScope::Full;
+
+        assert_eq!(app.index_scope, IndexScope::Incremental);
 
         assert!(!app.handle_key(KeyCode::Tab));
 
         assert_eq!(app.view, View::Indexing);
-        assert_eq!(app.index_scope, IndexScope::Incremental);
-        assert_eq!(app.message, "Index scope set to incremental.");
+        assert_eq!(app.index_scope, IndexScope::Full);
+        assert_eq!(app.message, "Index scope set to full.");
     }
 
     #[test]

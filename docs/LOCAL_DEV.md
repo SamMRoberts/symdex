@@ -220,13 +220,14 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   opens an Overview tab backed by SQLite metadata and local service
   configuration, then uses a compact repository summary beside or above the
   active workflow on other tabs. Use `Tab` / `Shift+Tab` on the Index tab to
-  select full or incremental scope, `o` to confirm offline indexing, `s` to
-  confirm semantic indexing, `c` to toggle continuous indexing, `[` / `]` to
-  move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
-  tabs, and `Tab` / `Shift+Tab` to toggle view-local modes including impact,
-  call-path, context-pack, and debug-context evidence modes. In the Doctor tab,
-  `Enter` starts diagnostics when no result rows are available, and `r` reruns
-  diagnostics after a completed or failed run. The storage
+  select full or incremental scope (default incremental), `o` to confirm
+  offline indexing, `s` to confirm semantic indexing, `c` to toggle continuous
+  indexing, `[` / `]` to move between the Overview, Index, Storage, Doctor,
+  Query, Calls, and Impact tabs, and `Tab` / `Shift+Tab` to toggle view-local
+  modes including impact, call-path, context-pack, and debug-context evidence
+  modes. In the Doctor tab, `Enter` starts diagnostics when no result rows are
+  available, and `r` reruns diagnostics after a completed or failed run. The
+  storage
   explorer always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs
   timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
