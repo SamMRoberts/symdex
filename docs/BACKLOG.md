@@ -120,6 +120,15 @@
 - [x] TUI toggle state tests.
 - [x] Tests for event coalescing, ignored paths, created-file indexing, modified-file reindexing, and unchanged-content skips.
 
+## Phase 10.5 — Ratatui widget UX improvements
+
+- [ ] Add built-in `Scrollbar` indicators to selectable TUI tables and long metadata detail panes.
+- [ ] Add built-in `BarChart` summaries for real local counts: call-resolution buckets, freshness states, embedding coverage, index-run outcomes, and fast/quality job state counts.
+- [ ] Evaluate `ratatui-textarea` for multiline debug-context input and preserve simple single-line query/call inputs unless textarea behavior is clearly better.
+- [ ] Evaluate `tui-tree-widget` for symbol outline and file hierarchy navigation with path, symbol kind, line range, child count, and status metadata only.
+- [ ] Add render/state tests for any new widget at normal and 80x24 sizes, including keyboard navigation, selected-row visibility, and no source-text rendering.
+- [ ] Defer or avoid `ratatui-image`, `tui-term`, `tui-big-text`, `tui-piechart`, mouse/menu-centric flows, and graph/canvas widgets until a specific design proves they improve evidence review.
+
 ## Phase 11 — Evidence freshness and provenance
 
 - [x] Index provenance schema for files, chunks, symbols, calls, vectors, and index runs.

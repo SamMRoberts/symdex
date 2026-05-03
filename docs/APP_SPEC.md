@@ -71,6 +71,7 @@ symdex serve-mcp
   fast and quality semantic readiness progress, file details, symbol outlines,
   call resolution, embedding coverage, and index runs.
 - TUI storage visualizations are grouped under an always-visible nested storage tab header so users can see the available storage panes while inspecting any one pane.
+- TUI widget choices prefer built-in ratatui widgets first; third-party widgets are limited to clear metadata-first improvements such as tree navigation or multiline debug input.
 - Unresolved or ambiguous relationships are labeled instead of fabricated.
 
 ## Future product directions
