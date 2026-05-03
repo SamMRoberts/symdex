@@ -39,10 +39,10 @@ use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
     CrossStoreHealthSummary, EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance,
     FileCoverageStatus, FileDetailSummary, IndexCoverageSummary, IndexRunTimelineRow,
-    IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
-    SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore, StorageExplorerSummary,
-    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
-    qdrant_collection_name,
+    IndexRunsTimelineSummary, QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
+    SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore,
+    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    SymbolOutlineSummary, qdrant_collection_name,
 };
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
@@ -558,6 +558,7 @@ impl App {
         self.status = sqlite
             .repository_status(&self.repository_id)
             .map_err(|error| error.to_string())?;
+        self.refresh_semantic_status()?;
         self.storage.explorer = match run_storage_explorer(&self.repo_input) {
             Ok(summary) => StorageStatus::Completed(summary),
             Err(error) => StorageStatus::Failed(error),
@@ -596,6 +597,11 @@ impl App {
         };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
+        Ok(())
+    }
+
+    fn refresh_semantic_status(&mut self) -> Result<(), String> {
+        self.semantic_status = run_semantic_status(&self.repo_input)?;
         Ok(())
     }
 
@@ -1283,6 +1289,7 @@ impl App {
             }
             ContinuousIndexEvent::QualityState { state } => {
                 self.continuous.apply_quality_state(&state);
+                self.apply_semantic_quality_state(&state);
                 self.message = format!(
                     "Quality state: {} on {}.",
                     state.quality_status, state.active_layer
@@ -1290,7 +1297,9 @@ impl App {
             }
             ContinuousIndexEvent::QualityStarted { state } => {
                 self.continuous.apply_quality_state(&state);
+                self.apply_semantic_quality_state(&state);
                 self.continuous.latest_quality_error = None;
+                self.semantic_status.latest_quality_error = None;
                 self.message = format!(
                     "Quality catch-up started: {} pending jobs.",
                     state.pending_jobs
@@ -1308,6 +1317,7 @@ impl App {
                 self.continuous.quality_failed_jobs = summary.progress.failed_jobs;
                 self.continuous.quality_stale_jobs = summary.progress.skipped_stale_jobs;
                 self.continuous.latest_quality_error = None;
+                self.apply_semantic_quality_summary(&summary);
                 self.message = format!(
                     "Quality catch-up completed: {} on {}.",
                     summary.quality_status, summary.active_layer
@@ -1316,11 +1326,74 @@ impl App {
             ContinuousIndexEvent::QualityFailed { state, error } => {
                 if let Some(state) = &state {
                     self.continuous.apply_quality_state(state);
+                    self.apply_semantic_quality_state(state);
                 }
-                self.continuous.latest_quality_error = Some(error);
+                self.continuous.latest_quality_error = Some(error.clone());
+                self.semantic_status.latest_quality_error = Some(error);
                 self.message = "Quality catch-up failed.".to_owned();
             }
         }
+    }
+
+    fn apply_semantic_quality_state(&mut self, state: &ContinuousQualityState) {
+        let Ok(active_layer) = SemanticLayer::parse(&state.active_layer) else {
+            return;
+        };
+        let Ok(quality_status) = SemanticLayerStatus::parse(&state.quality_status) else {
+            return;
+        };
+        let quality_progress = QualityGenerationProgress {
+            repository_id: state.repository_id.clone(),
+            generation_id: state.generation_id.clone(),
+            embeddable_chunks: state.embeddable_chunks,
+            quality_embedded_chunks: state.quality_embedded_chunks,
+            pending_jobs: state.pending_jobs,
+            running_jobs: state.running_jobs,
+            succeeded_jobs: state.succeeded_jobs,
+            failed_jobs: state.failed_jobs,
+            skipped_stale_jobs: state.skipped_stale_jobs,
+            skipped_excluded_jobs: state.skipped_excluded_jobs,
+        };
+        self.semantic_status.generation_id = Some(state.generation_id.clone());
+        self.semantic_status.active_layer = active_layer;
+        self.semantic_status.quality_status = quality_status;
+        self.semantic_status.quality.current_chunks = state.quality_embedded_chunks;
+        self.semantic_status.quality.total_chunks = state.quality_embedded_chunks;
+        self.semantic_status.quality.expected_chunks = state.embeddable_chunks;
+        self.semantic_status.quality.is_complete = quality_progress_is_complete(&quality_progress);
+        self.semantic_status.quality_progress = Some(quality_progress);
+        self.semantic_status.fallback_reason = semantic_fallback_reason_for_status(
+            active_layer,
+            quality_status,
+            self.semantic_status.quality.is_complete,
+        );
+    }
+
+    fn apply_semantic_quality_summary(&mut self, summary: &symdex_index::QualityIndexSummary) {
+        let Ok(active_layer) = SemanticLayer::parse(&summary.active_layer) else {
+            return;
+        };
+        let Ok(quality_status) = SemanticLayerStatus::parse(&summary.quality_status) else {
+            return;
+        };
+        self.semantic_status.repository_id = summary.repository_id.clone();
+        self.semantic_status.generation_id = Some(summary.generation_id.clone());
+        self.semantic_status.active_layer = active_layer;
+        self.semantic_status.quality_status = quality_status;
+        self.semantic_status.quality.embedding_model = summary.quality_model.clone();
+        self.semantic_status.quality.embedding_dimension = summary.quality_dimension;
+        self.semantic_status.quality.qdrant_collection = summary.qdrant_collection.clone();
+        self.semantic_status.quality.current_chunks = summary.progress.quality_embedded_chunks;
+        self.semantic_status.quality.total_chunks = summary.progress.quality_embedded_chunks;
+        self.semantic_status.quality.expected_chunks = summary.progress.embeddable_chunks;
+        self.semantic_status.quality.is_complete = quality_progress_is_complete(&summary.progress);
+        self.semantic_status.quality_progress = Some(summary.progress.clone());
+        self.semantic_status.latest_quality_error = None;
+        self.semantic_status.fallback_reason = semantic_fallback_reason_for_status(
+            active_layer,
+            quality_status,
+            self.semantic_status.quality.is_complete,
+        );
     }
 
     fn poll_diagnostics(&mut self) {
@@ -2408,6 +2481,38 @@ fn semantic_fallback_state(summary: &SemanticStatusSummary) -> &'static str {
         "fallback"
     } else {
         "ready"
+    }
+}
+
+fn quality_progress_is_complete(progress: &QualityGenerationProgress) -> bool {
+    progress.embeddable_chunks == progress.quality_embedded_chunks
+        && progress.pending_jobs == 0
+        && progress.running_jobs == 0
+        && progress.failed_jobs == 0
+        && progress.skipped_stale_jobs == 0
+}
+
+fn semantic_fallback_reason_for_status(
+    active_layer: SemanticLayer,
+    quality_status: SemanticLayerStatus,
+    quality_complete: bool,
+) -> Option<String> {
+    if active_layer == SemanticLayer::Quality
+        && quality_status == SemanticLayerStatus::QualityReady
+        && quality_complete
+    {
+        return None;
+    }
+    match quality_status {
+        SemanticLayerStatus::FastReady => None,
+        SemanticLayerStatus::QualityReady => {
+            Some("quality_ready_not_active_using_fast_layer".to_owned())
+        }
+        _ if !quality_complete => Some("quality_manifest_incomplete_using_fast_layer".to_owned()),
+        _ => Some(format!(
+            "quality_status_{}_using_fast_layer",
+            quality_status.as_str()
+        )),
     }
 }
 
@@ -5885,6 +5990,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
     use ratatui::style::Color;
+    use symdex_core::{SemanticLayer, SemanticLayerStatus};
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
     use symdex_query::{
         CallDirection, CallGraphSummary, CallPathSummary, DebugContextLimits, DebugContextPack,
@@ -7251,6 +7357,15 @@ mod tests {
             Some("quality_pending")
         );
         assert_eq!(app.continuous.quality_pending_jobs, 1);
+        assert_eq!(app.semantic_status.active_layer, SemanticLayer::Fast);
+        assert_eq!(
+            app.semantic_status.quality_status,
+            SemanticLayerStatus::QualityPending
+        );
+        assert_eq!(
+            app.semantic_status.fallback_reason.as_deref(),
+            Some("quality_manifest_incomplete_using_fast_layer")
+        );
         assert_eq!(app.message, "Quality state: quality_pending on fast.");
 
         app.apply_continuous_event(symdex_index::ContinuousIndexEvent::QualityCompleted {
@@ -7292,6 +7407,19 @@ mod tests {
             Some("quality_complete")
         );
         assert_eq!(app.continuous.quality_pending_jobs, 0);
+        assert_eq!(app.semantic_status.active_layer, SemanticLayer::Quality);
+        assert_eq!(
+            app.semantic_status.quality_status,
+            SemanticLayerStatus::QualityReady
+        );
+        assert_eq!(app.semantic_status.fallback_reason, None);
+        assert_eq!(
+            app.semantic_status
+                .quality_progress
+                .as_ref()
+                .map(|progress| progress.pending_jobs),
+            Some(0)
+        );
         assert_eq!(
             app.message,
             "Quality catch-up completed: quality_ready on quality."
@@ -7303,6 +7431,10 @@ mod tests {
         });
         assert_eq!(
             app.continuous.latest_quality_error.as_deref(),
+            Some("quality model unavailable")
+        );
+        assert_eq!(
+            app.semantic_status.latest_quality_error.as_deref(),
             Some("quality model unavailable")
         );
         assert_eq!(app.message, "Quality catch-up failed.");
