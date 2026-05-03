@@ -353,6 +353,9 @@ represent the indexed repository.
 - Show the same local diagnostics as `symdex doctor` from the Doctor tab.
 - In the Doctor tab, `Enter` starts diagnostics when no diagnostic result rows
   are available.
+- In the Doctor tab, `r` reruns diagnostics after an idle, completed, or failed
+  diagnostics state. If diagnostics are already running, keep the existing run
+  and show that status instead of starting a duplicate worker.
 - Surface service failures without panics.
 - Keep diagnostics local and avoid logging source text.
 - Render diagnostics as a table with check name, status, and detail columns.
@@ -438,6 +441,7 @@ Current dashboard keys:
 - `Up` / `Down`: move the selected row in completed result and storage tables
 - `Enter`: start Doctor diagnostics when the Doctor tab has no result rows
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
+- `r`: rerun Doctor diagnostics from the Doctor tab
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
 - typed text: edit the impact/call-path/context-pack/debug-context viewer input

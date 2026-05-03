@@ -787,13 +787,33 @@ impl App {
                 self.message = "Indexing controls ready.".to_owned();
             }
             KeyCode::Char('r') if !matches!(self.screen, Screen::IndexRunning(_)) => {
-                if let Err(error) = self.refresh_status() {
-                    self.message = format!("Refresh failed: {error}");
-                }
+                self.handle_refresh_key();
             }
             _ => {}
         }
         false
+    }
+
+    fn handle_refresh_key(&mut self) {
+        self.handle_refresh_key_with(|app| app.start_diagnostics());
+    }
+
+    fn handle_refresh_key_with<R>(&mut self, diagnostic_runner: R)
+    where
+        R: FnOnce(&mut Self),
+    {
+        if self.view == View::Diagnostics {
+            if self.diagnostics_receiver.is_some() {
+                self.message = "Doctor diagnostics already running.".to_owned();
+            } else {
+                diagnostic_runner(self);
+            }
+            return;
+        }
+
+        if let Err(error) = self.refresh_status() {
+            self.message = format!("Refresh failed: {error}");
+        }
     }
 
     fn tick_animation(&mut self) {
@@ -5450,7 +5470,7 @@ impl View {
                 ("[ ]", "tabs"),
                 ("Enter", "run/details"),
                 ("Up/Down", "select"),
-                ("r", "refresh"),
+                ("r", "rerun"),
                 ("q", "quit"),
             ],
             Self::Query => &[
@@ -6230,6 +6250,8 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("[Enter]"));
         assert!(rendered.contains("run/details"));
+        assert!(rendered.contains("[r]"));
+        assert!(rendered.contains("rerun"));
     }
 
     #[test]
@@ -7669,6 +7691,40 @@ mod tests {
                 panic!("diagnostics did not complete")
             }
         }
+    }
+
+    #[test]
+    fn doctor_refresh_reruns_completed_diagnostics() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        app.diagnostics = DiagnosticsState::Completed(sample_diagnostic_report());
+        app.diagnostics_details_expanded = true;
+
+        app.handle_refresh_key_with(|app| {
+            app.start_diagnostics_with(|repo| {
+                if repo == "/tmp/repo" {
+                    Ok(sample_diagnostic_report())
+                } else {
+                    Err(format!("unexpected repo path: {repo}"))
+                }
+            });
+        });
+
+        assert!(matches!(app.diagnostics, DiagnosticsState::Running));
+        assert!(!app.diagnostics_details_expanded);
+        assert_eq!(app.message, "Doctor diagnostics started.");
+    }
+
+    #[test]
+    fn doctor_refresh_does_not_start_duplicate_run() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        app.start_diagnostics_with(|_| Ok(sample_diagnostic_report()));
+
+        app.handle_refresh_key_with(|_| panic!("diagnostics should already be running"));
+
+        assert!(matches!(app.diagnostics, DiagnosticsState::Running));
+        assert_eq!(app.message, "Doctor diagnostics already running.");
     }
 
     #[test]

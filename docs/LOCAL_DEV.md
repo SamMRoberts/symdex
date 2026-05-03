@@ -225,11 +225,13 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
   tabs, and `Tab` / `Shift+Tab` to toggle view-local modes including impact,
   call-path, context-pack, and debug-context evidence modes. In the Doctor tab,
-  `Enter` starts diagnostics when no result rows are available. The storage
+  `Enter` starts diagnostics when no result rows are available, and `r` reruns
+  diagnostics after a completed or failed run. The storage
   explorer always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs
   timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
-  to refresh repository/storage status, and `q` or `Esc` to quit.
+  outside the Doctor tab to refresh repository/storage status, and `q` or `Esc`
+  to quit.
 - `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
