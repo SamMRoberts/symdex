@@ -152,6 +152,28 @@ Recommended implementation order:
 5. Revisit `Chart`, `Canvas`, `tui-nodes`, and `tui-logger` only after their
    backing data contracts exist and their accessibility tradeoffs are tested.
 
+Phase 10.5 implementation status:
+
+- Built-in `Scrollbar` indicators are used for selectable table panes and long
+  line-list metadata panes. They use ASCII thumb/track symbols for terminal
+  compatibility and keep row selection as the scrolling driver.
+- Built-in `BarChart` summaries are used only where real local counts already
+  exist: call-resolution buckets, embedding coverage, index-run outcomes,
+  freshness states, and fast/quality job state counts. Compact layouts keep the
+  detail pane visible and defer charts when height is constrained.
+- `ratatui-textarea` remains deferred. Debug-context input is the strongest fit,
+  but the current single-line query/call/context inputs remain faster and safer
+  until multiline debug-context editing needs paste/cursor behavior beyond the
+  existing string input state.
+- `tui-tree-widget` remains deferred. The current symbol outline table already
+  exposes path, symbol kind, line range, child count, and status-safe metadata;
+  a tree widget should wait until collapse/expand state and file hierarchy
+  navigation are needed enough to justify an additional dependency.
+- Image, embedded-terminal, decorative big-text, pie-chart, graph/canvas, and
+  mouse/menu-centric widgets remain avoided until a design proves they improve
+  evidence review without reducing 80x24 metadata density or weakening the
+  local read-only TUI boundary.
+
 ### Interaction Feedback
 
 - Highlight the active tab and focused input/list row.

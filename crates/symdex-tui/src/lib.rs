@@ -13,10 +13,13 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 pub(crate) use navigation::{IndexMode, ManualIndexRequest, Screen, UiAction, reduce_screen};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Tabs, Wrap};
+use ratatui::widgets::{
+    BarChart, Block, Borders, Gauge, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Tabs, Wrap,
+};
 use ratatui::widgets::{Cell, Row, Table, TableState};
 use symdex_core::{RepoRoot, SemanticLayer, SemanticLayerStatus};
 use symdex_diagnostics::{
@@ -2144,81 +2147,173 @@ fn render_storage_mode_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
         },
         StorageMode::Calls => match &app.storage.calls {
             CallResolutionStatus::Completed(summary) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(7), Constraint::Length(9)])
-                    .split(area);
-                render_selectable_table(
-                    frame,
-                    chunks[0],
-                    call_resolution_table(summary),
-                    app.storage.selection,
-                    call_resolution_row_count(summary),
-                );
-                frame.render_widget(
-                    call_resolution_detail_panel(summary, app.storage.selection),
-                    chunks[1],
-                );
+                if area.height >= 20 {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(7),
+                            Constraint::Length(7),
+                            Constraint::Length(9),
+                        ])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        call_resolution_table(summary),
+                        app.storage.selection,
+                        call_resolution_row_count(summary),
+                    );
+                    render_call_resolution_barchart(frame, chunks[1], summary);
+                    frame.render_widget(
+                        call_resolution_detail_panel(summary, app.storage.selection),
+                        chunks[2],
+                    );
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(7), Constraint::Length(9)])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        call_resolution_table(summary),
+                        app.storage.selection,
+                        call_resolution_row_count(summary),
+                    );
+                    frame.render_widget(
+                        call_resolution_detail_panel(summary, app.storage.selection),
+                        chunks[1],
+                    );
+                }
             }
             CallResolutionStatus::Failed(error) => render_storage_error(frame, area, error),
         },
         StorageMode::Embeddings => match &app.storage.embeddings {
             EmbeddingCoverageStatus::Completed(summary) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(7), Constraint::Length(9)])
-                    .split(area);
-                render_selectable_table(
-                    frame,
-                    chunks[0],
-                    embedding_coverage_table(summary),
-                    app.storage.selection,
-                    embedding_coverage_row_count(summary),
-                );
-                frame.render_widget(
-                    embedding_coverage_detail_panel(summary, app.storage.selection),
-                    chunks[1],
-                );
+                if area.height >= 20 {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(7),
+                            Constraint::Length(7),
+                            Constraint::Length(9),
+                        ])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        embedding_coverage_table(summary),
+                        app.storage.selection,
+                        embedding_coverage_row_count(summary),
+                    );
+                    render_embedding_coverage_barchart(frame, chunks[1], summary);
+                    frame.render_widget(
+                        embedding_coverage_detail_panel(summary, app.storage.selection),
+                        chunks[2],
+                    );
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(7), Constraint::Length(9)])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        embedding_coverage_table(summary),
+                        app.storage.selection,
+                        embedding_coverage_row_count(summary),
+                    );
+                    frame.render_widget(
+                        embedding_coverage_detail_panel(summary, app.storage.selection),
+                        chunks[1],
+                    );
+                }
             }
             EmbeddingCoverageStatus::Failed(error) => render_storage_error(frame, area, error),
         },
         StorageMode::Runs => match &app.storage.runs {
             IndexRunsTimelineStatus::Completed(summary) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(7), Constraint::Length(9)])
-                    .split(area);
-                render_selectable_table(
-                    frame,
-                    chunks[0],
-                    index_runs_timeline_table(summary),
-                    app.storage.selection,
-                    index_runs_timeline_row_count(summary),
-                );
-                frame.render_widget(
-                    index_runs_timeline_detail_panel(summary, app.storage.selection),
-                    chunks[1],
-                );
+                if area.height >= 20 {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(7),
+                            Constraint::Length(7),
+                            Constraint::Length(9),
+                        ])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        index_runs_timeline_table(summary),
+                        app.storage.selection,
+                        index_runs_timeline_row_count(summary),
+                    );
+                    render_index_runs_barchart(frame, chunks[1], summary);
+                    frame.render_widget(
+                        index_runs_timeline_detail_panel(summary, app.storage.selection),
+                        chunks[2],
+                    );
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(7), Constraint::Length(9)])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        index_runs_timeline_table(summary),
+                        app.storage.selection,
+                        index_runs_timeline_row_count(summary),
+                    );
+                    frame.render_widget(
+                        index_runs_timeline_detail_panel(summary, app.storage.selection),
+                        chunks[1],
+                    );
+                }
             }
             IndexRunsTimelineStatus::Failed(error) => render_storage_error(frame, area, error),
         },
         StorageMode::Freshness => match &app.storage.freshness {
             FreshnessStatus::Completed(summary) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(7), Constraint::Length(9)])
-                    .split(area);
-                render_selectable_table(
-                    frame,
-                    chunks[0],
-                    freshness_table(summary),
-                    app.storage.selection,
-                    freshness_row_count(summary),
-                );
-                frame.render_widget(
-                    freshness_detail_panel(summary, app.storage.selection),
-                    chunks[1],
-                );
+                if area.height >= 20 {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(7),
+                            Constraint::Length(7),
+                            Constraint::Length(9),
+                        ])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        freshness_table(summary),
+                        app.storage.selection,
+                        freshness_row_count(summary),
+                    );
+                    render_freshness_barchart(frame, chunks[1], summary);
+                    frame.render_widget(
+                        freshness_detail_panel(summary, app.storage.selection),
+                        chunks[2],
+                    );
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(7), Constraint::Length(9)])
+                        .split(area);
+                    render_selectable_table(
+                        frame,
+                        chunks[0],
+                        freshness_table(summary),
+                        app.storage.selection,
+                        freshness_row_count(summary),
+                    );
+                    frame.render_widget(
+                        freshness_detail_panel(summary, app.storage.selection),
+                        chunks[1],
+                    );
+                }
             }
             FreshnessStatus::Failed(error) => render_storage_error(frame, area, error),
         },
@@ -2396,19 +2491,11 @@ fn render_semantic_readiness_gauges(
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Min(7),
         ])
         .split(area);
     let fast_percent = layer_readiness_percent(&summary.fast);
     let quality_percent = layer_readiness_percent(&summary.quality);
-    let fast_pending_percent = fast_pending_percent(summary);
-    let fast_running_percent = fast_running_percent(summary);
-    let fast_stale_percent = fast_stale_percent(summary);
-    let pending_percent = quality_job_percent(summary, QualityJobMetric::Pending);
-    let running_percent = quality_job_percent(summary, QualityJobMetric::Running);
-    let stale_percent = quality_job_percent(summary, QualityJobMetric::SkippedStale);
     let fast_gauge = Gauge::default()
         .block(
             Block::default()
@@ -2437,141 +2524,192 @@ fn render_semantic_readiness_gauges(
         ));
     frame.render_widget(fast_gauge, chunks[0]);
     frame.render_widget(quality_gauge, chunks[1]);
-    render_pending_job_sparklines(frame, chunks[2], fast_pending_percent, pending_percent);
-    render_running_job_sparklines(frame, chunks[3], fast_running_percent, running_percent);
-    render_stale_job_sparklines(frame, chunks[4], fast_stale_percent, stale_percent);
+    render_semantic_job_barchart(frame, chunks[2], summary);
 }
 
-fn render_pending_job_sparklines(
+fn render_semantic_job_barchart(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    fast_percent: u16,
-    quality_percent: u16,
+    summary: &SemanticStatusSummary,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    render_job_sparkline(
+    render_count_barchart(
         frame,
-        chunks[0],
-        "Fast Pend",
-        fast_percent,
-        StatusTone::Warning,
-    );
-    render_job_sparkline(
-        frame,
-        chunks[1],
-        "Quality Pend",
-        quality_percent,
-        StatusTone::Warning,
-    );
-}
-
-fn render_running_job_sparklines(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    fast_percent: u16,
-    quality_percent: u16,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    render_job_sparkline(frame, chunks[0], "Fast Run", fast_percent, StatusTone::Info);
-    render_job_sparkline(
-        frame,
-        chunks[1],
-        "Quality Run",
-        quality_percent,
+        area,
+        "Fast/Quality Job States",
+        semantic_job_bars(summary),
         StatusTone::Info,
     );
 }
 
-fn render_stale_job_sparklines(
+fn render_call_resolution_barchart(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    fast_percent: u16,
-    quality_percent: u16,
+    summary: &CallResolutionSummary,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    render_job_sparkline(
+    render_count_barchart(
         frame,
-        chunks[0],
-        "Fast Stale",
-        fast_percent,
-        StatusTone::Warning,
-    );
-    render_job_sparkline(
-        frame,
-        chunks[1],
-        "Quality Stale",
-        quality_percent,
-        StatusTone::Warning,
+        area,
+        "Call Resolution Counts",
+        call_resolution_bars(summary),
+        StatusTone::Info,
     );
 }
 
-fn render_job_sparkline(
+fn render_embedding_coverage_barchart(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    summary: &EmbeddingCoverageSummary,
+) {
+    render_count_barchart(
+        frame,
+        area,
+        "Embedding Coverage Counts",
+        embedding_coverage_bars(summary),
+        StatusTone::Info,
+    );
+}
+
+fn render_index_runs_barchart(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    summary: &IndexRunsTimelineSummary,
+) {
+    render_count_barchart(
+        frame,
+        area,
+        "Index Run Outcomes",
+        index_run_outcome_bars(summary),
+        StatusTone::Info,
+    );
+}
+
+fn render_freshness_barchart(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    summary: &FreshnessSummary,
+) {
+    render_count_barchart(
+        frame,
+        area,
+        "Freshness States",
+        freshness_bars(summary),
+        StatusTone::Info,
+    );
+}
+
+fn render_count_barchart(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     title: &'static str,
-    percent: u16,
+    bars: Vec<(&'static str, u64)>,
     tone: StatusTone,
 ) {
-    let data = sparkline_percent_data(percent, area.width.saturating_sub(2));
-    let sparkline = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("{title} {percent}%")),
-        )
-        .style(tone_style(tone).add_modifier(Modifier::BOLD))
-        .max(100)
-        .data(data);
-    frame.render_widget(sparkline, area);
+    let max = bars.iter().map(|(_, value)| *value).max().unwrap_or(0).max(1);
+    let chart = BarChart::default()
+        .block(panel_block(title, StatusTone::Dim))
+        .data(bars.as_slice())
+        .max(max)
+        .bar_width(4)
+        .bar_gap(1)
+        .bar_style(tone_style(tone).add_modifier(Modifier::BOLD))
+        .value_style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
+        .label_style(metadata_style());
+    frame.render_widget(chart, area);
 }
 
-fn sparkline_percent_data(percent: u16, width: u16) -> Vec<u64> {
-    let width = usize::from(width.max(1));
-    vec![u64::from(percent.min(100)); width]
-}
-
-fn fast_pending_percent(summary: &SemanticStatusSummary) -> u16 {
-    let pending_chunks = summary
+fn semantic_job_bars(summary: &SemanticStatusSummary) -> Vec<(&'static str, u64)> {
+    let fast_pending = summary
         .fast
         .expected_chunks
         .saturating_sub(summary.fast.total_chunks);
-    layer_count_percent(pending_chunks, summary.fast.expected_chunks)
+    let progress = summary.quality_progress.as_ref();
+    vec![
+        ("fpen", fast_pending as u64),
+        ("ffail", summary.fast.failed_chunks as u64),
+        ("fstal", summary.fast.stale_chunks as u64),
+        (
+            "qpen",
+            progress.map(|row| row.pending_jobs).unwrap_or(0) as u64,
+        ),
+        (
+            "qrun",
+            progress.map(|row| row.running_jobs).unwrap_or(0) as u64,
+        ),
+        (
+            "qfail",
+            progress.map(|row| row.failed_jobs).unwrap_or(0) as u64,
+        ),
+        (
+            "qstal",
+            progress.map(|row| row.skipped_stale_jobs).unwrap_or(0) as u64,
+        ),
+    ]
 }
 
-fn fast_running_percent(summary: &SemanticStatusSummary) -> u16 {
-    layer_count_percent(0, summary.fast.expected_chunks)
+fn call_resolution_bars(summary: &CallResolutionSummary) -> Vec<(&'static str, u64)> {
+    let mut resolved = 0;
+    let mut unresolved = 0;
+    let mut ambiguous = 0;
+    let mut other = 0;
+    for bucket in &summary.buckets {
+        let count = bucket.call_count as u64;
+        if bucket.resolution_status.starts_with("resolved") {
+            resolved += count;
+        } else if bucket.resolution_status == "unresolved" {
+            unresolved += count;
+        } else if bucket.resolution_status.contains("ambiguous") {
+            ambiguous += count;
+        } else {
+            other += count;
+        }
+    }
+    vec![
+        ("res", resolved),
+        ("unres", unresolved),
+        ("amb", ambiguous),
+        ("oth", other),
+    ]
 }
 
-fn fast_stale_percent(summary: &SemanticStatusSummary) -> u16 {
-    layer_count_percent(summary.fast.stale_chunks, summary.fast.expected_chunks)
+fn embedding_coverage_bars(summary: &EmbeddingCoverageSummary) -> Vec<(&'static str, u64)> {
+    vec![
+        ("total", summary.total_chunks as u64),
+        ("emb", summary.embeddable_chunks as u64),
+        ("vec", summary.vector_backed_chunks as u64),
+        ("miss", summary.missing_vector_chunks as u64),
+        ("excl", summary.excluded_chunks as u64),
+    ]
 }
 
-#[derive(Clone, Copy)]
-enum QualityJobMetric {
-    Pending,
-    Running,
-    SkippedStale,
+fn index_run_outcome_bars(summary: &IndexRunsTimelineSummary) -> Vec<(&'static str, u64)> {
+    let mut success = 0;
+    let mut failed = 0;
+    let mut running = 0;
+    let mut other = 0;
+    for run in &summary.runs {
+        match run.status.as_str() {
+            "success" | "complete" | "completed" => success += 1,
+            "failed" | "error" => failed += 1,
+            "running" | "started" | "pending" => running += 1,
+            _ => other += 1,
+        }
+    }
+    vec![
+        ("ok", success),
+        ("fail", failed),
+        ("run", running),
+        ("oth", other),
+    ]
 }
 
-fn quality_job_percent(summary: &SemanticStatusSummary, metric: QualityJobMetric) -> u16 {
-    let Some(progress) = &summary.quality_progress else {
-        return 0;
-    };
-    let count = match metric {
-        QualityJobMetric::Pending => progress.pending_jobs,
-        QualityJobMetric::Running => progress.running_jobs,
-        QualityJobMetric::SkippedStale => progress.skipped_stale_jobs,
-    };
-    layer_count_percent(count, summary.quality.expected_chunks)
+fn freshness_bars(summary: &FreshnessSummary) -> Vec<(&'static str, u64)> {
+    vec![
+        ("fresh", summary.count(EvidenceFreshness::Fresh) as u64),
+        ("stale", summary.count(EvidenceFreshness::Stale) as u64),
+        ("del", summary.count(EvidenceFreshness::Deleted) as u64),
+        ("miss", summary.count(EvidenceFreshness::Missing) as u64),
+        ("unk", summary.count(EvidenceFreshness::Unknown) as u64),
+    ]
 }
 
 fn render_line_panel(
@@ -2580,9 +2718,11 @@ fn render_line_panel(
     title: &'static str,
     lines: Vec<Line<'_>>,
 ) {
+    let line_count = lines.len();
     let panel = List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
         .block(panel_block(title, StatusTone::Dim));
     frame.render_widget(panel, area);
+    render_scrollbar(frame, area, 0, line_count);
 }
 
 fn render_mode_bar(
@@ -2662,6 +2802,41 @@ fn render_selectable_table(
         area,
         &mut state,
     );
+    render_scrollbar(frame, area, selection, row_count);
+}
+
+fn render_scrollbar(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    position: usize,
+    content_length: usize,
+) {
+    let viewport_rows = scroll_viewport_rows(area);
+    if content_length <= viewport_rows {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_length)
+        .position(position.min(content_length.saturating_sub(1)))
+        .viewport_content_length(viewport_rows);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_symbol("#")
+        .track_symbol(Some("."))
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_style(tone_style(StatusTone::Info))
+        .track_style(tone_style(StatusTone::Dim));
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
+}
+
+fn scroll_viewport_rows(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(3).max(1))
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), String> {
@@ -6921,6 +7096,7 @@ mod tests {
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("src/file_18.rs"));
         assert!(rendered.contains("crate::file_18"));
+        assert!(rendered.contains("#"));
         assert_eq!(
             cell_bg_for_text(buffer, "src/file_18.rs", None),
             Some(Color::Cyan)
@@ -7142,6 +7318,39 @@ mod tests {
         assert!(rendered.contains("Resolution"));
         assert!(rendered.contains("Conf"));
         assert!(rendered.contains("Call Bucket"));
+    }
+
+    #[test]
+    fn renders_storage_barcharts_at_normal_height_without_source_text() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+
+        for (mode, title) in [
+            (StorageMode::Calls, "Call Resolution Counts"),
+            (StorageMode::Embeddings, "Embedding Coverage Counts"),
+            (StorageMode::Runs, "Index Run Outcomes"),
+            (StorageMode::Freshness, "Freshness States"),
+        ] {
+            app.storage.mode = mode;
+            let backend = TestBackend::new(150, 34);
+            let mut terminal = Terminal::new(backend).expect("terminal should build");
+            render(&mut terminal, &app).expect("render should succeed");
+
+            let rendered = format!("{:?}", terminal.backend().buffer());
+            assert!(rendered.contains(title));
+            assert!(!rendered.contains("source_text"));
+        }
     }
 
     #[test]
@@ -7839,12 +8048,11 @@ mod tests {
         assert!(rendered.contains("Quality Readiness"));
         assert!(rendered.contains("fast_ready 2/4 50%"));
         assert!(rendered.contains("quality_ready 1/4 25%"));
-        assert!(rendered.contains("Fast Pend 25%"));
-        assert!(rendered.contains("Quality Pend 50%"));
-        assert!(rendered.contains("Fast Run 0%"));
-        assert!(rendered.contains("Quality Run 25%"));
-        assert!(rendered.contains("Fast Stale 25%"));
-        assert!(rendered.contains("Quality Stale 25%"));
+        assert!(rendered.contains("Fast/Quality Job States"));
+        assert!(rendered.contains("fpen"));
+        assert!(rendered.contains("qpen"));
+        assert!(rendered.contains("qrun"));
+        assert!(rendered.contains("qsta"));
         let buffer = terminal.backend().buffer();
         assert_ne!(
             cell_fg_for_text(buffer, "fast_ready 2/4 50%", None),
