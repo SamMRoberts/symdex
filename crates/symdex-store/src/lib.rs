@@ -667,6 +667,92 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn upsert_watcher_client(&self, client: &WatcherClientRecord) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO watcher_clients (
+                   repository_id, client_id, client_kind, pid, started_at,
+                   heartbeat_at, last_seen_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(repository_id, client_id) DO UPDATE SET
+                   client_kind = excluded.client_kind,
+                   pid = excluded.pid,
+                   heartbeat_at = excluded.heartbeat_at,
+                   last_seen_at = excluded.last_seen_at",
+                params![
+                    client.repository_id,
+                    client.client_id,
+                    client.client_kind,
+                    client.pid.map(i64::from),
+                    client.started_at.as_deref().unwrap_or(&now),
+                    client.heartbeat_at.as_deref().unwrap_or(&now),
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn heartbeat_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "UPDATE watcher_clients
+                    SET heartbeat_at = ?3,
+                        last_seen_at = ?3
+                  WHERE repository_id = ?1 AND client_id = ?2",
+                params![repository_id, client_id, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn remove_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM watcher_clients
+                  WHERE repository_id = ?1 AND client_id = ?2",
+                params![repository_id, client_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn watcher_clients(&self, repository_id: &str) -> Result<Vec<WatcherClientRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT repository_id, client_id, client_kind, pid, started_at,
+                        heartbeat_at, last_seen_at
+                   FROM watcher_clients
+                  WHERE repository_id = ?1
+                  ORDER BY client_kind, started_at, client_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], watcher_client_record)
+            .map_err(StoreError::Sqlite)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn prune_stale_watcher_clients(
+        &self,
+        repository_id: &str,
+        stale_before_timestamp: &str,
+    ) -> Result<usize> {
+        let removed = self
+            .connection
+            .execute(
+                "DELETE FROM watcher_clients
+                  WHERE repository_id = ?1 AND heartbeat_at < ?2",
+                params![repository_id, stale_before_timestamp],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(removed)
+    }
+
     pub fn ensure_embedding_compatible(
         &self,
         repository_id: &str,
@@ -3628,6 +3714,17 @@ pub struct WatcherStatusRecord {
     pub quality_stale_jobs: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WatcherClientRecord {
+    pub repository_id: String,
+    pub client_id: String,
+    pub client_kind: String,
+    pub pid: Option<i32>,
+    pub started_at: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub last_seen_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRunRecord {
     pub id: String,
@@ -4865,6 +4962,18 @@ fn watcher_status_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatcherSta
     })
 }
 
+fn watcher_client_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatcherClientRecord> {
+    Ok(WatcherClientRecord {
+        repository_id: row.get(0)?,
+        client_id: row.get(1)?,
+        client_kind: row.get(2)?,
+        pid: row.get::<_, Option<i64>>(3)?.map(|pid| pid as i32),
+        started_at: row.get(4)?,
+        heartbeat_at: row.get(5)?,
+        last_seen_at: row.get(6)?,
+    })
+}
+
 fn call_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSearchRow> {
     Ok(CallSearchRow {
         callee_text: row.get(0)?,
@@ -5526,6 +5635,18 @@ CREATE TABLE IF NOT EXISTS watchers (
   FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS watcher_clients (
+  repository_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  client_kind TEXT NOT NULL,
+  pid INTEGER,
+  started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  PRIMARY KEY(repository_id, client_id),
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS files (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL,
@@ -5737,6 +5858,7 @@ CREATE INDEX IF NOT EXISTS idx_vector_points_repository_table ON vector_points(r
 CREATE INDEX IF NOT EXISTS idx_vector_points_chunk ON vector_points(chunk_id);
 CREATE INDEX IF NOT EXISTS idx_quality_embedding_jobs_repository_generation_status ON quality_embedding_jobs(repository_id, generation_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_watcher_clients_repository_heartbeat ON watcher_clients(repository_id, heartbeat_at);
 "#;
 
 pub fn current_timestamp() -> String {
@@ -5773,8 +5895,8 @@ mod tests {
         PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
         RepositoryRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
         StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, TestRecord, VectorPoint,
-        WatcherStatusRecord, validate_vector_table_name, vector_point_id, vector_rowid,
-        vector_table_name,
+        WatcherClientRecord, WatcherStatusRecord, validate_vector_table_name, vector_point_id,
+        vector_rowid, vector_table_name,
     };
 
     #[test]
@@ -8222,6 +8344,51 @@ mod tests {
         assert_eq!(status.files_seen, 3);
         assert_eq!(status.queued_events, 2);
         assert_eq!(status.last_indexed_path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn sqlite_persists_and_prunes_watcher_clients() {
+        let db = TestDb::new("watcher-clients");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .upsert_watcher_client(&WatcherClientRecord {
+                repository_id: "repo".to_owned(),
+                client_id: "mcp-1".to_owned(),
+                client_kind: "mcp".to_owned(),
+                pid: Some(123),
+                started_at: Some("1".to_owned()),
+                heartbeat_at: Some("1".to_owned()),
+                last_seen_at: None,
+            })
+            .expect("client should persist");
+
+        let clients = store.watcher_clients("repo").expect("clients should load");
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].client_kind, "mcp");
+
+        store
+            .heartbeat_watcher_client("repo", "mcp-1")
+            .expect("heartbeat should update");
+        let clients = store.watcher_clients("repo").expect("clients should load");
+        assert_ne!(clients[0].heartbeat_at.as_deref(), Some("1"));
+
+        let removed = store
+            .prune_stale_watcher_clients("repo", "999999999999")
+            .expect("stale clients should prune");
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .watcher_clients("repo")
+                .expect("clients should load")
+                .is_empty()
+        );
     }
 
     #[test]

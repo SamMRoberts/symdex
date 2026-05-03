@@ -184,9 +184,19 @@ fn watcher_status_check(repo: &str) -> DiagnosticCheck {
                 label: "watcher_status".to_owned(),
                 state,
                 message: format!(
-                    "state={} owner={} files_seen={} queued={} last={} error={}",
+                    "state={} owner={} clients={} client_kinds={} shutdown_after={} files_seen={} queued={} last={} error={}",
                     status.state,
                     status.owner_kind,
+                    status.attached_clients,
+                    if status.client_kinds.is_empty() {
+                        "<none>".to_owned()
+                    } else {
+                        status.client_kinds.join(",")
+                    },
+                    status
+                        .shutdown_after_seconds
+                        .map(|seconds| seconds.to_string())
+                        .unwrap_or_else(|| "<none>".to_owned()),
                     status.files_seen,
                     status.queued_events,
                     status.last_indexed_path.as_deref().unwrap_or("<none>"),

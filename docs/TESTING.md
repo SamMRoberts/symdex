@@ -35,8 +35,8 @@ Fixtures should be tiny and purpose-built.
 - continuous indexing reindexes modified files
 - continuous indexing indexes newly created eligible files
 - continuous indexing skips ignored, out-of-root, symlink-escape, and unchanged files
-- shared watcher start/status/stop, singleton guard, debounce, queued event,
-  and error states
+- shared watcher start/status/stop, client leases, singleton guard, debounce,
+  queued event, auto-shutdown, and error states
 - deleted file cleanup
 - unresolved calls preserved
 - ambiguous calls labeled

@@ -48,7 +48,7 @@ use symdex_store::{
     StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
     VectorStorageProjection, vector_table_name,
 };
-use symdex_watch::WatcherStatus;
+use symdex_watch::{WatcherAttachment, WatcherClientKind, WatcherStatus};
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
 
@@ -87,6 +87,7 @@ pub struct App {
     index_progress: Option<IndexProgress>,
     animation_tick: usize,
     continuous: ContinuousIndexState,
+    watcher_attachment: Option<WatcherAttachment>,
     diagnostics: DiagnosticsState,
     diagnostics_selection: usize,
     diagnostics_details_expanded: bool,
@@ -162,6 +163,7 @@ impl App {
             index_progress: None,
             animation_tick: 0,
             continuous: ContinuousIndexState::default(),
+            watcher_attachment: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
@@ -229,6 +231,7 @@ impl App {
             index_progress: None,
             animation_tick: 0,
             continuous: ContinuousIndexState::default(),
+            watcher_attachment: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
@@ -1119,8 +1122,12 @@ impl App {
     }
 
     fn start_continuous_index(&mut self) {
-        match symdex_watch::start_daemon(&self.repo_input) {
-            Ok(status) => {
+        match symdex_watch::start_or_attach(&self.repo_input, WatcherClientKind::Tui) {
+            Ok(attachment) => {
+                let status = attachment
+                    .status()
+                    .unwrap_or_else(|_| self.continuous_watcher_status_fallback());
+                self.watcher_attachment = Some(attachment);
                 self.apply_watcher_status(&status);
                 self.last_watcher_status_refresh = Some(Instant::now());
                 self.message = "Continuous indexing watcher attached.".to_owned();
@@ -1136,6 +1143,7 @@ impl App {
     }
 
     fn stop_continuous_index(&mut self) {
+        self.watcher_attachment = None;
         match symdex_watch::stop_daemon(&self.repo_input) {
             Ok(status) => {
                 self.apply_watcher_status(&status);
@@ -1150,6 +1158,35 @@ impl App {
         }
         self.continuous_receiver = None;
         self.continuous_stop = None;
+    }
+
+    fn continuous_watcher_status_fallback(&self) -> WatcherStatus {
+        WatcherStatus {
+            repository_id: self.repository_id.clone(),
+            root_path: self.repo_root.clone(),
+            mode: "semantic".to_owned(),
+            owner_kind: "unknown".to_owned(),
+            owner_pid: None,
+            socket_path: None,
+            state: "starting".to_owned(),
+            started_at: None,
+            updated_at: None,
+            heartbeat_at: None,
+            files_seen: self.continuous.files_seen,
+            queued_events: self.continuous.queued_events,
+            last_indexed_path: self.continuous.last_reindexed_file.clone(),
+            last_error: None,
+            active_layer: self.continuous.active_layer.clone(),
+            quality_status: self.continuous.quality_status.clone(),
+            quality_pending_jobs: self.continuous.quality_pending_jobs,
+            quality_running_jobs: self.continuous.quality_running_jobs,
+            quality_failed_jobs: self.continuous.quality_failed_jobs,
+            quality_stale_jobs: self.continuous.quality_stale_jobs,
+            attached_clients: 1,
+            client_kinds: vec!["tui".to_owned()],
+            clients: Vec::new(),
+            shutdown_after_seconds: None,
+        }
     }
 
     fn start_diagnostics(&mut self) {
@@ -1199,6 +1236,9 @@ impl App {
         self.continuous.quality_running_jobs = status.quality_running_jobs;
         self.continuous.quality_failed_jobs = status.quality_failed_jobs;
         self.continuous.quality_stale_jobs = status.quality_stale_jobs;
+        self.continuous.attached_clients = status.attached_clients;
+        self.continuous.client_kinds = status.client_kinds.clone();
+        self.continuous.shutdown_after_seconds = status.shutdown_after_seconds;
     }
 
     fn start_query(&mut self) {
@@ -6472,6 +6512,9 @@ struct ContinuousIndexState {
     quality_failed_jobs: usize,
     quality_stale_jobs: usize,
     latest_quality_error: Option<String>,
+    attached_clients: usize,
+    client_kinds: Vec<String>,
+    shutdown_after_seconds: Option<u64>,
 }
 
 impl Default for ContinuousIndexState {
@@ -6491,6 +6534,9 @@ impl Default for ContinuousIndexState {
             quality_failed_jobs: 0,
             quality_stale_jobs: 0,
             latest_quality_error: None,
+            attached_clients: 0,
+            client_kinds: Vec::new(),
+            shutdown_after_seconds: None,
         }
     }
 }
@@ -6509,11 +6555,23 @@ impl ContinuousIndexState {
     }
 
     fn summary(&self) -> String {
+        let client_kinds = if self.client_kinds.is_empty() {
+            "<none>".to_owned()
+        } else {
+            self.client_kinds.join(",")
+        };
+        let shutdown_after = self
+            .shutdown_after_seconds
+            .map(|seconds| seconds.to_string())
+            .unwrap_or_else(|| "<none>".to_owned());
         let base = format!(
-            "state={} files={} queued={} last={} err={}",
+            "state={} files={} queued={} clients={} kinds={} shutdown_after={} last={} err={}",
             self.status.label(),
             self.files_seen,
             self.queued_events,
+            self.attached_clients,
+            client_kinds,
+            shutdown_after,
             self.last_reindexed_file.as_deref().unwrap_or("<none>"),
             self.latest_error.as_deref().unwrap_or("<none>")
         );

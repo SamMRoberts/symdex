@@ -408,7 +408,7 @@ represent the indexed repository.
   sparklines in the Index tab, using each job count as a percentage of the
   total expected chunk count.
 - Start or attach the single background watcher when `symdex tui [repo]`
-  launches.
+  launches, and hold a watcher lease until the TUI exits.
 - Poll shared watcher status and index readiness on a short interval so the
   Index tab stays current even though the watcher daemon owns continuous
   indexing outside the TUI process.
@@ -425,7 +425,8 @@ represent the indexed repository.
   deleting index data.
 - Show running, completed, failed, and cancelled states.
 - Show continuous indexing state with explicit `on` / `off` labels, pending
-  debounce state, last reindexed file, queued event count, and latest error.
+  debounce state, attached client count, shutdown grace state, last reindexed
+  file, queued event count, and latest error.
 - When continuous indexing is on, show an animated ratatui-rendered activity
   indicator in the Indexing controls and the global footer status row.
 - Show final counts for files, chunks, symbols, calls, excluded chunks, and

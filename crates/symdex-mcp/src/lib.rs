@@ -1,6 +1,7 @@
 //! Read-only MCP tool contract boundary.
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -50,7 +51,8 @@ pub fn tool_names() -> [&'static str; 12] {
 }
 
 pub fn evidence_tool_result(name: &str, arguments: &Value) -> Result<Value, String> {
-    dispatch_tool(name, arguments).map(versioned_tool_result)
+    let mut state = McpServerState::default();
+    dispatch_tool(name, arguments, Some(&mut state)).map(versioned_tool_result)
 }
 
 pub fn serve_stdio() -> Result<(), String> {
@@ -59,14 +61,40 @@ pub fn serve_stdio() -> Result<(), String> {
     serve(stdin.lock(), stdout.lock())
 }
 
+pub fn serve_stdio_with_attachment(
+    attachment: symdex_watch::WatcherAttachment,
+) -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    serve_with_attachments(stdin.lock(), stdout.lock(), vec![attachment])
+}
+
 pub fn serve<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), String> {
+    let mut state = McpServerState::default();
+    serve_with_state(reader, &mut writer, &mut state)
+}
+
+fn serve_with_attachments<R: BufRead, W: Write>(
+    reader: R,
+    mut writer: W,
+    attachments: Vec<symdex_watch::WatcherAttachment>,
+) -> Result<(), String> {
+    let mut state = McpServerState::from_attachments(attachments);
+    serve_with_state(reader, &mut writer, &mut state)
+}
+
+fn serve_with_state<R: BufRead, W: Write>(
+    reader: R,
+    writer: &mut W,
+    state: &mut McpServerState,
+) -> Result<(), String> {
     for line in reader.lines() {
         let line = line.map_err(|error| format!("read MCP stdin: {error}"))?;
         if line.trim().is_empty() {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle_message(message),
+            Ok(message) => handle_message(message, &mut *state),
             Err(error) => Some(error_response(
                 Value::Null,
                 -32700,
@@ -74,7 +102,7 @@ pub fn serve<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), Strin
             )),
         };
         if let Some(response) = response {
-            serde_json::to_writer(&mut writer, &response)
+            serde_json::to_writer(&mut *writer, &response)
                 .map_err(|error| format!("write MCP response: {error}"))?;
             writer
                 .write_all(b"\n")
@@ -87,7 +115,23 @@ pub fn serve<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), Strin
     Ok(())
 }
 
-fn handle_message(message: Value) -> Option<Value> {
+#[derive(Default)]
+struct McpServerState {
+    watcher_attachments: HashMap<String, symdex_watch::WatcherAttachment>,
+}
+
+impl McpServerState {
+    fn from_attachments(attachments: Vec<symdex_watch::WatcherAttachment>) -> Self {
+        Self {
+            watcher_attachments: attachments
+                .into_iter()
+                .map(|attachment| (attachment.repository_id().to_owned(), attachment))
+                .collect(),
+        }
+    }
+}
+
+fn handle_message(message: Value, state: &mut McpServerState) -> Option<Value> {
     let id = message.get("id").cloned();
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return id.map(|id| error_response(id, -32600, "Invalid request: missing method"));
@@ -101,7 +145,7 @@ fn handle_message(message: Value) -> Option<Value> {
         ("tools/list", Some(id)) => {
             Some(success_response(id, json!({ "tools": tool_definitions() })))
         }
-        ("tools/call", Some(id)) => Some(success_response(id, call_tool_result(&message))),
+        ("tools/call", Some(id)) => Some(success_response(id, call_tool_result(&message, state))),
         (_, Some(id)) => Some(error_response(
             id,
             -32601,
@@ -136,7 +180,7 @@ fn initialize_result(message: &Value) -> Value {
     })
 }
 
-fn call_tool_result(message: &Value) -> Value {
+fn call_tool_result(message: &Value, state: &mut McpServerState) -> Value {
     let Some(name) = message.pointer("/params/name").and_then(Value::as_str) else {
         return tool_error("tools/call requires params.name");
     };
@@ -145,13 +189,17 @@ fn call_tool_result(message: &Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    match dispatch_tool(name, &arguments) {
+    match dispatch_tool(name, &arguments, Some(state)) {
         Ok(value) => tool_success_with_read_only(value, tool_is_read_only(name)),
         Err(error) => tool_error(&error),
     }
 }
 
-fn dispatch_tool(name: &str, arguments: &Value) -> Result<Value, String> {
+fn dispatch_tool(
+    name: &str,
+    arguments: &Value,
+    state: Option<&mut McpServerState>,
+) -> Result<Value, String> {
     match name {
         TOOL_SEARCH => tool_search(arguments),
         TOOL_FIND_SYMBOL => tool_find_symbol(arguments),
@@ -164,7 +212,7 @@ fn dispatch_tool(name: &str, arguments: &Value) -> Result<Value, String> {
         TOOL_STALENESS_CHECK => tool_staleness_check(arguments),
         TOOL_INDEX_STATUS => tool_index_status(arguments),
         TOOL_WATCH_STATUS => tool_watch_status(arguments),
-        TOOL_WATCH_START => tool_watch_start(arguments),
+        TOOL_WATCH_START => tool_watch_start(arguments, state),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -473,10 +521,31 @@ fn tool_watch_status(arguments: &Value) -> Result<Value, String> {
     serde_json::to_value(status).map_err(|error| error.to_string())
 }
 
-fn tool_watch_start(arguments: &Value) -> Result<Value, String> {
+fn tool_watch_start(
+    arguments: &Value,
+    state: Option<&mut McpServerState>,
+) -> Result<Value, String> {
     let repo = required_string(arguments, "repo")?;
-    let status = symdex_watch::start_daemon(repo)?;
-    serde_json::to_value(status).map_err(|error| error.to_string())
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    if let Some(state) = state {
+        if !state.watcher_attachments.contains_key(root.id()) {
+            let attachment =
+                symdex_watch::start_or_attach(repo, symdex_watch::WatcherClientKind::Mcp)?;
+            state
+                .watcher_attachments
+                .insert(root.id().to_owned(), attachment);
+        }
+        let status = state
+            .watcher_attachments
+            .get(root.id())
+            .ok_or_else(|| "watcher attachment missing after start".to_owned())?
+            .status()?;
+        serde_json::to_value(status).map_err(|error| error.to_string())
+    } else {
+        let attachment = symdex_watch::start_or_attach(repo, symdex_watch::WatcherClientKind::Mcp)?;
+        let status = attachment.status()?;
+        serde_json::to_value(status).map_err(|error| error.to_string())
+    }
 }
 
 fn tool_index_status_with_store(

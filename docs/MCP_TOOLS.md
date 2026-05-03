@@ -603,16 +603,19 @@ Input:
 }
 ```
 
-Output includes watcher state, owner metadata, heartbeat, files seen, queued
-event count, last indexed path, latest error, active semantic layer, and quality
-job counts. It never returns source text, vectors, or embeddings.
+Output includes watcher state, owner metadata, heartbeat, attached client count
+and kinds, shutdown grace metadata, files seen, queued event count, last indexed
+path, latest error, active semantic layer, and quality job counts. It never
+returns source text, vectors, or embeddings.
 
 ### `symdex_watch_start`
 
 Start or attach the single local background watcher for a repository. This is
 the explicit local-only write-capable exception to the read-only evidence-tool
 policy. It is idempotent and returns the same metadata shape as
-`symdex_watch_status`.
+`symdex_watch_status`. The MCP server holds the watcher lease until that MCP
+process exits; when no TUI, MCP, or CLI clients remain, the watcher exits after
+about 10 seconds.
 
 ## Future write-capable tools
 

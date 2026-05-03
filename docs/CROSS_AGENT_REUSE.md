@@ -38,10 +38,12 @@ index without each agent rebuilding or inventing its own evidence model.
 ## Read-Only Access Pattern
 
 1. One user process indexes a repository or starts the shared watcher with the
-   CLI, TUI, or `symdex_watch_start`.
+   TUI, an MCP server, foreground watch, or `symdex_watch_start`.
 2. One or more local agents connect to `symdex serve-mcp`.
 3. Agents call evidence tools with an explicit `repo` root, and may call
    `symdex_watch_status` or `symdex_watch_start` to manage watcher readiness.
+   Watcher leases are held by live TUI/MCP/CLI clients; when none remain the
+   watcher exits after about 10 seconds.
 4. Tool responses include compact evidence under `data` plus contract metadata.
 5. Agents inspect `freshness` and `provenance` before trusting evidence.
 

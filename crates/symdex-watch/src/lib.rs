@@ -6,8 +6,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -17,12 +18,43 @@ use symdex_index::{
     run_continuous_index_until,
 };
 use symdex_store::{
-    RepositoryRecord, SqliteStore, StoreConfig, WatcherStatusRecord, current_timestamp,
-    sqlite_parent,
+    RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord, WatcherStatusRecord,
+    current_timestamp, sqlite_parent,
 };
 
 const HEARTBEAT_STALE_SECONDS: u64 = 10;
+const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const NO_CLIENT_GRACE: Duration = Duration::from_secs(10);
 const START_WAIT: Duration = Duration::from_secs(3);
+
+static CLIENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherClientKind {
+    Tui,
+    Mcp,
+    Cli,
+}
+
+impl WatcherClientKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Mcp => "mcp",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WatcherClientStatus {
+    pub client_id: String,
+    pub client_kind: String,
+    pub pid: Option<i32>,
+    pub started_at: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub last_seen_at: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WatcherStatus {
@@ -46,6 +78,10 @@ pub struct WatcherStatus {
     pub quality_running_jobs: usize,
     pub quality_failed_jobs: usize,
     pub quality_stale_jobs: usize,
+    pub attached_clients: usize,
+    pub client_kinds: Vec<String>,
+    pub clients: Vec<WatcherClientStatus>,
+    pub shutdown_after_seconds: Option<u64>,
 }
 
 impl WatcherStatus {
@@ -78,6 +114,10 @@ impl WatcherStatus {
             quality_running_jobs: record.quality_running_jobs,
             quality_failed_jobs: record.quality_failed_jobs,
             quality_stale_jobs: record.quality_stale_jobs,
+            attached_clients: 0,
+            client_kinds: Vec::new(),
+            clients: Vec::new(),
+            shutdown_after_seconds: None,
         };
         if status.is_active() && heartbeat_is_stale(status.heartbeat_at.as_deref()) {
             status.state = "stale".to_owned();
@@ -107,6 +147,10 @@ impl WatcherStatus {
             quality_running_jobs: 0,
             quality_failed_jobs: 0,
             quality_stale_jobs: 0,
+            attached_clients: 0,
+            client_kinds: Vec::new(),
+            clients: Vec::new(),
+            shutdown_after_seconds: None,
         }
     }
 
@@ -136,9 +180,67 @@ impl WatcherStatus {
     }
 }
 
+pub struct WatcherAttachment {
+    repository_id: String,
+    client_id: String,
+    stop_heartbeat: Option<Sender<()>>,
+    heartbeat_thread: Option<JoinHandle<()>>,
+}
+
+impl WatcherAttachment {
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub fn status(&self) -> Result<WatcherStatus, String> {
+        let store = open_store()?;
+        let root_path = store
+            .watcher_status(&self.repository_id)
+            .map_err(|error| error.to_string())?
+            .map(|status| status.root_path)
+            .ok_or_else(|| "watcher status missing for attachment".to_owned())?;
+        status(&root_path)
+    }
+}
+
+impl Drop for WatcherAttachment {
+    fn drop(&mut self) {
+        if let Some(stop_heartbeat) = self.stop_heartbeat.take() {
+            let _ = stop_heartbeat.send(());
+        }
+        if let Some(handle) = self.heartbeat_thread.take() {
+            let _ = handle.join();
+        }
+        if let Ok(store) = open_store() {
+            let _ = store.remove_watcher_client(&self.repository_id, &self.client_id);
+        }
+    }
+}
+
+pub fn start_or_attach(
+    repo: &str,
+    client_kind: WatcherClientKind,
+) -> Result<WatcherAttachment, String> {
+    let root = open_repo_and_migrate(repo)?;
+    let attachment = register_client(&root, client_kind)?;
+    if let Err(error) = start_daemon_for_root(&root) {
+        drop(attachment);
+        return Err(error);
+    }
+    Ok(attachment)
+}
+
 pub fn start_daemon(repo: &str) -> Result<WatcherStatus, String> {
     let root = open_repo_and_migrate(repo)?;
-    let status = status_for_root(&root)?;
+    start_daemon_for_root(&root)
+}
+
+fn start_daemon_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
+    let status = status_for_root(root)?;
     if status.is_active() {
         return Ok(status);
     }
@@ -167,6 +269,10 @@ pub fn start_daemon(repo: &str) -> Result<WatcherStatus, String> {
         quality_running_jobs: 0,
         quality_failed_jobs: 0,
         quality_stale_jobs: 0,
+        attached_clients: 0,
+        client_kinds: Vec::new(),
+        clients: Vec::new(),
+        shutdown_after_seconds: None,
     };
     store
         .upsert_watcher_status(&starting.record())
@@ -186,13 +292,13 @@ pub fn start_daemon(repo: &str) -> Result<WatcherStatus, String> {
 
     let started = Instant::now();
     while started.elapsed() < START_WAIT {
-        let current = status_for_root(&root)?;
+        let current = status_for_root(root)?;
         if current.is_active() {
             return Ok(current);
         }
         thread::sleep(Duration::from_millis(50));
     }
-    status_for_root(&root)
+    status_for_root(root)
 }
 
 pub fn stop_daemon(repo: &str) -> Result<WatcherStatus, String> {
@@ -255,19 +361,27 @@ pub fn run_daemon(repo: &str) -> Result<(), String> {
         quality_running_jobs: 0,
         quality_failed_jobs: 0,
         quality_stale_jobs: 0,
+        attached_clients: 0,
+        client_kinds: Vec::new(),
+        clients: Vec::new(),
+        shutdown_after_seconds: None,
     };
     store
         .upsert_watcher_status(&initial.record())
         .map_err(|error| error.to_string())?;
 
     let mut current = initial;
+    let mut no_clients_since: Option<Instant> = None;
     let result = run_continuous_index_until(
         &ContinuousIndexOptions::new(root.path().display().to_string(), false),
         |event| {
             apply_event(&mut current, &event);
             let _ = store.upsert_watcher_status(&current.record());
         },
-        || should_continue.load(Ordering::SeqCst),
+        || {
+            should_continue.load(Ordering::SeqCst)
+                && clients_allow_continuing(root.id(), &mut no_clients_since)
+        },
     );
     let _ = fs::remove_file(&socket_path);
     match result {
@@ -295,6 +409,7 @@ pub fn run_foreground(
             root.path().display()
         ));
     }
+    let _attachment = register_client(&root, WatcherClientKind::Cli)?;
     let mut current = WatcherStatus {
         repository_id: root.id().to_owned(),
         root_path: root.path().display().to_string(),
@@ -316,6 +431,10 @@ pub fn run_foreground(
         quality_running_jobs: 0,
         quality_failed_jobs: 0,
         quality_stale_jobs: 0,
+        attached_clients: 0,
+        client_kinds: Vec::new(),
+        clients: Vec::new(),
+        shutdown_after_seconds: None,
     };
     let store = open_store()?;
     store
@@ -333,6 +452,52 @@ pub fn run_foreground(
     store
         .mark_watcher_stopped(root.id())
         .map_err(|error| error.to_string())
+}
+
+fn register_client(
+    root: &RepoRoot,
+    client_kind: WatcherClientKind,
+) -> Result<WatcherAttachment, String> {
+    let client_id = format!(
+        "{}-{}-{}",
+        client_kind.as_str(),
+        std::process::id(),
+        CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    let record = WatcherClientRecord {
+        repository_id: root.id().to_owned(),
+        client_id: client_id.clone(),
+        client_kind: client_kind.as_str().to_owned(),
+        pid: Some(std::process::id() as i32),
+        started_at: Some(current_timestamp()),
+        heartbeat_at: Some(current_timestamp()),
+        last_seen_at: None,
+    };
+    let store = open_store()?;
+    store
+        .upsert_watcher_client(&record)
+        .map_err(|error| error.to_string())?;
+
+    let repository_id = root.id().to_owned();
+    let heartbeat_client_id = client_id.clone();
+    let (stop_heartbeat, heartbeat_stop) = mpsc::channel();
+    let heartbeat_thread = thread::spawn(move || {
+        while heartbeat_stop
+            .recv_timeout(CLIENT_HEARTBEAT_INTERVAL)
+            .is_err()
+        {
+            if let Ok(store) = open_store() {
+                let _ = store.heartbeat_watcher_client(&repository_id, &heartbeat_client_id);
+            }
+        }
+    });
+
+    Ok(WatcherAttachment {
+        repository_id: root.id().to_owned(),
+        client_id,
+        stop_heartbeat: Some(stop_heartbeat),
+        heartbeat_thread: Some(heartbeat_thread),
+    })
 }
 
 fn open_repo_and_migrate(repo: &str) -> Result<RepoRoot, String> {
@@ -354,14 +519,48 @@ fn open_store() -> Result<SqliteStore, String> {
 
 fn status_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
     let store = open_store()?;
-    store
+    prune_stale_clients(&store, root.id())?;
+    let mut status = store
         .watcher_status(root.id())
-        .map_err(|error| error.to_string())
-        .map(|status| {
-            status
-                .map(WatcherStatus::from_record)
-                .unwrap_or_else(|| WatcherStatus::inactive(root))
+        .map_err(|error| error.to_string())?
+        .map(WatcherStatus::from_record)
+        .unwrap_or_else(|| WatcherStatus::inactive(root));
+    attach_clients(&store, root.id(), &mut status)?;
+    Ok(status)
+}
+
+fn attach_clients(
+    store: &SqliteStore,
+    repository_id: &str,
+    status: &mut WatcherStatus,
+) -> Result<(), String> {
+    let clients = store
+        .watcher_clients(repository_id)
+        .map_err(|error| error.to_string())?;
+    status.attached_clients = clients.len();
+    status.client_kinds = clients
+        .iter()
+        .map(|client| client.client_kind.clone())
+        .collect::<Vec<_>>();
+    status.client_kinds.sort();
+    status.client_kinds.dedup();
+    status.clients = clients
+        .into_iter()
+        .map(|client| WatcherClientStatus {
+            client_id: client.client_id,
+            client_kind: client.client_kind,
+            pid: client.pid,
+            started_at: client.started_at,
+            heartbeat_at: client.heartbeat_at,
+            last_seen_at: client.last_seen_at,
         })
+        .collect();
+    status.shutdown_after_seconds = if status.is_active() && status.attached_clients == 0 {
+        Some(NO_CLIENT_GRACE.as_secs())
+    } else {
+        None
+    };
+    Ok(())
 }
 
 fn socket_path_for_repo(repository_id: &str) -> Result<PathBuf, String> {
@@ -399,6 +598,46 @@ fn wait_for_stopped(root: &RepoRoot) -> Result<(), String> {
         thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+fn clients_allow_continuing(repository_id: &str, no_clients_since: &mut Option<Instant>) -> bool {
+    let Ok(store) = open_store() else {
+        return true;
+    };
+    let _ = prune_stale_clients(&store, repository_id);
+    let clients = store
+        .watcher_clients(repository_id)
+        .unwrap_or_default()
+        .len();
+    clients_allow_continuing_with_count(clients, no_clients_since)
+}
+
+fn clients_allow_continuing_with_count(
+    clients: usize,
+    no_clients_since: &mut Option<Instant>,
+) -> bool {
+    if clients > 0 {
+        *no_clients_since = None;
+        return true;
+    }
+    let since = no_clients_since.get_or_insert_with(Instant::now);
+    since.elapsed() < NO_CLIENT_GRACE
+}
+
+fn prune_stale_clients(store: &SqliteStore, repository_id: &str) -> Result<(), String> {
+    let stale_before = timestamp_minus(HEARTBEAT_STALE_SECONDS);
+    store
+        .prune_stale_watcher_clients(repository_id, &stale_before)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn timestamp_minus(seconds: u64) -> String {
+    current_timestamp()
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_sub(seconds)
+        .to_string()
 }
 
 fn heartbeat_is_stale(heartbeat_at: Option<&str>) -> bool {
@@ -489,7 +728,12 @@ fn latest_changed_path(changes: &WatchChangeSet) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WatcherStatus, heartbeat_is_stale};
+    use std::time::Instant;
+
+    use super::{
+        HEARTBEAT_STALE_SECONDS, NO_CLIENT_GRACE, WatcherStatus,
+        clients_allow_continuing_with_count, heartbeat_is_stale, timestamp_minus,
+    };
 
     #[test]
     fn stale_heartbeat_marks_active_status_stale() {
@@ -511,6 +755,34 @@ mod tests {
     #[test]
     fn missing_heartbeat_is_not_stale() {
         assert!(!heartbeat_is_stale(None));
+    }
+
+    #[test]
+    fn timestamp_minus_saturates() {
+        let stale_before = timestamp_minus(HEARTBEAT_STALE_SECONDS);
+
+        assert!(stale_before.parse::<u64>().is_ok());
+    }
+
+    #[test]
+    fn no_clients_grace_eventually_stops() {
+        let mut no_clients_since = Some(Instant::now() - NO_CLIENT_GRACE);
+
+        assert!(!clients_allow_continuing_with_count(
+            0,
+            &mut no_clients_since
+        ));
+    }
+
+    #[test]
+    fn active_clients_keep_watcher_running() {
+        let mut no_clients_since = Some(Instant::now() - NO_CLIENT_GRACE);
+
+        assert!(clients_allow_continuing_with_count(
+            1,
+            &mut no_clients_since
+        ));
+        assert!(no_clients_since.is_none());
     }
 
     fn sample_status(state: &str) -> symdex_store::WatcherStatusRecord {

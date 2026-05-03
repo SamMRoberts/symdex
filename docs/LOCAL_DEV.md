@@ -137,11 +137,13 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
   rust-analyzer enrichment readiness and eligible Rust file, symbol, and call
   counts without applying rust-analyzer facts.
-- `watch start|status|stop <repo>`: manages the single persistent background
-  watcher for a repository. It polls local eligible Rust, C#, JavaScript, and
-  TypeScript files, debounces event bursts, detects created/modified/deleted
-  paths by content-hash snapshots, and reindexes changed content through the
-  incremental semantic indexing path until explicitly stopped.
+- `watch start|status|stop <repo>`: manages the single background watcher for a
+  repository. Watchers are client-scoped: TUI, MCP, and CLI attachments keep
+  them alive, and they exit after about 10 seconds with no live clients. The
+  watcher polls local eligible Rust, C#, JavaScript, and TypeScript files,
+  debounces event bursts, detects created/modified/deleted paths by content-hash
+  snapshots, and reindexes changed content through the incremental semantic
+  indexing path.
 - `index --watch <repo>`: starts the legacy foreground continuous-indexing loop,
   guarded by the same one-watcher-per-repo state. Watch mode is always
   incremental; use a separate manual `index --full <repo>` when a forced rebuild
@@ -242,7 +244,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   to quit.
 - `serve-mcp [--watch <repo>]`: runs the MCP server over stdio. With
   `--watch <repo>`, it starts or attaches the repository background watcher
-  before serving tools. The server exposes
+  before serving tools and holds that watcher lease until the MCP process exits.
+  The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
   `symdex_debug_context`, `symdex_staleness_check`, `symdex_index_status`,

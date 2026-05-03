@@ -21,7 +21,7 @@ use symdex_query::{
     run_vector_verify_with_options,
 };
 use symdex_store::{EvidenceFreshness, SqliteStore, SqliteVectorStore, StoreConfig, sqlite_parent};
-use symdex_watch::WatcherStatus;
+use symdex_watch::{WatcherClientKind, WatcherStatus};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -461,7 +461,12 @@ fn staleness(repo: &str, symbol_query: Option<&str>) -> Result<(), String> {
 
 fn watch(args: &WatchArgs) -> Result<(), String> {
     let status = match args.action {
-        WatchAction::Start => symdex_watch::start_daemon(&args.repo)?,
+        WatchAction::Start => {
+            let attachment = symdex_watch::start_or_attach(&args.repo, WatcherClientKind::Cli)?;
+            let status = attachment.status()?;
+            drop(attachment);
+            status
+        }
         WatchAction::Status => symdex_watch::status(&args.repo)?,
         WatchAction::Stop => symdex_watch::stop_daemon(&args.repo)?,
     };
@@ -1535,6 +1540,22 @@ fn print_watcher_status(status: &WatcherStatus) {
     println!("quality_running_jobs: {}", status.quality_running_jobs);
     println!("quality_failed_jobs: {}", status.quality_failed_jobs);
     println!("quality_stale_jobs: {}", status.quality_stale_jobs);
+    println!("attached_clients: {}", status.attached_clients);
+    println!(
+        "client_kinds: {}",
+        if status.client_kinds.is_empty() {
+            "<none>".to_owned()
+        } else {
+            status.client_kinds.join(",")
+        }
+    );
+    println!(
+        "shutdown_after_seconds: {}",
+        status
+            .shutdown_after_seconds
+            .map(|seconds| seconds.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
 }
 
 fn continuous_quality_summary(state: &symdex_index::ContinuousQualityState) -> String {
@@ -1580,13 +1601,16 @@ fn chunks_embedded(embedding: &EmbeddingSummary) -> usize {
 
 fn serve_mcp(args: &ServeMcpArgs) -> Result<(), String> {
     if let Some(repo) = &args.watch_repo {
-        let status = symdex_watch::start_daemon(repo)?;
+        let attachment = symdex_watch::start_or_attach(repo, WatcherClientKind::Mcp)?;
+        let status = attachment.status()?;
         eprintln!(
-            "mcp_watch_attached repository_id={} state={} owner_kind={}",
-            status.repository_id, status.state, status.owner_kind
+            "mcp_watch_attached repository_id={} state={} owner_kind={} attached_clients={}",
+            status.repository_id, status.state, status.owner_kind, status.attached_clients
         );
+        symdex_mcp::serve_stdio_with_attachment(attachment)
+    } else {
+        symdex_mcp::serve_stdio()
     }
-    symdex_mcp::serve_stdio()
 }
 
 fn tui(repo: &str) -> Result<(), String> {

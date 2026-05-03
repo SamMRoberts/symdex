@@ -136,13 +136,16 @@ Current implementation status:
 
 - `symdex-index` exposes shared watch snapshot, diff, and continuous polling
   APIs.
-- `symdex watch start <repo>` starts the persistent background watcher or
-  returns the existing watcher status. `symdex watch status <repo>` reads shared
+- `symdex watch start <repo>` starts or attaches the background watcher and
+  prints status. Watchers are client-scoped, so this command alone does not make
+  a permanent daemon; without a live TUI, MCP server, or foreground watcher the
+  daemon exits after about 10 seconds. `symdex watch status <repo>` reads shared
   SQLite watcher state. `symdex watch stop <repo>` asks the daemon to stop.
 - `symdex index --watch <repo>` remains a foreground watch loop, but it refuses
   to run while a background or foreground watcher is already active.
 - `symdex serve-mcp --watch <repo>` starts or attaches the single background
-  watcher before serving MCP. MCP stdout remains protocol-only.
+  watcher before serving MCP and holds a client lease until the MCP process
+  exits. MCP stdout remains protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
 - Watch-driven batches are recorded with `run_kind = watch` in local index-run
