@@ -1590,9 +1590,10 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 render_repository_summary_panel(frame, body_chunks[0], app);
                 render_right_panel(frame, body_chunks[1], app);
             } else {
+                let summary_height = if app.view == View::Indexing { 4 } else { 6 };
                 let body_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(6), Constraint::Min(8)])
+                    .constraints([Constraint::Length(summary_height), Constraint::Min(8)])
                     .split(chunks[1]);
                 render_repository_summary_panel(frame, body_chunks[0], app);
                 render_right_panel(frame, body_chunks[1], app);
@@ -2331,7 +2332,7 @@ fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .split(inner);
             let side_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(12), Constraint::Length(3)])
+                .constraints([Constraint::Length(15), Constraint::Length(3)])
                 .split(chunks[1]);
             let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
             frame.render_widget(panel, chunks[0]);
@@ -2342,7 +2343,7 @@ fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(5),
-                    Constraint::Length(12),
+                    Constraint::Length(15),
                     Constraint::Length(3),
                 ])
                 .split(inner);
@@ -2363,7 +2364,7 @@ fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         } else {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(5), Constraint::Length(12)])
+                .constraints([Constraint::Min(5), Constraint::Length(15)])
                 .split(inner);
             let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
             frame.render_widget(panel, chunks[0]);
@@ -2397,14 +2398,17 @@ fn render_semantic_readiness_gauges(
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(3),
         ])
         .split(area);
     let fast_percent = layer_readiness_percent(&summary.fast);
     let quality_percent = layer_readiness_percent(&summary.quality);
     let fast_pending_percent = fast_pending_percent(summary);
     let fast_running_percent = fast_running_percent(summary);
+    let fast_stale_percent = fast_stale_percent(summary);
     let pending_percent = quality_job_percent(summary, QualityJobMetric::Pending);
     let running_percent = quality_job_percent(summary, QualityJobMetric::Running);
+    let stale_percent = quality_job_percent(summary, QualityJobMetric::SkippedStale);
     let fast_gauge = Gauge::default()
         .block(
             Block::default()
@@ -2435,6 +2439,7 @@ fn render_semantic_readiness_gauges(
     frame.render_widget(quality_gauge, chunks[1]);
     render_pending_job_sparklines(frame, chunks[2], fast_pending_percent, pending_percent);
     render_running_job_sparklines(frame, chunks[3], fast_running_percent, running_percent);
+    render_stale_job_sparklines(frame, chunks[4], fast_stale_percent, stale_percent);
 }
 
 fn render_pending_job_sparklines(
@@ -2483,6 +2488,32 @@ fn render_running_job_sparklines(
     );
 }
 
+fn render_stale_job_sparklines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    fast_percent: u16,
+    quality_percent: u16,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_job_sparkline(
+        frame,
+        chunks[0],
+        "Fast Stale",
+        fast_percent,
+        StatusTone::Warning,
+    );
+    render_job_sparkline(
+        frame,
+        chunks[1],
+        "Quality Stale",
+        quality_percent,
+        StatusTone::Warning,
+    );
+}
+
 fn render_job_sparkline(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -2520,10 +2551,15 @@ fn fast_running_percent(summary: &SemanticStatusSummary) -> u16 {
     layer_count_percent(0, summary.fast.expected_chunks)
 }
 
+fn fast_stale_percent(summary: &SemanticStatusSummary) -> u16 {
+    layer_count_percent(summary.fast.stale_chunks, summary.fast.expected_chunks)
+}
+
 #[derive(Clone, Copy)]
 enum QualityJobMetric {
     Pending,
     Running,
+    SkippedStale,
 }
 
 fn quality_job_percent(summary: &SemanticStatusSummary, metric: QualityJobMetric) -> u16 {
@@ -2533,6 +2569,7 @@ fn quality_job_percent(summary: &SemanticStatusSummary, metric: QualityJobMetric
     let count = match metric {
         QualityJobMetric::Pending => progress.pending_jobs,
         QualityJobMetric::Running => progress.running_jobs,
+        QualityJobMetric::SkippedStale => progress.skipped_stale_jobs,
     };
     layer_count_percent(count, summary.quality.expected_chunks)
 }
@@ -7776,6 +7813,7 @@ mod tests {
         app.semantic_status.fast.current_chunks = 2;
         app.semantic_status.fast.expected_chunks = 4;
         app.semantic_status.fast.total_chunks = 3;
+        app.semantic_status.fast.stale_chunks = 1;
         app.semantic_status.quality.current_chunks = 1;
         app.semantic_status.quality.expected_chunks = 4;
         app.semantic_status.quality_status = SemanticLayerStatus::QualityPending;
@@ -7788,7 +7826,7 @@ mod tests {
             running_jobs: 1,
             succeeded_jobs: 1,
             failed_jobs: 0,
-            skipped_stale_jobs: 0,
+            skipped_stale_jobs: 1,
             skipped_excluded_jobs: 0,
         });
         let backend = TestBackend::new(100, 28);
@@ -7805,6 +7843,8 @@ mod tests {
         assert!(rendered.contains("Quality Pend 50%"));
         assert!(rendered.contains("Fast Run 0%"));
         assert!(rendered.contains("Quality Run 25%"));
+        assert!(rendered.contains("Fast Stale 25%"));
+        assert!(rendered.contains("Quality Stale 25%"));
         let buffer = terminal.backend().buffer();
         assert_ne!(
             cell_fg_for_text(buffer, "fast_ready 2/4 50%", None),
