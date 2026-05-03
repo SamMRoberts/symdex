@@ -96,6 +96,62 @@ terminal panes.
   stateful table selection to scroll independently when the selected row moves
   beyond the currently visible viewport.
 
+### Ratatui widget evaluation
+
+The current TUI already uses the right stable baseline from `ratatui`: `Block`,
+`Paragraph`, `List`, `Table`, `Tabs`, `Gauge`, and `Sparkline`. Keep these as
+the default building blocks because they are built in, compact, easy to test
+with the ratatui test backend, and already match symdex's local metadata-first
+model.
+
+Built-in widget decisions:
+
+| Widget | Decision | Symdex fit |
+|---|---|---|
+| `Block` | Keep using | Primary panel boundary, titles, status-colored borders, footer containers, and detail panes. |
+| `Paragraph` | Keep using | Wrapped status, confirmations, details, and input echoes. |
+| `List` | Keep using | Compact notes and single-column fallback rows. |
+| `Table` | Keep using | Best default for evidence, storage, diagnostics, calls, impact, and context-pack metadata. |
+| `Tabs` | Keep using | Major views, storage subviews, and mode selectors. |
+| `Gauge` | Keep using | Manual indexing progress and fast/quality semantic readiness where real counts exist. |
+| `Sparkline` | Keep using sparingly | Quality/fast job activity only when derived from real counts; avoid decorative use. |
+| `Scrollbar` | Add next | Long selectable tables and detail panes need visible position without reducing evidence density. |
+| `BarChart` | Add after scrollbar | Useful for real bucketed metrics: call resolution buckets, index-run outcomes, freshness status counts, embedding coverage, and quality job states. |
+| `Chart` | Defer | Potentially useful for index-run duration/throughput over time, but only after store/query APIs expose stable time-series metrics. |
+| `Canvas` | Defer | Could visualize call paths or graph topology, but table evidence is clearer and more accessible for the MVP. |
+| `Calendar` | Avoid for now | Index activity is better shown as timeline rows or bar charts; calendar layout spends too much space at 80x24. |
+
+Third-party widget decisions:
+
+| Widget crate | Decision | Symdex fit |
+|---|---|---|
+| `tui-tree-widget` | Good candidate | Symbol outlines and future file/package hierarchy would benefit from collapsible keyboard navigation. Keep metadata-only labels: path, symbol kind, line range, child count, and status. |
+| `ratatui-textarea` | Good candidate | Debug-context input often needs pasted multiline panic/backtrace text. It can also improve query/call/context inputs if single-line behavior remains fast. |
+| `tui-scrollview` | Good candidate | Detail drawers and context-pack/debug-context metadata can exceed available height; use only if built-in scrollbars plus existing state are insufficient. |
+| `tui-widget-list` | Good candidate with caution | Could simplify stateful scrolling lists, but tables remain better for most symdex evidence. Consider it for command/result lists only after scrollbar work. |
+| `throbber-widgets-tui` | Optional | Could replace the current ASCII continuous-index activity indicator, but the existing indicator is sufficient unless users need clearer running states. |
+| `tui-checkbox` | Optional | Could make future settings toggles clearer, such as offline/semantic/full/incremental, but current explicit text confirmations are safer. |
+| `tui-menu` | Defer | Menus can help discoverability, but symdex must stay keyboard-first and text-entry-friendly; avoid menu systems that steal letter keys. |
+| `tui-nodes` | Defer | Possible call-graph topology view, but tables with confidence and line evidence are more actionable and accessible today. |
+| `tui-logger` | Defer | A log panel could help diagnostics, but logs must never include source text and structured logging is not yet a TUI surface. |
+| `tui-piechart` | Avoid | Pie charts are less precise than tables or bar charts for health and coverage counts. |
+| `tui-big-text` | Avoid | Decorative large labels reduce evidence density and hurt 80x24 usability. |
+| `ratatui-image` | Avoid | Image rendering does not support codebase intelligence workflows and complicates terminal compatibility. |
+| `tui-term` | Avoid | Embedding a terminal risks source execution workflows and conflicts with the TUI boundary that it must call Rust APIs directly. |
+
+Recommended implementation order:
+
+1. Add built-in `Scrollbar` support to every selectable table and any bounded
+   detail pane whose rows can exceed the visible height.
+2. Add `BarChart` summaries for storage health and semantic/indexing counts
+   that already exist in SQLite/query summaries.
+3. Evaluate `ratatui-textarea` for debug-context multiline input, including
+   paste, cursor, and 80x24 render tests.
+4. Evaluate `tui-tree-widget` for symbol outline and optional file hierarchy
+   drill-down, preserving table fallbacks for narrow terminals.
+5. Revisit `Chart`, `Canvas`, `tui-nodes`, and `tui-logger` only after their
+   backing data contracts exist and their accessibility tradeoffs are tested.
+
 ### Interaction Feedback
 
 - Highlight the active tab and focused input/list row.
