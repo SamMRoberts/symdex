@@ -16,7 +16,7 @@ use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, LineGauge, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::widgets::{Cell, Row, Table, TableState};
 use symdex_core::{RepoRoot, SemanticLayer, SemanticLayerStatus};
 use symdex_diagnostics::{
@@ -2498,14 +2498,13 @@ fn render_status_gauge_pair(
     frame.render_widget(status_line_gauge(quality), chunks[1]);
 }
 
-fn status_line_gauge(row: StatusGaugeRow) -> LineGauge<'static> {
-    LineGauge::default()
-        .filled_style(tone_style(row.tone).add_modifier(Modifier::BOLD))
-        .unfilled_style(Style::new().fg(Color::DarkGray))
-        .ratio(gauge_ratio(row.count, row.total))
-        .label(Line::from(gauge_label_span(status_gauge_label(
+fn status_line_gauge(row: StatusGaugeRow) -> Gauge<'static> {
+    Gauge::default()
+        .gauge_style(high_contrast_gauge_style(row.tone))
+        .percent(count_percent(row.count, row.total))
+        .label(gauge_label_span(status_gauge_label(
             row.label, row.count, row.total,
-        ))))
+        )))
 }
 
 #[derive(Clone, Copy)]
@@ -2557,13 +2556,6 @@ fn quality_job_status(summary: &SemanticStatusSummary) -> LayerJobStatus {
         },
         None => layer_job_status(&summary.quality),
     }
-}
-
-fn gauge_ratio(count: usize, total: usize) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-    (count as f64 / total as f64).clamp(0.0, 1.0)
 }
 
 fn status_gauge_label(label: &str, count: usize, total: usize) -> String {
