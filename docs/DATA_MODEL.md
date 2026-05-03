@@ -6,12 +6,17 @@ Initial schema names are stable enough for early implementation but may change b
 
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
-while the current write path persists repositories, files, chunks, symbols, and
-calls.
+while the current indexing write path persists repositories, files, chunks,
+symbols, calls, tests, fast semantic generations, and fast/quality
+`chunk_embeddings` manifests. The older chunk-level vector columns remain
+nullable compatibility schema, but layered manifests are the authoritative
+semantic projection.
 
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
 caller/callee traversal, and index-run metadata checks.
+Layered semantic indexes cover latest generation lookup, per-layer embedding
+manifests, and quality job status scans.
 
 ### `repositories`
 
@@ -58,7 +63,8 @@ Continuous indexing records compact batch summaries in `index_runs` through the
 same indexing path, so watch-driven updates are visible in storage views. The UI
 can distinguish manual/offline and semantic batches through `run_kind`, status,
 timestamps, files seen/indexed, chunks embedded, model, dimension, and any
-metadata-only error summary.
+metadata-only error summary. Watch-driven batches are currently recorded with
+`run_kind = watch`.
 
 ### `files`
 
@@ -125,14 +131,17 @@ CREATE TABLE chunks (
 ```
 
 `excluded_reason` is set when a chunk is kept as metadata but withheld from
-embedding. Chunks with an exclusion reason do not get a Qdrant point ID in the
-current implementation.
+embedding. The chunk-level `qdrant_point_id`, `embedding_model`,
+`embedding_dimension`, and `embedded_at` columns are retained only as nullable
+compatibility fields for local databases created before layered semantic
+manifests. New indexing leaves them unset and records vector provenance in
+`chunk_embeddings`.
 
 Before semantic indexing replaces changed-file chunk rows or removes deleted
-files, it reads existing non-null `qdrant_point_id` values for those chunks and
-uses them to delete stale Qdrant points. This keeps SQLite as the source of
-truth for vector lifecycle cleanup while avoiding source text in Qdrant payloads
-or cleanup reports.
+files, it reads current fast `chunk_embeddings` point IDs for those paths from
+the latest semantic generation and uses them to delete stale Qdrant points. This
+keeps SQLite as the source of truth for vector lifecycle cleanup while avoiding
+source text in Qdrant payloads or cleanup reports.
 
 ### `calls`
 
@@ -183,10 +192,142 @@ such as inline Jest, Vitest, or Mocha callbacks. The `tests` table supports
 exact/suffix failing-test name lookup for debug context packs and direct
 test-to-symbol call lookup for impact summaries.
 
+### `semantic_generations`
+
+```sql
+CREATE TABLE semantic_generations (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  fast_model TEXT NOT NULL,
+  fast_dimension INTEGER NOT NULL,
+  fast_completed_at TEXT NOT NULL,
+  quality_model TEXT,
+  quality_dimension INTEGER,
+  quality_status TEXT NOT NULL,
+  quality_started_at TEXT,
+  quality_completed_at TEXT,
+  active_layer TEXT NOT NULL,
+  files_seen INTEGER NOT NULL,
+  embeddable_chunks INTEGER NOT NULL,
+  fast_embedded_chunks INTEGER NOT NULL,
+  quality_embedded_chunks INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+This table tracks metadata for a semantic generation. Current semantic indexing
+records the fast layer after successful fast Qdrant upsert with
+`active_layer = fast` and `quality_status = fast_ready`. Generation IDs are
+deterministic over the current fast manifest, so unchanged manifests reuse the
+same generation ID and preserve existing quality fields such as
+`quality_status`, `quality_dimension`, `quality_completed_at`, `active_layer`,
+and `quality_embedded_chunks`. A changed fast manifest creates or selects a new
+generation whose default active layer is fast until quality catches up. Rows do
+not contain source text.
+
+The manual quality worker refreshes activation state from SQLite manifests and
+job counts. A latest generation becomes `quality_ready` with
+`active_layer = quality` only when the current quality manifest covers every
+embeddable chunk, the quality model and dimension are known, and no pending,
+running, failed, or `skipped_stale` jobs remain. Partial coverage remains
+`quality_pending`; terminal failures become `quality_failed`; blocked
+generations remain `quality_blocked`; and latest-generation `skipped_stale`
+jobs keep default routing on fast until a later generation can complete cleanly.
+`quality_completed_at` is set only by successful activation.
+
+### `chunk_embeddings`
+
+```sql
+CREATE TABLE chunk_embeddings (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  semantic_layer TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  embedding_dimension INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  qdrant_collection TEXT NOT NULL,
+  qdrant_point_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  embedded_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'current',
+  UNIQUE(chunk_id, semantic_layer, embedding_model, embedding_dimension)
+);
+```
+
+This table is the per-layer vector manifest. Current semantic indexing writes
+`fast` rows directly from the successful fast Qdrant upsert and writes `quality`
+rows from the deferred quality worker. It keeps fast and quality metadata
+separate by `semantic_layer`, model, dimension, generation, collection, and
+point ID so the two layers do not share one Qdrant collection. `status` is
+metadata-only and currently supports `current`, `stale`, `blocked`, and
+`failed`.
+
+Layer-aware Qdrant verification builds expected fast and quality point manifests
+from `current` rows in this table for the latest semantic generation. Older
+single-model local databases that predate layered manifests should run
+`symdex index <repo>` to create fast `chunk_embeddings` rows before using
+layer-aware verification.
+
+### `quality_embedding_jobs`
+
+```sql
+CREATE TABLE quality_embedding_jobs (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error_summary TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repository_id, generation_id, chunk_id)
+);
+```
+
+Quality jobs are long-lived metadata rows for deferred quality embedding work.
+They include enough hashes and path metadata to detect stale work before
+embedding, but never include source text. Current status values are `pending`,
+`running`, `succeeded`, `failed`, `skipped_stale`, and `skipped_excluded`.
+Fast semantic indexing creates `pending` jobs only for current embeddable chunks
+when quality indexing is enabled and the configured quality model is available.
+Chunks with `excluded_reason`, including secret-blocked and too-large chunks,
+do not get quality jobs. If a new fast generation supersedes queued work, only
+old `pending` and `running` jobs are marked `skipped_stale`; terminal history is
+preserved. If the quality model or service is unavailable, the semantic
+generation is marked `quality_blocked` and no pending quality jobs are created.
+`semantic_generations.quality_dimension` remains null until the quality worker
+records actual quality embeddings.
+
+The manual quality worker claims oldest `pending` jobs in bounded batches,
+marks them `running`, increments `attempts`, and then revalidates current file
+and chunk metadata before embedding. Successful jobs transactionally write a
+quality-layer `chunk_embeddings` row and move to `succeeded`. Service or vector
+write failures move to `failed` with a compact metadata-only error summary.
+Stale jobs, including chunks that now have an `excluded_reason`, move to
+`skipped_stale` and are not embedded.
+
+After worker progress, `semantic_generations.quality_embedded_chunks` is
+refreshed from current quality manifest rows. The first successful quality
+embedding records `quality_dimension`. If failures remain and no pending or
+running jobs remain for the latest generation, `quality_status` becomes
+`quality_failed`; otherwise a complete, clean latest generation is atomically
+marked `quality_ready` with `active_layer = quality`. Latest-generation
+`skipped_stale` jobs are treated as incomplete work, not successful coverage.
+
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
-files, chunks, symbols, and calls. Semantic indexing also fills chunk embedding
-model, dimension, and embedding timestamp metadata after vector upsert.
+files, chunks, symbols, and calls. Semantic indexing records fast and quality
+vector provenance in `chunk_embeddings`; legacy chunk embedding columns are no
+longer authoritative and are left unset by new indexing.
 `parser_version` must include the per-language parser identity and symdex
 indexer/chunker version so mixed-language indexes remain auditable.
 
@@ -261,11 +402,12 @@ closed with a reset/reindex message instead of mixing incompatible points in the
 same Qdrant collection. Different model names use different collection names.
 
 The Qdrant verifier treats SQLite as the expected vector manifest. It compares
-each non-null `chunks.qdrant_point_id` with Qdrant payload rows filtered by
-`repository_id`, checking point ID, chunk ID, path, line range, text hash,
-embedding model, and embedding dimension. Missing collections and missing
-points are errors; stale payload fields and orphaned Qdrant points are warnings.
-The report is metadata-only and does not request vectors or source text.
+latest-generation `chunk_embeddings` rows for the selected semantic layer with
+Qdrant payload rows filtered by `repository_id`, checking point ID, chunk ID,
+path, line range, text hash, embedding model, and embedding dimension. Missing
+collections and missing points are errors; stale payload fields and orphaned
+Qdrant points are warnings. The report is metadata-only and does not request
+vectors or source text.
 
 The Qdrant repair command uses verifier metadata as its repair plan. Orphaned
 point IDs are deleted from Qdrant. Missing or stale expected points, including
@@ -286,8 +428,8 @@ Use SQLite tables to show repository structure:
 - `index_runs`: latest and historical indexing status.
 - `files`: indexed paths, languages, content hashes, and indexed timestamps.
 - `symbols`: symbol names, qualified names, kinds, nesting, and line ranges.
-- `chunks`: chunk kinds, line ranges, text hashes, vector point IDs, and
-  exclusion reasons.
+- `chunks`: chunk kinds, line ranges, text hashes, compatibility vector fields,
+  and exclusion reasons.
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
 
 Use Qdrant metadata to show semantic storage:
@@ -304,7 +446,8 @@ Group by `files.path` and aggregate:
 - symbol count from `symbols`
 - call count from `calls` joined through caller symbols
 - embeddable chunk count from chunks where `excluded_reason IS NULL`
-- vector-backed chunk count from chunks with `qdrant_point_id IS NOT NULL`
+- vector-backed chunk count from current fast `chunk_embeddings` rows for the
+  latest semantic generation
 - excluded chunk count grouped by `excluded_reason`
 
 Use status labels such as `covered`, `metadata-only`, `excluded`, `stale`, and
@@ -314,7 +457,7 @@ Use status labels such as `covered`, `metadata-only`, `excluded`, `stale`, and
 
 For the selected file, show metadata rows from:
 
-- `chunks`: kind, line range, text hash, vector point ID, exclusion reason
+- `chunks`: kind, line range, text hash, layered vector status, exclusion reason
 - `symbols`: kind, qualified name, parent symbol, line range
 - `calls`: call line, callee text, resolved callee symbol, confidence, status
 
@@ -338,9 +481,9 @@ caller symbol, callee text, call line, path, confidence, and resolution status.
 Compare SQLite chunk metadata with Qdrant collection metadata:
 
 - chunks with `excluded_reason` are metadata-only and intentionally unembedded
-- chunks with `qdrant_point_id` should have matching Qdrant points
-- chunks without `qdrant_point_id` and without `excluded_reason` are missing
-  vectors
+- current fast `chunk_embeddings` rows should have matching Qdrant points
+- chunks without a current fast `chunk_embeddings` row and without
+  `excluded_reason` are missing vectors
 - latest successful `index_runs.embedding_model` and `embedding_dimension`
   should match the selected Qdrant collection metadata
 
@@ -350,19 +493,19 @@ as warning or error rows.
 The CLI `qdrant-verify` command implements this live comparison against Qdrant.
 The TUI can use the same status labels when it grows live cross-store actions.
 
-The first TUI implementation uses SQLite metadata and recorded Qdrant point IDs
-to show total, embeddable, vector-backed, missing-vector, and excluded chunk
-counts plus latest model, dimension, collection, run count, exclusion reasons,
-and health notes. It does not require a live Qdrant service for deterministic
-offline rendering.
+The first TUI implementation uses SQLite metadata and latest-generation fast
+`chunk_embeddings` rows to show total, embeddable, vector-backed,
+missing-vector, and excluded chunk counts plus latest model, dimension,
+collection, run count, exclusion reasons, and health notes. It does not require
+a live Qdrant service for deterministic offline rendering.
 
 The cross-store health view consolidates these checks into selectable warning
 rows. It flags missing collection metadata when embeddable chunks have no
 successful semantic run or no vector-backed chunks, missing vectors when
-eligible chunks lack `qdrant_point_id`, excluded chunks when `excluded_reason`
-is present, model drift when the configured model differs from the latest
-indexed model, and dimension drift when successful runs for the same model have
-recorded multiple vector dimensions.
+eligible chunks lack a current fast `chunk_embeddings` row, excluded chunks when
+`excluded_reason` is present, model drift when the configured model differs from
+the latest indexed model, and dimension drift when successful runs for the same
+model have recorded multiple vector dimensions.
 
 ### Index runs timeline
 

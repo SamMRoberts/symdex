@@ -8,14 +8,18 @@ use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexSummary,
-    RustAnalyzerEnrichmentSummary, WatchChangeSet, run_continuous_index, run_index,
+    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexScope,
+    IndexSummary, QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary,
+    WatchChangeSet, run_continuous_index, run_index, run_quality_index,
+    run_quality_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
-    ImpactSummary, QdrantVerifySummary, run_call_graph, run_call_path, run_context_pack,
-    run_debug_context_pack, run_freshness_report, run_impact, run_qdrant_verify,
-    run_semantic_search, run_symbol_search, run_unified_context_pack,
+    ImpactSummary, QdrantVerifyOptions, QdrantVerifySemanticLayer, QdrantVerifySummary,
+    SemanticStatusLayerSummary, SemanticStatusSummary, run_call_graph, run_call_path,
+    run_context_pack, run_debug_context_pack, run_freshness_report, run_impact,
+    run_qdrant_verify_with_options, run_semantic_search, run_semantic_status, run_symbol_search,
+    run_unified_context_pack,
 };
 use symdex_store::{EvidenceFreshness, QdrantClient, SqliteStore, StoreConfig, sqlite_parent};
 
@@ -46,12 +50,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "index" => {
             require_text_output(command, output)?;
-            let index_args = parse_index_args(&args[1..]);
+            let index_args = parse_index_args(&args[1..])?;
             index(&index_args)
+        }
+        "index-quality" => {
+            require_text_output(command, output)?;
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            index_quality(repo)
         }
         "index-status" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             index_status(repo, output)
+        }
+        "semantic-status" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            semantic_status(repo, output)
         }
         "staleness" | "freshness" => {
             require_text_output(command, output)?;
@@ -61,13 +74,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "qdrant-verify" => {
             require_text_output(command, output)?;
-            let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            qdrant_verify(repo)
+            let verify_args = parse_qdrant_maintenance_args(&args[1..])?;
+            qdrant_verify(&verify_args)
         }
         "qdrant-repair" => {
             require_text_output(command, output)?;
-            let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            qdrant_repair(repo)
+            let repair_args = parse_qdrant_maintenance_args(&args[1..])?;
+            qdrant_repair(&repair_args)
         }
         "symbol" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -222,8 +235,25 @@ fn index(args: &IndexArgs) -> Result<(), String> {
     let summary = run_index(&IndexOptions {
         repo: args.repo.clone(),
         offline: args.offline,
+        scope: args.scope,
     })?;
     print_index_summary(&summary);
+    Ok(())
+}
+
+fn index_quality(repo: &str) -> Result<(), String> {
+    let summary = run_quality_index_with_progress(
+        &QualityIndexOptions {
+            repo: repo.to_owned(),
+        },
+        |progress| {
+            println!(
+                "quality_progress phase={} completed={} total={} message={}",
+                progress.phase, progress.completed, progress.total, progress.message
+            );
+        },
+    )?;
+    print_quality_index_summary(&summary);
     Ok(())
 }
 
@@ -274,45 +304,207 @@ fn index_status(repo: &str, output: OutputMode) -> Result<(), String> {
     Ok(())
 }
 
+fn semantic_status(repo: &str, output: OutputMode) -> Result<(), String> {
+    let summary = run_semantic_status(repo)?;
+    if output == OutputMode::Json {
+        let json = serde_json::to_string_pretty(&semantic_status_json(&summary))
+            .map_err(|error| error.to_string())?;
+        println!("{json}");
+        return Ok(());
+    }
+    print_semantic_status_summary(&summary);
+    Ok(())
+}
+
+fn print_semantic_status_summary(summary: &SemanticStatusSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!(
+        "generation_id: {}",
+        summary.generation_id.as_deref().unwrap_or("<none>")
+    );
+    println!("active_layer: {}", summary.active_layer.as_str());
+    println!("quality_status: {}", summary.quality_status.as_str());
+    println!("quality_enabled: {}", summary.quality_enabled);
+    println!(
+        "fallback_reason: {}",
+        summary.fallback_reason.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "latest_quality_error: {}",
+        summary.latest_quality_error.as_deref().unwrap_or("<none>")
+    );
+    print_semantic_status_layer("fast", &summary.fast);
+    print_semantic_status_layer("quality", &summary.quality);
+    if let Some(progress) = &summary.quality_progress {
+        println!("quality_progress:");
+        println!("  embeddable_chunks: {}", progress.embeddable_chunks);
+        println!(
+            "  quality_embedded_chunks: {}",
+            progress.quality_embedded_chunks
+        );
+        println!("  pending_jobs: {}", progress.pending_jobs);
+        println!("  running_jobs: {}", progress.running_jobs);
+        println!("  succeeded_jobs: {}", progress.succeeded_jobs);
+        println!("  failed_jobs: {}", progress.failed_jobs);
+        println!("  skipped_stale_jobs: {}", progress.skipped_stale_jobs);
+        println!(
+            "  skipped_excluded_jobs: {}",
+            progress.skipped_excluded_jobs
+        );
+    } else {
+        println!("quality_progress: <none>");
+    }
+}
+
+fn print_semantic_status_layer(label: &str, layer: &SemanticStatusLayerSummary) {
+    println!("{label}_layer:");
+    println!("  semantic_layer: {}", layer.semantic_layer.as_str());
+    println!("  embedding_model: {}", layer.embedding_model);
+    println!(
+        "  embedding_dimension: {}",
+        layer
+            .embedding_dimension
+            .map(|dimension| dimension.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
+    println!("  qdrant_collection: {}", layer.qdrant_collection);
+    println!("  expected_chunks: {}", layer.expected_chunks);
+    println!("  current_chunks: {}", layer.current_chunks);
+    println!("  stale_chunks: {}", layer.stale_chunks);
+    println!("  blocked_chunks: {}", layer.blocked_chunks);
+    println!("  failed_chunks: {}", layer.failed_chunks);
+    println!("  other_chunks: {}", layer.other_chunks);
+    println!("  total_chunks: {}", layer.total_chunks);
+    println!("  is_complete: {}", layer.is_complete);
+}
+
+fn semantic_status_json(summary: &SemanticStatusSummary) -> serde_json::Value {
+    json!({
+        "repository_id": summary.repository_id.as_str(),
+        "generation_id": summary.generation_id.as_deref(),
+        "active_layer": summary.active_layer.as_str(),
+        "quality_status": summary.quality_status.as_str(),
+        "quality_enabled": summary.quality_enabled,
+        "fallback_reason": summary.fallback_reason.as_deref(),
+        "latest_quality_error": summary.latest_quality_error.as_deref(),
+        "fast": semantic_status_layer_json(&summary.fast),
+        "quality": semantic_status_layer_json(&summary.quality),
+        "quality_progress": summary.quality_progress.as_ref().map(|progress| json!({
+            "repository_id": progress.repository_id.as_str(),
+            "generation_id": progress.generation_id.as_str(),
+            "embeddable_chunks": progress.embeddable_chunks,
+            "quality_embedded_chunks": progress.quality_embedded_chunks,
+            "pending_jobs": progress.pending_jobs,
+            "running_jobs": progress.running_jobs,
+            "succeeded_jobs": progress.succeeded_jobs,
+            "failed_jobs": progress.failed_jobs,
+            "skipped_stale_jobs": progress.skipped_stale_jobs,
+            "skipped_excluded_jobs": progress.skipped_excluded_jobs,
+        })),
+    })
+}
+
+fn semantic_status_layer_json(layer: &SemanticStatusLayerSummary) -> serde_json::Value {
+    json!({
+        "semantic_layer": layer.semantic_layer.as_str(),
+        "embedding_model": layer.embedding_model.as_str(),
+        "embedding_dimension": layer.embedding_dimension,
+        "qdrant_collection": layer.qdrant_collection.as_str(),
+        "expected_chunks": layer.expected_chunks,
+        "current_chunks": layer.current_chunks,
+        "stale_chunks": layer.stale_chunks,
+        "blocked_chunks": layer.blocked_chunks,
+        "failed_chunks": layer.failed_chunks,
+        "other_chunks": layer.other_chunks,
+        "total_chunks": layer.total_chunks,
+        "is_complete": layer.is_complete,
+    })
+}
+
 fn staleness(repo: &str, symbol_query: Option<&str>) -> Result<(), String> {
     let summary = run_freshness_report(repo, symbol_query)?;
     print_freshness_summary(&summary);
     Ok(())
 }
 
-fn qdrant_verify(repo: &str) -> Result<(), String> {
-    let summary = run_qdrant_verify(repo)?;
+fn qdrant_verify(args: &QdrantMaintenanceArgs) -> Result<(), String> {
+    let summary = run_qdrant_verify_with_options(
+        &args.repo,
+        QdrantVerifyOptions {
+            semantic_layer: args.semantic_layer,
+        },
+    )?;
     print_qdrant_verify_summary(&summary);
     Ok(())
 }
 
-fn qdrant_repair(repo: &str) -> Result<(), String> {
-    let before = run_qdrant_verify(repo)?;
+fn qdrant_repair(args: &QdrantMaintenanceArgs) -> Result<(), String> {
+    let options = QdrantVerifyOptions {
+        semantic_layer: args.semantic_layer,
+    };
+    let before = run_qdrant_verify_with_options(&args.repo, options)?;
     println!("pre_repair_verify:");
     print_qdrant_verify_summary(&before);
 
     let orphaned_points_deleted = delete_orphaned_qdrant_points(&before)?;
     println!("orphaned_points_deleted: {orphaned_points_deleted}");
 
-    let reindex_required = before.missing_points > 0 || before.stale_payload_points > 0;
-    if reindex_required {
-        println!("semantic_reindex: started");
-        let index_summary = run_index(&IndexOptions {
-            repo: repo.to_owned(),
-            offline: false,
-        })?;
-        print_index_summary(&index_summary);
-    } else {
-        println!("semantic_reindex: skipped");
-    }
+    repair_qdrant_summary(&args.repo, &before)?;
 
-    let after = run_qdrant_verify(repo)?;
+    let after = run_qdrant_verify_with_options(&args.repo, options)?;
     println!("post_repair_verify:");
     print_qdrant_verify_summary(&after);
     Ok(())
 }
 
+fn repair_qdrant_summary(repo: &str, summary: &QdrantVerifySummary) -> Result<(), String> {
+    if !summary.layer_summaries.is_empty() {
+        for layer_summary in &summary.layer_summaries {
+            repair_qdrant_summary(repo, layer_summary)?;
+        }
+        return Ok(());
+    }
+
+    let reindex_required = summary.missing_points > 0 || summary.stale_payload_points > 0;
+    if !reindex_required {
+        println!(
+            "semantic_repair layer={} action=skipped",
+            summary.semantic_layer
+        );
+        return Ok(());
+    }
+
+    match QdrantVerifySemanticLayer::parse(&summary.semantic_layer)? {
+        QdrantVerifySemanticLayer::Fast => {
+            println!("semantic_repair layer=fast action=reindex_started");
+            let index_summary = run_index(&IndexOptions {
+                repo: repo.to_owned(),
+                offline: false,
+                scope: IndexScope::Full,
+            })?;
+            print_index_summary(&index_summary);
+        }
+        QdrantVerifySemanticLayer::Quality => {
+            println!("semantic_repair layer=quality action=quality_worker_started");
+            let quality_summary = run_quality_index(&QualityIndexOptions {
+                repo: repo.to_owned(),
+            })?;
+            print_quality_index_summary(&quality_summary);
+        }
+        QdrantVerifySemanticLayer::All => {}
+    }
+    Ok(())
+}
+
 fn delete_orphaned_qdrant_points(summary: &QdrantVerifySummary) -> Result<usize, String> {
+    if !summary.layer_summaries.is_empty() {
+        return summary
+            .layer_summaries
+            .iter()
+            .try_fold(0usize, |deleted, layer_summary| {
+                Ok(deleted + delete_orphaned_qdrant_points(layer_summary)?)
+            });
+    }
     if !summary.collection_exists || summary.orphaned_point_ids.is_empty() {
         return Ok(0);
     }
@@ -564,18 +756,36 @@ fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
 }
 
 fn print_qdrant_verify_summary(summary: &QdrantVerifySummary) {
-    println!("repository_id: {}", summary.repository_id);
-    println!("collection: {}", summary.collection_name);
-    println!("embedding_model: {}", summary.embedding_model);
-    println!("collection_exists: {}", summary.collection_exists);
-    println!("expected_vector_points: {}", summary.expected_vector_points);
-    println!("qdrant_payload_points: {}", summary.qdrant_payload_points);
-    println!("missing_points: {}", summary.missing_points);
-    println!("stale_payload_points: {}", summary.stale_payload_points);
-    println!("orphaned_points: {}", summary.orphaned_points);
+    print_qdrant_verify_summary_with_prefix(summary, "");
+    for layer_summary in &summary.layer_summaries {
+        println!("layer_summary: {}", layer_summary.semantic_layer);
+        print_qdrant_verify_summary_with_prefix(layer_summary, "  ");
+    }
+}
+
+fn print_qdrant_verify_summary_with_prefix(summary: &QdrantVerifySummary, prefix: &str) {
+    println!("{prefix}repository_id: {}", summary.repository_id);
+    println!("{prefix}semantic_layer: {}", summary.semantic_layer);
+    println!("{prefix}collection: {}", summary.collection_name);
+    println!("{prefix}embedding_model: {}", summary.embedding_model);
+    println!("{prefix}collection_exists: {}", summary.collection_exists);
+    println!(
+        "{prefix}expected_vector_points: {}",
+        summary.expected_vector_points
+    );
+    println!(
+        "{prefix}qdrant_payload_points: {}",
+        summary.qdrant_payload_points
+    );
+    println!("{prefix}missing_points: {}", summary.missing_points);
+    println!(
+        "{prefix}stale_payload_points: {}",
+        summary.stale_payload_points
+    );
+    println!("{prefix}orphaned_points: {}", summary.orphaned_points);
     for row in &summary.rows {
         println!(
-            "{} {} {}",
+            "{prefix}{} {} {}",
             storage_health_status_label(row.status),
             row.label,
             row.detail
@@ -873,6 +1083,39 @@ fn print_index_summary(summary: &IndexSummary) {
     }
 }
 
+fn print_quality_index_summary(summary: &QualityIndexSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!("generation_id: {}", summary.generation_id);
+    println!("quality_model: {}", summary.quality_model);
+    println!(
+        "quality_dimension: {}",
+        summary
+            .quality_dimension
+            .map(|dimension| dimension.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
+    println!("quality_status: {}", summary.quality_status);
+    println!("active_layer: {}", summary.active_layer);
+    println!("activation_reason: {}", summary.activation_reason);
+    println!("qdrant_collection: {}", summary.qdrant_collection);
+    println!("claimed_jobs: {}", summary.claimed_jobs);
+    println!("succeeded_jobs: {}", summary.succeeded_jobs);
+    println!("failed_jobs: {}", summary.failed_jobs);
+    println!("skipped_stale_jobs: {}", summary.skipped_stale_jobs);
+    println!("remaining_pending_jobs: {}", summary.remaining_pending_jobs);
+    println!(
+        "progress: embeddable_chunks={} quality_embedded_chunks={} pending={} running={} succeeded={} failed={} skipped_stale={} skipped_excluded={}",
+        summary.progress.embeddable_chunks,
+        summary.progress.quality_embedded_chunks,
+        summary.progress.pending_jobs,
+        summary.progress.running_jobs,
+        summary.progress.succeeded_jobs,
+        summary.progress.failed_jobs,
+        summary.progress.skipped_stale_jobs,
+        summary.progress.skipped_excluded_jobs
+    );
+}
+
 fn print_diagnostic_report(report: &DiagnosticReport) {
     println!("symdex doctor");
     println!("workspace: {}", report.workspace);
@@ -902,23 +1145,74 @@ fn print_diagnostic_check(check: &DiagnosticCheck) {
     }
 }
 
-fn parse_index_args(args: &[String]) -> IndexArgs {
+fn parse_index_args(args: &[String]) -> Result<IndexArgs, String> {
     let mut repo = ".".to_owned();
     let mut offline = false;
     let mut watch = false;
-    for arg in args {
+    let mut scope = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
         if arg == "--offline" {
             offline = true;
         } else if arg == "--watch" {
             watch = true;
+        } else if arg == "--full" {
+            set_index_scope(&mut scope, IndexScope::Full)?;
+        } else if arg == "--incremental" {
+            set_index_scope(&mut scope, IndexScope::Incremental)?;
+        } else if arg == "--scope" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err("--scope requires a value: full or incremental".to_owned());
+            };
+            set_index_scope(&mut scope, parse_index_scope(value)?)?;
+        } else if let Some(value) = arg.strip_prefix("--scope=") {
+            set_index_scope(&mut scope, parse_index_scope(value)?)?;
+        } else if arg.starts_with("--") {
+            return Err(format!("unsupported index option `{arg}`"));
         } else {
             repo = arg.clone();
         }
+        index += 1;
     }
-    IndexArgs {
+
+    let scope = scope.unwrap_or(if watch || offline {
+        IndexScope::Incremental
+    } else {
+        IndexScope::Full
+    });
+    if watch && scope == IndexScope::Full {
+        return Err(
+            "--watch uses incremental indexing; --full is not supported with --watch".to_owned(),
+        );
+    }
+
+    Ok(IndexArgs {
         repo,
         offline,
         watch,
+        scope,
+    })
+}
+
+fn set_index_scope(current: &mut Option<IndexScope>, next: IndexScope) -> Result<(), String> {
+    if let Some(current) = current
+        && *current != next
+    {
+        return Err("--full and --incremental are mutually exclusive".to_owned());
+    }
+    *current = Some(next);
+    Ok(())
+}
+
+fn parse_index_scope(value: &str) -> Result<IndexScope, String> {
+    match value {
+        "full" => Ok(IndexScope::Full),
+        "incremental" => Ok(IndexScope::Incremental),
+        other => Err(format!(
+            "unsupported index scope `{other}`; expected `full` or `incremental`"
+        )),
     }
 }
 
@@ -954,10 +1248,51 @@ fn parse_context_pack_args(args: &[String]) -> Result<ContextPackArgs, String> {
     })
 }
 
+fn parse_qdrant_maintenance_args(args: &[String]) -> Result<QdrantMaintenanceArgs, String> {
+    let mut positional = Vec::new();
+    let mut semantic_layer = QdrantVerifySemanticLayer::Fast;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--semantic-layer" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err("--semantic-layer requires a value".to_owned());
+            };
+            semantic_layer = QdrantVerifySemanticLayer::parse(value)?;
+        } else if let Some(value) = arg.strip_prefix("--semantic-layer=") {
+            semantic_layer = QdrantVerifySemanticLayer::parse(value)?;
+        } else if arg == "--all-semantic-layers" {
+            semantic_layer = QdrantVerifySemanticLayer::All;
+        } else if arg.starts_with("--") {
+            return Err(format!("unsupported qdrant maintenance option `{arg}`"));
+        } else {
+            positional.push(arg.clone());
+        }
+        index += 1;
+    }
+
+    Ok(QdrantMaintenanceArgs {
+        repo: positional
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ".".to_owned()),
+        semantic_layer,
+    })
+}
+
+#[derive(Debug)]
 struct IndexArgs {
     repo: String,
     offline: bool,
     watch: bool,
+    scope: IndexScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QdrantMaintenanceArgs {
+    repo: String,
+    semantic_layer: QdrantVerifySemanticLayer,
 }
 
 struct ContextPackArgs {
@@ -997,7 +1332,65 @@ fn print_continuous_index_event(event: ContinuousIndexEvent) {
                 error
             );
         }
+        ContinuousIndexEvent::QualityState { state } => {
+            println!("watch_quality_state {}", continuous_quality_summary(&state));
+        }
+        ContinuousIndexEvent::QualityStarted { state } => {
+            println!(
+                "watch_quality_started {}",
+                continuous_quality_summary(&state)
+            );
+        }
+        ContinuousIndexEvent::QualityProgress { progress } => {
+            println!(
+                "watch_quality_progress phase={} completed={} total={} message={}",
+                progress.phase, progress.completed, progress.total, progress.message
+            );
+        }
+        ContinuousIndexEvent::QualityCompleted { summary } => {
+            println!(
+                "watch_quality_completed generation_id={} active_layer={} quality_status={} activation_reason={} claimed_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} remaining_pending_jobs={}",
+                summary.generation_id,
+                summary.active_layer,
+                summary.quality_status,
+                summary.activation_reason,
+                summary.claimed_jobs,
+                summary.succeeded_jobs,
+                summary.failed_jobs,
+                summary.skipped_stale_jobs,
+                summary.remaining_pending_jobs
+            );
+        }
+        ContinuousIndexEvent::QualityFailed { state, error } => {
+            if let Some(state) = state {
+                println!(
+                    "watch_quality_failed {} error={}",
+                    continuous_quality_summary(&state),
+                    error
+                );
+            } else {
+                println!("watch_quality_failed error={error}");
+            }
+        }
     }
+}
+
+fn continuous_quality_summary(state: &symdex_index::ContinuousQualityState) -> String {
+    format!(
+        "generation_id={} active_layer={} quality_status={} activation_reason={} embeddable_chunks={} quality_embedded_chunks={} pending_jobs={} running_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} skipped_excluded_jobs={}",
+        state.generation_id,
+        state.active_layer,
+        state.quality_status,
+        state.activation_reason.as_deref().unwrap_or("<none>"),
+        state.embeddable_chunks,
+        state.quality_embedded_chunks,
+        state.pending_jobs,
+        state.running_jobs,
+        state.succeeded_jobs,
+        state.failed_jobs,
+        state.skipped_stale_jobs,
+        state.skipped_excluded_jobs
+    )
 }
 
 fn continuous_change_summary(changes: &WatchChangeSet) -> String {
@@ -1037,14 +1430,22 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--offline] [--watch] <repo>  Index Rust chunks and upsert semantic vectors\n    index-status <repo>    Show local SQLite index counts\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo>   Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo>   Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nJSON OUTPUT:\n    --json is supported for index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context. It prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--full|--incremental] [--offline] [--watch] <repo>  Index code with explicit full or incremental scope\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextPackMode, OutputMode, parse_cli_invocation, parse_context_pack_args};
+    use super::{
+        ContextPackMode, OutputMode, QdrantVerifySemanticLayer, parse_cli_invocation,
+        parse_context_pack_args, parse_index_args, parse_qdrant_maintenance_args,
+        require_text_output, semantic_status_json,
+    };
+    use symdex_core::{SemanticLayer, SemanticLayerStatus};
+    use symdex_index::IndexScope;
+    use symdex_query::{SemanticStatusLayerSummary, SemanticStatusSummary};
+    use symdex_store::QualityGenerationProgress;
 
     #[test]
     fn cli_invocation_parses_leading_json_flag() {
@@ -1082,6 +1483,60 @@ mod tests {
     }
 
     #[test]
+    fn index_args_parse_explicit_full_scope() {
+        let args = parse_index_args(&["--full".to_owned(), "repo".to_owned()])
+            .expect("index args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.scope, IndexScope::Full);
+        assert!(!args.offline);
+        assert!(!args.watch);
+    }
+
+    #[test]
+    fn index_args_parse_offline_incremental_scope() {
+        let args = parse_index_args(&[
+            "--offline".to_owned(),
+            "--incremental".to_owned(),
+            "repo".to_owned(),
+        ])
+        .expect("index args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.scope, IndexScope::Incremental);
+        assert!(args.offline);
+    }
+
+    #[test]
+    fn index_args_preserve_legacy_defaults() {
+        let semantic = parse_index_args(&["repo".to_owned()]).expect("args should parse");
+        let offline = parse_index_args(&["--offline".to_owned(), "repo".to_owned()])
+            .expect("args should parse");
+        let watch = parse_index_args(&["--watch".to_owned(), "repo".to_owned()])
+            .expect("args should parse");
+
+        assert_eq!(semantic.scope, IndexScope::Full);
+        assert_eq!(offline.scope, IndexScope::Incremental);
+        assert_eq!(watch.scope, IndexScope::Incremental);
+    }
+
+    #[test]
+    fn index_args_reject_conflicting_scopes() {
+        let error = parse_index_args(&["--full".to_owned(), "--incremental".to_owned()])
+            .expect_err("conflicting scopes should fail");
+
+        assert!(error.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn index_args_reject_full_watch() {
+        let error = parse_index_args(&["--watch".to_owned(), "--full".to_owned()])
+            .expect_err("full watch should fail");
+
+        assert!(error.contains("--watch uses incremental indexing"));
+    }
+
+    #[test]
     fn context_pack_args_parse_unified_mode() {
         let args = parse_context_pack_args(&[
             "repo".to_owned(),
@@ -1102,5 +1557,108 @@ mod tests {
             .expect("context-pack args should parse");
 
         assert_eq!(args.mode, ContextPackMode::Structural);
+    }
+
+    #[test]
+    fn qdrant_maintenance_args_parse_semantic_layer_flag() {
+        let args = parse_qdrant_maintenance_args(&[
+            "repo".to_owned(),
+            "--semantic-layer".to_owned(),
+            "quality".to_owned(),
+        ])
+        .expect("qdrant args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.semantic_layer, QdrantVerifySemanticLayer::Quality);
+    }
+
+    #[test]
+    fn qdrant_maintenance_args_parse_all_alias() {
+        let args =
+            parse_qdrant_maintenance_args(&["--semantic-layer=all".to_owned(), "repo".to_owned()])
+                .expect("qdrant args should parse");
+
+        assert_eq!(args.repo, "repo");
+        assert_eq!(args.semantic_layer, QdrantVerifySemanticLayer::All);
+    }
+
+    #[test]
+    fn qdrant_maintenance_args_reject_unknown_option() {
+        let error = parse_qdrant_maintenance_args(&["--bad".to_owned()])
+            .expect_err("unknown qdrant option should fail");
+
+        assert!(error.contains("unsupported qdrant maintenance option"));
+    }
+
+    #[test]
+    fn index_quality_rejects_json_output() {
+        let error = require_text_output("index-quality", OutputMode::Json)
+            .expect_err("index-quality should be text-only");
+
+        assert!(error.contains("index-quality does not support"));
+    }
+
+    #[test]
+    fn semantic_status_json_is_metadata_only() {
+        let status = sample_semantic_status();
+        let value = semantic_status_json(&status);
+
+        assert_eq!(value["repository_id"], "repo");
+        assert_eq!(value["active_layer"], "fast");
+        assert_eq!(value["quality_status"], "quality_pending");
+        assert_eq!(
+            value["fallback_reason"],
+            "quality_manifest_incomplete_using_fast_layer"
+        );
+        assert_eq!(value["fast"]["embedding_model"], "fast-model");
+        assert_eq!(value["quality_progress"]["pending_jobs"], 1);
+        assert!(value.get("source_text").is_none());
+    }
+
+    fn sample_semantic_status() -> SemanticStatusSummary {
+        SemanticStatusSummary {
+            repository_id: "repo".to_owned(),
+            generation_id: Some("generation-1".to_owned()),
+            active_layer: SemanticLayer::Fast,
+            quality_status: SemanticLayerStatus::QualityPending,
+            fallback_reason: Some("quality_manifest_incomplete_using_fast_layer".to_owned()),
+            fast: sample_semantic_status_layer(SemanticLayer::Fast, "fast-model", true),
+            quality: sample_semantic_status_layer(SemanticLayer::Quality, "quality-model", false),
+            quality_progress: Some(QualityGenerationProgress {
+                repository_id: "repo".to_owned(),
+                generation_id: "generation-1".to_owned(),
+                embeddable_chunks: 1,
+                quality_embedded_chunks: 0,
+                pending_jobs: 1,
+                running_jobs: 0,
+                succeeded_jobs: 0,
+                failed_jobs: 0,
+                skipped_stale_jobs: 0,
+                skipped_excluded_jobs: 0,
+            }),
+            latest_quality_error: None,
+            quality_enabled: true,
+        }
+    }
+
+    fn sample_semantic_status_layer(
+        semantic_layer: SemanticLayer,
+        embedding_model: &str,
+        is_complete: bool,
+    ) -> SemanticStatusLayerSummary {
+        SemanticStatusLayerSummary {
+            semantic_layer,
+            embedding_model: embedding_model.to_owned(),
+            embedding_dimension: Some(768),
+            qdrant_collection: format!("symdex_repo_{embedding_model}"),
+            current_chunks: usize::from(is_complete),
+            stale_chunks: usize::from(!is_complete),
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 1,
+            expected_chunks: 1,
+            is_complete,
+        }
     }
 }

@@ -71,6 +71,15 @@ Output:
 
 ```json
 {
+  "repository_id": "stable-repo-id",
+  "query": "where is retry logic handled?",
+  "semantic_layer": "fast",
+  "requested_layer": "auto",
+  "embedding_model": "nomic-embed-text",
+  "qdrant_collection": "symdex_repo_nomic_embed_text",
+  "generation_id": "repo-semantic-...",
+  "quality_status": "quality_pending",
+  "fallback_reason": "quality_manifest_incomplete_using_fast_layer",
   "results": [
     {
       "path": "crates/foo/src/lib.rs",
@@ -107,10 +116,11 @@ Output:
 }
 ```
 
-The search tool embeds the query with the configured local Ollama model and
-queries the local Qdrant collection. It returns chunk metadata, freshness state,
-trust, reason tags, and provenance only; it does not return source excerpts in
-the current MVP.
+The search tool uses the shared routed semantic query path. Default search uses
+quality only when the latest quality layer is complete and current; otherwise it
+falls back to fast and reports the fallback reason. It returns chunk metadata,
+semantic layer metadata, freshness state, trust, reason tags, and provenance
+only; it does not return source excerpts in the current MVP.
 
 ### `symdex_find_symbol`
 

@@ -173,7 +173,8 @@ must have a design doc before implementation.
 Requirements:
 
 - Scope every request to one configured repository root.
-- Allow optional path-scoped reindexing and explicit full reindex requests.
+- Allow optional path-scoped reindexing; CLI and TUI already expose explicit
+  full and incremental manual index scopes.
 - Default to offline structural reindexing.
 - Require explicit `semantic: true` before using Ollama or Qdrant.
 - Do not execute indexed repository code.

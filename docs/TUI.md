@@ -146,6 +146,8 @@ terminal panes.
 - Show selected repository root and repository ID.
 - Show SQLite index counts for files, chunks, symbols, and calls.
 - Show latest embedding model and vector dimension when available.
+- Show active semantic layer, quality readiness, fallback state, and compact
+  quality job counts.
 - Show local service status for SQLite path, Ollama, and Qdrant.
 - Use status-colored labels for local service health and index freshness.
 - Use compact table rows for index counts and local service targets instead of
@@ -155,9 +157,10 @@ terminal panes.
 - The Dashboard/Overview tab is the full home surface for repository and local
   service status. Other tabs should use a compact repository summary so active
   tables and detail panes get more screen space.
-- The Overview should surface compact operational state for indexing,
-  continuous indexing, storage mode, query mode, call direction, and evidence
-  mode without showing source text.
+- The Overview should surface compact operational state for indexing, active
+  semantic layer, quality readiness, quality job counts, continuous indexing,
+  storage mode, query mode, call direction, and evidence mode without showing
+  source text.
 
 ### Storage Explorer
 
@@ -260,7 +263,7 @@ represent the indexed repository.
 - Compare SQLite chunks against Qdrant-backed semantic coverage:
   - total chunks
   - chunks excluded from embedding
-  - chunks with `qdrant_point_id`
+  - chunks with current fast `chunk_embeddings` rows
   - chunks missing vector metadata
   - latest model and dimension
   - Qdrant collection name
@@ -316,6 +319,16 @@ represent the indexed repository.
 ### Indexing Controls
 
 - Offer offline indexing with `o` and semantic indexing with `s`.
+- Offer full and incremental manual indexing as separate scope choices, toggled
+  with `Tab` / `Shift+Tab` on the Index tab. Offline and semantic indexing both
+  use the selected scope after explicit `y` confirmation. The selected scope
+  defaults to incremental.
+- Show fast and quality semantic readiness as progress bars in the Index tab.
+  Each bar should display the percentage and ready/expected chunk counts for
+  `fast_ready` and `quality_ready` coverage.
+- Show fast and quality pending-job, running-job, and skipped-stale-job
+  sparklines in the Index tab, using each job count as a percentage of the
+  total expected chunk count.
 - Offer continuous indexing as a toggleable mode.
 - Continuous indexing is off by default.
 - When continuous indexing is on, modified or newly created eligible files are
@@ -347,6 +360,9 @@ represent the indexed repository.
 - Show the same local diagnostics as `symdex doctor` from the Doctor tab.
 - In the Doctor tab, `Enter` starts diagnostics when no diagnostic result rows
   are available.
+- In the Doctor tab, `r` reruns diagnostics after an idle, completed, or failed
+  diagnostics state. If diagnostics are already running, keep the existing run
+  and show that status instead of starting a duplicate worker.
 - Surface service failures without panics.
 - Keep diagnostics local and avoid logging source text.
 - Render diagnostics as a table with check name, status, and detail columns.
@@ -432,6 +448,7 @@ Current dashboard keys:
 - `Up` / `Down`: move the selected row in completed result and storage tables
 - `Enter`: start Doctor diagnostics when the Doctor tab has no result rows
 - `Enter`: toggle/focus selected-check details in Doctor diagnostics view
+- `r`: rerun Doctor diagnostics from the Doctor tab
 - typed text: edit the query workbench input
 - typed text: edit the symbol/call graph browser input
 - typed text: edit the impact/call-path/context-pack/debug-context viewer input

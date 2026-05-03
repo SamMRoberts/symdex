@@ -10,38 +10,41 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-pub(crate) use navigation::{IndexMode, Screen, UiAction, reduce_screen};
+pub(crate) use navigation::{IndexMode, ManualIndexRequest, Screen, UiAction, reduce_screen};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Tabs, Wrap};
 use ratatui::widgets::{Cell, Row, Table, TableState};
-use symdex_core::RepoRoot;
-use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics};
+use symdex_core::{RepoRoot, SemanticLayer, SemanticLayerStatus};
+use symdex_diagnostics::{
+    DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
+};
 use symdex_embed::EmbedConfig;
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexProgress,
-    IndexSummary, RustAnalyzerEnrichmentSummary, run_continuous_index_until,
-    run_index_with_progress,
+    ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, EmbeddingSummary,
+    IndexOptions, IndexProgress, IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary,
+    run_continuous_index_until, run_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
-    ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary, SymbolSearchSummary,
-    run_call_graph, run_call_path, run_call_resolution, run_context_pack, run_cross_store_health,
-    run_debug_context_pack, run_embedding_coverage, run_freshness_report, run_impact,
-    run_index_coverage, run_index_runs_timeline, run_semantic_neighborhood, run_semantic_search,
-    run_storage_explorer, run_symbol_outline, run_symbol_search,
+    ImpactSummary, QueryMode, QueryResult, SemanticSearchSummary, SemanticStatusLayerSummary,
+    SemanticStatusSummary, SymbolSearchSummary, run_call_graph, run_call_path, run_call_resolution,
+    run_context_pack, run_cross_store_health, run_debug_context_pack, run_embedding_coverage,
+    run_freshness_report, run_impact, run_index_coverage, run_index_runs_timeline,
+    run_semantic_neighborhood, run_semantic_search, run_semantic_status, run_storage_explorer,
+    run_symbol_outline, run_symbol_search,
 };
 use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
     CrossStoreHealthSummary, EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance,
     FileCoverageStatus, FileDetailSummary, IndexCoverageSummary, IndexRunTimelineRow,
-    IndexRunsTimelineSummary, QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
-    SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore, StorageExplorerSummary,
-    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
-    qdrant_collection_name,
+    IndexRunsTimelineSummary, QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
+    SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore,
+    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    SymbolOutlineSummary, qdrant_collection_name,
 };
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
@@ -67,9 +70,11 @@ pub struct App {
     ollama_url: String,
     embed_model: String,
     status: RepositoryStatus,
+    semantic_status: SemanticStatusSummary,
     message: String,
     view: View,
     screen: Screen,
+    index_scope: IndexScope,
     last_index_summary: Option<IndexSummary>,
     index_progress: Option<IndexProgress>,
     animation_tick: usize,
@@ -126,6 +131,7 @@ impl App {
         let cross_store_health = sqlite
             .cross_store_health_summary(root.id(), &embed_config.model)
             .map_err(|error| error.to_string())?;
+        let semantic_status = run_semantic_status(repo)?;
 
         Ok(Self {
             repo_input: repo.to_owned(),
@@ -136,9 +142,11 @@ impl App {
             ollama_url: embed_config.ollama_url,
             embed_model: embed_config.model,
             status,
+            semantic_status,
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
+            index_scope: IndexScope::Incremental,
             last_index_summary: None,
             index_progress: None,
             animation_tick: 0,
@@ -188,6 +196,7 @@ impl App {
         let semantic_neighborhood =
             semantic_neighborhood_summary_from_status(&repository_id, &status);
         let cross_store_health = cross_store_health_summary_from_status(&repository_id, &status);
+        let semantic_status = semantic_status_summary_from_status(&repository_id, &status);
         Self {
             repo_input: repo_root.clone(),
             repo_root,
@@ -197,9 +206,11 @@ impl App {
             ollama_url: "http://localhost:11434".to_owned(),
             embed_model: "nomic-embed-text".to_owned(),
             status,
+            semantic_status,
             message: "Overview loaded. Press q or Esc to quit.".to_owned(),
             view: View::Overview,
             screen: Screen::Dashboard,
+            index_scope: IndexScope::Incremental,
             last_index_summary: None,
             index_progress: None,
             animation_tick: 0,
@@ -234,6 +245,11 @@ impl App {
 
     fn index_lines(&self) -> Vec<Line<'_>> {
         let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Scope: ", Style::new().add_modifier(Modifier::BOLD)),
+                status_span(self.index_scope.label(), StatusTone::Info),
+                Span::raw(" press Tab"),
+            ]),
             Line::from(vec![
                 Span::styled("Offline index: ", Style::new().add_modifier(Modifier::BOLD)),
                 Span::raw("press o"),
@@ -296,13 +312,13 @@ impl App {
                     Span::raw(" No indexing job is pending."),
                 ]));
             }
-            Screen::ConfirmIndex(mode) => {
+            Screen::ConfirmIndex(request) => {
                 lines.push(Line::from(vec![
                     status_span("confirm", StatusTone::Warning),
                     Span::raw(" "),
                     Span::raw(format!(
                         "Run {} indexing for this repository?",
-                        mode.label()
+                        request.label()
                     )),
                 ]));
                 lines.push(Line::from("Press y to start, n or Esc to cancel."));
@@ -317,29 +333,29 @@ impl App {
                 ));
                 lines.push(Line::from("Press y to start, n or Esc to cancel."));
             }
-            Screen::IndexRunning(mode) => {
+            Screen::IndexRunning(request) => {
                 lines.push(Line::from(vec![
                     status_span("running", StatusTone::Info),
                     Span::raw(" "),
-                    Span::raw(format!("{} indexing", mode.label())),
+                    Span::raw(format!("{} indexing", request.label())),
                 ]));
                 lines.push(Line::from("The TUI will update when the job finishes."));
             }
-            Screen::IndexCompleted(mode) => {
+            Screen::IndexCompleted(request) => {
                 lines.push(Line::from(vec![
                     status_span("complete", StatusTone::Success),
                     Span::raw(" "),
-                    Span::raw(format!("{} indexing", mode.label())),
+                    Span::raw(format!("{} indexing", request.label())),
                 ]));
                 if let Some(summary) = &self.last_index_summary {
                     lines.extend(summary_lines(summary));
                 }
             }
-            Screen::IndexFailed(mode) => {
+            Screen::IndexFailed(request) => {
                 lines.push(Line::from(vec![
                     status_span("failed", StatusTone::Error),
                     Span::raw(" "),
-                    Span::raw(format!("{} indexing", mode.label())),
+                    Span::raw(format!("{} indexing", request.label())),
                 ]));
                 lines.push(Line::from(
                     self.last_error
@@ -552,6 +568,7 @@ impl App {
         self.status = sqlite
             .repository_status(&self.repository_id)
             .map_err(|error| error.to_string())?;
+        self.refresh_semantic_status()?;
         self.storage.explorer = match run_storage_explorer(&self.repo_input) {
             Ok(summary) => StorageStatus::Completed(summary),
             Err(error) => StorageStatus::Failed(error),
@@ -590,6 +607,11 @@ impl App {
         };
         self.storage.selection = 0;
         self.message = "Repository and storage status refreshed.".to_owned();
+        Ok(())
+    }
+
+    fn refresh_semantic_status(&mut self) -> Result<(), String> {
+        self.semantic_status = run_semantic_status(&self.repo_input)?;
         Ok(())
     }
 
@@ -724,14 +746,14 @@ impl App {
                 self.start_diagnostics();
             }
             KeyCode::Char('o') if self.screen.accepts_new_index_request() => {
-                self.screen =
-                    reduce_screen(self.screen, UiAction::RequestIndex(IndexMode::Offline));
-                self.message = "Confirm offline indexing before starting.".to_owned();
+                let request = self.selected_index_request(IndexMode::Offline);
+                self.screen = reduce_screen(self.screen, UiAction::RequestIndex(request));
+                self.message = format!("Confirm {} indexing before starting.", request.label());
             }
             KeyCode::Char('s') if self.screen.accepts_new_index_request() => {
-                self.screen =
-                    reduce_screen(self.screen, UiAction::RequestIndex(IndexMode::Semantic));
-                self.message = "Confirm semantic indexing before starting.".to_owned();
+                let request = self.selected_index_request(IndexMode::Semantic);
+                self.screen = reduce_screen(self.screen, UiAction::RequestIndex(request));
+                self.message = format!("Confirm {} indexing before starting.", request.label());
             }
             KeyCode::Char('c') if self.continuous.enabled => {
                 self.stop_continuous_index();
@@ -745,8 +767,8 @@ impl App {
                 self.message = "Confirm continuous indexing before starting.".to_owned();
             }
             KeyCode::Char('y') => {
-                if let Screen::ConfirmIndex(mode) = self.screen {
-                    self.start_index_job(mode);
+                if let Screen::ConfirmIndex(request) = self.screen {
+                    self.start_index_job(request);
                 } else if matches!(self.screen, Screen::ConfirmContinuous) {
                     self.start_continuous_index();
                 }
@@ -765,13 +787,33 @@ impl App {
                 self.message = "Indexing controls ready.".to_owned();
             }
             KeyCode::Char('r') if !matches!(self.screen, Screen::IndexRunning(_)) => {
-                if let Err(error) = self.refresh_status() {
-                    self.message = format!("Refresh failed: {error}");
-                }
+                self.handle_refresh_key();
             }
             _ => {}
         }
         false
+    }
+
+    fn handle_refresh_key(&mut self) {
+        self.handle_refresh_key_with(|app| app.start_diagnostics());
+    }
+
+    fn handle_refresh_key_with<R>(&mut self, diagnostic_runner: R)
+    where
+        R: FnOnce(&mut Self),
+    {
+        if self.view == View::Diagnostics {
+            if self.diagnostics_receiver.is_some() {
+                self.message = "Doctor diagnostics already running.".to_owned();
+            } else {
+                diagnostic_runner(self);
+            }
+            return;
+        }
+
+        if let Err(error) = self.refresh_status() {
+            self.message = format!("Refresh failed: {error}");
+        }
     }
 
     fn tick_animation(&mut self) {
@@ -788,6 +830,13 @@ impl App {
             format!("[{}]", continuous_activity_frame(self.animation_tick)),
             tone_style(self.continuous.status_tone()).add_modifier(Modifier::BOLD),
         ))
+    }
+
+    fn selected_index_request(&self, mode: IndexMode) -> ManualIndexRequest {
+        ManualIndexRequest {
+            mode,
+            scope: self.index_scope,
+        }
     }
 
     fn select_primary_tab(&mut self, reverse: bool) {
@@ -832,7 +881,11 @@ impl App {
                 self.message = "Overview has no alternate mode.".to_owned();
             }
             View::Indexing => {
-                self.message = "No alternate indexing mode is selected with Tab.".to_owned();
+                self.index_scope = match self.index_scope {
+                    IndexScope::Full => IndexScope::Incremental,
+                    IndexScope::Incremental => IndexScope::Full,
+                };
+                self.message = format!("Index scope set to {}.", self.index_scope.label());
             }
             View::Diagnostics => {
                 self.message = "No alternate doctor mode is selected with Tab.".to_owned();
@@ -966,7 +1019,7 @@ impl App {
         false
     }
 
-    fn start_index_job(&mut self, mode: IndexMode) {
+    fn start_index_job(&mut self, request: ManualIndexRequest) {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -974,7 +1027,8 @@ impl App {
             let result = run_index_with_progress(
                 &IndexOptions {
                     repo,
-                    offline: matches!(mode, IndexMode::Offline),
+                    offline: matches!(request.mode, IndexMode::Offline),
+                    scope: request.scope,
                 },
                 move |progress| {
                     let _ = progress_sender.send(IndexJobMessage::Progress(progress));
@@ -988,11 +1042,11 @@ impl App {
             phase: "start",
             completed: 0,
             total: 1,
-            message: format!("Starting {} indexing", mode.label()),
+            message: format!("Starting {} indexing", request.label()),
         });
         self.last_error = None;
         self.screen = reduce_screen(self.screen, UiAction::Confirm);
-        self.message = format!("{} indexing started.", mode.label());
+        self.message = format!("{} indexing started.", request.label());
     }
 
     fn start_continuous_index(&mut self) {
@@ -1020,10 +1074,7 @@ impl App {
         self.continuous = ContinuousIndexState {
             enabled: true,
             status: ContinuousIndexStatus::Starting,
-            files_seen: 0,
-            queued_events: 0,
-            last_reindexed_file: None,
-            latest_error: None,
+            ..ContinuousIndexState::default()
         };
         self.continuous_receiver = Some(receiver);
         self.continuous_stop = Some(active);
@@ -1035,18 +1086,24 @@ impl App {
         if let Some(active) = &self.continuous_stop {
             active.store(false, Ordering::SeqCst);
         }
-        self.continuous.enabled = false;
-        self.continuous.status = ContinuousIndexStatus::Off;
-        self.continuous.queued_events = 0;
+        self.continuous = ContinuousIndexState::default();
         self.continuous_receiver = None;
         self.continuous_stop = None;
         self.message = "Continuous indexing stopped.".to_owned();
     }
 
     fn start_diagnostics(&mut self) {
+        self.start_diagnostics_with(|repo| run_diagnostics_for_repo(Some(&repo)));
+    }
+
+    fn start_diagnostics_with<R>(&mut self, runner: R)
+    where
+        R: FnOnce(String) -> Result<DiagnosticReport, String> + Send + 'static,
+    {
         let (sender, receiver) = mpsc::channel();
+        let repo = self.repo_root.clone();
         thread::spawn(move || {
-            let result = run_diagnostics();
+            let result = runner(repo);
             let _ = sender.send(result);
         });
         self.view = View::Diagnostics;
@@ -1142,10 +1199,13 @@ impl App {
             }
             Ok(IndexJobMessage::Finished(Ok(summary))) => {
                 self.index_receiver = None;
-                let mode = self.screen.index_mode().unwrap_or(IndexMode::Offline);
+                let request = self.screen.index_request().unwrap_or(ManualIndexRequest {
+                    mode: IndexMode::Offline,
+                    scope: self.index_scope,
+                });
                 self.message = format!(
                     "{} indexing completed: {} files indexed, {} chunks indexed.",
-                    mode.label(),
+                    request.label(),
                     summary.sqlite_files_indexed,
                     summary.sqlite_chunks_indexed
                 );
@@ -1280,7 +1340,113 @@ impl App {
                 self.continuous.latest_error = Some(error);
                 self.message = "Continuous indexing batch failed.".to_owned();
             }
+            ContinuousIndexEvent::QualityState { state } => {
+                self.continuous.apply_quality_state(&state);
+                self.apply_semantic_quality_state(&state);
+                self.message = format!(
+                    "Quality state: {} on {}.",
+                    state.quality_status, state.active_layer
+                );
+            }
+            ContinuousIndexEvent::QualityStarted { state } => {
+                self.continuous.apply_quality_state(&state);
+                self.apply_semantic_quality_state(&state);
+                self.continuous.latest_quality_error = None;
+                self.semantic_status.latest_quality_error = None;
+                self.message = format!(
+                    "Quality catch-up started: {} pending jobs.",
+                    state.pending_jobs
+                );
+            }
+            ContinuousIndexEvent::QualityProgress { progress } => {
+                self.message = progress.message;
+            }
+            ContinuousIndexEvent::QualityCompleted { summary } => {
+                self.continuous.active_layer = Some(summary.active_layer.clone());
+                self.continuous.quality_status = Some(summary.quality_status.clone());
+                self.continuous.activation_reason = Some(summary.activation_reason.clone());
+                self.continuous.quality_pending_jobs = summary.progress.pending_jobs;
+                self.continuous.quality_running_jobs = summary.progress.running_jobs;
+                self.continuous.quality_failed_jobs = summary.progress.failed_jobs;
+                self.continuous.quality_stale_jobs = summary.progress.skipped_stale_jobs;
+                self.continuous.latest_quality_error = None;
+                self.apply_semantic_quality_summary(&summary);
+                self.message = format!(
+                    "Quality catch-up completed: {} on {}.",
+                    summary.quality_status, summary.active_layer
+                );
+            }
+            ContinuousIndexEvent::QualityFailed { state, error } => {
+                if let Some(state) = &state {
+                    self.continuous.apply_quality_state(state);
+                    self.apply_semantic_quality_state(state);
+                }
+                self.continuous.latest_quality_error = Some(error.clone());
+                self.semantic_status.latest_quality_error = Some(error);
+                self.message = "Quality catch-up failed.".to_owned();
+            }
         }
+    }
+
+    fn apply_semantic_quality_state(&mut self, state: &ContinuousQualityState) {
+        let Ok(active_layer) = SemanticLayer::parse(&state.active_layer) else {
+            return;
+        };
+        let Ok(quality_status) = SemanticLayerStatus::parse(&state.quality_status) else {
+            return;
+        };
+        let quality_progress = QualityGenerationProgress {
+            repository_id: state.repository_id.clone(),
+            generation_id: state.generation_id.clone(),
+            embeddable_chunks: state.embeddable_chunks,
+            quality_embedded_chunks: state.quality_embedded_chunks,
+            pending_jobs: state.pending_jobs,
+            running_jobs: state.running_jobs,
+            succeeded_jobs: state.succeeded_jobs,
+            failed_jobs: state.failed_jobs,
+            skipped_stale_jobs: state.skipped_stale_jobs,
+            skipped_excluded_jobs: state.skipped_excluded_jobs,
+        };
+        self.semantic_status.generation_id = Some(state.generation_id.clone());
+        self.semantic_status.active_layer = active_layer;
+        self.semantic_status.quality_status = quality_status;
+        self.semantic_status.quality.current_chunks = state.quality_embedded_chunks;
+        self.semantic_status.quality.total_chunks = state.quality_embedded_chunks;
+        self.semantic_status.quality.expected_chunks = state.embeddable_chunks;
+        self.semantic_status.quality.is_complete = quality_progress_is_complete(&quality_progress);
+        self.semantic_status.quality_progress = Some(quality_progress);
+        self.semantic_status.fallback_reason = semantic_fallback_reason_for_status(
+            active_layer,
+            quality_status,
+            self.semantic_status.quality.is_complete,
+        );
+    }
+
+    fn apply_semantic_quality_summary(&mut self, summary: &symdex_index::QualityIndexSummary) {
+        let Ok(active_layer) = SemanticLayer::parse(&summary.active_layer) else {
+            return;
+        };
+        let Ok(quality_status) = SemanticLayerStatus::parse(&summary.quality_status) else {
+            return;
+        };
+        self.semantic_status.repository_id = summary.repository_id.clone();
+        self.semantic_status.generation_id = Some(summary.generation_id.clone());
+        self.semantic_status.active_layer = active_layer;
+        self.semantic_status.quality_status = quality_status;
+        self.semantic_status.quality.embedding_model = summary.quality_model.clone();
+        self.semantic_status.quality.embedding_dimension = summary.quality_dimension;
+        self.semantic_status.quality.qdrant_collection = summary.qdrant_collection.clone();
+        self.semantic_status.quality.current_chunks = summary.progress.quality_embedded_chunks;
+        self.semantic_status.quality.total_chunks = summary.progress.quality_embedded_chunks;
+        self.semantic_status.quality.expected_chunks = summary.progress.embeddable_chunks;
+        self.semantic_status.quality.is_complete = quality_progress_is_complete(&summary.progress);
+        self.semantic_status.quality_progress = Some(summary.progress.clone());
+        self.semantic_status.latest_quality_error = None;
+        self.semantic_status.fallback_reason = semantic_fallback_reason_for_status(
+            active_layer,
+            quality_status,
+            self.semantic_status.quality.is_complete,
+        );
     }
 
     fn poll_diagnostics(&mut self) {
@@ -1424,9 +1590,10 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), S
                 render_repository_summary_panel(frame, body_chunks[0], app);
                 render_right_panel(frame, body_chunks[1], app);
             } else {
+                let summary_height = if app.view == View::Indexing { 4 } else { 6 };
                 let body_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(6), Constraint::Min(8)])
+                    .constraints([Constraint::Length(summary_height), Constraint::Min(8)])
                     .split(chunks[1]);
                 render_repository_summary_panel(frame, body_chunks[0], app);
                 render_right_panel(frame, body_chunks[1], app);
@@ -1715,6 +1882,18 @@ fn render_repository_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, a
             status_span("ollama", StatusTone::Success),
             Span::raw(" local"),
         ]),
+        Line::from(vec![
+            Span::styled("semantic ", metadata_style()),
+            status_span(
+                app.semantic_status.active_layer.as_str(),
+                semantic_status_tone(&app.semantic_status),
+            ),
+            Span::raw(" quality "),
+            status_span(
+                app.semantic_status.quality_status.as_str(),
+                semantic_quality_tone(&app.semantic_status),
+            ),
+        ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
@@ -1767,6 +1946,21 @@ fn render_overview_focus_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
                 },
             ),
             (
+                "layer",
+                app.semantic_status.active_layer.as_str().to_owned(),
+                semantic_status_tone(&app.semantic_status),
+            ),
+            (
+                "quality",
+                app.semantic_status.quality_status.as_str().to_owned(),
+                semantic_quality_tone(&app.semantic_status),
+            ),
+            (
+                "qjobs",
+                semantic_quality_jobs(&app.semantic_status),
+                semantic_quality_tone(&app.semantic_status),
+            ),
+            (
                 "watch",
                 app.continuous.summary(),
                 app.continuous.status_tone(),
@@ -1813,6 +2007,22 @@ fn render_overview_focus_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
             Cell::from("Storage"),
             Cell::from(app.storage.mode.label()),
             Cell::from(status_span("loaded", StatusTone::Success)),
+        ]),
+        Row::new(vec![
+            Cell::from("Semantic"),
+            Cell::from(semantic_status_mode(&app.semantic_status)),
+            Cell::from(status_span(
+                semantic_status_state(&app.semantic_status),
+                semantic_status_tone(&app.semantic_status),
+            )),
+        ]),
+        Row::new(vec![
+            Cell::from("QJobs"),
+            Cell::from(semantic_quality_jobs(&app.semantic_status)),
+            Cell::from(status_span(
+                semantic_fallback_state(&app.semantic_status),
+                semantic_quality_tone(&app.semantic_status),
+            )),
         ]),
         Row::new(vec![
             Cell::from("Query"),
@@ -2115,23 +2325,253 @@ fn render_index_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if matches!(app.screen, Screen::IndexRunning(_)) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(3)])
-            .split(inner);
-        let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
-        frame.render_widget(panel, chunks[0]);
-        let progress = app.index_progress.as_ref();
-        let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Progress"))
-            .gauge_style(tone_style(StatusTone::Info).add_modifier(Modifier::BOLD))
-            .percent(progress_percent(progress))
-            .label(progress_label(progress));
-        frame.render_widget(gauge, chunks[1]);
+        if inner.width >= 78 {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(38), Constraint::Length(38)])
+                .split(inner);
+            let side_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(15), Constraint::Length(3)])
+                .split(chunks[1]);
+            let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
+            frame.render_widget(panel, chunks[0]);
+            render_semantic_readiness_gauges(frame, side_chunks[0], &app.semantic_status);
+            render_index_progress_gauge(frame, side_chunks[1], app.index_progress.as_ref());
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(5),
+                    Constraint::Length(15),
+                    Constraint::Length(3),
+                ])
+                .split(inner);
+            let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
+            frame.render_widget(panel, chunks[0]);
+            render_semantic_readiness_gauges(frame, chunks[1], &app.semantic_status);
+            render_index_progress_gauge(frame, chunks[2], app.index_progress.as_ref());
+        }
     } else {
-        let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
-        frame.render_widget(panel, inner);
+        if inner.width >= 78 {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(38), Constraint::Length(38)])
+                .split(inner);
+            let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
+            frame.render_widget(panel, chunks[0]);
+            render_semantic_readiness_gauges(frame, chunks[1], &app.semantic_status);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(5), Constraint::Length(15)])
+                .split(inner);
+            let panel = Paragraph::new(app.index_lines()).wrap(Wrap { trim: true });
+            frame.render_widget(panel, chunks[0]);
+            render_semantic_readiness_gauges(frame, chunks[1], &app.semantic_status);
+        }
     }
+}
+
+fn render_index_progress_gauge(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    progress: Option<&IndexProgress>,
+) {
+    let gauge = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title("Progress"))
+        .gauge_style(readable_gauge_style(StatusTone::Info))
+        .percent(progress_percent(progress))
+        .label(progress_label(progress));
+    frame.render_widget(gauge, area);
+}
+
+fn render_semantic_readiness_gauges(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    summary: &SemanticStatusSummary,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let fast_percent = layer_readiness_percent(&summary.fast);
+    let quality_percent = layer_readiness_percent(&summary.quality);
+    let fast_pending_percent = fast_pending_percent(summary);
+    let fast_running_percent = fast_running_percent(summary);
+    let fast_stale_percent = fast_stale_percent(summary);
+    let pending_percent = quality_job_percent(summary, QualityJobMetric::Pending);
+    let running_percent = quality_job_percent(summary, QualityJobMetric::Running);
+    let stale_percent = quality_job_percent(summary, QualityJobMetric::SkippedStale);
+    let fast_gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Fast Readiness"),
+        )
+        .gauge_style(readable_gauge_style(StatusTone::Success))
+        .percent(fast_percent)
+        .label(layer_readiness_label(
+            "fast_ready",
+            &summary.fast,
+            fast_percent,
+        ));
+    let quality_gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Quality Readiness"),
+        )
+        .gauge_style(readable_gauge_style(semantic_quality_tone(summary)))
+        .percent(quality_percent)
+        .label(layer_readiness_label(
+            "quality_ready",
+            &summary.quality,
+            quality_percent,
+        ));
+    frame.render_widget(fast_gauge, chunks[0]);
+    frame.render_widget(quality_gauge, chunks[1]);
+    render_pending_job_sparklines(frame, chunks[2], fast_pending_percent, pending_percent);
+    render_running_job_sparklines(frame, chunks[3], fast_running_percent, running_percent);
+    render_stale_job_sparklines(frame, chunks[4], fast_stale_percent, stale_percent);
+}
+
+fn render_pending_job_sparklines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    fast_percent: u16,
+    quality_percent: u16,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_job_sparkline(
+        frame,
+        chunks[0],
+        "Fast Pend",
+        fast_percent,
+        StatusTone::Warning,
+    );
+    render_job_sparkline(
+        frame,
+        chunks[1],
+        "Quality Pend",
+        quality_percent,
+        StatusTone::Warning,
+    );
+}
+
+fn render_running_job_sparklines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    fast_percent: u16,
+    quality_percent: u16,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_job_sparkline(frame, chunks[0], "Fast Run", fast_percent, StatusTone::Info);
+    render_job_sparkline(
+        frame,
+        chunks[1],
+        "Quality Run",
+        quality_percent,
+        StatusTone::Info,
+    );
+}
+
+fn render_stale_job_sparklines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    fast_percent: u16,
+    quality_percent: u16,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_job_sparkline(
+        frame,
+        chunks[0],
+        "Fast Stale",
+        fast_percent,
+        StatusTone::Warning,
+    );
+    render_job_sparkline(
+        frame,
+        chunks[1],
+        "Quality Stale",
+        quality_percent,
+        StatusTone::Warning,
+    );
+}
+
+fn render_job_sparkline(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    percent: u16,
+    tone: StatusTone,
+) {
+    let data = sparkline_percent_data(percent, area.width.saturating_sub(2));
+    let sparkline = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{title} {percent}%")),
+        )
+        .style(tone_style(tone).add_modifier(Modifier::BOLD))
+        .max(100)
+        .data(data);
+    frame.render_widget(sparkline, area);
+}
+
+fn sparkline_percent_data(percent: u16, width: u16) -> Vec<u64> {
+    let width = usize::from(width.max(1));
+    vec![u64::from(percent.min(100)); width]
+}
+
+fn fast_pending_percent(summary: &SemanticStatusSummary) -> u16 {
+    let pending_chunks = summary
+        .fast
+        .expected_chunks
+        .saturating_sub(summary.fast.total_chunks);
+    layer_count_percent(pending_chunks, summary.fast.expected_chunks)
+}
+
+fn fast_running_percent(summary: &SemanticStatusSummary) -> u16 {
+    layer_count_percent(0, summary.fast.expected_chunks)
+}
+
+fn fast_stale_percent(summary: &SemanticStatusSummary) -> u16 {
+    layer_count_percent(summary.fast.stale_chunks, summary.fast.expected_chunks)
+}
+
+#[derive(Clone, Copy)]
+enum QualityJobMetric {
+    Pending,
+    Running,
+    SkippedStale,
+}
+
+fn quality_job_percent(summary: &SemanticStatusSummary, metric: QualityJobMetric) -> u16 {
+    let Some(progress) = &summary.quality_progress else {
+        return 0;
+    };
+    let count = match metric {
+        QualityJobMetric::Pending => progress.pending_jobs,
+        QualityJobMetric::Running => progress.running_jobs,
+        QualityJobMetric::SkippedStale => progress.skipped_stale_jobs,
+    };
+    layer_count_percent(count, summary.quality.expected_chunks)
 }
 
 fn render_line_panel(
@@ -2268,6 +2708,178 @@ fn index_embedding_status_span(status: &RepositoryStatus) -> Span<'static> {
         status_span("ready", StatusTone::Success)
     } else {
         status_span("none", StatusTone::Warning)
+    }
+}
+
+fn semantic_status_tone(summary: &SemanticStatusSummary) -> StatusTone {
+    match summary.quality_status {
+        SemanticLayerStatus::QualityBlocked | SemanticLayerStatus::QualityFailed => {
+            StatusTone::Error
+        }
+        SemanticLayerStatus::QualityPending
+        | SemanticLayerStatus::QualityStale
+        | SemanticLayerStatus::Missing => StatusTone::Warning,
+        SemanticLayerStatus::QualityReady if summary.active_layer == SemanticLayer::Quality => {
+            StatusTone::Success
+        }
+        SemanticLayerStatus::QualityReady => StatusTone::Warning,
+        SemanticLayerStatus::FastReady => StatusTone::Success,
+    }
+}
+
+fn semantic_quality_tone(summary: &SemanticStatusSummary) -> StatusTone {
+    match summary.quality_status {
+        SemanticLayerStatus::QualityReady => StatusTone::Success,
+        SemanticLayerStatus::QualityBlocked | SemanticLayerStatus::QualityFailed => {
+            StatusTone::Error
+        }
+        SemanticLayerStatus::FastReady => StatusTone::Dim,
+        SemanticLayerStatus::Missing
+        | SemanticLayerStatus::QualityPending
+        | SemanticLayerStatus::QualityStale => StatusTone::Warning,
+    }
+}
+
+fn semantic_status_mode(summary: &SemanticStatusSummary) -> String {
+    format!(
+        "{} {}",
+        summary.active_layer.as_str(),
+        summary.quality_status.as_str()
+    )
+}
+
+fn semantic_status_state(summary: &SemanticStatusSummary) -> &'static str {
+    if summary.fallback_reason.is_some() {
+        "fallback"
+    } else if summary.active_layer == SemanticLayer::Quality {
+        "quality"
+    } else {
+        "fast"
+    }
+}
+
+fn semantic_fallback_state(summary: &SemanticStatusSummary) -> &'static str {
+    if summary.latest_quality_error.is_some() {
+        "error"
+    } else if summary.fallback_reason.is_some() {
+        "fallback"
+    } else {
+        "ready"
+    }
+}
+
+fn quality_progress_is_complete(progress: &QualityGenerationProgress) -> bool {
+    progress.embeddable_chunks == progress.quality_embedded_chunks
+        && progress.pending_jobs == 0
+        && progress.running_jobs == 0
+        && progress.failed_jobs == 0
+        && progress.skipped_stale_jobs == 0
+}
+
+fn semantic_fallback_reason_for_status(
+    active_layer: SemanticLayer,
+    quality_status: SemanticLayerStatus,
+    quality_complete: bool,
+) -> Option<String> {
+    if active_layer == SemanticLayer::Quality
+        && quality_status == SemanticLayerStatus::QualityReady
+        && quality_complete
+    {
+        return None;
+    }
+    match quality_status {
+        SemanticLayerStatus::FastReady => None,
+        SemanticLayerStatus::QualityReady => {
+            Some("quality_ready_not_active_using_fast_layer".to_owned())
+        }
+        _ if !quality_complete => Some("quality_manifest_incomplete_using_fast_layer".to_owned()),
+        _ => Some(format!(
+            "quality_status_{}_using_fast_layer",
+            quality_status.as_str()
+        )),
+    }
+}
+
+fn semantic_quality_jobs(summary: &SemanticStatusSummary) -> String {
+    match &summary.quality_progress {
+        Some(progress) => format!(
+            "{}/{}/{}/{}",
+            progress.pending_jobs,
+            progress.running_jobs,
+            progress.failed_jobs,
+            progress.skipped_stale_jobs
+        ),
+        None => "<none>".to_owned(),
+    }
+}
+
+fn semantic_status_summary_from_status(
+    repository_id: &str,
+    status: &RepositoryStatus,
+) -> SemanticStatusSummary {
+    let fast_model = status
+        .embedding_model
+        .as_deref()
+        .unwrap_or("nomic-embed-text")
+        .to_owned();
+    let generation_id = status
+        .embedding_model
+        .as_ref()
+        .map(|_| "sample-generation".to_owned());
+    let quality_status = if status.embedding_model.is_some() {
+        SemanticLayerStatus::FastReady
+    } else {
+        SemanticLayerStatus::Missing
+    };
+    SemanticStatusSummary {
+        repository_id: repository_id.to_owned(),
+        generation_id,
+        active_layer: SemanticLayer::Fast,
+        quality_status,
+        fallback_reason: if status.embedding_model.is_some() {
+            None
+        } else {
+            Some("semantic_generation_missing_using_fast_layer".to_owned())
+        },
+        fast: SemanticStatusLayerSummary {
+            semantic_layer: SemanticLayer::Fast,
+            embedding_model: fast_model.clone(),
+            embedding_dimension: status.embedding_dimension,
+            qdrant_collection: qdrant_collection_name(repository_id, &fast_model),
+            current_chunks: if status.embedding_model.is_some() {
+                status.chunks_indexed
+            } else {
+                0
+            },
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: if status.embedding_model.is_some() {
+                status.chunks_indexed
+            } else {
+                0
+            },
+            expected_chunks: status.chunks_indexed,
+            is_complete: status.embedding_model.is_some(),
+        },
+        quality: SemanticStatusLayerSummary {
+            semantic_layer: SemanticLayer::Quality,
+            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
+            embedding_dimension: None,
+            qdrant_collection: qdrant_collection_name(repository_id, "nomic-embed-text-v2-moe"),
+            current_chunks: 0,
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 0,
+            expected_chunks: status.chunks_indexed,
+            is_complete: false,
+        },
+        quality_progress: None,
+        latest_quality_error: None,
+        quality_enabled: true,
     }
 }
 
@@ -2448,6 +3060,7 @@ fn index_runs_timeline_summary_from_status(
                 files_indexed: status.files_indexed,
                 chunks_embedded: status.chunks_indexed,
                 error_summary: None,
+                run_kind: "semantic".to_owned(),
             }]
         })
         .unwrap_or_default();
@@ -3002,9 +3615,17 @@ fn local_services_table(app: &App) -> Table<'_> {
             Cell::from(index_embedding(&app.status)),
         ]),
         Row::new(vec![
-            Cell::from("Model"),
-            Cell::from(status_span("cfg", StatusTone::Info)),
-            Cell::from(app.embed_model.as_str()),
+            Cell::from("Semantic"),
+            Cell::from(status_span(
+                app.semantic_status.active_layer.as_str(),
+                semantic_status_tone(&app.semantic_status),
+            )),
+            Cell::from(format!(
+                "model={} quality={} qjobs={}",
+                app.embed_model.as_str(),
+                app.semantic_status.quality_status.as_str(),
+                semantic_quality_jobs(&app.semantic_status)
+            )),
         ]),
     ];
 
@@ -3866,6 +4487,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         let tone = index_run_status_tone(run.status.as_str());
         Row::new(vec![
             Cell::from(run.started_at.as_str()),
+            Cell::from(run.run_kind.as_str()),
             Cell::from(status_span(run.status.as_str(), tone)),
             Cell::from(run.files_seen.to_string()),
             Cell::from(run.files_indexed.to_string()),
@@ -3883,6 +4505,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         rows,
         [
             Constraint::Percentage(24),
+            Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Length(5),
@@ -3892,7 +4515,7 @@ fn index_runs_timeline_table(summary: &IndexRunsTimelineSummary) -> Table<'_> {
         ],
     )
     .header(table_header([
-        "Started", "Status", "Seen", "Idx", "Emb", "Model", "Dim",
+        "Started", "Kind", "Status", "Seen", "Idx", "Emb", "Model", "Dim",
     ]))
     .block(Block::default().borders(Borders::ALL).title(format!(
         "Index Runs Timeline | Runs: {}",
@@ -3919,6 +4542,9 @@ fn index_runs_timeline_detail_panel(
         Line::from(vec![
             Span::styled("Run: ", Style::new().add_modifier(Modifier::BOLD)),
             Span::raw(run.id.as_str()),
+            Span::raw(" "),
+            Span::styled("Kind: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(run.run_kind.as_str()),
             Span::raw(" "),
             status_span(run.status.as_str(), tone),
         ]),
@@ -4959,6 +5585,25 @@ fn progress_label(progress: Option<&IndexProgress>) -> String {
     }
 }
 
+fn layer_readiness_percent(layer: &SemanticStatusLayerSummary) -> u16 {
+    layer_count_percent(layer.current_chunks, layer.expected_chunks)
+}
+
+fn layer_count_percent(count: usize, total_chunks: usize) -> u16 {
+    if total_chunks == 0 {
+        return 0;
+    }
+    let percent = count.saturating_mul(100) / total_chunks;
+    percent.min(100) as u16
+}
+
+fn layer_readiness_label(label: &str, layer: &SemanticStatusLayerSummary, percent: u16) -> String {
+    format!(
+        "{label} {}/{} {percent}%",
+        layer.current_chunks, layer.expected_chunks
+    )
+}
+
 fn line_range(start: usize, end: usize) -> String {
     format!("{start}-{end}")
 }
@@ -5075,7 +5720,7 @@ impl View {
                 ("[ ]", "tabs"),
                 ("Enter", "run/details"),
                 ("Up/Down", "select"),
-                ("r", "refresh"),
+                ("r", "rerun"),
                 ("q", "quit"),
             ],
             Self::Query => &[
@@ -5164,6 +5809,12 @@ fn tone_style(tone: StatusTone) -> Style {
         StatusTone::Dim => Color::DarkGray,
     };
     Style::new().fg(color)
+}
+
+fn readable_gauge_style(tone: StatusTone) -> Style {
+    tone_style(tone)
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
 }
 
 enum DiagnosticsState {
@@ -5515,6 +6166,14 @@ struct ContinuousIndexState {
     queued_events: usize,
     last_reindexed_file: Option<String>,
     latest_error: Option<String>,
+    active_layer: Option<String>,
+    quality_status: Option<String>,
+    activation_reason: Option<String>,
+    quality_pending_jobs: usize,
+    quality_running_jobs: usize,
+    quality_failed_jobs: usize,
+    quality_stale_jobs: usize,
+    latest_quality_error: Option<String>,
 }
 
 impl Default for ContinuousIndexState {
@@ -5526,6 +6185,14 @@ impl Default for ContinuousIndexState {
             queued_events: 0,
             last_reindexed_file: None,
             latest_error: None,
+            active_layer: None,
+            quality_status: None,
+            activation_reason: None,
+            quality_pending_jobs: 0,
+            quality_running_jobs: 0,
+            quality_failed_jobs: 0,
+            quality_stale_jobs: 0,
+            latest_quality_error: None,
         }
     }
 }
@@ -5544,14 +6211,47 @@ impl ContinuousIndexState {
     }
 
     fn summary(&self) -> String {
-        format!(
-            "state={} files_seen={} queued={} last={} error={}",
+        let base = format!(
+            "state={} files={} queued={} last={} err={}",
             self.status.label(),
             self.files_seen,
             self.queued_events,
             self.last_reindexed_file.as_deref().unwrap_or("<none>"),
             self.latest_error.as_deref().unwrap_or("<none>")
+        );
+        if self.active_layer.is_none()
+            && self.quality_status.is_none()
+            && self.activation_reason.is_none()
+            && self.quality_pending_jobs == 0
+            && self.quality_running_jobs == 0
+            && self.quality_failed_jobs == 0
+            && self.quality_stale_jobs == 0
+            && self.latest_quality_error.is_none()
+        {
+            return base;
+        }
+        format!(
+            "{} layer={} quality={} qjobs={}/{}/{}/{} reason={} qerr={}",
+            base,
+            self.active_layer.as_deref().unwrap_or("<none>"),
+            self.quality_status.as_deref().unwrap_or("<none>"),
+            self.quality_pending_jobs,
+            self.quality_running_jobs,
+            self.quality_failed_jobs,
+            self.quality_stale_jobs,
+            self.activation_reason.as_deref().unwrap_or("<none>"),
+            self.latest_quality_error.as_deref().unwrap_or("<none>")
         )
+    }
+
+    fn apply_quality_state(&mut self, state: &ContinuousQualityState) {
+        self.active_layer = Some(state.active_layer.clone());
+        self.quality_status = Some(state.quality_status.clone());
+        self.activation_reason = state.activation_reason.clone();
+        self.quality_pending_jobs = state.pending_jobs;
+        self.quality_running_jobs = state.running_jobs;
+        self.quality_failed_jobs = state.failed_jobs;
+        self.quality_stale_jobs = state.skipped_stale_jobs;
     }
 }
 
@@ -5599,7 +6299,9 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
     use ratatui::style::Color;
+    use symdex_core::{SemanticLayer, SemanticLayerStatus};
     use symdex_diagnostics::{DiagnosticCheck, DiagnosticReport, DiagnosticState};
+    use symdex_index::IndexScope;
     use symdex_query::{
         CallDirection, CallGraphSummary, CallPathSummary, DebugContextLimits, DebugContextPack,
         DebugFrameCallPath, DebugFrameMatch, EvidenceTrust, FileFreshnessRow, FreshnessSummary,
@@ -5613,17 +6315,17 @@ mod tests {
         EvidenceFreshness, EvidenceProvenance, FileCallDetailRow, FileChunkDetailRow,
         FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
         IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
-        QdrantStorageProjection, RepositoryStatus, SemanticNeighborhoodRow,
-        SemanticNeighborhoodSummary, SqliteStorageSummary, StorageExplorerSummary,
-        StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
-        SymbolSearchRow,
+        QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
+        SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
+        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
+        SymbolOutlineSummary, SymbolSearchRow,
     };
 
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
-        GraphStatus, IndexMode, QueryStatus, Screen, StorageExplorerState, StorageMode, UiAction,
-        View, continuous_activity_frame, parse_call_path_input, progress_percent, reduce_screen,
-        render,
+        GraphStatus, IndexMode, ManualIndexRequest, QueryStatus, Screen, StorageExplorerState,
+        StorageMode, UiAction, View, continuous_activity_frame, layer_count_percent,
+        layer_readiness_percent, parse_call_path_input, progress_percent, reduce_screen, render,
     };
 
     #[test]
@@ -5661,6 +6363,21 @@ mod tests {
         assert!(rendered.contains("Mode Snapshot"));
         assert!(rendered.contains("nomic-embed-text"));
         assert_eq!(cell_fg_for_text(buffer, "ready", None), Some(Color::Green));
+    }
+
+    #[test]
+    fn renders_dashboard_semantic_status() {
+        let app = App::from_status("/tmp/repo", "repo", sample_status());
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Semantic"));
+        assert!(rendered.contains("fast_ready"));
+        assert!(rendered.contains("QJobs"));
     }
 
     #[test]
@@ -5723,6 +6440,20 @@ mod tests {
     }
 
     #[test]
+    fn tab_toggles_index_scope_on_indexing_view() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Indexing;
+
+        assert_eq!(app.index_scope, IndexScope::Incremental);
+
+        assert!(!app.handle_key(KeyCode::Tab));
+
+        assert_eq!(app.view, View::Indexing);
+        assert_eq!(app.index_scope, IndexScope::Full);
+        assert_eq!(app.message, "Index scope set to full.");
+    }
+
+    #[test]
     fn brackets_switch_primary_tabs_from_text_entry_views() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Query;
@@ -5776,6 +6507,8 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("[Enter]"));
         assert!(rendered.contains("run/details"));
+        assert!(rendered.contains("[r]"));
+        assert!(rendered.contains("rerun"));
     }
 
     #[test]
@@ -6838,8 +7571,11 @@ mod tests {
     fn renders_index_confirmation_panel_with_warning_style() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
-        app.screen = Screen::ConfirmIndex(IndexMode::Semantic);
-        let backend = TestBackend::new(100, 24);
+        app.screen = Screen::ConfirmIndex(ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Full,
+        });
+        let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
         render(&mut terminal, &app).expect("render should succeed");
@@ -6847,7 +7583,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Confirm Indexing"));
-        assert!(rendered.contains("Run semantic indexing"));
+        assert!(rendered.contains("Run semantic full indexing"));
         assert!(rendered.contains("Press y to start"));
         assert_eq!(
             cell_fg_for_text(buffer, "Confirm Indexing", None),
@@ -6923,6 +7659,117 @@ mod tests {
     }
 
     #[test]
+    fn continuous_indexing_quality_events_update_status() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let state = symdex_index::ContinuousQualityState {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            active_layer: "fast".to_owned(),
+            quality_status: "quality_pending".to_owned(),
+            activation_reason: None,
+            embeddable_chunks: 2,
+            quality_embedded_chunks: 1,
+            pending_jobs: 1,
+            running_jobs: 0,
+            succeeded_jobs: 1,
+            failed_jobs: 0,
+            skipped_stale_jobs: 0,
+            skipped_excluded_jobs: 0,
+        };
+
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::QualityState {
+            state: state.clone(),
+        });
+        assert_eq!(app.continuous.active_layer.as_deref(), Some("fast"));
+        assert_eq!(
+            app.continuous.quality_status.as_deref(),
+            Some("quality_pending")
+        );
+        assert_eq!(app.continuous.quality_pending_jobs, 1);
+        assert_eq!(app.semantic_status.active_layer, SemanticLayer::Fast);
+        assert_eq!(
+            app.semantic_status.quality_status,
+            SemanticLayerStatus::QualityPending
+        );
+        assert_eq!(
+            app.semantic_status.fallback_reason.as_deref(),
+            Some("quality_manifest_incomplete_using_fast_layer")
+        );
+        assert_eq!(app.message, "Quality state: quality_pending on fast.");
+
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::QualityCompleted {
+            summary: Box::new(symdex_index::QualityIndexSummary {
+                repository_id: "repo".to_owned(),
+                generation_id: "generation-1".to_owned(),
+                quality_model: "nomic-embed-text-v2-moe".to_owned(),
+                quality_dimension: Some(768),
+                qdrant_collection: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
+                claimed_jobs: 1,
+                succeeded_jobs: 1,
+                failed_jobs: 0,
+                skipped_stale_jobs: 0,
+                remaining_pending_jobs: 0,
+                quality_status: "quality_ready".to_owned(),
+                active_layer: "quality".to_owned(),
+                activation_reason: "quality_complete".to_owned(),
+                progress: QualityGenerationProgress {
+                    repository_id: "repo".to_owned(),
+                    generation_id: "generation-1".to_owned(),
+                    embeddable_chunks: 2,
+                    quality_embedded_chunks: 2,
+                    pending_jobs: 0,
+                    running_jobs: 0,
+                    succeeded_jobs: 2,
+                    failed_jobs: 0,
+                    skipped_stale_jobs: 0,
+                    skipped_excluded_jobs: 0,
+                },
+            }),
+        });
+        assert_eq!(app.continuous.active_layer.as_deref(), Some("quality"));
+        assert_eq!(
+            app.continuous.quality_status.as_deref(),
+            Some("quality_ready")
+        );
+        assert_eq!(
+            app.continuous.activation_reason.as_deref(),
+            Some("quality_complete")
+        );
+        assert_eq!(app.continuous.quality_pending_jobs, 0);
+        assert_eq!(app.semantic_status.active_layer, SemanticLayer::Quality);
+        assert_eq!(
+            app.semantic_status.quality_status,
+            SemanticLayerStatus::QualityReady
+        );
+        assert_eq!(app.semantic_status.fallback_reason, None);
+        assert_eq!(
+            app.semantic_status
+                .quality_progress
+                .as_ref()
+                .map(|progress| progress.pending_jobs),
+            Some(0)
+        );
+        assert_eq!(
+            app.message,
+            "Quality catch-up completed: quality_ready on quality."
+        );
+
+        app.apply_continuous_event(symdex_index::ContinuousIndexEvent::QualityFailed {
+            state: Some(state),
+            error: "quality model unavailable".to_owned(),
+        });
+        assert_eq!(
+            app.continuous.latest_quality_error.as_deref(),
+            Some("quality model unavailable")
+        );
+        assert_eq!(
+            app.semantic_status.latest_quality_error.as_deref(),
+            Some("quality model unavailable")
+        );
+        assert_eq!(app.message, "Quality catch-up failed.");
+    }
+
+    #[test]
     fn renders_continuous_indexing_status() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
@@ -6933,6 +7780,10 @@ mod tests {
         app.continuous.queued_events = 2;
         app.continuous.last_reindexed_file = Some("src/lib.rs".to_owned());
         app.continuous.latest_error = Some("ollama unavailable".to_owned());
+        app.continuous.active_layer = Some("fast".to_owned());
+        app.continuous.quality_status = Some("quality_pending".to_owned());
+        app.continuous.quality_pending_jobs = 3;
+        app.continuous.activation_reason = Some("quality_jobs_pending".to_owned());
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
 
@@ -6946,10 +7797,70 @@ mod tests {
         assert!(rendered.contains("pending"));
         assert!(rendered.contains("queued=2"));
         assert!(rendered.contains("src/lib.rs"));
+        assert!(rendered.contains("quality_pending"));
+        assert!(rendered.contains("qjobs=3/0/0/0"));
         assert!(rendered.contains("ollama unavailable"));
         assert_eq!(
             cell_fg_for_text(buffer, "pending", None),
             Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn renders_index_semantic_readiness_gauges() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Indexing;
+        app.semantic_status.fast.current_chunks = 2;
+        app.semantic_status.fast.expected_chunks = 4;
+        app.semantic_status.fast.total_chunks = 3;
+        app.semantic_status.fast.stale_chunks = 1;
+        app.semantic_status.quality.current_chunks = 1;
+        app.semantic_status.quality.expected_chunks = 4;
+        app.semantic_status.quality_status = SemanticLayerStatus::QualityPending;
+        app.semantic_status.quality_progress = Some(QualityGenerationProgress {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            embeddable_chunks: 4,
+            quality_embedded_chunks: 1,
+            pending_jobs: 2,
+            running_jobs: 1,
+            succeeded_jobs: 1,
+            failed_jobs: 0,
+            skipped_stale_jobs: 1,
+            skipped_excluded_jobs: 0,
+        });
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal should build");
+
+        render(&mut terminal, &app).expect("render should succeed");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Fast Readiness"));
+        assert!(rendered.contains("Quality Readiness"));
+        assert!(rendered.contains("fast_ready 2/4 50%"));
+        assert!(rendered.contains("quality_ready 1/4 25%"));
+        assert!(rendered.contains("Fast Pend 25%"));
+        assert!(rendered.contains("Quality Pend 50%"));
+        assert!(rendered.contains("Fast Run 0%"));
+        assert!(rendered.contains("Quality Run 25%"));
+        assert!(rendered.contains("Fast Stale 25%"));
+        assert!(rendered.contains("Quality Stale 25%"));
+        let buffer = terminal.backend().buffer();
+        assert_ne!(
+            cell_fg_for_text(buffer, "fast_ready 2/4 50%", None),
+            Some(Color::White)
+        );
+        assert_ne!(
+            cell_bg_for_text(buffer, "fast_ready 2/4 50%", None),
+            Some(Color::Black)
+        );
+        assert_ne!(
+            cell_fg_for_text(buffer, "quality_ready 1/4 25%", None),
+            Some(Color::White)
+        );
+        assert_ne!(
+            cell_bg_for_text(buffer, "quality_ready 1/4 25%", None),
+            Some(Color::Black)
         );
     }
 
@@ -6973,7 +7884,10 @@ mod tests {
     fn renders_running_index_progress_gauge() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
-        app.screen = Screen::IndexRunning(IndexMode::Semantic);
+        app.screen = Screen::IndexRunning(ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Incremental,
+        });
         app.index_progress = Some(symdex_index::IndexProgress {
             phase: "parse",
             completed: 2,
@@ -6990,6 +7904,14 @@ mod tests {
         assert!(rendered.contains("Indexing Running"));
         assert!(rendered.contains("Progress"));
         assert!(rendered.contains("parse 2/4"));
+        assert_ne!(
+            cell_fg_for_text(buffer, "parse 2/4", None),
+            Some(Color::White)
+        );
+        assert_ne!(
+            cell_bg_for_text(buffer, "parse 2/4", None),
+            Some(Color::Black)
+        );
         assert_eq!(
             cell_fg_for_text(buffer, "Indexing Running", None),
             Some(Color::Cyan)
@@ -7006,6 +7928,30 @@ mod tests {
         };
 
         assert_eq!(progress_percent(Some(&progress)), 100);
+    }
+
+    #[test]
+    fn layer_readiness_percent_uses_ready_chunks_over_expected_chunks() {
+        let app = App::from_status("/tmp/repo", "repo", sample_status());
+        let mut layer = app.semantic_status.fast.clone();
+        layer.expected_chunks = 8;
+        layer.current_chunks = 3;
+
+        assert_eq!(layer_readiness_percent(&layer), 37);
+
+        layer.current_chunks = 10;
+        assert_eq!(layer_readiness_percent(&layer), 100);
+
+        layer.expected_chunks = 0;
+        assert_eq!(layer_readiness_percent(&layer), 0);
+    }
+
+    #[test]
+    fn layer_count_percent_clamps_to_total_chunks() {
+        assert_eq!(layer_count_percent(2, 4), 50);
+        assert_eq!(layer_count_percent(1, 4), 25);
+        assert_eq!(layer_count_percent(5, 4), 100);
+        assert_eq!(layer_count_percent(1, 0), 0);
     }
 
     #[test]
@@ -7062,6 +8008,70 @@ mod tests {
         assert!(!app.handle_key(KeyCode::Enter));
         assert!(!app.diagnostics_details_expanded);
         assert_eq!(app.message, "Doctor selected-check details collapsed.");
+    }
+
+    #[test]
+    fn doctor_diagnostics_pass_loaded_repo_root() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.start_diagnostics_with(|repo| {
+            if repo == "/tmp/repo" {
+                Ok(sample_diagnostic_report())
+            } else {
+                Err(format!("unexpected repo path: {repo}"))
+            }
+        });
+
+        for _ in 0..1000 {
+            app.poll_diagnostics();
+            if matches!(app.diagnostics, DiagnosticsState::Completed(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        match &app.diagnostics {
+            DiagnosticsState::Completed(report) => {
+                assert_eq!(report.workspace, "/tmp/repo");
+            }
+            DiagnosticsState::Failed(error) => panic!("diagnostics failed: {error}"),
+            DiagnosticsState::Idle | DiagnosticsState::Running => {
+                panic!("diagnostics did not complete")
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_refresh_reruns_completed_diagnostics() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        app.diagnostics = DiagnosticsState::Completed(sample_diagnostic_report());
+        app.diagnostics_details_expanded = true;
+
+        app.handle_refresh_key_with(|app| {
+            app.start_diagnostics_with(|repo| {
+                if repo == "/tmp/repo" {
+                    Ok(sample_diagnostic_report())
+                } else {
+                    Err(format!("unexpected repo path: {repo}"))
+                }
+            });
+        });
+
+        assert!(matches!(app.diagnostics, DiagnosticsState::Running));
+        assert!(!app.diagnostics_details_expanded);
+        assert_eq!(app.message, "Doctor diagnostics started.");
+    }
+
+    #[test]
+    fn doctor_refresh_does_not_start_duplicate_run() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Diagnostics;
+        app.start_diagnostics_with(|_| Ok(sample_diagnostic_report()));
+
+        app.handle_refresh_key_with(|_| panic!("diagnostics should already be running"));
+
+        assert!(matches!(app.diagnostics, DiagnosticsState::Running));
+        assert_eq!(app.message, "Doctor diagnostics already running.");
     }
 
     #[test]
@@ -7493,22 +8503,24 @@ mod tests {
 
     #[test]
     fn reducer_requires_confirmation_before_indexing() {
-        let screen = reduce_screen(
-            Screen::Dashboard,
-            UiAction::RequestIndex(IndexMode::Offline),
-        );
-        assert_eq!(screen, Screen::ConfirmIndex(IndexMode::Offline));
+        let request = ManualIndexRequest {
+            mode: IndexMode::Offline,
+            scope: IndexScope::Incremental,
+        };
+        let screen = reduce_screen(Screen::Dashboard, UiAction::RequestIndex(request));
+        assert_eq!(screen, Screen::ConfirmIndex(request));
 
         let screen = reduce_screen(screen, UiAction::Confirm);
-        assert_eq!(screen, Screen::IndexRunning(IndexMode::Offline));
+        assert_eq!(screen, Screen::IndexRunning(request));
     }
 
     #[test]
     fn reducer_cancels_pending_index_without_running() {
-        let screen = reduce_screen(
-            Screen::Dashboard,
-            UiAction::RequestIndex(IndexMode::Semantic),
-        );
+        let request = ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Full,
+        };
+        let screen = reduce_screen(Screen::Dashboard, UiAction::RequestIndex(request));
         let screen = reduce_screen(screen, UiAction::Cancel);
 
         assert_eq!(screen, Screen::Dashboard);
@@ -7516,13 +8528,14 @@ mod tests {
 
     #[test]
     fn reducer_tracks_index_completion_and_dismissal() {
-        let screen = reduce_screen(
-            Screen::Dashboard,
-            UiAction::RequestIndex(IndexMode::Offline),
-        );
+        let request = ManualIndexRequest {
+            mode: IndexMode::Offline,
+            scope: IndexScope::Incremental,
+        };
+        let screen = reduce_screen(Screen::Dashboard, UiAction::RequestIndex(request));
         let screen = reduce_screen(screen, UiAction::Confirm);
         let screen = reduce_screen(screen, UiAction::JobSucceeded);
-        assert_eq!(screen, Screen::IndexCompleted(IndexMode::Offline));
+        assert_eq!(screen, Screen::IndexCompleted(request));
 
         let screen = reduce_screen(screen, UiAction::Dismiss);
         assert_eq!(screen, Screen::Dashboard);
@@ -7769,6 +8782,7 @@ mod tests {
                     files_indexed: 2,
                     chunks_embedded: 1,
                     error_summary: Some("qdrant unavailable".to_owned()),
+                    run_kind: "watch".to_owned(),
                 },
                 IndexRunTimelineRow {
                     id: "run-success".to_owned(),
@@ -7781,6 +8795,7 @@ mod tests {
                     files_indexed: 3,
                     chunks_embedded: 7,
                     error_summary: None,
+                    run_kind: "semantic".to_owned(),
                 },
             ],
         }

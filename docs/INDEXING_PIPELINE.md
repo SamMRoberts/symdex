@@ -140,6 +140,35 @@ recorded as partial runs with metadata-only error summaries. Before upserting
 vectors, semantic indexing rejects a same-repository, same-model dimension
 change so an existing Qdrant collection is not reused with incompatible vector
 sizes. Different model names map to different Qdrant collection names.
+Continuous watch batches use the same incremental indexing path and are recorded
+with `run_kind = watch` in index-run metadata.
+
+The SQLite schema also includes additive layered semantic tables for
+`semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
+After a successful fast Qdrant upsert, semantic indexing records a deterministic
+fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
+The older chunk-level vector columns remain nullable compatibility schema, but
+new indexing does not use them as the authoritative fast manifest.
+When quality indexing is enabled and the quality model is locally available,
+semantic indexing then marks superseded pending/running quality jobs stale and
+first carries forward current quality `chunk_embeddings` rows whose chunk ID,
+content hash, text hash, and quality model still match the latest fast manifest.
+It then queues metadata-only `quality_embedding_jobs` rows only for changed or
+newly embeddable chunks missing reusable quality coverage. This keeps the latest
+generation complete without forcing a full quality rebuild after every
+incremental fast index. If the quality model or service is unavailable, the
+latest generation is marked `quality_blocked` and no pending quality jobs are
+created.
+Semantic search consults SQLite readiness metadata from the latest semantic
+generation and compact `chunk_embeddings` summaries before choosing the active
+model and Qdrant collection. The manual quality worker is available through
+`symdex index-quality <repo>`; it drains pending latest-generation jobs in
+bounded batches, revalidates hashes from disk before embedding, writes quality
+Qdrant points and quality `chunk_embeddings` rows, then refreshes activation
+state in SQLite. Activation switches default routing to quality only when the
+latest fast generation has complete current quality coverage, a known quality
+dimension, and no pending, running, failed, or stale quality jobs. Partial,
+stale, blocked, or failed quality state leaves `active_layer = fast`.
 
 ## Qdrant Collections
 
@@ -154,16 +183,17 @@ Payloads include repository, file, chunk, symbol, path, language, line range,
 chunk kind, and text hash metadata. Payloads intentionally do not include source
 text.
 
-Semantic indexing captures existing Qdrant point IDs from SQLite before changed
-file facts are replaced or deleted-file rows are removed. When the target
-collection exists, stale points for changed and deleted chunks are deleted from
-Qdrant before SQLite mutation so vector cleanup does not lose the old point IDs.
-If stale point deletion fails, semantic indexing fails before replacing SQLite
-facts and records the run failure in `index_runs`.
+Semantic indexing captures existing latest-generation fast `chunk_embeddings`
+point IDs from SQLite before changed-file facts are replaced or deleted-file
+rows are removed. When the target collection exists, stale points for changed
+and deleted chunks are deleted from Qdrant before SQLite mutation so vector
+cleanup does not lose the old point IDs. If stale point deletion fails, semantic
+indexing fails before replacing SQLite facts and records the run failure in
+`index_runs`.
 
 `symdex qdrant-verify <repo>` performs a metadata-only lifecycle check for the
-configured embedding model. It derives the expected point manifest from SQLite
-chunks with `qdrant_point_id`, scrolls Qdrant payloads filtered by
+selected semantic layer. It derives the expected point manifest from
+latest-generation `chunk_embeddings`, scrolls Qdrant payloads filtered by
 `repository_id`, and reports missing collections, missing points, stale payload
 fields, and orphaned points. The verifier requests payloads only, not vectors,
 and never returns source text.
@@ -177,6 +207,25 @@ provenance, and index-run lifecycle behavior as `symdex index <repo>`.
 
 Semantic search uses Qdrant `POST /collections/:collection_name/points/query`
 with the embedded query vector, `with_payload: true`, and `with_vector: false`.
+The embedded query model and target collection come from active-layer routing:
+auto search uses quality only when the active generation is `quality_ready` and
+the quality manifest is complete, otherwise it uses the fast layer. Forced
+quality routing fails clearly when quality is unavailable or incomplete.
+
+`symdex index --watch <repo>` performs cooperative quality catch-up in semantic
+watch mode when quality indexing is enabled. Watch-driven fast batches queue
+quality jobs and emit completion before catch-up begins. Quality catch-up then
+processes bounded batches through the normal quality worker during post-batch or
+idle watch ticks, refreshing activation state after each bounded run.
+
+Qdrant verification and repair are layer-aware maintenance paths. `qdrant-verify`
+and `qdrant-repair` accept `--semantic-layer fast|quality|all`. Verification
+builds expected fast and quality manifests from latest-generation
+`chunk_embeddings` rows for the selected layer. Fast verification no longer uses
+legacy `chunks.qdrant_point_id` metadata; legacy-only local databases need a
+fresh `symdex index <repo>` run before layered verification. Repair routes fast
+rebuilds through normal semantic indexing and quality rebuilds through the
+quality worker path.
 
 ## Call extraction
 
@@ -265,11 +314,15 @@ A file can be skipped only when:
 
 Changed files should replace their SQLite facts and Qdrant points atomically where practical.
 
-Current implementation skips unchanged files by path plus content hash for
-`symdex index --offline`, persists changed file/chunk facts to SQLite, and
-removes SQLite rows for deleted files. Semantic `symdex index` currently parses
-and embeds all discovered chunks so Qdrant can be rebuilt even when SQLite
-already has matching structural facts. Same-model dimension changes fail closed;
+Current implementation exposes scope independently from semantic/offline mode:
+`symdex index --full <repo>` reparses every eligible file and rebuilds eligible
+semantic vectors when not offline, while `symdex index --incremental <repo>`
+skips unchanged files by path plus content hash. Plain `symdex index <repo>`
+keeps the legacy semantic default of full scope, and plain
+`symdex index --offline <repo>` keeps the legacy structural default of
+incremental scope; either command can be made explicit with `--full` or
+`--incremental`. Incremental runs persist changed file/chunk facts to SQLite and
+remove SQLite rows for deleted files. Same-model dimension changes fail closed;
 automated collection migration/reset remains future hardening.
 
 Files indexed from tree-sitter error trees are included in normal structural and
