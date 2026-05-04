@@ -96,9 +96,9 @@ Fixtures should be tiny and purpose-built.
 - Rust chunking coverage for function, method, type-definition, trait,
   impl-summary, trait impl-summary names, trait impl method qualified names, and
   fallback chunks.
-- Optional rust-analyzer readiness coverage for default-off behavior, explicit
-  truthy opt-in flags, command override parsing, and doctor check status without
-  requiring rust-analyzer in ordinary tests.
+- Optional rust-analyzer readiness coverage for default auto-detection, explicit
+  enable/disable flags, command override parsing, and doctor check status
+  without requiring rust-analyzer in ordinary tests.
 - Optional rust-analyzer enrichment planning coverage for disabled, not-ready,
   no-Rust-file, and planned eligible Rust file/symbol/call count states without
   requiring rust-analyzer in ordinary tests.
@@ -205,8 +205,9 @@ and two independent MCP readers using the same SQLite index-status path without
 write-capable tools. Current MCP staleness tests cover tool schema, path
 validation, symbol scope, explicit paths, stale/deleted/missing/unknown states,
 and source-free envelope output.
-Current diagnostics tests cover optional rust-analyzer readiness configuration
-without invoking project analysis or requiring rust-analyzer to be installed.
+Current diagnostics tests cover optional rust-analyzer readiness auto-detection
+and override configuration without invoking project analysis or requiring
+rust-analyzer to be installed.
 
 Current call path tests cover deterministic path order, unresolved terminal
 edges matched by callee text, ambiguous terminal edges matched by callee text,

@@ -318,14 +318,16 @@ also resolve to persisted unchanged methods on the same impl receiver. Symbols
 from files being replaced are ignored so incremental indexing does not resolve
 against stale facts.
 
-Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
-diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is
-available when `SYMDEX_RUST_ANALYZER=1` is set, but indexing does not invoke
-project analysis by default. Index runs also report a metadata-only enrichment
-plan when explicitly enabled: disabled, not ready, skipped because no changed
-Rust files were indexed, or planned with eligible Rust file, symbol, and call
-counts. This plan is reporting only; it does not mutate persisted symbols or
-calls. Future symbol and call fact application must keep this opt-in boundary,
+Optional rust-analyzer enrichment auto-detects the configured command, defaulting
+to `rust-analyzer`. If that command can be launched, `symdex doctor` checks
+readiness with `rust-analyzer --version`; if it is missing, enrichment is
+disabled. `SYMDEX_RUST_ANALYZER=0` force-disables enrichment and
+`SYMDEX_RUST_ANALYZER=1` forces readiness checking for the configured command.
+Index runs report a metadata-only enrichment plan when enabled: disabled, not
+ready, skipped because no changed Rust files were indexed, or planned with
+eligible Rust file, symbol, and call counts. This plan is reporting only; it does
+not invoke rust-analyzer project analysis or mutate persisted symbols or calls.
+Future symbol and call fact application must keep an explicit override boundary,
 preserve source-text privacy, and avoid executing indexed repository code.
 
 ## Incremental indexing

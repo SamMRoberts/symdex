@@ -1113,7 +1113,7 @@ fn print_index_summary(summary: &IndexSummary) {
     println!("sqlite_files_removed: {}", summary.sqlite_files_removed);
     match &summary.rust_analyzer {
         RustAnalyzerEnrichmentSummary::Disabled { enable_env } => {
-            println!("rust_analyzer_enrichment: disabled (set {enable_env}=1)");
+            println!("rust_analyzer_enrichment: disabled (set {enable_env}=1 to force)");
         }
         RustAnalyzerEnrichmentSummary::NotReady { command, reason } => {
             println!("rust_analyzer_enrichment: not_ready command={command} reason={reason}");

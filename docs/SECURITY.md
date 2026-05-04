@@ -26,11 +26,13 @@ The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 - Continuous indexing must enforce the same local-only, path-boundary,
   symlink, ignore, and secret-filtering rules as manual indexing.
 
-Optional rust-analyzer integration must remain disabled by default. Readiness
-diagnostics and indexing enrichment planning may run `rust-analyzer --version`
-when explicitly enabled, but current indexing only reports candidate counts. Any
-future project analysis must be designed so it does not execute indexed
-repository code or leak source text.
+Optional rust-analyzer integration auto-detects the configured command,
+defaulting to `rust-analyzer`, and disables itself when the command is missing.
+Readiness diagnostics and indexing enrichment planning may run
+`rust-analyzer --version` when auto-detected or explicitly enabled, but current
+indexing only reports candidate counts. `SYMDEX_RUST_ANALYZER=0` remains a
+force-disable override. Any future project analysis must be designed so it does
+not execute indexed repository code or leak source text.
 
 Current implementation requires repository roots to be directories. Path
 normalization canonicalizes existing paths before accepting them, rejects

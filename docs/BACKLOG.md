@@ -318,8 +318,8 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### P2 — Semantic precision
 
-- [x] Add optional rust-analyzer enrichment readiness gate.
-- [x] Add opt-in rust-analyzer enrichment planning and reporting.
+- [x] Add optional rust-analyzer enrichment readiness gate with default command auto-detection.
+- [x] Add rust-analyzer enrichment planning and reporting with environment overrides.
 - [ ] Add opt-in rust-analyzer symbol and call fact application.
 - [x] Improve Rust crate-prefix and simple `use` alias call resolution.
 - [x] Add conservative Rust `self.method()` and `Self::method()` local resolution.

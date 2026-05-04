@@ -30,15 +30,17 @@ SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_EMBED_BATCH_SIZE=16
 SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
 SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
-SYMDEX_RUST_ANALYZER=0
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
 
-`SYMDEX_RUST_ANALYZER=1` enables an optional `symdex doctor` readiness check for
-the configured rust-analyzer binary. The check runs `rust-analyzer --version`
-only. Indexing uses the same opt-in flag to report a metadata-only enrichment
-plan for changed Rust files, but does not run rust-analyzer project analysis by
-default.
+Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
+default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command
+can be launched, `symdex doctor` checks readiness with `rust-analyzer --version`
+and indexing reports a metadata-only enrichment plan for changed Rust files. If
+the command is missing, enrichment is disabled. Set `SYMDEX_RUST_ANALYZER=0` to
+force-disable auto-detected enrichment or `SYMDEX_RUST_ANALYZER=1` to force a
+readiness check for the configured command. Current indexing does not run
+rust-analyzer project analysis or apply rust-analyzer facts.
 
 `SYMDEX_EMBED_TRUNCATE` defaults to `true`, matching Ollama's embedding API
 behavior for oversized local inputs. Symdex still excludes large chunks before
@@ -120,8 +122,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 
 - `init`: creates the local state directory for the configured SQLite path.
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
-  service checks, optional rust-analyzer enrichment readiness when explicitly
-  enabled, the active MCP evidence contract version, and repo-specific index
+  service checks, auto-detected or explicitly overridden rust-analyzer
+  enrichment readiness, the active MCP evidence contract version, and repo-specific index
   freshness/provenance readiness when a repo path is provided.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
   applies built-in excludes and scoped glob-aware `.gitignore` rules with
@@ -134,9 +136,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   accepts `--full` or `--incremental`. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/sqlite-vec embedding.
-  When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
-  rust-analyzer enrichment readiness and eligible Rust file, symbol, and call
-  counts without applying rust-analyzer facts.
+  When rust-analyzer enrichment is auto-detected or explicitly enabled, index
+  output also reports readiness and eligible Rust file, symbol, and call counts
+  without applying rust-analyzer facts.
 - `watch start|status|stop <repo>`: manages the single background watcher for a
   repository. Watchers are client-scoped: TUI, MCP, and CLI attachments keep
   them alive, and they exit after about 10 seconds with no live clients. The
@@ -288,7 +290,7 @@ The app should not require network access beyond local loopback services during 
 - embedding model is available
 - vector dimension can be determined
 - active MCP evidence contract version and watcher-start exception
-- optional rust-analyzer enrichment readiness when `SYMDEX_RUST_ANALYZER=1`
+- auto-detected or explicitly overridden rust-analyzer enrichment readiness
 - configured repo root exists
 - repo-specific index freshness, provenance consistency, and watcher status
   when a repo is passed

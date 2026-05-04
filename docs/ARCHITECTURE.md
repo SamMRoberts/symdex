@@ -75,7 +75,7 @@ Local diagnostics:
 - SQLite parent path checks
 - Ollama model and embedding dimension checks
 - sqlite-vec health checks
-- optional rust-analyzer enrichment readiness checks when explicitly enabled
+- auto-detected rust-analyzer enrichment readiness checks with environment overrides
 - fast and quality embedding model readiness when layered indexing is enabled
 
 Do not mutate repository data. Keep diagnostics local and reusable by CLI and

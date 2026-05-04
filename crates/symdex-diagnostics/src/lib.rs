@@ -394,14 +394,22 @@ impl RustAnalyzerDiagnosticsConfig {
     }
 
     fn from_values(enabled: Option<&str>, command: Option<&str>) -> Self {
-        Self {
-            enabled: enabled.is_some_and(env_flag_enabled),
-            command: command
-                .map(str::trim)
-                .filter(|command| !command.is_empty())
-                .unwrap_or("rust-analyzer")
-                .to_owned(),
-        }
+        Self::from_values_with_detector(enabled, command, rust_analyzer_command_exists)
+    }
+
+    fn from_values_with_detector(
+        enabled: Option<&str>,
+        command: Option<&str>,
+        command_exists: impl FnOnce(&str) -> bool,
+    ) -> Self {
+        let command = command
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .unwrap_or("rust-analyzer")
+            .to_owned();
+        let enabled = enabled.map_or_else(|| command_exists(&command), env_flag_enabled);
+
+        Self { enabled, command }
     }
 }
 
@@ -410,6 +418,13 @@ fn env_flag_enabled(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn rust_analyzer_command_exists(command: &str) -> bool {
+    match Command::new(command).arg("--version").output() {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 fn rust_analyzer_check(config: &RustAnalyzerDiagnosticsConfig) -> DiagnosticCheck {
@@ -542,15 +557,42 @@ mod tests {
     }
 
     #[test]
-    fn rust_analyzer_config_is_disabled_by_default_and_honors_command_override() {
-        let default = RustAnalyzerDiagnosticsConfig::from_values(None, None);
-        assert!(!default.enabled);
-        assert_eq!(default.command, "rust-analyzer");
+    fn rust_analyzer_config_auto_detects_by_default_and_honors_command_override() {
+        let detected =
+            RustAnalyzerDiagnosticsConfig::from_values_with_detector(None, None, |command| {
+                command == "rust-analyzer"
+            });
+        assert!(detected.enabled);
+        assert_eq!(detected.command, "rust-analyzer");
 
-        let configured =
-            RustAnalyzerDiagnosticsConfig::from_values(Some("yes"), Some("/bin/rust-analyzer"));
-        assert!(configured.enabled);
-        assert_eq!(configured.command, "/bin/rust-analyzer");
+        let missing =
+            RustAnalyzerDiagnosticsConfig::from_values_with_detector(None, None, |_| false);
+        assert!(!missing.enabled);
+        assert_eq!(missing.command, "rust-analyzer");
+
+        let command_override = RustAnalyzerDiagnosticsConfig::from_values_with_detector(
+            None,
+            Some("/bin/custom-rust-analyzer"),
+            |command| command == "/bin/custom-rust-analyzer",
+        );
+        assert!(command_override.enabled);
+        assert_eq!(command_override.command, "/bin/custom-rust-analyzer");
+
+        let forced_disabled =
+            RustAnalyzerDiagnosticsConfig::from_values_with_detector(Some("0"), None, |_| true);
+        assert!(!forced_disabled.enabled);
+        assert_eq!(forced_disabled.command, "rust-analyzer");
+
+        let forced_enabled = RustAnalyzerDiagnosticsConfig::from_values_with_detector(
+            Some("yes"),
+            Some("/bin/rust-analyzer"),
+            |_| false,
+        );
+        assert!(forced_enabled.enabled);
+        assert_eq!(forced_enabled.command, "/bin/rust-analyzer");
+
+        let default = RustAnalyzerDiagnosticsConfig::from_values(None, None);
+        assert_eq!(default.command, "rust-analyzer");
     }
 
     #[test]
