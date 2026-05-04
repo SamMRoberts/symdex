@@ -1495,9 +1495,9 @@ pub fn run_semantic_status(repo: &str) -> Result<SemanticStatusSummary, String> 
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
-    let routing = sqlite
-        .semantic_routing_summary(root.id())
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    let routing =
+        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
     let quality_progress = match routing.as_ref() {
         Some(summary) => Some(
             sqlite
@@ -1658,9 +1658,9 @@ fn semantic_search_for_root(
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
-    let routing = sqlite
-        .semantic_routing_summary(root.id())
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(root, &sqlite)?;
+    let routing =
+        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
     let target =
         resolve_semantic_search_target(root.id(), options, routing.as_ref(), &layered_config)?;
     let embed_config = embed_config_for_semantic_target(&layered_config, &target);
@@ -1674,7 +1674,6 @@ fn semantic_search_for_root(
     };
 
     let vector_store = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
-    let repository_ref_id = active_ref_scope(root, &sqlite)?;
     let points = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
         vector_store.query_points_for_ref(
             &target.vector_table,
@@ -1701,6 +1700,24 @@ fn semantic_search_for_root(
         query: query.to_owned(),
         results,
     })
+}
+
+fn semantic_routing_summary_for_scope(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    repository_ref_id: Option<&str>,
+) -> Result<Option<SemanticRoutingSummary>, String> {
+    if let Some(repository_ref_id) = repository_ref_id {
+        let routing = sqlite
+            .semantic_routing_summary_for_ref(repository_id, repository_ref_id)
+            .map_err(|error| error.to_string())?;
+        if routing.is_some() {
+            return Ok(routing);
+        }
+    }
+    sqlite
+        .semantic_routing_summary(repository_id)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

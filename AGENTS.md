@@ -103,8 +103,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   exist, while preserving legacy repo-wide fallback for indexes without
   manifests.
 - Semantic search should filter sqlite-vec candidates through the live worktree
-  ref's `ref_files` manifest when manifests exist; semantic generation state is
-  still repo-wide until a later generation-routing slice.
+  ref's `ref_files` manifest when manifests exist; semantic routing should use
+  the active ref's linked generation from `semantic_generation_refs` with
+  legacy repo-wide fallback for indexes without ref mappings.
 - Hash file contents to skip unchanged work.
 - Keep public APIs boring, explicit, and versionable.
 

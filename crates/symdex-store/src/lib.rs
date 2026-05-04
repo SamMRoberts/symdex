@@ -1551,6 +1551,77 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)
     }
 
+    pub fn link_semantic_generation_to_ref(
+        &mut self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        generation_id: &str,
+        linked_at: &str,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO semantic_generation_refs (
+                   repository_ref_id, repository_id, generation_id, linked_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(repository_ref_id) DO UPDATE SET
+                   repository_id = excluded.repository_id,
+                   generation_id = excluded.generation_id,
+                   linked_at = excluded.linked_at",
+                params![repository_ref_id, repository_id, generation_id, linked_at],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn latest_semantic_generation_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Option<SemanticGenerationRecord>> {
+        self.connection
+            .query_row(
+                "SELECT semantic_generations.id, semantic_generations.repository_id,
+                        semantic_generations.fast_model, semantic_generations.fast_dimension,
+                        semantic_generations.fast_completed_at,
+                        semantic_generations.quality_model,
+                        semantic_generations.quality_dimension,
+                        semantic_generations.quality_status,
+                        semantic_generations.quality_started_at,
+                        semantic_generations.quality_completed_at,
+                        semantic_generations.active_layer,
+                        semantic_generations.files_seen,
+                        semantic_generations.embeddable_chunks,
+                        semantic_generations.fast_embedded_chunks,
+                        semantic_generations.quality_embedded_chunks,
+                        semantic_generations.created_at,
+                        semantic_generations.updated_at
+                   FROM semantic_generation_refs
+                   JOIN semantic_generations
+                     ON semantic_generations.id = semantic_generation_refs.generation_id
+                  WHERE semantic_generation_refs.repository_id = ?1
+                    AND semantic_generation_refs.repository_ref_id = ?2
+                  LIMIT 1",
+                params![repository_id, repository_ref_id],
+                semantic_generation_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn semantic_routing_summary_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Option<SemanticRoutingSummary>> {
+        let Some(generation) =
+            self.latest_semantic_generation_for_ref(repository_id, repository_ref_id)?
+        else {
+            return Ok(None);
+        };
+        self.semantic_routing_summary_for_generation(generation)
+    }
+
     pub fn semantic_routing_summary(
         &self,
         repository_id: &str,
@@ -1558,7 +1629,13 @@ impl SqliteStore {
         let Some(generation) = self.latest_semantic_generation(repository_id)? else {
             return Ok(None);
         };
+        self.semantic_routing_summary_for_generation(generation)
+    }
 
+    fn semantic_routing_summary_for_generation(
+        &self,
+        generation: SemanticGenerationRecord,
+    ) -> Result<Option<SemanticRoutingSummary>> {
         let active_layer = SemanticLayer::parse(&generation.active_layer)
             .map_err(|error| StoreError::UnexpectedResponse(error.to_owned()))?;
         let quality_status = SemanticLayerStatus::parse(&generation.quality_status)
@@ -6848,6 +6925,16 @@ CREATE TABLE IF NOT EXISTS semantic_generations (
     FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS semantic_generation_refs (
+    repository_ref_id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE CASCADE,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(generation_id) REFERENCES semantic_generations(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -6939,6 +7026,7 @@ CREATE INDEX IF NOT EXISTS idx_tests_symbol_id ON tests(symbol_id);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON semantic_generations(repository_id, fast_completed_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_semantic_generation_refs_generation ON semantic_generation_refs(repository_id, generation_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_generation_chunk ON chunk_embeddings(generation_id, chunk_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_generation_layer_status ON chunk_embeddings(repository_id, generation_id, semantic_layer, status);
@@ -7691,6 +7779,7 @@ mod tests {
             "idx_index_runs_repository_status",
             "idx_index_runs_repository_model_status",
             "idx_semantic_generations_repository_fast_completed",
+            "idx_semantic_generation_refs_generation",
             "idx_chunk_embeddings_repository_layer_model",
             "idx_chunk_embeddings_generation_chunk",
             "idx_chunk_embeddings_repository_generation_layer_status",
@@ -7773,6 +7862,7 @@ mod tests {
 
         for expected in [
             "semantic_generations",
+            "semantic_generation_refs",
             "chunk_embeddings",
             "quality_embedding_jobs",
         ] {
@@ -7781,6 +7871,94 @@ mod tests {
                 "missing SQLite table {expected}; found {tables:?}"
             );
         }
+    }
+
+    #[test]
+    fn semantic_generation_refs_route_generations_per_ref() {
+        let db = TestDb::new("semantic-generation-refs");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        store.sync_repository_ref(&main).expect("main should sync");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature should sync");
+
+        let mut main_generation = sample_semantic_generation();
+        main_generation.id = "generation-main".to_owned();
+        main_generation.fast_completed_at = "100".to_owned();
+        main_generation.created_at = "100".to_owned();
+        main_generation.updated_at = "100".to_owned();
+        store
+            .upsert_semantic_generation(&main_generation)
+            .expect("main generation should persist");
+        let mut feature_generation = sample_semantic_generation();
+        feature_generation.id = "generation-feature".to_owned();
+        feature_generation.fast_completed_at = "200".to_owned();
+        feature_generation.created_at = "200".to_owned();
+        feature_generation.updated_at = "200".to_owned();
+        feature_generation.quality_status = "quality_ready".to_owned();
+        feature_generation.active_layer = "quality".to_owned();
+        store
+            .upsert_semantic_generation(&feature_generation)
+            .expect("feature generation should persist");
+
+        store
+            .link_semantic_generation_to_ref("repo", &main.id, &main_generation.id, "101")
+            .expect("main generation should link");
+        store
+            .link_semantic_generation_to_ref("repo", &feature.id, &feature_generation.id, "201")
+            .expect("feature generation should link");
+
+        let repo_latest = store
+            .latest_semantic_generation("repo")
+            .expect("latest repo generation should load")
+            .expect("latest repo generation should exist");
+        assert_eq!(repo_latest.id, "generation-feature");
+        let main_latest = store
+            .latest_semantic_generation_for_ref("repo", &main.id)
+            .expect("main ref generation should load")
+            .expect("main ref generation should exist");
+        assert_eq!(main_latest.id, "generation-main");
+        let feature_latest = store
+            .latest_semantic_generation_for_ref("repo", &feature.id)
+            .expect("feature ref generation should load")
+            .expect("feature ref generation should exist");
+        assert_eq!(feature_latest.id, "generation-feature");
+
+        let main_routing = store
+            .semantic_routing_summary_for_ref("repo", &main.id)
+            .expect("main routing should load")
+            .expect("main routing should exist");
+        assert_eq!(main_routing.generation_id, "generation-main");
+        assert_eq!(main_routing.active_layer, SemanticLayer::Fast);
+        let feature_routing = store
+            .semantic_routing_summary_for_ref("repo", &feature.id)
+            .expect("feature routing should load")
+            .expect("feature routing should exist");
+        assert_eq!(feature_routing.generation_id, "generation-feature");
+        assert_eq!(feature_routing.active_layer, SemanticLayer::Quality);
     }
 
     #[test]

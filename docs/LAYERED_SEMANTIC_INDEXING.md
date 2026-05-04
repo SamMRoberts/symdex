@@ -158,9 +158,11 @@ Older indexes without manifests fall back to the legacy repo-wide vector query.
 The manifest points at content-addressed file snapshots, so candidate filtering
 can distinguish local refs that share a path but have different content. Stale
 vector cleanup protects sqlite-vec points whose file snapshots are still
-referenced by any ref manifest. The active semantic generation is still
-repository-wide until a later generation-routing slice makes fast/quality
-generation state ref-aware.
+referenced by any ref manifest. Semantic status and search also prefer the live
+ref's linked generation from `semantic_generation_refs`, then fall back to the
+legacy repo-wide latest generation when no ref mapping exists. This keeps
+fast/quality routing tied to the branch that is currently checked out while
+preserving older indexes.
 
 ## Activation rule
 

@@ -40,8 +40,10 @@ points at them, so same-path/different-content local branches can coexist.
 Unchanged files skipped by hash are still linked into the active ref manifest.
 Structural symbol, call graph, impact, and context-pack queries use the live
 worktree ref when `ref_files` manifests exist. Semantic search filters
-sqlite-vec candidates through the same active ref manifest; semantic generation
-state remains repo-wide until a later generation-routing slice.
+sqlite-vec candidates through the same active ref manifest and routes using the
+active ref's linked semantic generation when `semantic_generation_refs` has a
+mapping. Older indexes without ref generation mappings fall back to the legacy
+repo-wide latest generation.
 
 Respect:
 

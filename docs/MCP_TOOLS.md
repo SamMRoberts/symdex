@@ -61,8 +61,9 @@ manifest. Older indexes with no `ref_files` manifests fall back to the legacy
 repo-wide structural view. Semantic search uses the same active ref manifest to
 filter sqlite-vec candidates when manifests exist. The manifest points at
 content-addressed file snapshots, so same-path/different-content local refs can
-return distinct structural and vector evidence. Semantic generation metadata
-remains repo-wide until the generation-routing slice.
+return distinct structural and vector evidence. Semantic routing also prefers
+the active ref's linked generation from `semantic_generation_refs`, falling back
+to the repo-wide latest generation for older indexes without ref mappings.
 
 ### `symdex_search`
 

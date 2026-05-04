@@ -923,10 +923,13 @@ fn run_index_internal(
         match finalize_semantic_index(
             &mut sqlite,
             &root,
-            &store_config,
-            &layered_embed_config,
             prepared_semantic.expect("semantic indexing should be prepared when not offline"),
-            &stale_vector_point_ids,
+            SemanticFinalizationContext {
+                store_config: &store_config,
+                layered_embed_config: &layered_embed_config,
+                repository_ref_id: run_scope.repository_ref_id,
+                stale_vector_point_ids: &stale_vector_point_ids,
+            },
             &mut on_progress,
         ) {
             Ok(embedding) => {
@@ -1830,30 +1833,52 @@ fn prepare_semantic_index(
     ))
 }
 
+struct SemanticFinalizationContext<'a> {
+    store_config: &'a StoreConfig,
+    layered_embed_config: &'a LayeredEmbedConfig,
+    repository_ref_id: Option<&'a str>,
+    stale_vector_point_ids: &'a BTreeSet<String>,
+}
+
 fn finalize_semantic_index(
     sqlite: &mut SqliteStore,
     root: &RepoRoot,
-    store_config: &StoreConfig,
-    layered_embed_config: &LayeredEmbedConfig,
     prepared: PreparedSemanticIndex,
-    stale_vector_point_ids: &BTreeSet<String>,
+    context: SemanticFinalizationContext<'_>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
     let prepared = match prepared {
         PreparedSemanticIndex::SkippedNoChunks => {
-            let vector_table =
-                vector_table_name(root.id(), &layered_embed_config.fast_embed_config().model);
+            let vector_table = vector_table_name(
+                root.id(),
+                &context.layered_embed_config.fast_embed_config().model,
+            );
             let protected_point_ids = sqlite
                 .vector_point_ids_referenced_by_ref_files(root.id(), &vector_table)
                 .map_err(|error| error.to_string())?;
             delete_stale_vector_points(
                 root,
-                store_config,
-                &layered_embed_config.fast_embed_config().model,
-                stale_vector_point_ids,
+                context.store_config,
+                &context.layered_embed_config.fast_embed_config().model,
+                context.stale_vector_point_ids,
                 &protected_point_ids,
                 on_progress,
             )?;
+            if let Some(repository_ref_id) = context.repository_ref_id
+                && let Some(generation) = sqlite
+                    .latest_semantic_generation(root.id())
+                    .map_err(|error| error.to_string())?
+            {
+                let linked_at = current_timestamp();
+                sqlite
+                    .link_semantic_generation_to_ref(
+                        root.id(),
+                        repository_ref_id,
+                        &generation.id,
+                        &linked_at,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
             return Ok(EmbeddingSummary::SkippedNoChunks);
         }
         PreparedSemanticIndex::Completed(prepared) => prepared,
@@ -1871,10 +1896,20 @@ fn finalize_semantic_index(
             completed_at: &recorded_at,
         })
         .map_err(|error| error.to_string())?;
+    if let Some(repository_ref_id) = context.repository_ref_id {
+        sqlite
+            .link_semantic_generation_to_ref(
+                root.id(),
+                repository_ref_id,
+                &generation.id,
+                &recorded_at,
+            )
+            .map_err(|error| error.to_string())?;
+    }
     queue_quality_jobs_after_fast_indexing(
         sqlite,
         root.id(),
-        layered_embed_config,
+        context.layered_embed_config,
         &generation,
         on_progress,
     )?;
@@ -1886,9 +1921,9 @@ fn finalize_semantic_index(
     );
     delete_stale_vector_points(
         root,
-        store_config,
+        context.store_config,
         &prepared.model,
-        stale_vector_point_ids,
+        context.stale_vector_point_ids,
         &protected_point_ids,
         on_progress,
     )?;

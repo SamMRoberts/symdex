@@ -108,8 +108,9 @@ New index runs record `repository_ref_id` when the active local ref is known.
 The current branch-awareness slices record active ref metadata, populate
 `ref_files`, and route structural and semantic evidence queries through the
 active ref manifest when available. File facts are content-addressed snapshots,
-while semantic generation state still uses the repo-wide view until the
-generation-routing migration lands.
+while semantic routing prefers the active ref's linked generation from
+`semantic_generation_refs` and falls back to the repo-wide latest generation for
+legacy indexes without ref mappings.
 Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
 Successful semantic runs include the embedding model, vector dimension, and
 embedded chunk count. Semantic runs with no changed embeddable chunks finish as
@@ -308,6 +309,26 @@ eligible coverage remains `quality_pending`; terminal failures become
 latest-generation `skipped_stale` jobs keep default routing on fast until a
 later generation can complete cleanly.
 `quality_completed_at` is set only by successful activation.
+
+### `semantic_generation_refs`
+
+```sql
+CREATE TABLE semantic_generation_refs (
+  repository_ref_id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  linked_at TEXT NOT NULL
+);
+```
+
+This table records the current semantic generation associated with each local
+repository ref. Semantic indexing links the active ref to the generation it
+records. If a run has no changed embeddable chunks, the active ref is relinked
+to the latest known generation when one exists. Semantic status and search use
+this mapping when `ref_files` manifests are present, then fall back to the
+legacy repo-wide latest generation for older indexes that have no ref mapping.
+The mapping stores only metadata and is removed when the repository ref row is
+removed.
 
 ### `chunk_embeddings`
 
