@@ -792,7 +792,7 @@ mod control_ipc {
     use interprocess::local_socket::{
         GenericNamespaced, ListenerOptions, ToNsName as _,
         prelude::{LocalSocketListener, LocalSocketStream},
-        traits::{Listener as _, Stream as _},
+        traits::{ListenerExt as _, Stream as _},
     };
 
     use super::{BufRead, BufReader, handle_control_stream, watcher_endpoint_name};
