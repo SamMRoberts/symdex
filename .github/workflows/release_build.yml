@@ -5,25 +5,65 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      build_macos:
+        description: Build aarch64-apple-darwin
+        type: boolean
+        default: true
+      build_windows:
+        description: Build x86_64-pc-windows-msvc
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
+  prepare-matrix:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Select targets
+        id: matrix
+        shell: bash
+        run: |
+          include='[]'
+
+          add_target() {
+            include="$(jq -c \
+              --arg os "$1" \
+              --arg target "$2" \
+              --arg bin_ext "$3" \
+              '. + [{ os: $os, target: $target, bin_ext: $bin_ext }]' \
+              <<<"$include")"
+          }
+
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ inputs.build_macos }}" = "true" ]; then
+            add_target "macos-latest" "aarch64-apple-darwin" ""
+          fi
+
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ inputs.build_windows }}" = "true" ]; then
+            add_target "windows-latest" "x86_64-pc-windows-msvc" ".exe"
+          fi
+
+          if [ "$(jq length <<<"$include")" -eq 0 ]; then
+            echo "::error::Select at least one release build target."
+            exit 1
+          fi
+
+          echo "matrix=$(jq -c '{ include: . }' <<<"$include")" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: prepare-matrix
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bin_ext: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin_ext: ".exe"
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
 
     steps:
       - name: Checkout
