@@ -75,9 +75,10 @@ Indexing upserts a path mapping for each active file it persists and removes
 paths missing from that ref's latest discovery result. Branch-aware cleanup only
 removes repo-wide file facts that are missing from the active discovery result
 and no longer referenced by any remaining ref manifest. This slice still keeps
-the existing repo-wide query behavior intact; later work will make file
-snapshots content-addressed and route query/semantic evidence through the active
-ref manifest.
+repo-wide `files` rows as the structural fact storage, but structural symbol,
+call graph, impact, and context-pack query paths use the live worktree ref when
+`ref_files` manifests exist. Later work will make file snapshots
+content-addressed and route semantic evidence through the active ref manifest.
 
 ### `index_runs`
 
@@ -103,10 +104,10 @@ CREATE TABLE index_runs (
 
 Indexing records a row when a run starts and finalizes it when the run finishes.
 New index runs record `repository_ref_id` when the active local ref is known.
-The current branch-awareness slices record active ref metadata and populate
-`ref_files`. Structural file facts, chunks, symbols, calls, and semantic
-generations still use the repo-wide view until the snapshot and query-routing
-migrations land.
+The current branch-awareness slices record active ref metadata, populate
+`ref_files`, and route structural evidence queries through the active ref
+manifest when available. File fact storage and semantic generations still use
+the repo-wide view until the snapshot and semantic-routing migrations land.
 Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
 Successful semantic runs include the embedding model, vector dimension, and
 embedded chunk count. Semantic runs with no changed embeddable chunks finish as

@@ -54,6 +54,13 @@ The CLI mirrors this envelope when run with top-level `--json` or
 `symdex --json search <repo> <query>` prints the same
 `symdex.mcp.evidence.v1` object that MCP returns in `structuredContent`.
 
+Structural MCP tools resolve the live local worktree ref without writing index
+state. When `ref_files` manifests exist for the repository, symbol search, call
+graph, impact, and context-pack evidence is filtered through the active ref's
+manifest. Older indexes with no `ref_files` manifests fall back to the legacy
+repo-wide structural view. Semantic search remains repo-wide until the semantic
+generation routing slice.
+
 ### `symdex_search`
 
 Semantic search over indexed chunks.

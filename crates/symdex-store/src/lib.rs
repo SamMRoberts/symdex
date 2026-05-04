@@ -2539,6 +2539,78 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn find_symbols_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        query: &str,
+    ) -> Result<Vec<SymbolSearchRow>> {
+        let like = format!("%{query}%");
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
+                 FROM symbols
+                 JOIN files ON symbols.file_id = files.id
+                 JOIN ref_files ON ref_files.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND ref_files.repository_ref_id = ?2
+                   AND (symbols.name = ?3 OR symbols.qualified_name = ?3
+                        OR symbols.name LIKE ?4 OR symbols.qualified_name LIKE ?4)
+                 ORDER BY
+                   CASE
+                     WHEN symbols.qualified_name = ?3 THEN 0
+                     WHEN symbols.name = ?3 THEN 1
+                     ELSE 2
+                   END,
+                   files.path,
+                   symbols.start_line
+                 LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, query, like],
+                |row| {
+                    Ok(SymbolSearchRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        qualified_name: row.get(2)?,
+                        kind: row.get(3)?,
+                        path: row.get(4)?,
+                        start_line: row.get::<_, i64>(5)? as usize,
+                        end_line: row.get::<_, i64>(6)? as usize,
+                        provenance: EvidenceProvenance {
+                            content_hash: row.get(7)?,
+                            index_run_id: row.get(8)?,
+                            parser_version: row.get(9)?,
+                            indexed_at: row.get(10)?,
+                            embedding_model: None,
+                            embedding_dimension: None,
+                            embedded_at: None,
+                        },
+                    })
+                },
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn repository_has_ref_file_manifests(&self, repository_id: &str) -> Result<bool> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM ref_files WHERE repository_id = ?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(count > 0)
+    }
+
     pub fn file_provenance(
         &self,
         repository_id: &str,
@@ -2677,6 +2749,44 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn callers_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<CallSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
+                        caller.id, caller.name, caller.qualified_name, caller.kind,
+                        caller_files.path, caller.start_line, caller.end_line,
+                        caller_files.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_files.indexed_at
+                  FROM calls
+                  JOIN symbols target ON calls.callee_symbol_id = target.id
+                  JOIN files target_files ON target.file_id = target_files.id
+                  JOIN ref_files target_ref ON target_ref.file_id = target_files.id
+                  JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                  JOIN files caller_files ON caller.file_id = caller_files.id
+                  JOIN ref_files caller_ref ON caller_ref.file_id = caller_files.id
+                 WHERE caller_files.repository_id = ?1
+                   AND target_ref.repository_ref_id = ?2
+                   AND caller_ref.repository_ref_id = ?2
+                   AND (target.id = ?3 OR target.name = ?3 OR target.qualified_name = ?3)
+                 ORDER BY caller_files.path, calls.call_line
+                 LIMIT 50",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, symbol_query],
+                call_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn tests_matching_name(
         &self,
         repository_id: &str,
@@ -2765,6 +2875,46 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn callees_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<CallSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
+                        callee.id, callee.name, callee.qualified_name, callee.kind,
+                        caller_files.path, callee.start_line, callee.end_line,
+                        caller_files.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_files.indexed_at
+                  FROM calls
+                  JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                  JOIN files caller_files ON caller.file_id = caller_files.id
+                  JOIN ref_files caller_ref ON caller_ref.file_id = caller_files.id
+                  LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                  LEFT JOIN files callee_files ON callee.file_id = callee_files.id
+                  LEFT JOIN ref_files callee_ref
+                    ON callee_ref.file_id = callee_files.id
+                   AND callee_ref.repository_ref_id = ?2
+                 WHERE caller_files.repository_id = ?1
+                   AND caller_ref.repository_ref_id = ?2
+                   AND (callee.id IS NULL OR callee_ref.repository_ref_id IS NOT NULL)
+                   AND (caller.id = ?3 OR caller.name = ?3 OR caller.qualified_name = ?3)
+                 ORDER BY calls.call_line, calls.callee_text
+                 LIMIT 50",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, symbol_query],
+                call_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn call_paths(
         &self,
         repository_id: &str,
@@ -2780,6 +2930,56 @@ impl SqliteStore {
             .map(|symbol| symbol.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         let edges = self.call_path_edges(repository_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            trace_call_paths(
+                &source.id,
+                max_depth,
+                &TraceContext {
+                    target_query,
+                    target_ids: &target_ids,
+                    edges_by_caller: &edges_by_caller,
+                },
+                &mut visited,
+                &mut stack,
+                &mut paths,
+            );
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
+    pub fn call_paths_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        source_query: &str,
+        target_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let sources =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, source_query)?;
+        let targets =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, target_query)?;
+        let target_ids = targets
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let edges = self.call_path_edges_for_ref(repository_id, repository_ref_id)?;
         let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
         for edge in edges {
             edges_by_caller
@@ -2863,6 +3063,59 @@ impl SqliteStore {
         Ok(paths)
     }
 
+    pub fn transitive_call_paths_to_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        target_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let targets =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, target_query)?;
+        let target_ids = targets
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let sources = self.all_symbol_refs_for_ref(repository_id, repository_ref_id)?;
+        let edges = self.call_path_edges_for_ref(repository_id, repository_ref_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            if target_ids.contains(&source.id) {
+                continue;
+            }
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            let mut source_paths = Vec::new();
+            trace_call_paths(
+                &source.id,
+                max_depth,
+                &TraceContext {
+                    target_query,
+                    target_ids: &target_ids,
+                    edges_by_caller: &edges_by_caller,
+                },
+                &mut visited,
+                &mut stack,
+                &mut source_paths,
+            );
+            paths.extend(source_paths.into_iter().filter(|path| path.hops > 1));
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
     pub fn transitive_call_paths_from(
         &self,
         repository_id: &str,
@@ -2872,6 +3125,45 @@ impl SqliteStore {
         let max_depth = clamp_call_path_depth(max_depth);
         let sources = self.resolve_symbol_refs(repository_id, source_query)?;
         let edges = self.call_path_edges(repository_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            trace_reachable_call_paths(
+                &source.id,
+                max_depth,
+                &edges_by_caller,
+                &mut visited,
+                &mut stack,
+                &mut paths,
+            );
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
+    pub fn transitive_call_paths_from_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        source_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let sources =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, source_query)?;
+        let edges = self.call_path_edges_for_ref(repository_id, repository_ref_id)?;
         let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
         for edge in edges {
             edges_by_caller
@@ -2925,6 +3217,35 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    fn resolve_symbol_refs_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<SymbolRef>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id
+                  FROM symbols
+                  JOIN files ON symbols.file_id = files.id
+                  JOIN ref_files ON ref_files.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND ref_files.repository_ref_id = ?2
+                   AND (symbols.id = ?3 OR symbols.name = ?3 OR symbols.qualified_name = ?3)
+                 ORDER BY symbols.qualified_name, files.path, symbols.start_line
+                 LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, symbol_query],
+                |row| Ok(SymbolRef { id: row.get(0)? }),
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     fn all_symbol_refs(&self, repository_id: &str) -> Result<Vec<SymbolRef>> {
         let mut statement = self
             .connection
@@ -2939,6 +3260,32 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id], |row| {
+                Ok(SymbolRef { id: row.get(0)? })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn all_symbol_refs_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<SymbolRef>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id
+                  FROM symbols
+                  JOIN files ON symbols.file_id = files.id
+                  JOIN ref_files ON ref_files.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND ref_files.repository_ref_id = ?2
+                 ORDER BY symbols.qualified_name, files.path, symbols.start_line
+                 LIMIT 500",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], |row| {
                 Ok(SymbolRef { id: row.get(0)? })
             })
             .map_err(StoreError::Sqlite)?;
@@ -2969,6 +3316,44 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id], call_path_edge)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn call_path_edges_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<CallPathEdge>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.id, calls.callee_text, calls.call_line, calls.confidence,
+                        calls.resolution_status,
+                        caller.id, caller.name, caller.qualified_name, caller.kind,
+                        caller_file.path, caller.start_line, caller.end_line,
+                        callee.id, callee.name, callee.qualified_name, callee.kind,
+                        callee_file.path, callee.start_line, callee.end_line,
+                        caller_file.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_file.indexed_at
+                   FROM calls
+                   JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                   JOIN files caller_file ON caller.file_id = caller_file.id
+                   JOIN ref_files caller_ref ON caller_ref.file_id = caller_file.id
+                   LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                   LEFT JOIN files callee_file ON callee.file_id = callee_file.id
+                   LEFT JOIN ref_files callee_ref
+                     ON callee_ref.file_id = callee_file.id
+                    AND callee_ref.repository_ref_id = ?2
+                  WHERE caller_file.repository_id = ?1
+                    AND caller_ref.repository_ref_id = ?2
+                    AND (callee.id IS NULL OR callee_ref.repository_ref_id IS NOT NULL)
+                  ORDER BY caller.qualified_name, caller_file.path, calls.call_line,
+                           calls.callee_text, calls.id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], call_path_edge)
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }
@@ -3013,6 +3398,55 @@ impl SqliteStore {
             notes: vec![
                 "metadata_only_no_source_text".to_owned(),
                 "direct_relationships_only".to_owned(),
+            ],
+        })
+    }
+
+    pub fn context_pack_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+        limit: usize,
+    ) -> Result<ContextPack> {
+        let limit = limit.clamp(1, 25);
+        let mut focus_symbols =
+            self.find_symbols_for_ref(repository_id, repository_ref_id, symbol_query)?;
+        focus_symbols.truncate(limit);
+        let mut direct_callers =
+            self.callers_for_ref(repository_id, repository_ref_id, symbol_query)?;
+        direct_callers.truncate(limit);
+        let mut direct_callees =
+            self.callees_for_ref(repository_id, repository_ref_id, symbol_query)?;
+        direct_callees.truncate(limit);
+
+        let mut files = std::collections::BTreeSet::new();
+        for symbol in &focus_symbols {
+            files.insert(symbol.path.clone());
+        }
+        for row in direct_callers.iter().chain(direct_callees.iter()) {
+            if let Some(path) = &row.path {
+                files.insert(path.clone());
+            }
+        }
+
+        Ok(ContextPack {
+            format: "symdex.context_pack.v1".to_owned(),
+            repository_id: repository_id.to_owned(),
+            query: symbol_query.to_owned(),
+            focus_symbols,
+            direct_callers,
+            direct_callees,
+            files: files.into_iter().collect(),
+            limits: ContextPackLimits {
+                max_symbols: limit,
+                max_callers: limit,
+                max_callees: limit,
+            },
+            notes: vec![
+                "metadata_only_no_source_text".to_owned(),
+                "direct_relationships_only".to_owned(),
+                "repository_ref_scoped".to_owned(),
             ],
         })
     }
@@ -6547,6 +6981,140 @@ mod tests {
     }
 
     #[test]
+    fn scoped_queries_filter_through_ref_files() {
+        let db = TestDb::new("ref-scoped-queries");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+
+        store.sync_repository_ref(&main).expect("refs should sync");
+        let main_symbols = vec![
+            sample_symbol_in_file("main-caller", "main-file", "caller", "main::caller"),
+            sample_symbol_in_file("main-helper", "main-file", "helper", "main::helper"),
+        ];
+        let main_calls = vec![sample_call(
+            "main-call",
+            "main-caller",
+            "helper",
+            Some("main-helper"),
+            4,
+        )];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file", "src/main.rs", "hash-main"),
+                &main_symbols,
+                &[],
+                &main_calls,
+                &[],
+            )
+            .expect("main facts should persist");
+
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature ref should sync");
+        let feature_symbols = vec![
+            sample_symbol_in_file(
+                "feature-caller",
+                "feature-file",
+                "caller",
+                "feature::caller",
+            ),
+            sample_symbol_in_file(
+                "feature-helper",
+                "feature-file",
+                "helper",
+                "feature::helper",
+            ),
+        ];
+        let feature_calls = vec![sample_call(
+            "feature-call",
+            "feature-caller",
+            "helper",
+            Some("feature-helper"),
+            8,
+        )];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file", "src/feature.rs", "hash-feature"),
+                &feature_symbols,
+                &[],
+                &feature_calls,
+                &[],
+            )
+            .expect("feature facts should persist");
+
+        assert!(
+            store
+                .repository_has_ref_file_manifests("repo")
+                .expect("manifest check should run")
+        );
+        let main_symbols = store
+            .find_symbols_for_ref("repo", &main.id, "helper")
+            .expect("main symbol search should run");
+        assert_eq!(main_symbols.len(), 1);
+        assert_eq!(main_symbols[0].qualified_name, "main::helper");
+        let feature_symbols = store
+            .find_symbols_for_ref("repo", &feature.id, "helper")
+            .expect("feature symbol search should run");
+        assert_eq!(feature_symbols.len(), 1);
+        assert_eq!(feature_symbols[0].qualified_name, "feature::helper");
+
+        let main_callers = store
+            .callers_for_ref("repo", &main.id, "main::helper")
+            .expect("main callers should run");
+        assert_eq!(main_callers.len(), 1);
+        assert_eq!(
+            main_callers[0].symbol_qualified_name.as_deref(),
+            Some("main::caller")
+        );
+        let feature_callers = store
+            .callers_for_ref("repo", &feature.id, "feature::helper")
+            .expect("feature callers should run");
+        assert_eq!(feature_callers.len(), 1);
+        assert_eq!(
+            feature_callers[0].symbol_qualified_name.as_deref(),
+            Some("feature::caller")
+        );
+        assert!(
+            store
+                .callers_for_ref("repo", &main.id, "feature::helper")
+                .expect("cross-ref callers should run")
+                .is_empty()
+        );
+
+        let pack = store
+            .context_pack_for_ref("repo", &main.id, "helper", 5)
+            .expect("scoped context pack should build");
+        assert_eq!(pack.focus_symbols[0].qualified_name, "main::helper");
+        assert_eq!(pack.direct_callers.len(), 1);
+        assert_eq!(pack.files, vec!["src/main.rs".to_owned()]);
+        assert!(pack.notes.contains(&"repository_ref_scoped".to_owned()));
+    }
+
+    #[test]
     fn sqlite_vec_upserts_queries_scrolls_and_deletes_points() {
         let db = TestDb::new("sqlite-vec-roundtrip");
         let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
@@ -9497,9 +10065,18 @@ mod tests {
     }
 
     fn sample_symbol(id: &str, name: &str, qualified_name: &str) -> SymbolRecord {
+        sample_symbol_in_file(id, "file", name, qualified_name)
+    }
+
+    fn sample_symbol_in_file(
+        id: &str,
+        file_id: &str,
+        name: &str,
+        qualified_name: &str,
+    ) -> SymbolRecord {
         SymbolRecord {
             id: id.to_owned(),
-            file_id: "file".to_owned(),
+            file_id: file_id.to_owned(),
             parent_symbol_id: None,
             name: name.to_owned(),
             qualified_name: qualified_name.to_owned(),

@@ -95,6 +95,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   explicit repository-ref metadata.
 - Keep active branch file membership in `ref_files`; do not treat repository-wide
   file facts as sufficient for future branch-scoped query or semantic routing.
+- Structural symbol, call graph, impact, and context-pack query paths should
+  filter through the live worktree ref's `ref_files` manifest when manifests
+  exist, while preserving legacy repo-wide fallback for indexes without
+  manifests.
 - Hash file contents to skip unchanged work.
 - Keep public APIs boring, explicit, and versionable.
 
