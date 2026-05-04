@@ -152,6 +152,12 @@ sqlite-vec collection, generation ID, quality status, and fallback reason in the
 structured `data` payload so agents can tell when results are fast fallback
 evidence rather than quality-backed evidence.
 
+When branch-aware `ref_files` manifests exist, semantic search resolves the live
+local worktree ref and constrains sqlite-vec candidates through that manifest.
+Older indexes without manifests fall back to the legacy repo-wide vector query.
+The active semantic generation is still repository-wide until a later generation
+routing slice makes fast/quality generation state ref-aware.
+
 ## Activation rule
 
 The quality layer may become active only when all of the following are true:

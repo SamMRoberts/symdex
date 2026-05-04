@@ -36,8 +36,9 @@ path manifest for the active ref and removes paths missing from that ref's
 latest discovery result. Repo-wide file facts are removed only when no remaining
 ref manifest points at them. Structural symbol, call graph, impact, and
 context-pack queries use the live worktree ref when `ref_files` manifests exist.
-Semantic generation selection remains repo-wide until the later semantic-routing
-slice.
+Semantic search filters sqlite-vec candidates through the same active ref
+manifest; semantic generation state remains repo-wide until a later
+generation-routing slice.
 
 Respect:
 

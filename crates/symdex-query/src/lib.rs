@@ -1674,12 +1674,20 @@ fn semantic_search_for_root(
     };
 
     let vector_store = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
-    let results = vector_store
-        .query_points(&target.vector_table, query_vector, limit)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(semantic_result_from_point)
-        .collect();
+    let repository_ref_id = active_ref_scope(root, &sqlite)?;
+    let points = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        vector_store.query_points_for_ref(
+            &target.vector_table,
+            root.id(),
+            repository_ref_id,
+            query_vector,
+            limit,
+        )
+    } else {
+        vector_store.query_points(&target.vector_table, query_vector, limit)
+    }
+    .map_err(|error| error.to_string())?;
+    let results = points.into_iter().map(semantic_result_from_point).collect();
 
     Ok(SemanticSearchSummary {
         repository_id: root.id().to_owned(),

@@ -7171,6 +7171,110 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_vec_queries_filter_through_ref_files() {
+        let db = TestDb::new("sqlite-vec-ref-query");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        store
+            .sync_repository_ref(&main)
+            .expect("main ref should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file", "src/main.rs", "hash-main"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("main file should persist");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature ref should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file", "src/feature.rs", "hash-feature"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("feature file should persist");
+        drop(store);
+
+        let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
+        let table = vector_table_name("repo", "nomic-embed-text");
+        let main_point = vector_point_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("main point id should format");
+        let feature_point = vector_point_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .expect("feature point id should format");
+        vector_store
+            .upsert_points(
+                &table,
+                &[
+                    VectorPoint {
+                        id: main_point.clone(),
+                        vector: vec![1.0, 0.0],
+                        payload: PointPayload {
+                            file_id: "main-file".to_owned(),
+                            chunk_id: "main-chunk".to_owned(),
+                            path: "src/main.rs".to_owned(),
+                            ..sample_payload()
+                        },
+                    },
+                    VectorPoint {
+                        id: feature_point.clone(),
+                        vector: vec![0.0, 1.0],
+                        payload: PointPayload {
+                            file_id: "feature-file".to_owned(),
+                            chunk_id: "feature-chunk".to_owned(),
+                            path: "src/feature.rs".to_owned(),
+                            ..sample_payload()
+                        },
+                    },
+                ],
+            )
+            .expect("points should upsert");
+
+        let main_results = vector_store
+            .query_points_for_ref(&table, "repo", &main.id, vec![0.0, 1.0], 5)
+            .expect("main scoped query should run");
+        assert_eq!(main_results.len(), 1);
+        assert_eq!(main_results[0].id, main_point);
+        assert_eq!(main_results[0].payload.path, "src/main.rs");
+
+        let feature_results = vector_store
+            .query_points_for_ref(&table, "repo", &feature.id, vec![1.0, 0.0], 5)
+            .expect("feature scoped query should run");
+        assert_eq!(feature_results.len(), 1);
+        assert_eq!(feature_results[0].id, feature_point);
+        assert_eq!(feature_results[0].payload.path, "src/feature.rs");
+    }
+
+    #[test]
     fn freshness_for_hash_labels_evidence_states() {
         assert_eq!(
             crate::freshness_for_hash(Some("same"), Some("same")),

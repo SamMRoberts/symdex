@@ -270,6 +270,84 @@ impl SqliteVectorStore {
         collect_rows(rows)
     }
 
+    pub fn query_points_for_ref(
+        &self,
+        table_name: &str,
+        repository_id: &str,
+        repository_ref_id: &str,
+        vector: Vec<f32>,
+        limit: usize,
+    ) -> Result<Vec<ScoredPoint>> {
+        validate_vector_table_name(table_name)?;
+        if vector.is_empty() {
+            return Err(StoreError::InvalidVectorSize(0));
+        }
+        if limit == 0 {
+            return Err(StoreError::InvalidLimit(limit));
+        }
+
+        let connection = self.connection()?;
+        ensure_vector_points_table(&connection)?;
+        if !self.table_exists(table_name)? {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "WITH eligible AS (
+               SELECT vector_points.vector_rowid
+               FROM vector_points
+               JOIN ref_files ON ref_files.file_id = vector_points.file_id
+               WHERE vector_points.vector_store = 'sqlite_vec'
+                 AND vector_points.vector_table = ?3
+                 AND vector_points.repository_id = ?4
+                 AND ref_files.repository_ref_id = ?5
+             ),
+             matches AS (
+               SELECT rowid, distance
+               FROM {table_name}
+               WHERE embedding MATCH ?1
+                 AND k = ?2
+                 AND rowid IN (SELECT vector_rowid FROM eligible)
+             )
+             SELECT vector_points.vector_point_id, matches.distance,
+                    vector_points.repository_id, vector_points.file_id,
+                    vector_points.chunk_id, vector_points.symbol_id,
+                    vector_points.symbol_name, vector_points.path,
+                    vector_points.language, vector_points.chunk_kind,
+                    vector_points.start_line, vector_points.end_line,
+                    vector_points.text_hash, vector_points.parser_version,
+                    vector_points.content_hash, vector_points.index_run_id,
+                    vector_points.embedding_model, vector_points.embedding_dimension,
+                    vector_points.indexed_at
+             FROM matches
+             JOIN vector_points
+               ON vector_points.vector_store = 'sqlite_vec'
+              AND vector_points.vector_table = ?3
+              AND vector_points.vector_rowid = matches.rowid
+             ORDER BY matches.distance ASC"
+        );
+        let mut statement = connection.prepare(&sql).map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    vector.as_bytes(),
+                    limit as i64,
+                    table_name,
+                    repository_id,
+                    repository_ref_id,
+                ],
+                |row| {
+                    let distance = row.get::<_, f64>(1)?;
+                    Ok(ScoredPoint {
+                        id: row.get(0)?,
+                        score: 1.0 - distance,
+                        payload: payload_from_row(row, 2)?,
+                    })
+                },
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     fn connection(&self) -> Result<rusqlite::Connection> {
         if let Some(parent) = self.sqlite_path.parent() {
             std::fs::create_dir_all(parent).map_err(StoreError::Io)?;

@@ -58,8 +58,9 @@ Structural MCP tools resolve the live local worktree ref without writing index
 state. When `ref_files` manifests exist for the repository, symbol search, call
 graph, impact, and context-pack evidence is filtered through the active ref's
 manifest. Older indexes with no `ref_files` manifests fall back to the legacy
-repo-wide structural view. Semantic search remains repo-wide until the semantic
-generation routing slice.
+repo-wide structural view. Semantic search uses the same active ref manifest to
+filter sqlite-vec candidates when manifests exist; semantic generation metadata
+remains repo-wide until the generation-routing slice.
 
 ### `symdex_search`
 
