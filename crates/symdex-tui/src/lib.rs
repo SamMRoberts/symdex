@@ -5486,6 +5486,9 @@ fn diagnostic_hint(check: &DiagnosticCheck) -> &'static str {
     match check.state {
         DiagnosticState::Ok => "No action needed.",
         DiagnosticState::Missing => "Create or configure the missing local path or dependency.",
+        DiagnosticState::Pending => {
+            "Let the local job finish or run the matching catch-up command."
+        }
         DiagnosticState::Unreachable => {
             "Start the local service or verify the configured localhost endpoint."
         }
@@ -5983,6 +5986,7 @@ fn diagnostic_status(state: DiagnosticState) -> (&'static str, StatusTone) {
     match state {
         DiagnosticState::Ok => ("ok", StatusTone::Success),
         DiagnosticState::Missing => ("missing", StatusTone::Warning),
+        DiagnosticState::Pending => ("pending", StatusTone::Info),
         DiagnosticState::Unreachable => ("unreachable", StatusTone::Error),
         DiagnosticState::Error => ("error", StatusTone::Error),
         DiagnosticState::Skipped => ("skipped", StatusTone::Warning),

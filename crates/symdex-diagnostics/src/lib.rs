@@ -34,6 +34,7 @@ pub struct DiagnosticCheck {
 pub enum DiagnosticState {
     Ok,
     Missing,
+    Pending,
     Unreachable,
     Error,
     Skipped,
@@ -44,6 +45,7 @@ impl DiagnosticState {
         match self {
             Self::Ok => "ok",
             Self::Missing => "missing",
+            Self::Pending => "pending",
             Self::Unreachable => "unreachable",
             Self::Error => "error",
             Self::Skipped => "skipped",
@@ -239,9 +241,9 @@ fn semantic_quality_status_check(status: &SemanticStatusSummary) -> DiagnosticCh
         || running > 0
         || matches!(status.quality_status, SemanticLayerStatus::QualityPending)
     {
-        DiagnosticState::Unreachable
+        DiagnosticState::Pending
     } else if matches!(status.quality_status, SemanticLayerStatus::QualityBlocked) {
-        DiagnosticState::Skipped
+        DiagnosticState::Unreachable
     } else {
         DiagnosticState::Missing
     };
@@ -578,13 +580,16 @@ fn rust_analyzer_version_message(command: &str, output: &std::process::Output) -
 
 #[cfg(test)]
 mod tests {
-    use symdex_query::{FileFreshnessRow, FreshnessSummary};
-    use symdex_store::EvidenceFreshness;
+    use symdex_core::{SemanticLayer, SemanticLayerStatus};
+    use symdex_query::{
+        FileFreshnessRow, FreshnessSummary, SemanticStatusLayerSummary, SemanticStatusSummary,
+    };
+    use symdex_store::{EvidenceFreshness, QualityGenerationProgress};
 
     use crate::{
         DiagnosticState, RustAnalyzerDiagnosticsConfig, env_flag_enabled, index_freshness_check,
-        provenance_consistency_check, rust_analyzer_check, sqlite_database_check,
-        writable_dir_check,
+        provenance_consistency_check, rust_analyzer_check, semantic_quality_status_check,
+        sqlite_database_check, writable_dir_check,
     };
 
     #[test]
@@ -709,6 +714,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantic_quality_pending_is_reported_as_pending_not_unreachable() {
+        let status = semantic_status(
+            SemanticLayerStatus::QualityPending,
+            Some("quality_manifest_incomplete_using_fast_layer"),
+            Some(QualityGenerationProgress {
+                repository_id: "repo".to_owned(),
+                generation_id: "generation".to_owned(),
+                embeddable_chunks: 1_788,
+                quality_eligible_chunks: 1_772,
+                quality_ineligible_chunks: 16,
+                quality_embedded_chunks: 23,
+                pending_jobs: 1_749,
+                running_jobs: 0,
+                succeeded_jobs: 0,
+                failed_jobs: 0,
+                skipped_stale_jobs: 0,
+                skipped_excluded_jobs: 16,
+            }),
+            Some("quality_chunk_too_large_for_embedding"),
+        );
+
+        let check = semantic_quality_status_check(&status);
+
+        assert_eq!(check.state, DiagnosticState::Pending);
+        assert!(check.message.contains("quality_status=quality_pending"));
+        assert!(check.message.contains("embedded=23/1772"));
+    }
+
+    #[test]
+    fn semantic_quality_blocked_is_reported_as_unreachable() {
+        let status = semantic_status(
+            SemanticLayerStatus::QualityBlocked,
+            Some("quality_status_quality_blocked_using_fast_layer"),
+            None,
+            Some("quality model unavailable"),
+        );
+
+        let check = semantic_quality_status_check(&status);
+
+        assert_eq!(check.state, DiagnosticState::Unreachable);
+        assert!(check.message.contains("quality_status=quality_blocked"));
+    }
+
     fn freshness_summary(files: Vec<FileFreshnessRow>) -> FreshnessSummary {
         FreshnessSummary {
             repository_id: "repo".to_owned(),
@@ -716,6 +765,43 @@ mod tests {
             files,
             focus_symbols: Vec::new(),
             context_pack: None,
+        }
+    }
+
+    fn semantic_status(
+        quality_status: SemanticLayerStatus,
+        fallback_reason: Option<&str>,
+        quality_progress: Option<QualityGenerationProgress>,
+        latest_quality_error: Option<&str>,
+    ) -> SemanticStatusSummary {
+        SemanticStatusSummary {
+            repository_id: "repo".to_owned(),
+            generation_id: Some("generation".to_owned()),
+            active_layer: SemanticLayer::Fast,
+            quality_status,
+            fallback_reason: fallback_reason.map(str::to_owned),
+            fast: semantic_status_layer(SemanticLayer::Fast),
+            quality: semantic_status_layer(SemanticLayer::Quality),
+            quality_progress,
+            latest_quality_error: latest_quality_error.map(str::to_owned),
+            quality_enabled: true,
+        }
+    }
+
+    fn semantic_status_layer(semantic_layer: SemanticLayer) -> SemanticStatusLayerSummary {
+        SemanticStatusLayerSummary {
+            semantic_layer,
+            embedding_model: "model".to_owned(),
+            embedding_dimension: Some(768),
+            vector_table: "vectors".to_owned(),
+            current_chunks: 0,
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 0,
+            expected_chunks: 0,
+            is_complete: false,
         }
     }
 

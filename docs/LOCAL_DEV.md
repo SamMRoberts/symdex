@@ -127,8 +127,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   freshness/provenance readiness when a repo path is provided. Repo-specific
   diagnostics also report semantic quality-layer progress separately from file
   freshness, including pending, running, failed, stale, excluded, embedded, and
-  fallback status. Quality progress is scoped to the latest current fast
-  embeddings, so terminal jobs for superseded file snapshots do not block
+  fallback status. Incomplete quality catch-up reports as `pending` while fast
+  search remains active; `unreachable` is reserved for blocked quality
+  model/service availability. Quality progress is scoped to the latest current
+  fast embeddings, so terminal jobs for superseded file snapshots do not block
   readiness. New SQLite databases are initialized in WAL mode and store
   connections use a 30-second busy timeout so diagnostics, TUI refreshes, MCP
   calls, and watcher catch-up can overlap normal local reads and writes without
