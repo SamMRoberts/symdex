@@ -105,6 +105,7 @@ pub struct App {
     query_receiver: Option<Receiver<Result<QueryResult, String>>>,
     graph_receiver: Option<Receiver<Result<CallGraphSummary, String>>>,
     evidence_receiver: Option<Receiver<Result<EvidenceResult, String>>>,
+    status_refresh_receiver: Option<Receiver<StatusRefreshMessage>>,
 }
 
 impl App {
@@ -191,6 +192,7 @@ impl App {
             query_receiver: None,
             graph_receiver: None,
             evidence_receiver: None,
+            status_refresh_receiver: None,
         })
     }
 
@@ -259,6 +261,7 @@ impl App {
             query_receiver: None,
             graph_receiver: None,
             evidence_receiver: None,
+            status_refresh_receiver: None,
         }
     }
 
@@ -580,93 +583,47 @@ impl App {
         lines
     }
 
-    fn refresh_status(&mut self) -> Result<(), String> {
-        let store_config = StoreConfig::from_env();
-        let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-        sqlite.migrate().map_err(|error| error.to_string())?;
-        self.status = sqlite
-            .repository_status(&self.repository_id)
-            .map_err(|error| error.to_string())?;
-        self.refresh_semantic_status()?;
-        self.storage.explorer = match run_storage_explorer(&self.repo_input) {
-            Ok(summary) => StorageStatus::Completed(summary),
-            Err(error) => StorageStatus::Failed(error),
-        };
-        self.storage.coverage = match run_index_coverage(&self.repo_input) {
-            Ok(summary) => CoverageStatus::Completed(summary),
-            Err(error) => CoverageStatus::Failed(error),
-        };
-        self.storage.outline = match run_symbol_outline(&self.repo_input) {
-            Ok(summary) => OutlineStatus::Completed(summary),
-            Err(error) => OutlineStatus::Failed(error),
-        };
-        self.storage.calls = match run_call_resolution(&self.repo_input) {
-            Ok(summary) => CallResolutionStatus::Completed(summary),
-            Err(error) => CallResolutionStatus::Failed(error),
-        };
-        self.storage.embeddings = match run_embedding_coverage(&self.repo_input) {
-            Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
-            Err(error) => EmbeddingCoverageStatus::Failed(error),
-        };
-        self.storage.runs = match run_index_runs_timeline(&self.repo_input) {
-            Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
-            Err(error) => IndexRunsTimelineStatus::Failed(error),
-        };
-        self.storage.freshness = match run_freshness_report(&self.repo_input, None) {
-            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
-            Err(error) => FreshnessStatus::Failed(error),
-        };
-        self.storage.neighborhood = match run_semantic_neighborhood(&self.repo_input) {
-            Ok(summary) => SemanticNeighborhoodStatus::Completed(summary),
-            Err(error) => SemanticNeighborhoodStatus::Failed(error),
-        };
-        self.storage.health = match run_cross_store_health(&self.repo_input) {
-            Ok(summary) => CrossStoreHealthStatus::Completed(summary),
-            Err(error) => CrossStoreHealthStatus::Failed(error),
-        };
+    fn apply_status_refresh(&mut self, snapshot: StatusRefreshSnapshot) {
+        self.status = snapshot.status;
+        self.semantic_status = snapshot.semantic_status;
+        self.storage.explorer = snapshot.explorer;
+        self.storage.coverage = snapshot.coverage;
+        if let Some(outline) = snapshot.outline {
+            self.storage.outline = outline;
+        }
+        if let Some(calls) = snapshot.calls {
+            self.storage.calls = calls;
+        }
+        self.storage.embeddings = snapshot.embeddings;
+        self.storage.runs = snapshot.runs;
+        self.storage.freshness = snapshot.freshness;
+        if let Some(neighborhood) = snapshot.neighborhood {
+            self.storage.neighborhood = neighborhood;
+        }
+        self.storage.health = snapshot.health;
         self.storage.selection = 0;
-        self.message = "Repository and storage status refreshed.".to_owned();
-        Ok(())
     }
 
-    fn refresh_index_status(&mut self) -> Result<(), String> {
-        let store_config = StoreConfig::from_env();
-        let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-        sqlite.migrate().map_err(|error| error.to_string())?;
-        self.status = sqlite
-            .repository_status(&self.repository_id)
-            .map_err(|error| error.to_string())?;
-        self.refresh_semantic_status()?;
-        self.storage.explorer = match run_storage_explorer(&self.repo_input) {
-            Ok(summary) => StorageStatus::Completed(summary),
-            Err(error) => StorageStatus::Failed(error),
-        };
-        self.storage.coverage = match run_index_coverage(&self.repo_input) {
-            Ok(summary) => CoverageStatus::Completed(summary),
-            Err(error) => CoverageStatus::Failed(error),
-        };
-        self.storage.embeddings = match run_embedding_coverage(&self.repo_input) {
-            Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
-            Err(error) => EmbeddingCoverageStatus::Failed(error),
-        };
-        self.storage.runs = match run_index_runs_timeline(&self.repo_input) {
-            Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
-            Err(error) => IndexRunsTimelineStatus::Failed(error),
-        };
-        self.storage.freshness = match run_freshness_report(&self.repo_input, None) {
-            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
-            Err(error) => FreshnessStatus::Failed(error),
-        };
-        self.storage.health = match run_cross_store_health(&self.repo_input) {
-            Ok(summary) => CrossStoreHealthStatus::Completed(summary),
-            Err(error) => CrossStoreHealthStatus::Failed(error),
-        };
-        Ok(())
-    }
-
-    fn refresh_semantic_status(&mut self) -> Result<(), String> {
-        self.semantic_status = run_semantic_status(&self.repo_input)?;
-        Ok(())
+    fn start_status_refresh(
+        &mut self,
+        scope: StatusRefreshScope,
+        success_message: Option<String>,
+    ) -> bool {
+        if self.status_refresh_receiver.is_some() {
+            return false;
+        }
+        let repo_input = self.repo_input.clone();
+        let repository_id = self.repository_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = collect_status_refresh(&repo_input, &repository_id, scope).map(Box::new);
+            let _ = sender.send(StatusRefreshMessage::Finished {
+                result,
+                success_message,
+            });
+        });
+        self.status_refresh_receiver = Some(receiver);
+        true
     }
 
     fn diagnostics_row_count(&self) -> usize {
@@ -865,10 +822,14 @@ impl App {
             return;
         }
 
-        if let Err(error) = self.refresh_status() {
-            self.message = format!("Refresh failed: {error}");
-        } else {
+        if self.start_status_refresh(
+            StatusRefreshScope::Full,
+            Some("Repository and storage status refreshed.".to_owned()),
+        ) {
             self.last_index_status_refresh = Some(Instant::now());
+            self.message = "Refreshing repository and storage status...".to_owned();
+        } else {
+            self.message = "Status refresh already running.".to_owned();
         }
     }
 
@@ -1341,11 +1302,11 @@ impl App {
                 self.last_index_summary = Some(*summary);
                 self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
-                if let Err(error) = self.refresh_status() {
-                    self.message =
-                        format!("Indexing completed, but status refresh failed: {error}");
-                } else {
+                if self
+                    .start_status_refresh(StatusRefreshScope::Full, Some(completed_message.clone()))
+                {
                     self.last_index_status_refresh = Some(Instant::now());
+                } else {
                     self.message = completed_message;
                 }
             }
@@ -1414,7 +1375,7 @@ impl App {
     }
 
     fn refresh_index_status_on_interval(&mut self) {
-        if self.index_receiver.is_some() {
+        if self.index_receiver.is_some() || self.status_refresh_receiver.is_some() {
             return;
         }
         let now = Instant::now();
@@ -1422,8 +1383,38 @@ impl App {
             return;
         }
         self.last_index_status_refresh = Some(now);
-        if let Err(error) = self.refresh_index_status() {
-            self.last_error = Some(error);
+        let _ = self.start_status_refresh(StatusRefreshScope::Index, None);
+    }
+
+    fn poll_status_refresh(&mut self) {
+        let Some(receiver) = &self.status_refresh_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(StatusRefreshMessage::Finished {
+                result,
+                success_message,
+            }) => {
+                self.status_refresh_receiver = None;
+                match result {
+                    Ok(snapshot) => {
+                        self.apply_status_refresh(*snapshot);
+                        if let Some(message) = success_message {
+                            self.message = message;
+                        }
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error.clone());
+                        self.message = format!("Refresh failed: {error}");
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.status_refresh_receiver = None;
+                self.last_error = Some("status refresh worker disconnected".to_owned());
+                self.message = "Refresh failed: status refresh worker disconnected".to_owned();
+            }
         }
     }
 
@@ -1474,15 +1465,12 @@ impl App {
                     changes.paths().first().map(|path| (*path).to_owned());
                 self.continuous.latest_error = None;
                 self.last_index_summary = Some(*summary);
-                if let Err(error) = self.refresh_status() {
-                    self.message =
-                        format!("Continuous indexing completed, but refresh failed: {error}");
-                } else {
+                let completed_message = format!(
+                    "Continuous indexing updated {} file events.",
+                    changes.event_count()
+                );
+                if self.start_status_refresh(StatusRefreshScope::Full, Some(completed_message)) {
                     self.last_index_status_refresh = Some(Instant::now());
-                    self.message = format!(
-                        "Continuous indexing updated {} file events.",
-                        changes.event_count()
-                    );
                 }
             }
             ContinuousIndexEvent::BatchFailed { changes, error } => {
@@ -3004,6 +2992,73 @@ fn refresh_due(last_refresh: Option<Instant>, now: Instant, interval: Duration) 
         .unwrap_or(true)
 }
 
+fn collect_status_refresh(
+    repo_input: &str,
+    repository_id: &str,
+    scope: StatusRefreshScope,
+) -> Result<StatusRefreshSnapshot, String> {
+    let store_config = StoreConfig::from_env();
+    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    sqlite.migrate().map_err(|error| error.to_string())?;
+    let status = sqlite
+        .repository_status(repository_id)
+        .map_err(|error| error.to_string())?;
+    let semantic_status = run_semantic_status(repo_input)?;
+
+    Ok(StatusRefreshSnapshot {
+        status,
+        semantic_status,
+        explorer: match run_storage_explorer(repo_input) {
+            Ok(summary) => StorageStatus::Completed(summary),
+            Err(error) => StorageStatus::Failed(error),
+        },
+        coverage: match run_index_coverage(repo_input) {
+            Ok(summary) => CoverageStatus::Completed(summary),
+            Err(error) => CoverageStatus::Failed(error),
+        },
+        outline: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_symbol_outline(repo_input) {
+                Ok(summary) => OutlineStatus::Completed(summary),
+                Err(error) => OutlineStatus::Failed(error),
+            })
+        } else {
+            None
+        },
+        calls: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_call_resolution(repo_input) {
+                Ok(summary) => CallResolutionStatus::Completed(summary),
+                Err(error) => CallResolutionStatus::Failed(error),
+            })
+        } else {
+            None
+        },
+        embeddings: match run_embedding_coverage(repo_input) {
+            Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
+            Err(error) => EmbeddingCoverageStatus::Failed(error),
+        },
+        runs: match run_index_runs_timeline(repo_input) {
+            Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
+            Err(error) => IndexRunsTimelineStatus::Failed(error),
+        },
+        freshness: match run_freshness_report(repo_input, None) {
+            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
+            Err(error) => FreshnessStatus::Failed(error),
+        },
+        neighborhood: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_semantic_neighborhood(repo_input) {
+                Ok(summary) => SemanticNeighborhoodStatus::Completed(summary),
+                Err(error) => SemanticNeighborhoodStatus::Failed(error),
+            })
+        } else {
+            None
+        },
+        health: match run_cross_store_health(repo_input) {
+            Ok(summary) => CrossStoreHealthStatus::Completed(summary),
+            Err(error) => CrossStoreHealthStatus::Failed(error),
+        },
+    })
+}
+
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), String> {
     let mut app = app;
     loop {
@@ -3011,6 +3066,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), Strin
         app.poll_index_job();
         app.poll_continuous_index();
         app.refresh_index_status_on_interval();
+        app.poll_status_refresh();
         app.poll_diagnostics();
         app.poll_query();
         app.poll_graph();
@@ -6499,6 +6555,33 @@ enum EvidenceResult {
 enum IndexJobMessage {
     Progress(IndexProgress),
     Finished(Result<Box<IndexSummary>, String>),
+}
+
+#[derive(Clone, Copy)]
+enum StatusRefreshScope {
+    Full,
+    Index,
+}
+
+struct StatusRefreshSnapshot {
+    status: RepositoryStatus,
+    semantic_status: SemanticStatusSummary,
+    explorer: StorageStatus,
+    coverage: CoverageStatus,
+    outline: Option<OutlineStatus>,
+    calls: Option<CallResolutionStatus>,
+    embeddings: EmbeddingCoverageStatus,
+    runs: IndexRunsTimelineStatus,
+    freshness: FreshnessStatus,
+    neighborhood: Option<SemanticNeighborhoodStatus>,
+    health: CrossStoreHealthStatus,
+}
+
+enum StatusRefreshMessage {
+    Finished {
+        result: Result<Box<StatusRefreshSnapshot>, String>,
+        success_message: Option<String>,
+    },
 }
 
 #[allow(dead_code)]
