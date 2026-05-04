@@ -1150,9 +1150,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn heartbeat_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
+    pub fn heartbeat_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<usize> {
         let now = timestamp();
-        self.connection
+        let updated = self
+            .connection
             .execute(
                 "UPDATE watcher_clients
                     SET heartbeat_at = ?3,
@@ -1161,7 +1162,7 @@ impl SqliteStore {
                 params![repository_id, client_id, now],
             )
             .map_err(StoreError::Sqlite)?;
-        Ok(())
+        Ok(updated)
     }
 
     pub fn remove_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
@@ -2228,6 +2229,52 @@ impl SqliteStore {
 
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(claimed)
+    }
+
+    pub fn requeue_current_stale_quality_embedding_jobs(
+        &self,
+        repository_id: &str,
+        generation_id: &str,
+        requeued_at: &str,
+    ) -> Result<usize> {
+        let requeued = self
+            .connection
+            .execute(
+                "UPDATE quality_embedding_jobs
+                    SET status = 'pending',
+                        error_summary = NULL,
+                        updated_at = ?3
+                  WHERE repository_id = ?1
+                    AND generation_id = ?2
+                    AND status = 'skipped_stale'
+                    AND EXISTS (
+                        SELECT 1
+                          FROM files
+                          JOIN chunks
+                            ON chunks.file_id = files.id
+                         WHERE files.repository_id = quality_embedding_jobs.repository_id
+                           AND files.id = quality_embedding_jobs.file_id
+                           AND files.path = quality_embedding_jobs.path
+                           AND files.content_hash = quality_embedding_jobs.content_hash
+                           AND chunks.id = quality_embedding_jobs.chunk_id
+                           AND chunks.text_hash = quality_embedding_jobs.text_hash
+                           AND chunks.excluded_reason IS NULL
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM chunk_embeddings AS quality
+                         WHERE quality.repository_id = quality_embedding_jobs.repository_id
+                           AND quality.generation_id = quality_embedding_jobs.generation_id
+                           AND quality.chunk_id = quality_embedding_jobs.chunk_id
+                           AND quality.semantic_layer = 'quality'
+                           AND quality.content_hash = quality_embedding_jobs.content_hash
+                           AND quality.text_hash = quality_embedding_jobs.text_hash
+                           AND quality.status = 'current'
+                    )",
+                params![repository_id, generation_id, requeued_at],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(requeued)
     }
 
     pub fn quality_job_source_rows(&self, job_ids: &[String]) -> Result<Vec<QualityJobSourceRow>> {
@@ -10320,6 +10367,11 @@ mod tests {
         let clients = store.watcher_clients("repo").expect("clients should load");
         assert_ne!(clients[0].heartbeat_at.as_deref(), Some("1"));
 
+        let updated = store
+            .heartbeat_watcher_client("repo", "missing")
+            .expect("missing heartbeat should not fail");
+        assert_eq!(updated, 0);
+
         let removed = store
             .prune_stale_watcher_clients("repo", "999999999999")
             .expect("stale clients should prune");
@@ -10329,6 +10381,93 @@ mod tests {
                 .watcher_clients("repo")
                 .expect("clients should load")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn quality_worker_requeues_current_stale_jobs() {
+        let db = TestDb::new("quality-worker-requeue-current-stale");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-1",
+                "skipped_stale",
+            ))
+            .expect("stale job should persist");
+
+        let requeued = store
+            .requeue_current_stale_quality_embedding_jobs("repo", "generation-1", "600")
+            .expect("current stale jobs should requeue");
+
+        assert_eq!(requeued, 1);
+        let jobs = store
+            .quality_jobs_by_status("repo", "generation-1", "pending")
+            .expect("pending jobs should load");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].error_summary, None);
+        assert_eq!(jobs[0].updated_at, "600");
+    }
+
+    #[test]
+    fn quality_worker_does_not_requeue_mismatched_stale_jobs() {
+        let db = TestDb::new("quality-worker-keeps-mismatched-stale");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("new-content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-1",
+                "skipped_stale",
+            ))
+            .expect("stale job should persist");
+
+        let requeued = store
+            .requeue_current_stale_quality_embedding_jobs("repo", "generation-1", "600")
+            .expect("mismatched stale jobs should be ignored");
+
+        assert_eq!(requeued, 0);
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "skipped_stale")
+                .expect("stale jobs should load")
+                .len(),
+            1
         );
     }
 

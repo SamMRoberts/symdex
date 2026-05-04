@@ -59,6 +59,8 @@ execute indexed repository code or expose source text by default.
 - sqlite-vec extension health.
 - Ollama endpoint, model, and vector dimension health.
 - Index freshness and provenance consistency.
+- Semantic quality-layer progress and fallback state, separate from file
+  freshness.
 - Whether an agent is receiving stale, missing, deleted, unknown, or fresh
   evidence.
 - The active MCP evidence contract schema/version and local-only/read-only

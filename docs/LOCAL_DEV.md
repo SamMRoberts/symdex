@@ -124,7 +124,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
   service checks, auto-detected or explicitly overridden rust-analyzer
   enrichment readiness, the active MCP evidence contract version, and repo-specific index
-  freshness/provenance readiness when a repo path is provided.
+  freshness/provenance readiness when a repo path is provided. Repo-specific
+  diagnostics also report semantic quality-layer progress separately from file
+  freshness, including pending, running, failed, stale, excluded, embedded, and
+  fallback status.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, TypeScript, TOML,
   YAML, and scoped opt-in JSON files,
   applies built-in excludes and scoped glob-aware `.gitignore` rules with
@@ -146,9 +149,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   without applying rust-analyzer facts.
 - `watch start|status|stop <repo>`: manages the single background watcher for a
   repository. Watchers are client-scoped: TUI, MCP, and CLI attachments keep
-  them alive, and they exit after about 10 seconds with no live clients. The
-  watcher polls local eligible Rust, C#, JavaScript, TypeScript, TOML, YAML, and
-  scoped opt-in JSON files,
+  them alive, and they exit after about 10 seconds with no live clients. Live
+  clients heartbeat their lease and reinsert it if a transient stale-client prune
+  removed the row. The watcher polls local eligible Rust, C#, JavaScript,
+  TypeScript, TOML, YAML, and scoped opt-in JSON files,
   debounces event bursts, detects created/modified/deleted paths by content-hash
   snapshots, and reindexes changed content through the incremental semantic
   indexing path.

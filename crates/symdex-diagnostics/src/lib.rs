@@ -5,9 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
+use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, SemanticLayerStatus};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_query::FreshnessSummary;
+use symdex_query::{FreshnessSummary, SemanticStatusSummary};
 use symdex_store::{EvidenceFreshness, SqliteVectorStore, StoreConfig, sqlite_parent};
 
 const RUST_ANALYZER_ENABLE_ENV: &str = "SYMDEX_RUST_ANALYZER";
@@ -139,6 +139,11 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 state: DiagnosticState::Skipped,
                 message: "pass a repository path to check watcher status".to_owned(),
             },
+            DiagnosticCheck {
+                label: "semantic_quality".to_owned(),
+                state: DiagnosticState::Skipped,
+                message: "pass a repository path to check semantic quality status".to_owned(),
+            },
         ];
     };
 
@@ -149,6 +154,7 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 provenance_consistency_check(&summary),
             ];
             checks.push(watcher_status_check(repo));
+            checks.push(semantic_quality_check(repo));
             checks
         }
         Err(error) => {
@@ -165,8 +171,91 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 },
             ];
             checks.push(watcher_status_check(repo));
+            checks.push(semantic_quality_check(repo));
             checks
         }
+    }
+}
+
+fn semantic_quality_check(repo: &str) -> DiagnosticCheck {
+    match symdex_query::run_semantic_status(repo) {
+        Ok(status) => semantic_quality_status_check(&status),
+        Err(error) => DiagnosticCheck {
+            label: "semantic_quality".to_owned(),
+            state: DiagnosticState::Error,
+            message: error,
+        },
+    }
+}
+
+fn semantic_quality_status_check(status: &SemanticStatusSummary) -> DiagnosticCheck {
+    if !status.quality_enabled {
+        return DiagnosticCheck {
+            label: "semantic_quality".to_owned(),
+            state: DiagnosticState::Skipped,
+            message: format!(
+                "quality_enabled=false active_layer={} quality_status={}",
+                status.active_layer.as_str(),
+                status.quality_status.as_str()
+            ),
+        };
+    }
+    if status.generation_id.is_none() {
+        return DiagnosticCheck {
+            label: "semantic_quality".to_owned(),
+            state: DiagnosticState::Missing,
+            message: "no semantic generation recorded; run `symdex index` first".to_owned(),
+        };
+    }
+
+    let progress = status.quality_progress.as_ref();
+    let pending = progress.map(|value| value.pending_jobs).unwrap_or(0);
+    let running = progress.map(|value| value.running_jobs).unwrap_or(0);
+    let failed = progress.map(|value| value.failed_jobs).unwrap_or(0);
+    let skipped_stale = progress.map(|value| value.skipped_stale_jobs).unwrap_or(0);
+    let skipped_excluded = progress
+        .map(|value| value.skipped_excluded_jobs)
+        .unwrap_or(0);
+    let embedded = progress
+        .map(|value| value.quality_embedded_chunks)
+        .unwrap_or(0);
+    let eligible = progress
+        .map(|value| value.quality_eligible_chunks)
+        .unwrap_or(0);
+    let state = if matches!(status.quality_status, SemanticLayerStatus::QualityReady)
+        && failed == 0
+        && skipped_stale == 0
+    {
+        DiagnosticState::Ok
+    } else if failed > 0
+        || skipped_stale > 0
+        || matches!(
+            status.quality_status,
+            SemanticLayerStatus::QualityFailed | SemanticLayerStatus::QualityStale
+        )
+    {
+        DiagnosticState::Error
+    } else if pending > 0
+        || running > 0
+        || matches!(status.quality_status, SemanticLayerStatus::QualityPending)
+    {
+        DiagnosticState::Unreachable
+    } else if matches!(status.quality_status, SemanticLayerStatus::QualityBlocked) {
+        DiagnosticState::Skipped
+    } else {
+        DiagnosticState::Missing
+    };
+
+    DiagnosticCheck {
+        label: "semantic_quality".to_owned(),
+        state,
+        message: format!(
+            "quality_status={} active_layer={} reason={} pending={pending} running={running} failed={failed} stale={skipped_stale} excluded={skipped_excluded} embedded={embedded}/{eligible} latest_error={}",
+            status.quality_status.as_str(),
+            status.active_layer.as_str(),
+            status.fallback_reason.as_deref().unwrap_or("<none>"),
+            status.latest_quality_error.as_deref().unwrap_or("<none>")
+        ),
     }
 }
 

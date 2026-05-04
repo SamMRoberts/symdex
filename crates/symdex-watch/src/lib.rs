@@ -465,6 +465,7 @@ fn register_client(
         .upsert_watcher_client(&record)
         .map_err(|error| error.to_string())?;
 
+    let heartbeat_record = record.clone();
     let repository_id = root.id().to_owned();
     let heartbeat_client_id = client_id.clone();
     let (stop_heartbeat, heartbeat_stop) = mpsc::channel();
@@ -474,7 +475,17 @@ fn register_client(
             .is_err()
         {
             if let Ok(store) = open_store() {
-                let _ = store.heartbeat_watcher_client(&repository_id, &heartbeat_client_id);
+                match store.heartbeat_watcher_client(&repository_id, &heartbeat_client_id) {
+                    Ok(0) => {
+                        let now = current_timestamp();
+                        let mut revived = heartbeat_record.clone();
+                        revived.heartbeat_at = Some(now);
+                        revived.last_seen_at = None;
+                        let _ = store.upsert_watcher_client(&revived);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
             }
         }
     });

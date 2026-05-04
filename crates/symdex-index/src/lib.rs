@@ -393,6 +393,18 @@ fn run_quality_index_limited_with_progress(
     let mut stats = QualityWorkerStats::default();
     let mut quality_dimension = generation.quality_dimension;
     let batch_size = layered_embed_config.quality_batch_size.max(1);
+    let requeued_at = current_timestamp();
+    let requeued_stale_jobs = sqlite
+        .requeue_current_stale_quality_embedding_jobs(root.id(), &generation.id, &requeued_at)
+        .map_err(|error| error.to_string())?;
+    if requeued_stale_jobs > 0 {
+        on_progress(IndexProgress::new(
+            "quality_index",
+            0,
+            requeued_stale_jobs,
+            format!("Requeued {requeued_stale_jobs} current stale quality jobs"),
+        ));
+    }
 
     loop {
         let remaining_limit = max_jobs.map(|limit| limit.saturating_sub(stats.claimed_jobs));
