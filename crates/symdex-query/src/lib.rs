@@ -2923,7 +2923,7 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
 }
 
 fn sqlite_for_read_with_config(store_config: &StoreConfig) -> Result<SqliteStore, String> {
-    SqliteStore::open(store_config).map_err(|error| error.to_string())
+    SqliteStore::open_read_only(store_config).map_err(|error| error.to_string())
 }
 
 fn active_ref_scope(root: &RepoRoot, sqlite: &SqliteStore) -> Result<Option<String>, String> {

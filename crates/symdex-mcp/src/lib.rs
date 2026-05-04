@@ -883,9 +883,7 @@ fn sqlite() -> Result<SqliteStore, String> {
 }
 
 fn sqlite_with_config(config: &StoreConfig) -> Result<SqliteStore, String> {
-    let store = SqliteStore::open(config).map_err(|error| error.to_string())?;
-    store.migrate().map_err(|error| error.to_string())?;
-    Ok(store)
+    SqliteStore::open_read_only(config).map_err(|error| error.to_string())
 }
 
 fn required_string<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -1465,6 +1463,8 @@ mod tests {
     #[test]
     fn multiple_agents_can_read_same_index_without_write_tools() {
         let store_config = temp_store_config();
+        let store = SqliteStore::open(&store_config).expect("store should open");
+        store.migrate().expect("store should migrate");
         let arguments = json!({ "repo": "." });
 
         let agent_one = tool_index_status_with_store(&arguments, &store_config)

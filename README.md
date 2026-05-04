@@ -118,10 +118,11 @@ symdex enforces one watcher per repository. The watcher polls eligible files,
 debounces changes, respects ignore/path-boundary rules, and runs incremental
 indexing for changed content.
 
-symdex also enforces a single database writer per repository. The active
-watcher, manual index command, quality catch-up, repair, or cleanup job owns
-SQLite/sqlite-vec writes; other clients read shared state, attach, queue work,
-or refuse rather than starting a competing writer.
+symdex also enforces a single database writer per configured SQLite database.
+The active watcher daemon, manual index command, quality catch-up, repair, or
+cleanup job owns SQLite/sqlite-vec writes through a sidecar writer lock file;
+other clients read shared state, attach through watcher IPC, queue work, or
+refuse with owner metadata rather than starting a competing writer.
 
 Watcher lifetime is client-scoped:
 

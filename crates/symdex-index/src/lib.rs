@@ -19,8 +19,8 @@ use symdex_store::{
     FastSemanticGenerationInput, FileIndexEventRecord, FileRecord, IndexRunRecord, PointPayload,
     QualityActivationSummary, QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow,
     QualityQueueSummary, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
-    SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint, current_timestamp,
-    vector_point_id, vector_table_name,
+    SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint, WriterLease, WriterLeaseKind,
+    WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,24 +336,53 @@ pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
     run_index_with_progress(options, |_| {})
 }
 
+pub fn run_index_with_existing_writer(options: &IndexOptions) -> Result<IndexSummary, String> {
+    run_index_internal(
+        options,
+        options.scope.skips_unchanged(),
+        None,
+        false,
+        |_| {},
+    )
+}
+
 pub fn run_quality_index(options: &QualityIndexOptions) -> Result<QualityIndexSummary, String> {
     run_quality_index_with_progress(options, |_| {})
+}
+
+pub fn run_quality_index_with_existing_writer(
+    options: &QualityIndexOptions,
+) -> Result<QualityIndexSummary, String> {
+    run_quality_index_limited_with_progress(options, None, false, |_| {})
 }
 
 pub fn run_quality_index_with_progress(
     options: &QualityIndexOptions,
     on_progress: impl FnMut(IndexProgress),
 ) -> Result<QualityIndexSummary, String> {
-    run_quality_index_limited_with_progress(options, None, on_progress)
+    run_quality_index_limited_with_progress(options, None, true, on_progress)
 }
 
 fn run_quality_index_limited_with_progress(
     options: &QualityIndexOptions,
     max_jobs: Option<usize>,
+    acquire_writer: bool,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<QualityIndexSummary, String> {
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
+    let _writer_lease = if acquire_writer {
+        Some(
+            WriterLease::acquire(
+                &store_config,
+                WriterLeaseRequest::new(WriterLeaseKind::QualityIndex, "index-quality")
+                    .for_repo(root.id(), root.path().display().to_string()),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     let repository = RepositoryRecord {
@@ -524,11 +553,11 @@ fn run_quality_index_limited_with_progress(
 }
 
 pub fn run_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
-    run_index_internal(options, true, None, |_| {})
+    run_index_internal(options, true, None, true, |_| {})
 }
 
 fn run_watch_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
-    run_index_internal(options, true, Some("watch"), |_| {})
+    run_index_internal(options, true, Some("watch"), false, |_| {})
 }
 
 pub fn run_continuous_index(
@@ -638,6 +667,7 @@ fn run_continuous_quality_catch_up(
             repo: options.repo.clone(),
         },
         Some(layered_config.quality_batch_size.max(1)),
+        false,
         |progress| on_event(ContinuousIndexEvent::QualityProgress { progress }),
     ) {
         Ok(summary) => on_event(ContinuousIndexEvent::QualityCompleted {
@@ -743,6 +773,7 @@ pub fn run_index_with_progress(
         options,
         options.scope.skips_unchanged(),
         None,
+        true,
         &mut on_progress,
     )
 }
@@ -751,6 +782,7 @@ fn run_index_internal(
     options: &IndexOptions,
     skip_unchanged: bool,
     run_kind_override: Option<&'static str>,
+    acquire_writer: bool,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<IndexSummary, String> {
     on_progress(IndexProgress::new(
@@ -761,6 +793,22 @@ fn run_index_internal(
     ));
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
+    let _writer_lease = if acquire_writer {
+        let kind = match run_kind_override {
+            Some("watch") => WriterLeaseKind::WatcherDaemon,
+            _ => WriterLeaseKind::ManualIndex,
+        };
+        Some(
+            WriterLease::acquire(
+                &store_config,
+                WriterLeaseRequest::new(kind, "index")
+                    .for_repo(root.id(), root.path().display().to_string()),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     sqlite

@@ -113,8 +113,8 @@ impl App {
         let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
         let store_config = StoreConfig::from_env();
         let embed_config = EmbedConfig::from_env();
-        let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-        sqlite.migrate().map_err(|error| error.to_string())?;
+        let sqlite =
+            SqliteStore::open_read_only(&store_config).map_err(|error| error.to_string())?;
         let status = sqlite
             .repository_status(root.id())
             .map_err(|error| error.to_string())?;
@@ -3064,7 +3064,7 @@ fn collect_status_refresh(
     scope: StatusRefreshScope,
 ) -> Result<StatusRefreshSnapshot, String> {
     let store_config = StoreConfig::from_env();
-    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    let sqlite = SqliteStore::open_read_only(&store_config).map_err(|error| error.to_string())?;
     let status = sqlite
         .repository_status(repository_id)
         .map_err(|error| error.to_string())?;

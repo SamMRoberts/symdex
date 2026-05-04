@@ -407,10 +407,19 @@ from degrading into broad table scans as repositories grow.
 
 ## Local Database Writer Contract
 
-Only ONE process may write to the local SQLite/sqlite-vec database for a
-repository at a time. This is a product invariant, not just an implementation
-detail: competing write loops cause SQLite lock errors and make index provenance
-hard to reason about.
+Only ONE process may write to the configured local SQLite/sqlite-vec database at
+a time. This is a product invariant, not just an implementation detail:
+competing write loops cause SQLite lock errors and make index provenance hard to
+reason about.
+
+The guard is database-file scoped, not repository scoped. `symdex-store` derives
+a sidecar writer lock file from `StoreConfig.sqlite_path`, acquires an advisory
+exclusive lock before mutations, and records JSON owner metadata with owner
+kind, process id, operation, repository id, repository path, and start time when
+available. If another process holds the lock, write paths fail closed with a
+`database writer busy` message that includes the owner metadata when readable.
+Crashes are handled by the operating system lock release; stale metadata is
+overwritten by the next successful owner.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
@@ -419,7 +428,9 @@ or coalesce work, or fail closed with a clear owner/status message instead of
 opening a second writer. Read paths such as TUI refreshes, MCP evidence tools,
 diagnostics, semantic status, staleness checks, and query tools must not run
 migrations, stale-client pruning, repair, or quality catch-up as a side effect
-while a writer is active.
+while a writer is active. Structural read helpers open SQLite in read-only mode;
+missing or unmigrated local state should be reported to the caller rather than
+self-initialized from a read path.
 
 ## Continuous indexing
 

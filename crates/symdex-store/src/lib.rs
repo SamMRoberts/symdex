@@ -5,11 +5,14 @@ mod vector;
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::{Display, Formatter};
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use fs2::FileExt;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use symdex_core::{
     RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
 };
@@ -46,6 +49,168 @@ pub fn sqlite_parent(config: &StoreConfig) -> Option<PathBuf> {
     config.sqlite_path.parent().map(PathBuf::from)
 }
 
+pub fn writer_lock_path(config: &StoreConfig) -> PathBuf {
+    let lock_name = config
+        .sqlite_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.writer.lock"))
+        .unwrap_or_else(|| "symdex.sqlite.writer.lock".to_owned());
+    config
+        .sqlite_path
+        .parent()
+        .map(|parent| parent.join(&lock_name))
+        .unwrap_or_else(|| PathBuf::from(lock_name))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriterLeaseKind {
+    Init,
+    ManualIndex,
+    WatcherDaemon,
+    WatcherForeground,
+    WatcherLauncher,
+    QualityIndex,
+    VectorRepair,
+    Maintenance,
+}
+
+impl WriterLeaseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::ManualIndex => "manual_index",
+            Self::WatcherDaemon => "watcher_daemon",
+            Self::WatcherForeground => "watcher_foreground",
+            Self::WatcherLauncher => "watcher_launcher",
+            Self::QualityIndex => "quality_index",
+            Self::VectorRepair => "vector_repair",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterLeaseRequest {
+    pub kind: WriterLeaseKind,
+    pub operation: String,
+    pub repository_id: Option<String>,
+    pub repo_root: Option<String>,
+}
+
+impl WriterLeaseRequest {
+    pub fn new(kind: WriterLeaseKind, operation: impl Into<String>) -> Self {
+        Self {
+            kind,
+            operation: operation.into(),
+            repository_id: None,
+            repo_root: None,
+        }
+    }
+
+    pub fn for_repo(mut self, repository_id: &str, repo_root: impl Into<String>) -> Self {
+        self.repository_id = Some(repository_id.to_owned());
+        self.repo_root = Some(repo_root.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriterLeaseInfo {
+    pub owner_kind: String,
+    pub pid: u32,
+    pub operation: String,
+    pub repository_id: Option<String>,
+    pub repo_root: Option<String>,
+    pub started_at: String,
+}
+
+impl WriterLeaseInfo {
+    pub fn from_request(request: &WriterLeaseRequest) -> Self {
+        Self {
+            owner_kind: request.kind.as_str().to_owned(),
+            pid: std::process::id(),
+            operation: request.operation.clone(),
+            repository_id: request.repository_id.clone(),
+            repo_root: request.repo_root.clone(),
+            started_at: current_timestamp(),
+        }
+    }
+
+    pub fn read_for(config: &StoreConfig) -> Result<Option<Self>> {
+        read_writer_lease_info(&writer_lock_path(config))
+    }
+}
+
+#[derive(Debug)]
+pub struct WriterLease {
+    file: File,
+    lock_path: PathBuf,
+    pub info: WriterLeaseInfo,
+}
+
+impl WriterLease {
+    pub fn acquire(config: &StoreConfig, request: WriterLeaseRequest) -> Result<Self> {
+        if let Some(parent) = sqlite_parent(config) {
+            std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
+        }
+        let lock_path = writer_lock_path(config);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(StoreError::Io)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let owner = read_writer_lease_info(&lock_path).ok().flatten();
+                return Err(StoreError::WriterBusy { owner });
+            }
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+
+        let info = WriterLeaseInfo::from_request(&request);
+        file.set_len(0).map_err(StoreError::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(StoreError::Io)?;
+        let metadata = serde_json::to_vec(&info).map_err(StoreError::Json)?;
+        file.write_all(&metadata).map_err(StoreError::Io)?;
+        file.write_all(b"\n").map_err(StoreError::Io)?;
+        file.sync_data().map_err(StoreError::Io)?;
+        Ok(Self {
+            file,
+            lock_path,
+            info,
+        })
+    }
+
+    pub fn lock_path(&self) -> &PathBuf {
+        &self.lock_path
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn read_writer_lease_info(lock_path: &PathBuf) -> Result<Option<WriterLeaseInfo>> {
+    let mut file = match File::open(lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::Io(error)),
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(StoreError::Io)?;
+    if contents.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(contents.trim())
+        .map(Some)
+        .map_err(StoreError::Json)
+}
+
 #[derive(Debug)]
 pub struct SqliteStore {
     connection: Connection,
@@ -70,6 +235,20 @@ impl SqliteStore {
                 .execute_batch("PRAGMA journal_mode = WAL;")
                 .map_err(StoreError::Sqlite)?;
         }
+        Ok(Self { connection })
+    }
+
+    pub fn open_read_only(config: &StoreConfig) -> Result<Self> {
+        symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
+        let connection =
+            Connection::open_with_flags(&config.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(StoreError::Sqlite)?;
+        connection
+            .busy_timeout(Duration::from_secs(30))
+            .map_err(StoreError::Sqlite)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(StoreError::Sqlite)?;
         Ok(Self { connection })
     }
 
@@ -5876,6 +6055,7 @@ fn env_value(upper: &str, legacy: &str) -> Option<String> {
 #[derive(Debug)]
 pub enum StoreError {
     Io(std::io::Error),
+    Json(serde_json::Error),
     Sqlite(rusqlite::Error),
     SqliteVecRegistration(symdex_sqlite_vec::SqliteVecRegistrationError),
     InvalidVectorTableName(String),
@@ -5889,6 +6069,9 @@ pub enum StoreError {
         previous_dimension: usize,
         current_dimension: usize,
     },
+    WriterBusy {
+        owner: Option<WriterLeaseInfo>,
+    },
     UnexpectedResponse(String),
 }
 
@@ -5896,6 +6079,7 @@ impl Display for StoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "filesystem error: {error}"),
+            Self::Json(error) => write!(f, "JSON error: {error}"),
             Self::Sqlite(error) => write!(f, "SQLite error: {error}"),
             Self::SqliteVecRegistration(error) => write!(f, "{error}"),
             Self::InvalidVectorTableName(name) => {
@@ -5916,11 +6100,28 @@ impl Display for StoreError {
                 f,
                 "embedding dimension changed for repository `{repository_id}` and model `{embedding_model}`: previous={previous_dimension} current={current_dimension}; reset the collection or use a new model name before reindexing"
             ),
+            Self::WriterBusy { owner } => {
+                write!(f, "{}", writer_busy_message(owner.as_ref()))
+            }
             Self::UnexpectedResponse(message) => {
                 write!(f, "unexpected vector store response: {message}")
             }
         }
     }
+}
+
+pub fn writer_busy_message(owner: Option<&WriterLeaseInfo>) -> String {
+    let Some(owner) = owner else {
+        return "database writer busy: owner=<unknown>; stop the active writer or wait for it to finish"
+            .to_owned();
+    };
+    format!(
+        "database writer busy: owner={} pid={} repo={} operation={}; stop the active writer or wait for it to finish",
+        owner.owner_kind,
+        owner.pid,
+        owner.repo_root.as_deref().unwrap_or("<none>"),
+        owner.operation
+    )
 }
 
 impl std::error::Error for StoreError {}
@@ -7584,8 +7785,9 @@ mod tests {
         QualityEmbeddingJobRecord, QualityJobCompletion, RepositoryRecord,
         SemanticGenerationRecord, SqliteStore, SqliteVectorStore, StorageHealthStatus, StoreConfig,
         StoreError, SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint,
-        WatcherClientRecord, WatcherStatusRecord, validate_vector_table_name, vector_point_id,
-        vector_rowid, vector_table_name,
+        WatcherClientRecord, WatcherStatusRecord, WriterLease, WriterLeaseInfo, WriterLeaseKind,
+        WriterLeaseRequest, validate_vector_table_name, vector_point_id, vector_rowid,
+        vector_table_name,
     };
 
     #[test]
@@ -7668,6 +7870,76 @@ mod tests {
             .expect("journal mode should be readable");
 
         assert_eq!(journal_mode, "delete");
+    }
+
+    #[test]
+    fn writer_lease_excludes_second_writer_for_same_database() {
+        let db = TestDb::new("writer-lease-exclusive");
+        let config = db.config();
+        let _lease = WriterLease::acquire(
+            &config,
+            WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index")
+                .for_repo("repo", "/tmp/repo"),
+        )
+        .expect("first writer should acquire lease");
+
+        let error = WriterLease::acquire(
+            &config,
+            WriterLeaseRequest::new(WriterLeaseKind::QualityIndex, "index-quality"),
+        )
+        .expect_err("second writer should fail");
+
+        match error {
+            StoreError::WriterBusy { owner } => {
+                let owner = owner.expect("owner metadata should be available");
+                assert_eq!(owner.owner_kind, "manual_index");
+                assert_eq!(owner.operation, "index");
+                assert_eq!(owner.repo_root.as_deref(), Some("/tmp/repo"));
+            }
+            other => panic!("expected writer busy, got {other}"),
+        }
+    }
+
+    #[test]
+    fn writer_lease_allows_different_database_paths() {
+        let first = TestDb::new("writer-lease-first");
+        let second = TestDb::new("writer-lease-second");
+
+        let _first_lease = WriterLease::acquire(
+            &first.config(),
+            WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index"),
+        )
+        .expect("first database should acquire lease");
+        let _second_lease = WriterLease::acquire(
+            &second.config(),
+            WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index"),
+        )
+        .expect("second database should acquire lease independently");
+    }
+
+    #[test]
+    fn writer_lease_drop_allows_reacquisition_and_replaces_metadata() {
+        let db = TestDb::new("writer-lease-reacquire");
+        let config = db.config();
+        {
+            let _lease = WriterLease::acquire(
+                &config,
+                WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index"),
+            )
+            .expect("first lease should acquire");
+        }
+
+        let _lease = WriterLease::acquire(
+            &config,
+            WriterLeaseRequest::new(WriterLeaseKind::QualityIndex, "index-quality"),
+        )
+        .expect("lease should reacquire after drop");
+        let info = WriterLeaseInfo::read_for(&config)
+            .expect("lease metadata should read")
+            .expect("lease metadata should exist");
+
+        assert_eq!(info.owner_kind, "quality_index");
+        assert_eq!(info.operation, "index-quality");
     }
 
     #[test]

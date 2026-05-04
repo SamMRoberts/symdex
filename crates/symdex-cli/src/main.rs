@@ -3,14 +3,15 @@ use std::fs;
 use std::io::Read;
 
 use serde_json::json;
-use symdex_core::{RepoRoot, RepositoryRefSnapshot};
+use symdex_core::RepoRoot;
 use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
 use symdex_index::{
     ContinuousIndexEvent, EmbeddingSummary, IndexOptions, IndexScope, IndexSummary,
     QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
-    run_index, run_quality_index, run_quality_index_with_progress,
+    run_index, run_index_with_existing_writer, run_quality_index_with_existing_writer,
+    run_quality_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
@@ -20,7 +21,10 @@ use symdex_query::{
     run_semantic_search, run_semantic_status, run_symbol_search, run_unified_context_pack,
     run_vector_verify_with_options,
 };
-use symdex_store::{EvidenceFreshness, SqliteStore, SqliteVectorStore, StoreConfig, sqlite_parent};
+use symdex_store::{
+    EvidenceFreshness, SqliteStore, SqliteVectorStore, StoreConfig, WriterLease, WriterLeaseKind,
+    WriterLeaseRequest, sqlite_parent,
+};
 use symdex_watch::{WatcherClientKind, WatcherStatus};
 
 fn main() {
@@ -240,6 +244,11 @@ fn doctor(repo: Option<&str>) -> Result<(), String> {
 
 fn init() -> Result<(), String> {
     let store = StoreConfig::from_env();
+    let _writer = WriterLease::acquire(
+        &store,
+        WriterLeaseRequest::new(WriterLeaseKind::Init, "init"),
+    )
+    .map_err(|error| error.to_string())?;
     if let Some(parent) = sqlite_parent(&store) {
         fs::create_dir_all(&parent)
             .map_err(|error| format!("create sqlite directory {}: {error}", parent.display()))?;
@@ -295,18 +304,7 @@ fn index_status(repo: &str, output: OutputMode) -> Result<(), String> {
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
-    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
-    sqlite
-        .upsert_repository(&symdex_store::RepositoryRecord {
-            id: root.id().to_owned(),
-            root_path: root.path().display().to_string(),
-        })
-        .map_err(|error| error.to_string())?;
-    let repository_ref = RepositoryRefSnapshot::detect(&root).map_err(|error| error.to_string())?;
-    sqlite
-        .sync_repository_ref(&repository_ref)
-        .map_err(|error| error.to_string())?;
+    let sqlite = SqliteStore::open_read_only(&store_config).map_err(|error| error.to_string())?;
     let status = sqlite
         .repository_status(root.id())
         .map_err(|error| error.to_string())?;
@@ -512,6 +510,14 @@ fn vector_verify(args: &VectorMaintenanceArgs) -> Result<(), String> {
 }
 
 fn vector_repair(args: &VectorMaintenanceArgs) -> Result<(), String> {
+    let root = RepoRoot::open(&args.repo).map_err(|error| error.to_string())?;
+    let store_config = StoreConfig::from_env();
+    let _writer = WriterLease::acquire(
+        &store_config,
+        WriterLeaseRequest::new(WriterLeaseKind::VectorRepair, "vector-repair")
+            .for_repo(root.id(), root.path().display().to_string()),
+    )
+    .map_err(|error| error.to_string())?;
     let options = VectorVerifyOptions {
         semantic_layer: args.semantic_layer,
     };
@@ -550,7 +556,7 @@ fn repair_vector_summary(repo: &str, summary: &VectorVerifySummary) -> Result<()
     match VectorVerifySemanticLayer::parse(&summary.semantic_layer)? {
         VectorVerifySemanticLayer::Fast => {
             println!("semantic_repair layer=fast action=reindex_started");
-            let index_summary = run_index(&IndexOptions {
+            let index_summary = run_index_with_existing_writer(&IndexOptions {
                 repo: repo.to_owned(),
                 offline: false,
                 scope: IndexScope::Full,
@@ -559,7 +565,7 @@ fn repair_vector_summary(repo: &str, summary: &VectorVerifySummary) -> Result<()
         }
         VectorVerifySemanticLayer::Quality => {
             println!("semantic_repair layer=quality action=quality_worker_started");
-            let quality_summary = run_quality_index(&QualityIndexOptions {
+            let quality_summary = run_quality_index_with_existing_writer(&QualityIndexOptions {
                 repo: repo.to_owned(),
             })?;
             print_quality_index_summary(&quality_summary);

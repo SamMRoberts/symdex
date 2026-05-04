@@ -26,12 +26,14 @@ enabled, modified or newly created eligible files are automatically reindexed.
   `mxbai-embed-large` layer as deferred work.
 - Continuous indexing must not wait for quality indexing before returning to
   watch mode.
-- Single-writer rule: only ONE process may write to the local SQLite/sqlite-vec
-  database for a repository at a time. When continuous indexing is active, the
-  shared watcher owns database writes; TUI, MCP, diagnostics, status, and query
-  paths must read shared state without migrations or cleanup writes, and manual
-  indexing, quality catch-up, repair, or future write-capable tools must attach,
-  queue/coalesce work, or refuse rather than starting a competing writer.
+- Single-writer rule: only ONE process may write to the configured local
+  SQLite/sqlite-vec database at a time. The guard is database-file scoped and
+  uses a sidecar writer lock file derived from the SQLite path. When continuous
+  indexing is active, the shared watcher daemon owns database writes; TUI, MCP,
+  diagnostics, status, and query paths must read shared state without migrations
+  or cleanup writes, and manual indexing, quality catch-up, repair, or future
+  write-capable tools must attach, queue/coalesce work, or refuse with owner
+  metadata rather than starting a competing writer.
 
 ## Event Handling
 
@@ -139,7 +141,7 @@ outputs to distinguish these states:
   quality-job persistence, sqlite-vec point replacement, and index run metadata.
 - `symdex-store` is the persistence boundary, but it does not grant permission
   for every process to write. Write-capable callers must first satisfy the
-  single-writer rule for the target repository database.
+  single-writer rule for the configured database.
 - `symdex-query` owns active semantic layer routing for search. It must not
   decide to use a partial quality layer unless an explicit future diagnostic
   mode is added.
@@ -154,18 +156,25 @@ Current implementation status:
 
 - `symdex-index` exposes shared watch snapshot, diff, and continuous polling
   APIs.
+- `symdex-store` exposes `WriterLease`, `WriterLeaseRequest`, and
+  `WriterLeaseInfo`. Lock metadata records owner kind, process id, operation,
+  and repository path/id when available. A busy writer returns a
+  `database writer busy` error with owner metadata when the lock metadata can be
+  read.
 - `symdex watch start <repo>` starts or attaches the background watcher and
   prints status. Watchers are client-scoped, so this command alone does not make
   a permanent daemon; without a live TUI, MCP server, or foreground watcher the
   daemon exits after about 10 seconds. `symdex watch status <repo>` reads shared
   SQLite watcher state without running migrations or pruning stale client rows,
   keeping status polling read-only while the watcher writes index updates.
-  `symdex watch stop <repo>` asks the daemon to stop.
+  `symdex watch stop <repo>` asks the daemon to stop. Watcher clients attach,
+  heartbeat, detach, and request status through the daemon IPC endpoint, and the
+  daemon writes `watchers` / `watcher_clients` rows on their behalf.
 - `symdex index --watch <repo>` remains a foreground watch loop, but it refuses
   to run while a background or foreground watcher is already active.
-- Manual `symdex index`, `symdex index-quality`, `vector-repair`, and future
-  write-capable MCP tools must use the same single-writer guard before mutating
-  SQLite or sqlite-vec. If another writer is active, they should report the
+- Manual `symdex index`, `symdex index-quality`, `vector-repair`, migrations,
+  and future write-capable MCP tools use the same single-writer guard before
+  mutating SQLite or sqlite-vec. If another writer is active, they report the
   owner and either attach to the watcher, enqueue/coalesce work, or ask the user
   to stop the active writer.
 - `symdex serve-mcp --watch <repo>` starts or attaches the single background
