@@ -469,7 +469,19 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(None, file, symbols, chunks, calls, tests)
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, &[], tests)
+    }
+
+    pub fn replace_file_facts_with_references_and_tests(
+        &mut self,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, symbol_references, tests)
     }
 
     pub fn replace_file_facts_for_ref_with_tests(
@@ -481,7 +493,36 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(Some(repository_ref_id), file, symbols, chunks, calls, tests)
+        self.replace_file_facts_inner(
+            Some(repository_ref_id),
+            file,
+            symbols,
+            chunks,
+            calls,
+            &[],
+            tests,
+        )
+    }
+
+    pub fn replace_file_facts_for_ref_with_references_and_tests(
+        &mut self,
+        repository_ref_id: &str,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(
+            Some(repository_ref_id),
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            tests,
+        )
     }
 
     fn replace_file_facts_inner(
@@ -491,6 +532,7 @@ impl SqliteStore {
         symbols: &[SymbolRecord],
         chunks: &[ChunkRecord],
         calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
         let indexed_at = timestamp();
@@ -571,6 +613,13 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         transaction
+            .execute(
+                "DELETE FROM symbol_references
+                 WHERE file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
             .execute("DELETE FROM tests WHERE file_id = ?1", params![file.id])
             .map_err(StoreError::Sqlite)?;
         transaction
@@ -599,6 +648,13 @@ impl SqliteStore {
                 .execute(
                     "DELETE FROM calls
                      WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM symbol_references
+                     WHERE file_id = ?1",
                     params![&stale_file_id],
                 )
                 .map_err(StoreError::Sqlite)?;
@@ -651,6 +707,46 @@ impl SqliteStore {
                         symbol.end_byte as i64,
                         symbol.index_run_id,
                         symbol.parser_version,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO symbol_references (
+                        id, file_id, source_symbol_id, target_symbol_id, reference_text, reference_kind,
+                        line, confidence, resolution_status, index_run_id, parser_version
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                      ON CONFLICT(id) DO UPDATE SET
+                        file_id = excluded.file_id,
+                        source_symbol_id = excluded.source_symbol_id,
+                        target_symbol_id = excluded.target_symbol_id,
+                        reference_text = excluded.reference_text,
+                        reference_kind = excluded.reference_kind,
+                        line = excluded.line,
+                        confidence = excluded.confidence,
+                        resolution_status = excluded.resolution_status,
+                        index_run_id = excluded.index_run_id,
+                        parser_version = excluded.parser_version",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for reference in symbol_references {
+                statement
+                    .execute(params![
+                        reference.id,
+                        reference.file_id,
+                        reference.source_symbol_id,
+                        reference.target_symbol_id,
+                        reference.reference_text,
+                        reference.reference_kind,
+                        reference.line as i64,
+                        reference.confidence as f64,
+                        reference.resolution_status,
+                        reference.index_run_id,
+                        reference.parser_version,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -859,6 +955,13 @@ impl SqliteStore {
                     )
                     .map_err(StoreError::Sqlite)?;
                 transaction
+                    .execute(
+                        "DELETE FROM symbol_references
+                         WHERE file_id = ?1",
+                        params![&file_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                transaction
                     .execute("DELETE FROM tests WHERE file_id = ?1", params![&file_id])
                     .map_err(StoreError::Sqlite)?;
                 transaction
@@ -907,6 +1010,13 @@ impl SqliteStore {
                     .execute(
                         "DELETE FROM calls
                          WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                        params![&file_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute(
+                        "DELETE FROM symbol_references
+                         WHERE file_id = ?1",
                         params![&file_id],
                     )
                     .map_err(StoreError::Sqlite)?;
@@ -4943,6 +5053,21 @@ pub struct CallRecord {
     pub parser_version: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolReferenceRecord {
+    pub id: String,
+    pub file_id: String,
+    pub source_symbol_id: Option<String>,
+    pub target_symbol_id: Option<String>,
+    pub reference_text: String,
+    pub reference_kind: String,
+    pub line: usize,
+    pub confidence: f32,
+    pub resolution_status: String,
+    pub index_run_id: String,
+    pub parser_version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestRecord {
     pub id: String,
@@ -7215,6 +7340,38 @@ CREATE TABLE IF NOT EXISTS calls (
   parser_version TEXT
 );
 
+CREATE TABLE IF NOT EXISTS symbol_references (
+    id TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    source_symbol_id TEXT,
+    target_symbol_id TEXT,
+    reference_text TEXT NOT NULL,
+    reference_kind TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    resolution_status TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    CHECK(reference_kind IN (
+        'import',
+        'type_reference',
+        'implementation',
+        'attribute',
+        'inheritance',
+        'decorator',
+        'config_link'
+    )),
+    CHECK(resolution_status IN (
+        'resolved_exact',
+        'resolved_local_candidate',
+        'unresolved',
+        'ambiguous'
+    )),
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+    FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS tests (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -7362,6 +7519,10 @@ CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_calls_caller_symbol_id ON calls(caller_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_calls_callee_symbol_id ON calls(callee_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_file_kind ON symbol_references(file_id, reference_kind);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_source_kind ON symbol_references(source_symbol_id, reference_kind);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_target_kind ON symbol_references(target_symbol_id, reference_kind);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_kind_status ON symbol_references(reference_kind, resolution_status);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_name ON tests(repository_id, name);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_qualified_name ON tests(repository_id, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_tests_file_id ON tests(file_id);
@@ -7419,9 +7580,9 @@ mod tests {
         FileIndexEventRecord, FileRecord, PointPayload, QualityActivationReason,
         QualityEmbeddingJobRecord, QualityJobCompletion, RepositoryRecord,
         SemanticGenerationRecord, SqliteStore, SqliteVectorStore, StorageHealthStatus, StoreConfig,
-        StoreError, SymbolRecord, TestRecord, VectorPoint, WatcherClientRecord,
-        WatcherStatusRecord, validate_vector_table_name, vector_point_id, vector_rowid,
-        vector_table_name,
+        StoreError, SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint,
+        WatcherClientRecord, WatcherStatusRecord, validate_vector_table_name, vector_point_id,
+        vector_rowid, vector_table_name,
     };
 
     #[test]
@@ -8181,6 +8342,10 @@ mod tests {
             "idx_symbols_qualified_name",
             "idx_calls_caller_symbol_id",
             "idx_calls_callee_symbol_id",
+            "idx_symbol_references_file_kind",
+            "idx_symbol_references_source_kind",
+            "idx_symbol_references_target_kind",
+            "idx_symbol_references_kind_status",
             "idx_tests_repository_name",
             "idx_tests_repository_qualified_name",
             "idx_tests_file_id",
@@ -8274,6 +8439,7 @@ mod tests {
 
         for expected in [
             "file_index_events",
+            "symbol_references",
             "semantic_generations",
             "semantic_generation_refs",
             "chunk_embeddings",
@@ -10156,6 +10322,68 @@ mod tests {
         let callees = store.callees("repo", "caller").expect("callees query");
         assert_eq!(callees.len(), 1);
         assert_eq!(callees[0].symbol_qualified_name.as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn sqlite_persists_symbol_references() {
+        let db = TestDb::new("symbol-references");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![sample_symbol("source-symbol", "run", "run")];
+        let references = vec![SymbolReferenceRecord {
+            id: "reference-1".to_owned(),
+            file_id: "file".to_owned(),
+            source_symbol_id: Some("source-symbol".to_owned()),
+            target_symbol_id: None,
+            reference_text: "use crate::worker::Task;".to_owned(),
+            reference_kind: "import".to_owned(),
+            line: 2,
+            confidence: 0.4,
+            resolution_status: "unresolved".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        }];
+
+        store
+            .replace_file_facts_with_references_and_tests(
+                &sample_file("hash-1"),
+                &symbols,
+                &[],
+                &[],
+                &references,
+                &[],
+            )
+            .expect("symbol references should persist");
+
+        let row: (String, String, i64, f64, String) = store
+            .connection
+            .query_row(
+                "SELECT source_symbol_id, reference_kind, line, confidence, resolution_status
+                   FROM symbol_references
+                  WHERE id = 'reference-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("symbol reference should load");
+        assert_eq!(row.0, "source-symbol");
+        assert_eq!(row.1, "import");
+        assert_eq!(row.2, 2);
+        assert_eq!(row.4, "unresolved");
     }
 
     #[test]

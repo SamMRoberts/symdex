@@ -319,6 +319,44 @@ pub struct CallEdge {
     pub resolution_status: ResolutionStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolReferenceKind {
+    Import,
+    TypeReference,
+    Implementation,
+    Attribute,
+    Inheritance,
+    Decorator,
+    ConfigLink,
+}
+
+impl SymbolReferenceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Import => "import",
+            Self::TypeReference => "type_reference",
+            Self::Implementation => "implementation",
+            Self::Attribute => "attribute",
+            Self::Inheritance => "inheritance",
+            Self::Decorator => "decorator",
+            Self::ConfigLink => "config_link",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolReference {
+    pub id: String,
+    pub file_id: String,
+    pub source_symbol_id: Option<String>,
+    pub target_symbol_id: Option<String>,
+    pub reference_text: String,
+    pub reference_kind: SymbolReferenceKind,
+    pub line: usize,
+    pub confidence: f32,
+    pub resolution_status: ResolutionStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseDiagnostic {
     pub byte_range: ByteRange,
@@ -345,6 +383,7 @@ pub struct SourceFileIndex {
     pub chunks: Vec<CodeChunk>,
     pub symbols: Vec<Symbol>,
     pub calls: Vec<CallEdge>,
+    pub symbol_references: Vec<SymbolReference>,
     pub parse_diagnostics: Vec<ParseDiagnostic>,
     pub tests: Vec<DiscoveredTest>,
 }

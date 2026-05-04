@@ -68,14 +68,16 @@ Active language targets:
 
 Rust, C#, JavaScript, and TypeScript are implemented language targets. C#, JS,
 and TS support starts conservatively with syntax-aware function/method chunks,
-symbols, and call-like references; it does not claim whole-language type
-inference. TOML and YAML configuration files are indexed as fallback-only
-configuration evidence with no symbols, calls, tests, or tree-sitter parse
-diagnostics. JSON configuration files are disabled by default and are indexed
-only when `SYMDEX_INDEX_JSON_PATHS` contains a matching repo-relative folder
-scope. Future languages must be added through the same discovery, parsing,
-chunking, symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec,
-manual indexing, and continuous indexing contracts.
+symbols, call-like references, and conservative symbol-reference edges for
+imports/usings, type-like references, implementation or inheritance syntax, and
+attributes/decorators; it does not claim whole-language type inference. TOML
+and YAML configuration files are indexed as fallback-only configuration
+evidence with no symbols, calls, tests, or tree-sitter parse diagnostics. JSON
+configuration files are disabled by default and are indexed only when
+`SYMDEX_INDEX_JSON_PATHS` contains a matching repo-relative folder scope.
+Future languages must be added through the same discovery, parsing, chunking,
+symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec, manual
+indexing, and continuous indexing contracts.
 
 `SYMDEX_INDEX_JSON_PATHS` is an optional comma-separated list of repo-relative
 directory scopes for JSON indexing, such as `config,.vscode,packages/app`.
@@ -300,6 +302,11 @@ Resolution states:
 
 Never drop unresolved calls. They are useful evidence.
 
+Never drop unresolved symbol references. Imports, type references,
+implementations, inheritance, attributes, decorators, and future config-to-code
+links are useful debugging evidence even when they cannot be resolved to a local
+target symbol.
+
 Current implementation extracts Rust function and method symbols from
 `function_item` nodes. Free functions use module-derived qualified names, while
 methods include the enclosing `impl` container when tree-sitter exposes it.
@@ -329,6 +336,15 @@ invocations are preserved as unresolved call edges with low confidence; macro
 expansion is not analyzed. Each macro invocation also emits a
 metadata-only diagnostic noting that the invocation was preserved without
 expansion.
+
+Symbol-reference extraction is intentionally broader than call extraction.
+Current indexing records conservative reference rows in `symbol_references` for
+Rust `use` declarations, type-like nodes, `impl` relationships, and attributes.
+C#, JavaScript, and TypeScript use parser-backed hooks for imports/usings,
+base-list or class-heritage inheritance, attributes/decorators, and type-like
+syntax where available. Resolution is local and conservative: a single local
+symbol suffix/name match becomes `resolved_local_candidate`, multiple matches
+are `ambiguous`, and otherwise the reference is preserved as `unresolved`.
 
 After per-file parsing, the indexer performs a conservative Rust cross-file
 resolution pass before persisting SQLite facts. Qualified module calls such as

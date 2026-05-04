@@ -7,7 +7,7 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, tests, fast semantic generations, and fast/quality
+symbols, calls, symbol references, tests, fast semantic generations, and fast/quality
 `chunk_embeddings` manifests. The older chunk-level vector columns remain
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
@@ -15,6 +15,8 @@ semantic projection.
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
 caller/callee traversal, and index-run metadata checks.
+Symbol-reference indexes cover source-symbol, target-symbol, kind, and
+resolution-status scans for broader structural evidence beyond calls.
 Layered semantic indexes cover latest generation lookup, per-layer embedding
 manifests, and quality job status scans.
 
@@ -285,6 +287,41 @@ CREATE TABLE calls (
   parser_version TEXT
 );
 ```
+
+### `symbol_references`
+
+```sql
+CREATE TABLE symbol_references (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  source_symbol_id TEXT,
+  target_symbol_id TEXT,
+  reference_text TEXT NOT NULL,
+  reference_kind TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  confidence REAL NOT NULL,
+  resolution_status TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT
+);
+```
+
+`symbol_references` stores conservative structural references that are useful
+to coding agents but are not caller/callee execution edges. Reference kinds are
+`import`, `type_reference`, `implementation`, `attribute`, `inheritance`,
+`decorator`, and `config_link`. `file_id` anchors lifecycle cleanup for
+file-level references. `source_symbol_id` is nullable because imports,
+file-level attributes, and future configuration links can originate outside a
+function or method symbol. `target_symbol_id` is nullable and should only be
+set when local evidence resolves the reference conservatively.
+
+Current Rust extraction records `use` declarations, type-like syntax nodes,
+`impl` relationships, and attributes. C#, JavaScript, and TypeScript have
+conservative parser hooks for imports/usings, inheritance or base lists,
+attributes/decorators, and type-like syntax where tree-sitter exposes stable
+nodes. The table stores no source text beyond the compact reference expression,
+and unresolved or ambiguous references are retained with confidence and
+`resolution_status` metadata.
 
 ### `tests`
 
@@ -586,6 +623,8 @@ Use SQLite tables to show repository structure:
 - `chunks`: chunk kinds, line ranges, text hashes, compatibility vector fields,
   and exclusion reasons.
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
+- `symbol_references`: imports, type references, implementations, inheritance,
+  attributes/decorators, confidence, and resolution status.
 
 Use sqlite-vec metadata to show semantic storage:
 
@@ -600,6 +639,8 @@ Group by `files.path` and aggregate:
 - chunk count from `chunks`
 - symbol count from `symbols`
 - call count from `calls` joined through caller symbols
+- symbol-reference count from `symbol_references` joined through files and,
+  when present, source symbols
 - embeddable chunk count from chunks where `excluded_reason IS NULL`
 - vector-backed chunk count from current fast `chunk_embeddings` rows for the
   latest semantic generation
@@ -615,6 +656,8 @@ For the selected file, show metadata rows from:
 - `chunks`: kind, line range, text hash, layered vector status, exclusion reason
 - `symbols`: kind, qualified name, parent symbol, line range
 - `calls`: call line, callee text, resolved callee symbol, confidence, status
+- `symbol_references`: reference line, kind, text, resolved target symbol,
+  confidence, status
 
 Do not show source previews unless a future source-preview design explicitly
 allows it.
@@ -702,6 +745,7 @@ file_id   = hash(repository_id + normalized_relative_path)
 symbol_id = hash(file_id + kind + qualified_name + start_byte + signature_hash)
 chunk_id  = hash(file_id + kind + start_byte + end_byte + text_hash)
 call_id   = hash(caller_symbol_id + callee_text + call_line)
+symbol_reference_id = hash(file_id + source_symbol_id + reference_text + reference_kind + line)
 ```
 
 ## Call path traversal

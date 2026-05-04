@@ -35,6 +35,7 @@
 - [x] qualified names.
 - [x] call extraction.
 - [x] unresolved calls.
+- [x] conservative symbol references beyond calls.
 - [x] direct callers/callees CLI.
 - [x] basic impact analysis.
 
@@ -336,6 +337,8 @@ architecture, and compatibility with the local-first evidence contract.
 - [x] Add macro-aware limitations and diagnostics.
 - [x] Add Rust type-definition, trait, and impl-summary chunks.
 - [x] Add cross-file and cross-module call resolution.
+- [x] Add `symbol_references` storage for imports, type references,
+  implementations, inheritance, attributes, decorators, and future config links.
 
 ### P3 — Operational polish
 

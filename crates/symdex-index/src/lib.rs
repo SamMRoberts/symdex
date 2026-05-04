@@ -11,7 +11,7 @@ use std::time::Duration;
 use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, NormalizedRepoPath,
     ParseDiagnostic, RepoRoot, RepositoryRefSnapshot, ResolutionStatus, SemanticLayer, Symbol,
-    SymbolKind, content_hash, discover_indexable_files, index_source_file,
+    SymbolKind, SymbolReference, content_hash, discover_indexable_files, index_source_file,
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
@@ -19,7 +19,8 @@ use symdex_store::{
     FastSemanticGenerationInput, FileIndexEventRecord, FileRecord, IndexRunRecord, PointPayload,
     QualityActivationSummary, QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow,
     QualityQueueSummary, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
-    SymbolRecord, TestRecord, VectorPoint, current_timestamp, vector_point_id, vector_table_name,
+    SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint, current_timestamp,
+    vector_point_id, vector_table_name,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1098,6 +1099,7 @@ fn collect_index_reports_with_options(
                 chunks: Vec::new(),
                 symbols: Vec::new(),
                 calls: Vec::new(),
+                symbol_references: Vec::new(),
                 tests: Vec::new(),
                 parse_diagnostics: Vec::new(),
                 source: String::new(),
@@ -1123,6 +1125,7 @@ fn collect_index_reports_with_options(
             chunks: file_index.chunks,
             symbols: file_index.symbols,
             calls: file_index.calls,
+            symbol_references: file_index.symbol_references,
             tests: file_index.tests,
             parse_diagnostics: file_index.parse_diagnostics,
             source,
@@ -1683,6 +1686,17 @@ fn persist_structural_index(
             .iter()
             .map(|call| call_record(call, index_run_id, report.file.language.parser_version()))
             .collect::<Vec<_>>();
+        let symbol_references = report
+            .symbol_references
+            .iter()
+            .map(|reference| {
+                symbol_reference_record(
+                    reference,
+                    index_run_id,
+                    report.file.language.parser_version(),
+                )
+            })
+            .collect::<Vec<_>>();
         let tests = report
             .tests
             .iter()
@@ -1753,18 +1767,26 @@ fn persist_structural_index(
         calls_indexed += calls.len();
         if let Some(repository_ref_id) = repository_ref_id {
             sqlite
-                .replace_file_facts_for_ref_with_tests(
+                .replace_file_facts_for_ref_with_references_and_tests(
                     repository_ref_id,
                     &file,
                     &symbols,
                     &chunks,
                     &calls,
+                    &symbol_references,
                     &tests,
                 )
                 .map_err(|error| error.to_string())?;
         } else {
             sqlite
-                .replace_file_facts_with_tests(&file, &symbols, &chunks, &calls, &tests)
+                .replace_file_facts_with_references_and_tests(
+                    &file,
+                    &symbols,
+                    &chunks,
+                    &calls,
+                    &symbol_references,
+                    &tests,
+                )
                 .map_err(|error| error.to_string())?;
         }
         on_progress(IndexProgress::new(
@@ -2861,6 +2883,26 @@ fn call_record(call: &CallEdge, index_run_id: &str, parser_version: &str) -> Cal
     }
 }
 
+fn symbol_reference_record(
+    reference: &SymbolReference,
+    index_run_id: &str,
+    parser_version: &str,
+) -> SymbolReferenceRecord {
+    SymbolReferenceRecord {
+        id: reference.id.clone(),
+        file_id: reference.file_id.clone(),
+        source_symbol_id: reference.source_symbol_id.clone(),
+        target_symbol_id: reference.target_symbol_id.clone(),
+        reference_text: reference.reference_text.clone(),
+        reference_kind: reference.reference_kind.as_str().to_owned(),
+        line: reference.line,
+        confidence: reference.confidence,
+        resolution_status: reference.resolution_status.as_str().to_owned(),
+        index_run_id: index_run_id.to_owned(),
+        parser_version: parser_version.to_owned(),
+    }
+}
+
 fn test_record(
     repository_id: &str,
     test: &DiscoveredTest,
@@ -3013,6 +3055,7 @@ struct IndexReport {
     chunks: Vec<CodeChunk>,
     symbols: Vec<Symbol>,
     calls: Vec<CallEdge>,
+    symbol_references: Vec<SymbolReference>,
     tests: Vec<DiscoveredTest>,
     parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
@@ -3090,6 +3133,7 @@ mod tests {
             chunks: vec![public.clone(), secret.clone()],
             symbols: Vec::new(),
             calls: Vec::new(),
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
@@ -3221,6 +3265,7 @@ mod tests {
             chunks: vec![small.clone(), large.clone()],
             symbols: Vec::new(),
             calls: Vec::new(),
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
@@ -3603,6 +3648,7 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -3643,6 +3689,7 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![outer_caller, sibling_caller],
             calls: vec![outer_call, sibling_call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -3686,6 +3733,7 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -3725,6 +3773,7 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![self_call, self_type_call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -3774,6 +3823,7 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -3807,6 +3857,7 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![sample_unresolved_call("run", "crate::worker::helper")],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -3965,6 +4016,7 @@ mod tests {
             chunks: Vec::new(),
             symbols: Vec::new(),
             calls: Vec::new(),
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
