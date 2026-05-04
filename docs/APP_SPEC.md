@@ -69,6 +69,10 @@ symdex serve-mcp --watch <repo>
   run only while TUI, MCP, or CLI clients hold leases, can be toggled on and
   off, and reindex modified or newly created eligible files without source
   execution.
+- Only one local process writes to a repository's SQLite/sqlite-vec database at
+  a time. All write-capable indexing, quality, repair, cleanup, and future MCP
+  operations coordinate through that writer or refuse instead of racing a second
+  writer.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.

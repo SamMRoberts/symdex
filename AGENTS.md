@@ -26,6 +26,12 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
+- Only ONE process may write to the local SQLite/sqlite-vec database for a
+  repository at a time. TUI, MCP, diagnostics, query, and status paths must be
+  read-only unless they are starting or attaching the single writer. Manual
+  indexing, continuous indexing, quality catch-up, repair, and future write
+  tools must coordinate through that writer, queue/coalesce work, or refuse
+  while another writer is active to prevent SQLite database lock errors.
 - SQLite stores local Git/ref metadata for repository indexes. Branch-aware
   work must preserve local branch/ref identity, detached HEAD support, and
   non-Git repository behavior.
@@ -135,6 +141,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Continuous indexing uses one background watcher per repository. TUI, MCP, and
   CLI clients hold visible watcher leases; when no clients remain, the watcher
   exits after a short grace period.
+- The watcher is the continuous-indexing database writer. Other processes must
+  not run concurrent SQLite/sqlite-vec writes while it is active; they must
+  attach, read shared state, queue/coalesce, or fail closed with a clear message.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 - Branch-aware indexing must read only local Git metadata. Do not execute hooks,
   fetch remotes, contact hosted services, or treat branch names as trusted input.

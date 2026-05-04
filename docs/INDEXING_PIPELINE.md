@@ -405,6 +405,22 @@ Current SQLite migrations include indexes for file cleanup, symbol lookup,
 caller/callee traversal, and index-run metadata. This keeps structural queries
 from degrading into broad table scans as repositories grow.
 
+## Local Database Writer Contract
+
+Only ONE process may write to the local SQLite/sqlite-vec database for a
+repository at a time. This is a product invariant, not just an implementation
+detail: competing write loops cause SQLite lock errors and make index provenance
+hard to reason about.
+
+Write-capable work includes manual indexing, continuous indexing, quality
+catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
+tool. These paths must coordinate through the repository's active writer, queue
+or coalesce work, or fail closed with a clear owner/status message instead of
+opening a second writer. Read paths such as TUI refreshes, MCP evidence tools,
+diagnostics, semantic status, staleness checks, and query tools must not run
+migrations, stale-client pruning, repair, or quality catch-up as a side effect
+while a writer is active.
+
 ## Continuous indexing
 
 Continuous indexing is a local watch mode layered on top of incremental
