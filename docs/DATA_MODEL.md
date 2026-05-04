@@ -467,7 +467,10 @@ Returned evidence rows now include compact provenance metadata where available:
 content hash, index run ID, parser version, indexed timestamp, embedding model,
 embedding dimension, and embedding timestamp. Freshness checks compare persisted
 content hashes with the current eligible file hashes and label rows as `fresh`,
-`stale`, `deleted`, `missing`, or `unknown`.
+`stale`, `deleted`, `missing`, or `unknown`. When `ref_files` manifests exist,
+repository-level freshness reports compare only the active local ref manifest so
+retained snapshots from other refs or earlier same-path content do not appear as
+repairable stale rows.
 
 Returned impact and debug-context evidence also includes an `EvidenceTrust`
 score where the query layer has enough metadata to evaluate it. The score is a

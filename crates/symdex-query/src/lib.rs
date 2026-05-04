@@ -937,9 +937,13 @@ fn build_freshness_report(
     scope: FreshnessScope,
 ) -> Result<FreshnessSummary, String> {
     let current_hashes = current_hashes(root)?;
-    let indexed = sqlite
-        .indexed_file_freshness_snapshots(root.id())
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(root, sqlite)?;
+    let indexed = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        sqlite.indexed_file_freshness_snapshots_for_ref(root.id(), repository_ref_id)
+    } else {
+        sqlite.indexed_file_freshness_snapshots(root.id())
+    }
+    .map_err(|error| error.to_string())?;
 
     let explicit_paths = normalize_freshness_paths(&scope.paths)?;
 
@@ -953,15 +957,21 @@ fn build_freshness_report(
         .filter(|query| !query.is_empty())
         .map(str::to_owned);
     if let Some(query) = &query {
-        focus_symbols = sqlite
-            .find_symbols(root.id(), query)
-            .map_err(|error| error.to_string())?;
+        focus_symbols = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+            sqlite.find_symbols_for_ref(root.id(), repository_ref_id, query)
+        } else {
+            sqlite.find_symbols(root.id(), query)
+        }
+        .map_err(|error| error.to_string())?;
         for symbol in &focus_symbols {
             symbol_scoped_paths.insert(symbol.path.clone());
         }
-        let pack = sqlite
-            .context_pack(root.id(), query, 8)
-            .map_err(|error| error.to_string())?;
+        let pack = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+            sqlite.context_pack_for_ref(root.id(), repository_ref_id, query, 8)
+        } else {
+            sqlite.context_pack(root.id(), query, 8)
+        }
+        .map_err(|error| error.to_string())?;
         for path in &pack.files {
             symbol_scoped_paths.insert(path.clone());
         }
@@ -2930,7 +2940,7 @@ fn active_ref_scope(root: &RepoRoot, sqlite: &SqliteStore) -> Result<Option<Stri
 }
 
 fn current_hashes(root: &RepoRoot) -> Result<BTreeMap<String, String>, String> {
-    discover_indexable_files(root, &DiscoveryOptions::default())
+    discover_indexable_files(root, &DiscoveryOptions::from_env())
         .map_err(|error| error.to_string())
         .map(|files| {
             files
@@ -3352,7 +3362,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
-        RepoRoot, SemanticLayer, SemanticLayerMode, SemanticLayerStatus, content_hash,
+        RepoRoot, RepositoryRefSnapshot, SemanticLayer, SemanticLayerMode, SemanticLayerStatus,
+        content_hash,
     };
     use symdex_embed::LayeredEmbedConfig;
     use symdex_store::{
@@ -4384,6 +4395,91 @@ mod tests {
                 ("src/fresh.rs", EvidenceFreshness::Fresh),
                 ("src/missing.rs", EvidenceFreshness::Missing),
                 ("src/unknown.rs", EvidenceFreshness::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn freshness_report_uses_active_ref_manifest_when_available() {
+        let mut fixture = DebugFixture::new();
+        let active_ref =
+            RepositoryRefSnapshot::detect(&fixture.root).expect("active ref should detect");
+        let fresh_hash = content_hash(b"fn fresh() {}\n");
+        let stale_hash = content_hash(b"fn stale() {}\n");
+        fixture
+            .store
+            .sync_repository_ref(&active_ref)
+            .expect("active ref should sync");
+        fixture
+            .store
+            .replace_file_facts_for_ref_with_tests(
+                &active_ref.id,
+                &FileRecord {
+                    id: "file-fresh-current".to_owned(),
+                    repository_id: fixture.root.id().to_owned(),
+                    path: "src/fresh.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: fresh_hash,
+                    index_run_id: "run-current".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-fresh-current",
+                    "file-fresh-current",
+                    "fresh",
+                    "crate::fresh",
+                )],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("fresh file should persist for active ref");
+        fixture
+            .store
+            .replace_file_facts_for_ref_with_tests(
+                &active_ref.id,
+                &FileRecord {
+                    id: "file-stale-current".to_owned(),
+                    repository_id: fixture.root.id().to_owned(),
+                    path: "src/stale.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: stale_hash,
+                    index_run_id: "run-current".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-stale-current",
+                    "file-stale-current",
+                    "stale",
+                    "crate::stale",
+                )],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("stale file should persist for active ref");
+
+        let summary = build_freshness_report(
+            &fixture.root,
+            &fixture.store,
+            FreshnessScope {
+                symbol_query: None,
+                paths: Vec::new(),
+            },
+        )
+        .expect("freshness report should build");
+
+        assert_eq!(summary.count(EvidenceFreshness::Stale), 0);
+        assert_eq!(summary.count(EvidenceFreshness::Deleted), 0);
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .map(|row| (row.path.as_str(), row.freshness))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/fresh.rs", EvidenceFreshness::Fresh),
+                ("src/stale.rs", EvidenceFreshness::Fresh),
             ]
         );
     }

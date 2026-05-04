@@ -281,6 +281,8 @@ represent the indexed repository.
 
 - Compare indexed file content hashes with the current eligible files for
   implemented languages.
+- When branch-aware `ref_files` manifests exist, compare the active local ref's
+  file manifest instead of all retained repository file snapshots.
 - Show fresh, stale, deleted, missing, and unknown labels with selected-row
   provenance details.
 - Include content hash, index run ID, parser version, and indexed timestamp

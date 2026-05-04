@@ -4201,6 +4201,38 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn indexed_file_freshness_snapshots_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<FileFreshnessSnapshot>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ref_files.path, files.content_hash, files.indexed_at,
+                        files.index_run_id, files.parser_version
+                   FROM ref_files
+                   JOIN files ON files.id = ref_files.file_id
+                             AND files.repository_id = ref_files.repository_id
+                  WHERE ref_files.repository_id = ?1
+                    AND ref_files.repository_ref_id = ?2
+                  ORDER BY ref_files.path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], |row| {
+                Ok(FileFreshnessSnapshot {
+                    path: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    indexed_at: row.get(2)?,
+                    index_run_id: row.get(3)?,
+                    parser_version: row.get(4)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn rust_symbols_for_repository(&self, repository_id: &str) -> Result<Vec<SymbolRecord>> {
         let mut statement = self
             .connection
@@ -7266,6 +7298,68 @@ mod tests {
                 .ref_file_paths(&main.id)
                 .expect("main paths should still remain"),
             vec!["src/lib.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn freshness_snapshots_can_be_scoped_to_repository_ref() {
+        let db = TestDb::new("ref-freshness-snapshots");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let old = sample_file_at("old-file", "src/lib.rs", "hash-old");
+        let current = sample_file_at("current-file", "src/lib.rs", "hash-current");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(&feature.id, &old, &[], &[], &[], &[])
+            .expect("old ref snapshot should persist");
+        store.sync_repository_ref(&main).expect("main should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(&main.id, &current, &[], &[], &[], &[])
+            .expect("current ref snapshot should persist");
+
+        let mut repository_hashes = store
+            .indexed_file_freshness_snapshots("repo")
+            .expect("repo snapshots should load")
+            .into_iter()
+            .map(|row| row.content_hash)
+            .collect::<Vec<_>>();
+        repository_hashes.sort();
+        assert_eq!(
+            repository_hashes,
+            vec!["hash-current".to_owned(), "hash-old".to_owned()]
+        );
+        assert_eq!(
+            store
+                .indexed_file_freshness_snapshots_for_ref("repo", &main.id)
+                .expect("ref snapshots should load")
+                .into_iter()
+                .map(|row| row.content_hash)
+                .collect::<Vec<_>>(),
+            vec!["hash-current".to_owned()]
         );
     }
 
