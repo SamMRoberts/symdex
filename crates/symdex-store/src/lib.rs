@@ -57,6 +57,7 @@ impl SqliteStore {
         if let Some(parent) = sqlite_parent(config) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
+        let initialize_wal = !config.sqlite_path.exists();
         let connection = Connection::open(&config.sqlite_path).map_err(StoreError::Sqlite)?;
         connection
             .busy_timeout(Duration::from_secs(30))
@@ -64,13 +65,15 @@ impl SqliteStore {
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(StoreError::Sqlite)?;
+        if initialize_wal {
+            connection
+                .execute_batch("PRAGMA journal_mode = WAL;")
+                .map_err(StoreError::Sqlite)?;
+        }
         Ok(Self { connection })
     }
 
     pub fn migrate(&self) -> Result<()> {
-        self.connection
-            .execute_batch("PRAGMA journal_mode = WAL;")
-            .map_err(StoreError::Sqlite)?;
         self.connection
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;
@@ -7569,7 +7572,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use rusqlite::params;
+    use rusqlite::{Connection, params};
     use symdex_core::{
         RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
     };
@@ -7630,6 +7633,41 @@ mod tests {
             .health_check()
             .expect("sqlite-vec should report a version");
         assert!(version.starts_with("v"));
+    }
+
+    #[test]
+    fn sqlite_open_initializes_new_database_in_wal_mode() {
+        let db = TestDb::new("sqlite-new-wal");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+
+        let journal_mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode should be readable");
+
+        assert_eq!(journal_mode, "wal");
+    }
+
+    #[test]
+    fn sqlite_open_existing_database_does_not_change_journal_mode() {
+        let db = TestDb::new("sqlite-existing-journal");
+        let config = db.config();
+        let connection = Connection::open(&config.sqlite_path).expect("raw database should open");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 CREATE TABLE existing_table (id INTEGER PRIMARY KEY);",
+            )
+            .expect("raw database should be initialized");
+        drop(connection);
+
+        let store = SqliteStore::open(&config).expect("store should open");
+        let journal_mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode should be readable");
+
+        assert_eq!(journal_mode, "delete");
     }
 
     #[test]

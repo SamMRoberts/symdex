@@ -129,9 +129,10 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   freshness, including pending, running, failed, stale, excluded, embedded, and
   fallback status. Quality progress is scoped to the latest current fast
   embeddings, so terminal jobs for superseded file snapshots do not block
-  readiness. SQLite store connections use WAL mode plus a 30-second busy timeout
-  so diagnostics, TUI refreshes, MCP calls, and watcher catch-up can overlap
-  normal local reads and writes.
+  readiness. New SQLite databases are initialized in WAL mode and store
+  connections use a 30-second busy timeout so diagnostics, TUI refreshes, MCP
+  calls, and watcher catch-up can overlap normal local reads and writes without
+  changing journal mode during routine migrations.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, TypeScript, TOML,
   YAML, and scoped opt-in JSON files,
   applies built-in excludes and scoped glob-aware `.gitignore` rules with
