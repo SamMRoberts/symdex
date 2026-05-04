@@ -146,7 +146,9 @@ Current implementation status:
   prints status. Watchers are client-scoped, so this command alone does not make
   a permanent daemon; without a live TUI, MCP server, or foreground watcher the
   daemon exits after about 10 seconds. `symdex watch status <repo>` reads shared
-  SQLite watcher state. `symdex watch stop <repo>` asks the daemon to stop.
+  SQLite watcher state without running migrations or pruning stale client rows,
+  keeping status polling read-only while the watcher writes index updates.
+  `symdex watch stop <repo>` asks the daemon to stop.
 - `symdex index --watch <repo>` remains a foreground watch loop, but it refuses
   to run while a background or foreground watcher is already active.
 - `symdex serve-mcp --watch <repo>` starts or attaches the single background

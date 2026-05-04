@@ -132,7 +132,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   readiness. New SQLite databases are initialized in WAL mode and store
   connections use a 30-second busy timeout so diagnostics, TUI refreshes, MCP
   calls, and watcher catch-up can overlap normal local reads and writes without
-  changing journal mode during routine migrations.
+  changing journal mode during routine migrations. TUI status refreshes and
+  watcher status polling avoid schema migrations in their read paths while
+  continuous indexing is active.
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, TypeScript, TOML,
   YAML, and scoped opt-in JSON files,
   applies built-in excludes and scoped glob-aware `.gitignore` rules with

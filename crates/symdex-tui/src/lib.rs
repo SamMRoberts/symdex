@@ -3065,7 +3065,6 @@ fn collect_status_refresh(
 ) -> Result<StatusRefreshSnapshot, String> {
     let store_config = StoreConfig::from_env();
     let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
     let status = sqlite
         .repository_status(repository_id)
         .map_err(|error| error.to_string())?;

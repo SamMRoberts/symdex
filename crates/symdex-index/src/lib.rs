@@ -666,7 +666,6 @@ fn continuous_quality_state(
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
     let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
     let Some(routing) = sqlite
         .semantic_routing_summary(root.id())
         .map_err(|error| error.to_string())?

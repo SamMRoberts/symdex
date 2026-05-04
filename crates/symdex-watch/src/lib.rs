@@ -315,7 +315,7 @@ pub fn stop_daemon(repo: &str) -> Result<WatcherStatus, String> {
 }
 
 pub fn status(repo: &str) -> Result<WatcherStatus, String> {
-    let root = open_repo_and_migrate(repo)?;
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     status_for_root(&root)
 }
 
@@ -517,7 +517,6 @@ fn open_store() -> Result<SqliteStore, String> {
 
 fn status_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
     let store = open_store()?;
-    prune_stale_clients(&store, root.id())?;
     let mut status = store
         .watcher_status(root.id())
         .map_err(|error| error.to_string())?
@@ -532,9 +531,15 @@ fn attach_clients(
     repository_id: &str,
     status: &mut WatcherStatus,
 ) -> Result<(), String> {
+    let stale_before = timestamp_minus(HEARTBEAT_STALE_SECONDS)
+        .parse::<u64>()
+        .unwrap_or(0);
     let clients = store
         .watcher_clients(repository_id)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|client| watcher_client_is_live(client, stale_before))
+        .collect::<Vec<_>>();
     status.attached_clients = clients.len();
     status.client_kinds = clients
         .iter()
@@ -559,6 +564,15 @@ fn attach_clients(
         None
     };
     Ok(())
+}
+
+fn watcher_client_is_live(client: &WatcherClientRecord, stale_before: u64) -> bool {
+    client
+        .heartbeat_at
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|heartbeat| heartbeat >= stale_before)
+        .unwrap_or(true)
 }
 
 fn wait_for_stopped(root: &RepoRoot) -> Result<(), String> {
@@ -866,8 +880,9 @@ mod tests {
     use super::{
         HEARTBEAT_STALE_SECONDS, NO_CLIENT_GRACE, WatcherStatus,
         clients_allow_continuing_with_count, heartbeat_is_stale, timestamp_minus,
-        watcher_endpoint_name,
+        watcher_client_is_live, watcher_endpoint_name,
     };
+    use symdex_store::WatcherClientRecord;
 
     #[test]
     fn stale_heartbeat_marks_active_status_stale() {
@@ -920,6 +935,21 @@ mod tests {
     }
 
     #[test]
+    fn stale_clients_are_hidden_from_read_only_status() {
+        let stale_before = 100;
+        let mut client = sample_client();
+
+        client.heartbeat_at = Some("99".to_owned());
+        assert!(!watcher_client_is_live(&client, stale_before));
+
+        client.heartbeat_at = Some("100".to_owned());
+        assert!(watcher_client_is_live(&client, stale_before));
+
+        client.heartbeat_at = None;
+        assert!(watcher_client_is_live(&client, stale_before));
+    }
+
+    #[test]
     fn watcher_endpoint_name_is_deterministic_and_namespaced() {
         assert_eq!(watcher_endpoint_name("repo/id"), "symdex-watch-repo_id");
         assert_eq!(
@@ -968,6 +998,18 @@ mod tests {
             quality_running_jobs: 0,
             quality_failed_jobs: 0,
             quality_stale_jobs: 0,
+        }
+    }
+
+    fn sample_client() -> WatcherClientRecord {
+        WatcherClientRecord {
+            repository_id: "repo".to_owned(),
+            client_id: "tui-1".to_owned(),
+            client_kind: "tui".to_owned(),
+            pid: Some(1),
+            started_at: Some("1".to_owned()),
+            heartbeat_at: Some("100".to_owned()),
+            last_seen_at: Some("100".to_owned()),
         }
     }
 }
