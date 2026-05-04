@@ -1,10 +1,15 @@
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
 
-use crate::{CoreError, FileFacts, Language, RepoRoot, Result, content_hash, stable_id};
+use crate::{
+    CoreError, FileFacts, Language, NormalizedRepoPath, RepoRoot, Result, content_hash, stable_id,
+};
+
+const JSON_INCLUDE_PATHS_ENV: &str = "SYMDEX_INDEX_JSON_PATHS";
 
 const BUILT_IN_EXCLUDED_DIRS: &[&str] = &[
     ".git",
@@ -21,13 +26,30 @@ const BUILT_IN_EXCLUDED_DIRS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct DiscoveryOptions {
     pub respect_gitignore: bool,
+    pub json_include_roots: Vec<String>,
 }
 
 impl Default for DiscoveryOptions {
     fn default() -> Self {
         Self {
             respect_gitignore: true,
+            json_include_roots: Vec::new(),
         }
+    }
+}
+
+impl DiscoveryOptions {
+    pub fn from_env() -> Self {
+        let mut options = Self::default();
+        if let Ok(value) = env::var(JSON_INCLUDE_PATHS_ENV) {
+            options.json_include_roots = parse_json_include_roots(&value);
+        }
+        options
+    }
+
+    pub fn with_json_include_roots(mut self, value: &str) -> Self {
+        self.json_include_roots = parse_json_include_roots(value);
+        self
     }
 }
 
@@ -47,7 +69,13 @@ pub fn discover_indexable_files(
         IgnoreRules::default()
     };
     let mut files = Vec::new();
-    visit_dir(root, root.path(), &ignore_rules, &mut files)?;
+    visit_dir(
+        root,
+        root.path(),
+        &ignore_rules,
+        &options.json_include_roots,
+        &mut files,
+    )?;
     files.sort_by(|left, right| left.facts.relative_path.cmp(&right.facts.relative_path));
     Ok(files)
 }
@@ -68,6 +96,7 @@ fn visit_dir(
     root: &RepoRoot,
     dir: &Path,
     ignore_rules: &IgnoreRules,
+    json_include_roots: &[String],
     files: &mut Vec<DiscoveredFile>,
 ) -> Result<()> {
     let ignore_rules = ignore_rules.extend_from_gitignore(root, dir)?;
@@ -92,7 +121,7 @@ fn visit_dir(
                 continue;
             }
             root.normalize_existing_path(&path)?;
-            visit_dir(root, &path, &ignore_rules, files)?;
+            visit_dir(root, &path, &ignore_rules, json_include_roots, files)?;
             continue;
         }
 
@@ -111,6 +140,11 @@ fn visit_dir(
         if ignore_rules.matches_file(relative.as_str()) {
             continue;
         }
+        if language == Language::Json
+            && !json_path_is_enabled(relative.as_str(), json_include_roots)
+        {
+            continue;
+        }
 
         let bytes = fs::read(&path).map_err(|source| CoreError::io("read file", &path, source))?;
         let hash = content_hash(&bytes);
@@ -127,6 +161,41 @@ fn visit_dir(
         });
     }
     Ok(())
+}
+
+fn parse_json_include_roots(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(|entry| normalize_json_include_root(entry.trim()))
+        .collect()
+}
+
+fn normalize_json_include_root(entry: &str) -> Option<String> {
+    let raw = entry.trim();
+    if raw.starts_with('/') || raw.contains(':') {
+        return None;
+    }
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_current = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    if without_current == "." {
+        return Some(String::new());
+    }
+    NormalizedRepoPath::new(without_current)
+        .ok()
+        .map(|path| path.as_str().to_owned())
+}
+
+fn json_path_is_enabled(relative_path: &str, include_roots: &[String]) -> bool {
+    include_roots.iter().any(|root| {
+        root.is_empty()
+            || relative_path == root
+            || relative_path
+                .strip_prefix(root.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -323,6 +392,10 @@ mod tests {
         let repo = TestRepo::new("active-languages");
         repo.write("src/lib.rs", "pub fn lib() {}\n");
         repo.write("src/Program.cs", "class Program { void Run() {} }\n");
+        repo.write("Cargo.toml", "[package]\nname = \"demo\"\n");
+        repo.write(".github/workflows/ci.yml", "name: ci\n");
+        repo.write("config/app.yaml", "service: app\n");
+        repo.write("config/app.json", "{\"service\":\"app\"}\n");
         repo.write("web/app.jsx", "function App() { return null; }\n");
         repo.write("web/util.ts", "export function util(): void {}\n");
         repo.write("README.md", "# ignored\n");
@@ -338,11 +411,75 @@ mod tests {
         assert_eq!(
             paths,
             vec![
+                (".github/workflows/ci.yml", Language::Yaml),
+                ("Cargo.toml", Language::Toml),
+                ("config/app.yaml", Language::Yaml),
                 ("src/Program.cs", Language::CSharp),
                 ("src/lib.rs", Language::Rust),
                 ("web/app.jsx", Language::JavaScript),
                 ("web/util.ts", Language::TypeScript),
             ]
+        );
+    }
+
+    #[test]
+    fn scoped_json_discovery_includes_configured_subfolders_only() {
+        let repo = TestRepo::new("scoped-json");
+        repo.write("config/app.json", "{\"service\":\"app\"}\n");
+        repo.write("config/sub/app.json", "{\"service\":\"sub\"}\n");
+        repo.write("config2/app.json", "{\"service\":\"other\"}\n");
+        repo.write("other/app.json", "{\"service\":\"ignored\"}\n");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let files = discover_indexable_files(
+            &root,
+            &DiscoveryOptions::default().with_json_include_roots("config"),
+        )
+        .expect("discovery should succeed");
+
+        let paths: Vec<_> = files
+            .iter()
+            .map(|file| (file.facts.relative_path.as_str(), file.facts.language))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("config/app.json", Language::Json),
+                ("config/sub/app.json", Language::Json),
+                ("src/lib.rs", Language::Rust),
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_json_discovery_respects_gitignore() {
+        let repo = TestRepo::new("scoped-json-ignore");
+        repo.write(".gitignore", "config/ignored.json\n");
+        repo.write("config/app.json", "{\"service\":\"app\"}\n");
+        repo.write("config/ignored.json", "{\"service\":\"ignored\"}\n");
+
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let files = discover_indexable_files(
+            &root,
+            &DiscoveryOptions::default().with_json_include_roots("config"),
+        )
+        .expect("discovery should succeed");
+
+        let paths: Vec<_> = files
+            .iter()
+            .map(|file| file.facts.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["config/app.json"]);
+    }
+
+    #[test]
+    fn scoped_json_include_roots_ignore_invalid_entries() {
+        assert_eq!(
+            super::parse_json_include_roots(
+                "config, ./settings/ ,.,/abs,..,config/../bad,C:\\abs,"
+            ),
+            vec!["config", "settings", ""]
         );
     }
 

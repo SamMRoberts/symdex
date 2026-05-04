@@ -20,6 +20,7 @@ tests/fixtures/
   rust_ignore/
   rust_secrets/
   csharp_basic/
+  config_basic/
   javascript_basic/
   typescript_basic/
 ```
@@ -44,6 +45,9 @@ Fixtures should be tiny and purpose-built.
 - repo-root path enforcement
 - ignored files not indexed
 - likely secrets excluded from embeddings
+- TOML/YAML config files indexed as fallback chunks
+- JSON config files excluded by default and included only under scoped
+  `SYMDEX_INDEX_JSON_PATHS` folders and subfolders
 - MCP tools reject invalid paths
 - TUI navigation and confirmation flows
 - TUI loading, empty, and error states

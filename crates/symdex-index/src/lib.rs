@@ -661,7 +661,14 @@ fn continuous_quality_state(
 }
 
 pub fn watch_snapshot(root: &RepoRoot) -> Result<WatchSnapshot, String> {
-    let files = discover_indexable_files(root, &DiscoveryOptions::default())
+    watch_snapshot_with_options(root, &DiscoveryOptions::from_env())
+}
+
+fn watch_snapshot_with_options(
+    root: &RepoRoot,
+    options: &DiscoveryOptions,
+) -> Result<WatchSnapshot, String> {
+    let files = discover_indexable_files(root, options)
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|file| (file.facts.relative_path, file.facts.content_hash))
@@ -1003,8 +1010,17 @@ fn collect_index_reports(
     sqlite: Option<&SqliteStore>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<IndexCollection, String> {
-    let files = discover_indexable_files(root, &DiscoveryOptions::default())
-        .map_err(|error| error.to_string())?;
+    collect_index_reports_with_options(root, sqlite, &DiscoveryOptions::from_env(), on_progress)
+}
+
+fn collect_index_reports_with_options(
+    root: &RepoRoot,
+    sqlite: Option<&SqliteStore>,
+    discovery_options: &DiscoveryOptions,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<IndexCollection, String> {
+    let files =
+        discover_indexable_files(root, discovery_options).map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
         "discover",
         0,
@@ -2814,8 +2830,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
-        ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
-        ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
+        ByteRange, CallEdge, ChunkKind, CodeChunk, DiscoveryOptions, FileFacts, Language,
+        LineRange, RepoRoot, ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
     use symdex_embed::{LayeredEmbedConfig, LayeredEmbedConfigValues};
     use symdex_store::{
@@ -2827,10 +2843,10 @@ mod tests {
         ContinuousIndexOptions, IndexCollection, IndexReport, IndexScope, QualityJobPreparation,
         RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness,
         WatchSnapshot, apply_embedding_size_limits, chunk_record, chunk_texts,
-        collect_index_reports, detect_watch_changes, diff_watch_snapshots, index_run_kind,
-        plan_rust_analyzer_enrichment, prepare_quality_job, quality_chunk_embedding_record,
-        quality_vector_point, resolve_cross_file_rust_calls,
-        should_run_continuous_quality_catch_up, watch_snapshot,
+        collect_index_reports, collect_index_reports_with_options, detect_watch_changes,
+        diff_watch_snapshots, index_run_kind, plan_rust_analyzer_enrichment, prepare_quality_job,
+        quality_chunk_embedding_record, quality_vector_point, resolve_cross_file_rust_calls,
+        should_run_continuous_quality_catch_up, watch_snapshot, watch_snapshot_with_options,
     };
 
     #[test]
@@ -3102,6 +3118,45 @@ mod tests {
     }
 
     #[test]
+    fn watch_snapshot_tracks_default_config_files() {
+        let repo = TestRepo::new("watch-config");
+        repo.write("Cargo.toml", "[package]\nname = \"old\"\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let snapshot = watch_snapshot(&root).expect("snapshot should load");
+
+        repo.write("Cargo.toml", "[package]\nname = \"new\"\n");
+        repo.write("config/app.yaml", "service: app\n");
+        let (_next, changes) =
+            detect_watch_changes(&root, &snapshot).expect("changes should detect");
+
+        assert_eq!(changes.created, vec!["config/app.yaml"]);
+        assert_eq!(changes.modified, vec!["Cargo.toml"]);
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn watch_snapshot_tracks_scoped_json_with_options() {
+        let repo = TestRepo::new("watch-scoped-json");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let options = DiscoveryOptions::default().with_json_include_roots("config");
+        let snapshot = watch_snapshot_with_options(&root, &options).expect("snapshot should load");
+
+        repo.write("config/app.json", "{\"service\":\"app\"}\n");
+        repo.write("config/sub/app.json", "{\"service\":\"sub\"}\n");
+        repo.write("config2/app.json", "{\"service\":\"other\"}\n");
+        let next = watch_snapshot_with_options(&root, &options).expect("snapshot should reload");
+        let changes = diff_watch_snapshots(&snapshot, &next);
+
+        assert_eq!(
+            changes.created,
+            vec!["config/app.json", "config/sub/app.json"]
+        );
+        assert!(changes.modified.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
     fn detect_watch_changes_skips_ignored_unsupported_and_unchanged_files() {
         let repo = TestRepo::new("watch-ignored-unchanged");
         repo.write(".gitignore", "ignored.rs\nignored_dir/\n");
@@ -3212,6 +3267,36 @@ mod tests {
         assert!(!collection.reports[0].parse_diagnostics.is_empty());
         let summaries = super::file_summaries(&collection.reports);
         assert!(!summaries[0].parse_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn index_collection_indexes_default_config_files_without_json() {
+        let repo = TestRepo::new("config-collection");
+        repo.write("Cargo.toml", "[package]\nname = \"demo\"\n");
+        repo.write(".github/workflows/ci.yml", "name: ci\n");
+        repo.write("config/app.json", "{\"service\":\"app\"}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+
+        let collection = collect_index_reports_with_options(
+            &root,
+            None,
+            &DiscoveryOptions::default(),
+            &mut |_| {},
+        )
+        .expect("collection should index config files");
+
+        let summaries = super::file_summaries(&collection.reports);
+        let paths: Vec<_> = summaries
+            .iter()
+            .map(|summary| summary.path.as_str())
+            .collect();
+        assert_eq!(paths, vec![".github/workflows/ci.yml", "Cargo.toml"]);
+        assert!(summaries.iter().all(|summary| summary.chunks.len() == 1));
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.chunks[0].kind == "file_fallback")
+        );
     }
 
     #[test]

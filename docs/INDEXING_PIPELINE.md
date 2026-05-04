@@ -61,13 +61,27 @@ Active language targets:
 | C# | `.cs` | `tree-sitter-c-sharp` | `csharp` |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | `tree-sitter-javascript` | `javascript` |
 | TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | `tree-sitter-typescript` | `typescript` |
+| TOML config | `.toml` | fallback config chunk | `toml` |
+| YAML config | `.yaml`, `.yml` | fallback config chunk | `yaml` |
+| JSON config | `.json` | fallback config chunk, opt-in by path | `json` |
 
 Rust, C#, JavaScript, and TypeScript are implemented language targets. C#, JS,
 and TS support starts conservatively with syntax-aware function/method chunks,
 symbols, and call-like references; it does not claim whole-language type
-inference. Future languages must be added through the same discovery, parsing,
+inference. TOML and YAML configuration files are indexed as fallback-only
+configuration evidence with no symbols, calls, tests, or tree-sitter parse
+diagnostics. JSON configuration files are disabled by default and are indexed
+only when `SYMDEX_INDEX_JSON_PATHS` contains a matching repo-relative folder
+scope. Future languages must be added through the same discovery, parsing,
 chunking, symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec,
 manual indexing, and continuous indexing contracts.
+
+`SYMDEX_INDEX_JSON_PATHS` is an optional comma-separated list of repo-relative
+directory scopes for JSON indexing, such as `config,.vscode,packages/app`.
+Configured scopes include subfolders, use path-boundary matching, and keep the
+same root-boundary, symlink, built-in exclude, and `.gitignore` behavior as
+other discovered files. Use `.` only when all repository JSON should be indexed
+explicitly.
 
 Current implementation applies built-in directory excludes and scoped
 `.gitignore` rules from the repository root and nested directories. Rules are
@@ -106,6 +120,8 @@ Rust structural chunks for `struct`, `enum`, `union`, `type`, `trait`, and
 nominal types, and traits use `type_definition` chunks. Trait impl summaries
 preserve both sides of the implementation, for example `impl Runnable for Mode`.
 A file fallback chunk is emitted only when no better chunkable unit exists.
+Configuration files always use this fallback chunk strategy because they are
+semantic configuration evidence rather than syntax-aware code evidence.
 Files with tree-sitter syntax errors produce partial chunks where possible and
 return metadata-only parse diagnostics with line and byte ranges instead of
 failing the whole index run.

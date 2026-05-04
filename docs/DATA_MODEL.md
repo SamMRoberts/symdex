@@ -150,9 +150,11 @@ lookups fast. Older local databases with the legacy `(repository_id, path)`
 unique constraint are migrated to the snapshot shape during `migrate`.
 
 `language` stores a stable language slug such as `rust`, `csharp`,
-`javascript`, or `typescript`. The schema is intentionally language-neutral; no
-table change is required when adding C#, JavaScript, TypeScript, or future
-languages that follow the same evidence contracts.
+`javascript`, `typescript`, `toml`, `yaml`, or `json`. The schema is
+intentionally language-neutral; no table change is required when adding C#,
+JavaScript, TypeScript, fallback-only configuration formats, or future languages
+that follow the same evidence contracts. Configuration chunks use nullable
+`symbol_id` fields because they do not emit code symbols.
 
 ### `symbols`
 

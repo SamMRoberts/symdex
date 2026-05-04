@@ -125,7 +125,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   service checks, auto-detected or explicitly overridden rust-analyzer
   enrichment readiness, the active MCP evidence contract version, and repo-specific index
   freshness/provenance readiness when a repo path is provided.
-- `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
+- `index <repo>`: discovers eligible Rust, C#, JavaScript, TypeScript, TOML,
+  YAML, and scoped opt-in JSON files,
   applies built-in excludes and scoped glob-aware `.gitignore` rules with
   negation, hashes file contents, extracts tree-sitter function and method chunks where supported,
   embeds chunk text with local Ollama, creates the sqlite-vec collection if needed,
@@ -136,13 +137,18 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   accepts `--full` or `--incremental`. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
   metadata, and omitted from Ollama/sqlite-vec embedding.
+  JSON indexing is disabled by default; set `SYMDEX_INDEX_JSON_PATHS` to a
+  comma-separated list of repo-relative folders, such as
+  `SYMDEX_INDEX_JSON_PATHS=config,.vscode`, to include matching `.json` files in
+  those folders and subfolders.
   When rust-analyzer enrichment is auto-detected or explicitly enabled, index
   output also reports readiness and eligible Rust file, symbol, and call counts
   without applying rust-analyzer facts.
 - `watch start|status|stop <repo>`: manages the single background watcher for a
   repository. Watchers are client-scoped: TUI, MCP, and CLI attachments keep
   them alive, and they exit after about 10 seconds with no live clients. The
-  watcher polls local eligible Rust, C#, JavaScript, and TypeScript files,
+  watcher polls local eligible Rust, C#, JavaScript, TypeScript, TOML, YAML, and
+  scoped opt-in JSON files,
   debounces event bursts, detects created/modified/deleted paths by content-hash
   snapshots, and reindexes changed content through the incremental semantic
   indexing path.

@@ -10,6 +10,7 @@ The indexed repository may contain:
 - malicious files
 - symlinks escaping the root
 - generated code too large for useful indexing
+- configuration files that may contain credentials or deployment settings
 
 The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 
@@ -25,6 +26,7 @@ The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 - No mutation tools in MVP.
 - Continuous indexing must enforce the same local-only, path-boundary,
   symlink, ignore, and secret-filtering rules as manual indexing.
+- JSON configuration indexing is disabled by default. Enable it only with repo-relative `SYMDEX_INDEX_JSON_PATHS` folder scopes. TOML and YAML config files are indexed by default but still pass through the same ignore and secret exclusion rules as source files.
 
 Optional rust-analyzer integration auto-detects the configured command,
 defaulting to `rust-analyzer`, and disables itself when the command is missing.

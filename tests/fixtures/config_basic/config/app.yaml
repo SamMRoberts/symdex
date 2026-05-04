@@ -1,0 +1,2 @@
+service: config-basic
+port: 8080

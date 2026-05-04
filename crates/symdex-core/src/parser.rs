@@ -21,6 +21,10 @@ pub fn index_rust_file(file: &FileFacts, source: &str) -> Result<SourceFileIndex
 }
 
 pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileIndex> {
+    if file.language.is_config() {
+        return Ok(index_config_file(file, source));
+    }
+
     let mut parser = Parser::new();
     set_parser_language(&mut parser, file.language, is_tsx_path(&file.relative_path))?;
 
@@ -103,6 +107,21 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
         parse_diagnostics,
         tests,
     })
+}
+
+fn index_config_file(file: &FileFacts, source: &str) -> SourceFileIndex {
+    let chunks = if source.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![file_fallback_chunk(file, source)]
+    };
+    SourceFileIndex {
+        chunks,
+        symbols: Vec::new(),
+        calls: Vec::new(),
+        parse_diagnostics: Vec::new(),
+        tests: Vec::new(),
+    }
 }
 
 fn collect_parse_diagnostics(root: Node<'_>) -> Vec<ParseDiagnostic> {
@@ -189,6 +208,11 @@ fn set_parser_language(parser: &mut Parser, language: Language, tsx: bool) -> Re
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::TypeScript if tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Json | Language::Toml | Language::Yaml => {
+            return Err(CoreError::ParserLanguage {
+                message: "configuration files use fallback indexing".to_owned(),
+            });
+        }
     };
     parser
         .set_language(&grammar)
@@ -1543,6 +1567,7 @@ fn is_call_expression(language: Language, node: Node<'_>) -> bool {
         Language::JavaScript | Language::Rust | Language::TypeScript => {
             node.kind() == "call_expression"
         }
+        _ => false,
     }
 }
 
@@ -1655,6 +1680,33 @@ impl Counter {
         assert_eq!(chunks[0].kind, ChunkKind::FileFallback);
         assert_eq!(chunks[0].line_range.start, 1);
         assert_eq!(chunks[0].line_range.end, 1);
+    }
+
+    #[test]
+    fn indexes_config_files_as_fallback_chunks_without_symbols() {
+        let file = file_with_language("Cargo.toml", Language::Toml);
+        let source = "[package]\nname = \"demo\"\n";
+
+        let index = index_source_file(&file, source).expect("config should index");
+
+        assert_eq!(index.chunks.len(), 1);
+        assert_eq!(index.chunks[0].kind, ChunkKind::FileFallback);
+        assert_eq!(index.chunks[0].line_range.start, 1);
+        assert_eq!(index.chunks[0].line_range.end, 2);
+        assert!(index.symbols.is_empty());
+        assert!(index.calls.is_empty());
+        assert!(index.tests.is_empty());
+        assert!(index.parse_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn skips_empty_config_chunks() {
+        let file = file_with_language("config/app.yaml", Language::Yaml);
+
+        let index = index_source_file(&file, "\n  \n").expect("config should index");
+
+        assert!(index.chunks.is_empty());
+        assert!(index.symbols.is_empty());
     }
 
     #[test]

@@ -141,27 +141,36 @@ impl SemanticLayerStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     CSharp,
+    Json,
     JavaScript,
     Rust,
+    Toml,
     TypeScript,
+    Yaml,
 }
 
 impl Language {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CSharp => "csharp",
+            Self::Json => "json",
             Self::JavaScript => "javascript",
             Self::Rust => "rust",
+            Self::Toml => "toml",
             Self::TypeScript => "typescript",
+            Self::Yaml => "yaml",
         }
     }
 
     pub fn from_extension(extension: &str) -> Option<Self> {
         match extension {
             "cs" => Some(Self::CSharp),
+            "json" => Some(Self::Json),
             "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
             "rs" => Some(Self::Rust),
+            "toml" => Some(Self::Toml),
             "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "yaml" | "yml" => Some(Self::Yaml),
             _ => None,
         }
     }
@@ -169,10 +178,17 @@ impl Language {
     pub fn parser_version(self) -> &'static str {
         match self {
             Self::CSharp => crate::CSHARP_PARSER_VERSION,
+            Self::Json => crate::JSON_CONFIG_PARSER_VERSION,
             Self::JavaScript => crate::JAVASCRIPT_PARSER_VERSION,
             Self::Rust => crate::RUST_PARSER_VERSION,
+            Self::Toml => crate::TOML_CONFIG_PARSER_VERSION,
             Self::TypeScript => crate::TYPESCRIPT_PARSER_VERSION,
+            Self::Yaml => crate::YAML_CONFIG_PARSER_VERSION,
         }
+    }
+
+    pub fn is_config(self) -> bool {
+        matches!(self, Self::Json | Self::Toml | Self::Yaml)
     }
 }
 
