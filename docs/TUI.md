@@ -187,6 +187,8 @@ Phase 10.5 implementation status:
 - In the Storage view, always show a self-contained storage tab header above
   the active storage visualization so users can see every storage subview
   without relying on footer help.
+- In the Storage view, provide a confirmed keyboard action to repair stale,
+  deleted, or missing evidence rows by running semantic incremental indexing.
 - In the Storage view, `Tab` and `Shift+Tab` cycle between storage overview,
   index coverage, symbol outline, call resolution, embedding coverage, index
   runs timeline, evidence freshness, semantic neighborhood payload, and
@@ -283,6 +285,8 @@ represent the indexed repository.
   provenance details.
 - Include content hash, index run ID, parser version, and indexed timestamp
   without showing source text.
+- Pressing `f` from the Storage view switches to a confirmation for semantic
+  incremental indexing when stale, deleted, or missing evidence rows are present.
 
 ### Index Coverage View
 

@@ -241,7 +241,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   storage
   explorer always shows its own nested tab header for storage overview/index
   coverage/symbol outline/call resolution/embedding coverage/index runs
-  timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
+  timeline/evidence freshness/semantic neighborhood/cross-store health. Use `f`
+  in Storage to confirm semantic incremental indexing for stale evidence, `r`
   outside the Doctor tab to refresh repository/storage status, and `q` or `Esc`
   to quit.
 - `serve-mcp [--watch <repo>]`: runs the MCP server over stdio. With

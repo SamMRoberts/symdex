@@ -747,6 +747,9 @@ impl App {
                     next_selection(self.storage.selection, self.storage_row_count());
                 self.message = "Storage row selection moved.".to_owned();
             }
+            KeyCode::Char('f') if self.view == View::Storage => {
+                self.request_stale_evidence_repair();
+            }
             KeyCode::Up if self.view == View::Diagnostics && self.diagnostics_row_count() > 0 => {
                 self.diagnostics_selection =
                     previous_selection(self.diagnostics_selection, self.diagnostics_row_count());
@@ -884,6 +887,52 @@ impl App {
             mode,
             scope: self.index_scope,
         }
+    }
+
+    fn repairable_freshness_count(&self) -> Option<usize> {
+        match &self.storage.freshness {
+            FreshnessStatus::Completed(summary) => Some(
+                summary.count(EvidenceFreshness::Stale)
+                    + summary.count(EvidenceFreshness::Deleted)
+                    + summary.count(EvidenceFreshness::Missing),
+            ),
+            FreshnessStatus::Failed(_) => None,
+        }
+    }
+
+    fn request_stale_evidence_repair(&mut self) {
+        if !self.screen.accepts_new_index_request() {
+            self.message =
+                "Dismiss or finish the current indexing job before fixing stale evidence."
+                    .to_owned();
+            return;
+        }
+
+        let Some(repairable_rows) = self.repairable_freshness_count() else {
+            self.storage.mode = StorageMode::Freshness;
+            self.storage.selection = 0;
+            self.message =
+                "Freshness status is unavailable; press r to refresh storage first.".to_owned();
+            return;
+        };
+
+        self.storage.mode = StorageMode::Freshness;
+        self.storage.selection = 0;
+        if repairable_rows == 0 {
+            self.message = "No stale, deleted, or missing evidence rows need repair.".to_owned();
+            return;
+        }
+
+        let request = ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Incremental,
+        };
+        self.index_scope = IndexScope::Incremental;
+        self.view = View::Indexing;
+        self.screen = reduce_screen(self.screen, UiAction::RequestIndex(request));
+        self.message = format!(
+            "Confirm semantic incremental indexing to repair {repairable_rows} stale evidence rows."
+        );
     }
 
     fn select_primary_tab(&mut self, reverse: bool) {
@@ -1316,10 +1365,9 @@ impl App {
                 self.last_index_summary = Some(*summary);
                 self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
-                if self.start_status_refresh(
-                    StatusRefreshScope::Index,
-                    Some(completed_message.clone()),
-                ) {
+                if self
+                    .start_status_refresh(StatusRefreshScope::Full, Some(completed_message.clone()))
+                {
                     self.last_index_status_refresh = Some(Instant::now());
                 } else {
                     self.message = completed_message;
@@ -6161,6 +6209,7 @@ impl View {
                 ("[ ]", "tabs"),
                 ("Tab", "storage view"),
                 ("Up/Down", "select"),
+                ("f", "fix stale"),
                 ("r", "refresh"),
                 ("q", "quit"),
             ],
@@ -7084,6 +7133,73 @@ mod tests {
         assert!(rendered.contains("Selected"));
         assert!(rendered.contains("SQLite / files"));
         assert!(rendered.contains("Indexed file rows in SQLite."));
+    }
+
+    #[test]
+    fn storage_fix_stale_requests_confirmed_incremental_semantic_index() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+        app.storage.mode = StorageMode::Explorer;
+        app.index_scope = IndexScope::Full;
+
+        assert!(!app.handle_key(KeyCode::Char('f')));
+
+        assert_eq!(app.view, View::Indexing);
+        assert_eq!(app.storage.mode, StorageMode::Freshness);
+        assert_eq!(app.index_scope, IndexScope::Incremental);
+        assert!(matches!(
+            app.screen,
+            Screen::ConfirmIndex(ManualIndexRequest {
+                mode: IndexMode::Semantic,
+                scope: IndexScope::Incremental,
+            })
+        ));
+        assert!(
+            app.message
+                .contains("Confirm semantic incremental indexing")
+        );
+    }
+
+    #[test]
+    fn storage_fix_stale_reports_when_freshness_is_current() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        let mut freshness = sample_freshness_summary();
+        for file in &mut freshness.files {
+            file.freshness = EvidenceFreshness::Fresh;
+        }
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            freshness,
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+
+        assert!(!app.handle_key(KeyCode::Char('f')));
+
+        assert_eq!(app.view, View::Storage);
+        assert_eq!(app.storage.mode, StorageMode::Freshness);
+        assert!(matches!(app.screen, Screen::Dashboard));
+        assert_eq!(
+            app.message,
+            "No stale, deleted, or missing evidence rows need repair."
+        );
     }
 
     #[test]
