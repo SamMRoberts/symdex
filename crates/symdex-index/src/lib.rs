@@ -876,6 +876,7 @@ fn run_index_internal(
         &root,
         &collection,
         &index_run_id,
+        run_scope.repository_ref_id,
         &mut on_progress,
     ) {
         Ok(persistence) => persistence,
@@ -1549,6 +1550,7 @@ fn persist_structural_index(
     root: &RepoRoot,
     collection: &IndexCollection,
     index_run_id: &str,
+    repository_ref_id: Option<&str>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<PersistenceSummary, String> {
     let mut chunks_indexed = 0usize;
@@ -1596,9 +1598,22 @@ fn persist_structural_index(
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
         calls_indexed += calls.len();
-        sqlite
-            .replace_file_facts_with_tests(&file, &symbols, &chunks, &calls, &tests)
-            .map_err(|error| error.to_string())?;
+        if let Some(repository_ref_id) = repository_ref_id {
+            sqlite
+                .replace_file_facts_for_ref_with_tests(
+                    repository_ref_id,
+                    &file,
+                    &symbols,
+                    &chunks,
+                    &calls,
+                    &tests,
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            sqlite
+                .replace_file_facts_with_tests(&file, &symbols, &chunks, &calls, &tests)
+                .map_err(|error| error.to_string())?;
+        }
         on_progress(IndexProgress::new(
             "sqlite",
             index + 1,
@@ -1607,14 +1622,32 @@ fn persist_structural_index(
         ));
     }
 
-    let files_removed = sqlite
-        .remove_missing_files(root.id(), &collection.active_paths)
-        .map_err(|error| error.to_string())?;
+    let ref_files_removed = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite
+            .remove_missing_ref_files(repository_ref_id, &collection.active_paths)
+            .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let files_removed = if repository_ref_id.is_some() {
+        sqlite
+            .remove_unreferenced_missing_files(root.id(), &collection.active_paths)
+            .map_err(|error| error.to_string())?
+    } else {
+        sqlite
+            .remove_missing_files(root.id(), &collection.active_paths)
+            .map_err(|error| error.to_string())?
+    };
+    let removed_message = if ref_files_removed > 0 {
+        format!("Removed {files_removed} stale files and {ref_files_removed} ref mappings")
+    } else {
+        format!("Removed {files_removed} stale files")
+    };
     on_progress(IndexProgress::new(
         "sqlite",
         collection.reports.len(),
         collection.reports.len(),
-        format!("Removed {files_removed} stale files"),
+        removed_message,
     ));
     Ok(PersistenceSummary {
         files_indexed: collection.reports.len(),

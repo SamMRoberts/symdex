@@ -31,8 +31,11 @@ Before discovery, indexing resolves local repository-ref metadata without
 executing repository code. Attached local branches are recorded by branch name,
 detached HEADs by object ID, unusual refs as `other`, and non-Git repositories
 as a stable `non_git` working-tree ref. This first slice stores the ref metadata
-and attaches it to index-run provenance; branch-specific file manifests and
-semantic routing are planned follow-up work.
+and attaches it to index-run provenance. Indexing also records a `ref_files`
+path manifest for the active ref and removes paths missing from that ref's
+latest discovery result. Repo-wide file facts are removed only when no remaining
+ref manifest points at them. Query routing and semantic generation selection
+remain repo-wide until the later branch snapshot/routing slices.
 
 Respect:
 

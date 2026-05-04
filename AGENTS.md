@@ -93,6 +93,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Keep repository identity separate from local ref identity: `repository_id`
   remains rooted in the canonical repo path, while branch-aware state uses
   explicit repository-ref metadata.
+- Keep active branch file membership in `ref_files`; do not treat repository-wide
+  file facts as sufficient for future branch-scoped query or semantic routing.
 - Hash file contents to skip unchanged work.
 - Keep public APIs boring, explicit, and versionable.
 

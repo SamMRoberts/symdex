@@ -56,6 +56,29 @@ index-run provenance. Local branch refs missing from current Git metadata are
 marked with `deleted_at`; full branch-specific snapshot and vector garbage
 collection is a later branch-aware indexing slice.
 
+### `ref_files`
+
+```sql
+CREATE TABLE ref_files (
+  repository_ref_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  indexed_at TEXT NOT NULL,
+  index_run_id TEXT,
+  PRIMARY KEY(repository_ref_id, path)
+);
+```
+
+`ref_files` records the current file manifest for each local repository ref.
+Indexing upserts a path mapping for each active file it persists and removes
+paths missing from that ref's latest discovery result. Branch-aware cleanup only
+removes repo-wide file facts that are missing from the active discovery result
+and no longer referenced by any remaining ref manifest. This slice still keeps
+the existing repo-wide query behavior intact; later work will make file
+snapshots content-addressed and route query/semantic evidence through the active
+ref manifest.
+
 ### `index_runs`
 
 ```sql
@@ -80,9 +103,10 @@ CREATE TABLE index_runs (
 
 Indexing records a row when a run starts and finalizes it when the run finishes.
 New index runs record `repository_ref_id` when the active local ref is known.
-This is metadata only in the first branch-awareness slice; structural files,
-chunks, symbols, calls, and semantic generations still use the current
-repo-wide view until the branch manifest/snapshot migration lands.
+The current branch-awareness slices record active ref metadata and populate
+`ref_files`. Structural file facts, chunks, symbols, calls, and semantic
+generations still use the repo-wide view until the snapshot and query-routing
+migrations land.
 Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
 Successful semantic runs include the embedding model, vector dimension, and
 embedded chunk count. Semantic runs with no changed embeddable chunks finish as

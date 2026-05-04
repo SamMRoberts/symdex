@@ -2,6 +2,7 @@
 
 mod vector;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -264,6 +265,31 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, tests)
+    }
+
+    pub fn replace_file_facts_for_ref_with_tests(
+        &mut self,
+        repository_ref_id: &str,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(Some(repository_ref_id), file, symbols, chunks, calls, tests)
+    }
+
+    fn replace_file_facts_inner(
+        &mut self,
+        repository_ref_id: Option<&str>,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        let indexed_at = timestamp();
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         transaction
             .execute(
@@ -285,12 +311,35 @@ impl SqliteStore {
                     file.path,
                     file.language,
                     file.content_hash,
-                    timestamp(),
+                    indexed_at,
                     file.index_run_id,
                     file.parser_version
                 ],
             )
             .map_err(StoreError::Sqlite)?;
+        if let Some(repository_ref_id) = repository_ref_id {
+            transaction
+                .execute(
+                    "INSERT INTO ref_files (
+                       repository_ref_id, repository_id, path, file_id, indexed_at, index_run_id
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(repository_ref_id, path) DO UPDATE SET
+                       repository_id = excluded.repository_id,
+                       file_id = excluded.file_id,
+                       indexed_at = excluded.indexed_at,
+                       index_run_id = excluded.index_run_id",
+                    params![
+                        repository_ref_id,
+                        file.repository_id,
+                        file.path,
+                        file.id,
+                        indexed_at,
+                        file.index_run_id,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
         transaction
             .execute(
                 "DELETE FROM calls
@@ -450,14 +499,119 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn ref_file_paths(&self, repository_ref_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path
+                   FROM ref_files
+                  WHERE repository_ref_id = ?1
+                  ORDER BY path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_ref_id], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn remove_missing_ref_files(
+        &mut self,
+        repository_ref_id: &str,
+        active_paths: &[String],
+    ) -> Result<usize> {
+        let existing = self.ref_file_paths(repository_ref_id)?;
+        let active: BTreeSet<&str> = active_paths.iter().map(String::as_str).collect();
+        let missing: Vec<String> = existing
+            .into_iter()
+            .filter(|path| !active.contains(path.as_str()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        for path in &missing {
+            transaction
+                .execute(
+                    "DELETE FROM ref_files
+                      WHERE repository_ref_id = ?1
+                        AND path = ?2",
+                    params![repository_ref_id, path],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(missing.len())
+    }
+
+    pub fn remove_unreferenced_missing_files(
+        &mut self,
+        repository_id: &str,
+        active_paths: &[String],
+    ) -> Result<usize> {
+        let existing = self.file_paths(repository_id)?;
+        let active: BTreeSet<&str> = active_paths.iter().map(String::as_str).collect();
+        let missing: Vec<String> = existing
+            .into_iter()
+            .filter(|path| !active.contains(path.as_str()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let mut removed = 0usize;
+        for path in &missing {
+            let file_id: Option<String> = transaction
+                .query_row(
+                    "SELECT id FROM files WHERE repository_id = ?1 AND path = ?2",
+                    params![repository_id, path],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?;
+            let Some(file_id) = file_id else {
+                continue;
+            };
+            let ref_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM ref_files WHERE file_id = ?1",
+                    params![file_id],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::Sqlite)?;
+            if ref_count > 0 {
+                continue;
+            }
+            transaction
+                .execute(
+                    "DELETE FROM calls
+                     WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                    params![file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
+                .map_err(StoreError::Sqlite)?;
+            removed += transaction
+                .execute(
+                    "DELETE FROM files WHERE repository_id = ?1 AND path = ?2",
+                    params![repository_id, path],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(removed)
+    }
+
     pub fn remove_missing_files(
         &mut self,
         repository_id: &str,
         active_paths: &[String],
     ) -> Result<usize> {
         let existing = self.file_paths(repository_id)?;
-        let active: std::collections::BTreeSet<&str> =
-            active_paths.iter().map(String::as_str).collect();
+        let active: BTreeSet<&str> = active_paths.iter().map(String::as_str).collect();
         let missing: Vec<String> = existing
             .into_iter()
             .filter(|path| !active.contains(path.as_str()))
@@ -5871,6 +6025,25 @@ CREATE INDEX IF NOT EXISTS idx_repository_refs_current
 CREATE INDEX IF NOT EXISTS idx_repository_refs_branch_name
     ON repository_refs(repository_id, ref_kind, ref_name);
 
+CREATE TABLE IF NOT EXISTS ref_files (
+    repository_ref_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    index_run_id TEXT,
+    PRIMARY KEY(repository_ref_id, path),
+    FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE CASCADE,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ref_files_repository_path
+    ON ref_files(repository_id, path);
+
+CREATE INDEX IF NOT EXISTS idx_ref_files_file
+    ON ref_files(file_id);
+
 CREATE TABLE IF NOT EXISTS index_runs (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL,
@@ -6168,7 +6341,7 @@ mod tests {
 
     use rusqlite::params;
     use symdex_core::{
-        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus,
+        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
     };
 
     use crate::{
@@ -6273,6 +6446,103 @@ mod tests {
         assert_eq!(
             current.head_oid.as_deref(),
             Some("fedcba9876543210fedcba9876543210fedcba98")
+        );
+    }
+
+    #[test]
+    fn ref_files_track_paths_per_repository_ref() {
+        let db = TestDb::new("ref-files");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+
+        store.sync_repository_ref(&main).expect("main should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file", "src/lib.rs", "hash-main"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("main file should persist");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file", "src/feature.rs", "hash-feature"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("feature file should persist");
+
+        assert_eq!(
+            store
+                .ref_file_paths(&main.id)
+                .expect("main paths should load"),
+            vec!["src/lib.rs".to_owned()]
+        );
+        assert_eq!(
+            store
+                .ref_file_paths(&feature.id)
+                .expect("feature paths should load"),
+            vec!["src/feature.rs".to_owned()]
+        );
+
+        let removed = store
+            .remove_missing_ref_files(&feature.id, &[])
+            .expect("feature manifest cleanup should run");
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store
+                .ref_file_paths(&main.id)
+                .expect("main paths should remain"),
+            vec!["src/lib.rs".to_owned()]
+        );
+        assert!(
+            store
+                .ref_file_paths(&feature.id)
+                .expect("feature paths should be empty")
+                .is_empty()
+        );
+
+        let removed_files = store
+            .remove_unreferenced_missing_files("repo", &[])
+            .expect("unreferenced file cleanup should run");
+        assert_eq!(removed_files, 1);
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.files_indexed, 1);
+        assert_eq!(
+            store
+                .ref_file_paths(&main.id)
+                .expect("main paths should still remain"),
+            vec!["src/lib.rs".to_owned()]
         );
     }
 
@@ -9163,10 +9433,14 @@ mod tests {
     }
 
     fn sample_file(content_hash: &str) -> FileRecord {
+        sample_file_at("file", "src/lib.rs", content_hash)
+    }
+
+    fn sample_file_at(id: &str, path: &str, content_hash: &str) -> FileRecord {
         FileRecord {
-            id: "file".to_owned(),
+            id: id.to_owned(),
             repository_id: "repo".to_owned(),
-            path: "src/lib.rs".to_owned(),
+            path: path.to_owned(),
             language: "rust".to_owned(),
             content_hash: content_hash.to_owned(),
             index_run_id: "run".to_owned(),
