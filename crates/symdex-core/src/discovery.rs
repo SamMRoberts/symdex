@@ -115,7 +115,7 @@ fn visit_dir(
         let bytes = fs::read(&path).map_err(|source| CoreError::io("read file", &path, source))?;
         let hash = content_hash(&bytes);
         let relative_path = relative.as_str().to_owned();
-        let file_id = stable_id(&[root.id(), &relative_path]);
+        let file_id = stable_id(&[root.id(), &relative_path, &hash]);
         files.push(DiscoveredFile {
             facts: FileFacts {
                 id: file_id,

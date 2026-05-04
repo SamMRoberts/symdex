@@ -2,6 +2,7 @@
 
 mod vector;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -9,7 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use symdex_core::{SemanticLayer, SemanticLayerStatus, stable_id};
+use symdex_core::{
+    RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
+};
 
 pub use vector::{
     PointPayload, RetrievedPoint, ScoredPoint, SqliteVectorStore, VectorPoint, vector_point_id,
@@ -66,7 +69,79 @@ impl SqliteStore {
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;
         self.ensure_compatibility_columns()?;
+        self.ensure_content_addressed_files()?;
         Ok(())
+    }
+
+    fn ensure_content_addressed_files(&self) -> Result<()> {
+        if self.files_has_unique_repository_path_constraint()? {
+            self.connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     BEGIN;
+                     CREATE TABLE files_new (
+                       id TEXT PRIMARY KEY,
+                       repository_id TEXT NOT NULL,
+                       path TEXT NOT NULL,
+                       language TEXT NOT NULL,
+                       content_hash TEXT NOT NULL,
+                       indexed_at TEXT NOT NULL,
+                       index_run_id TEXT,
+                       parser_version TEXT,
+                       FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+                     );
+                     INSERT OR IGNORE INTO files_new (
+                       id, repository_id, path, language, content_hash, indexed_at,
+                       index_run_id, parser_version
+                     )
+                     SELECT id, repository_id, path, language, content_hash, indexed_at,
+                            index_run_id, parser_version
+                       FROM files;
+                     DROP TABLE files;
+                     ALTER TABLE files_new RENAME TO files;
+                     COMMIT;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        self.connection
+            .execute_batch(FILES_CONTENT_ADDRESSING_INDEXES)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn files_has_unique_repository_path_constraint(&self) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA index_list(files)")
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
+            .map_err(StoreError::Sqlite)?;
+        for row in rows {
+            let (index_name, unique) = row.map_err(StoreError::Sqlite)?;
+            if unique == 0 {
+                continue;
+            }
+            if self.index_columns(&index_name)? == ["repository_id", "path"] {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn index_columns(&self, index_name: &str) -> Result<Vec<String>> {
+        let escaped = index_name.replace('"', "\"\"");
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA index_info(\"{escaped}\")"))
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
     }
 
     fn ensure_compatibility_columns(&self) -> Result<()> {
@@ -125,28 +200,152 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn sync_repository_ref(
+        &self,
+        snapshot: &RepositoryRefSnapshot,
+    ) -> Result<RepositoryRefSyncSummary> {
+        let now = timestamp();
+        let current = RepositoryRefRecord::from_snapshot(snapshot, true, &now);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE repository_refs
+                    SET is_current = 0,
+                        updated_at = ?2
+                  WHERE repository_id = ?1",
+                params![snapshot.repository_id, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        for branch in &snapshot.local_branches {
+            let record = RepositoryRefRecord::local_branch(&snapshot.repository_id, branch, &now);
+            upsert_repository_ref_in_transaction(&transaction, &record)?;
+        }
+        upsert_repository_ref_in_transaction(&transaction, &current)?;
+
+        let mut deleted_refs = 0usize;
+        {
+            if !snapshot.local_branches.is_empty() {
+                let active = snapshot
+                    .local_branches
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT id, ref_name
+                           FROM repository_refs
+                          WHERE repository_id = ?1
+                            AND ref_kind = 'branch'
+                            AND deleted_at IS NULL",
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                let rows = statement
+                    .query_map(params![snapshot.repository_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(StoreError::Sqlite)?;
+                for row in rows {
+                    let (id, ref_name) = row.map_err(StoreError::Sqlite)?;
+                    if ref_name
+                        .as_deref()
+                        .is_some_and(|name| !active.contains(name))
+                    {
+                        deleted_refs += transaction
+                            .execute(
+                                "UPDATE repository_refs
+                                    SET deleted_at = ?2,
+                                        is_current = 0,
+                                        updated_at = ?2
+                                  WHERE id = ?1",
+                                params![id, now],
+                            )
+                            .map_err(StoreError::Sqlite)?;
+                    }
+                }
+            }
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(RepositoryRefSyncSummary {
+            current,
+            deleted_refs,
+        })
+    }
+
+    pub fn current_repository_ref(
+        &self,
+        repository_id: &str,
+    ) -> Result<Option<RepositoryRefRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_id, ref_kind, ref_name, ref_identity, head_oid,
+                        is_current, last_seen_at, deleted_at, created_at, updated_at
+                   FROM repository_refs
+                  WHERE repository_id = ?1
+                    AND is_current = 1
+                    AND deleted_at IS NULL
+                  ORDER BY last_seen_at DESC, updated_at DESC, id DESC
+                  LIMIT 1",
+                params![repository_id],
+                repository_ref_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
     pub fn file_unchanged(
         &self,
         repository_id: &str,
+        file_id: &str,
         path: &str,
         content_hash: &str,
         parser_version: &str,
     ) -> Result<bool> {
-        let stored: Option<(String, Option<String>)> = self
+        let unchanged: i64 = self
             .connection
             .query_row(
-                "SELECT content_hash, parser_version FROM files WHERE repository_id = ?1 AND path = ?2",
-                params![repository_id, path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT EXISTS(
+                   SELECT 1
+                     FROM files
+                    WHERE repository_id = ?1
+                      AND id = ?2
+                      AND path = ?3
+                      AND content_hash = ?4
+                      AND parser_version = ?5
+                 )",
+                params![repository_id, file_id, path, content_hash, parser_version],
+                |row| row.get(0),
             )
-            .optional()
             .map_err(StoreError::Sqlite)?;
-        Ok(stored
-            .as_ref()
-            .is_some_and(|(stored_hash, stored_parser_version)| {
-                stored_hash == content_hash
-                    && stored_parser_version.as_deref() == Some(parser_version)
-            }))
+        Ok(unchanged != 0)
+    }
+
+    pub fn link_file_to_ref(&mut self, repository_ref_id: &str, file: &FileRecord) -> Result<()> {
+        let indexed_at = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO ref_files (
+                   repository_ref_id, repository_id, path, file_id, indexed_at, index_run_id
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(repository_ref_id, path) DO UPDATE SET
+                   repository_id = excluded.repository_id,
+                   file_id = excluded.file_id,
+                   indexed_at = excluded.indexed_at,
+                   index_run_id = excluded.index_run_id",
+                params![
+                    repository_ref_id,
+                    file.repository_id,
+                    file.path,
+                    file.id,
+                    indexed_at,
+                    file.index_run_id,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
     }
 
     pub fn replace_file_facts(
@@ -167,6 +366,31 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, tests)
+    }
+
+    pub fn replace_file_facts_for_ref_with_tests(
+        &mut self,
+        repository_ref_id: &str,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(Some(repository_ref_id), file, symbols, chunks, calls, tests)
+    }
+
+    fn replace_file_facts_inner(
+        &mut self,
+        repository_ref_id: Option<&str>,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        let indexed_at = timestamp();
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         transaction
             .execute(
@@ -175,8 +399,9 @@ impl SqliteStore {
                    index_run_id, parser_version
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                  ON CONFLICT(repository_id, path) DO UPDATE SET
-                    id = excluded.id,
+                                    ON CONFLICT(id) DO UPDATE SET
+                                        repository_id = excluded.repository_id,
+                                        path = excluded.path,
                     language = excluded.language,
                     content_hash = excluded.content_hash,
                     indexed_at = excluded.indexed_at,
@@ -188,12 +413,53 @@ impl SqliteStore {
                     file.path,
                     file.language,
                     file.content_hash,
-                    timestamp(),
+                    indexed_at,
                     file.index_run_id,
                     file.parser_version
                 ],
             )
             .map_err(StoreError::Sqlite)?;
+        if let Some(repository_ref_id) = repository_ref_id {
+            transaction
+                .execute(
+                    "INSERT INTO ref_files (
+                       repository_ref_id, repository_id, path, file_id, indexed_at, index_run_id
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(repository_ref_id, path) DO UPDATE SET
+                       repository_id = excluded.repository_id,
+                       file_id = excluded.file_id,
+                       indexed_at = excluded.indexed_at,
+                       index_run_id = excluded.index_run_id",
+                    params![
+                        repository_ref_id,
+                        file.repository_id,
+                        file.path,
+                        file.id,
+                        indexed_at,
+                        file.index_run_id,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        let stale_same_path_file_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id
+                       FROM files
+                      WHERE repository_id = ?1
+                        AND path = ?2
+                        AND id <> ?3
+                      ORDER BY indexed_at, id",
+                )
+                .map_err(StoreError::Sqlite)?;
+            let rows = statement
+                .query_map(params![file.repository_id, file.path, file.id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(StoreError::Sqlite)?;
+            collect_rows(rows)?
+        };
         transaction
             .execute(
                 "DELETE FROM calls
@@ -210,6 +476,51 @@ impl SqliteStore {
         transaction
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file.id])
             .map_err(StoreError::Sqlite)?;
+
+        for stale_file_id in stale_same_path_file_ids {
+            let ref_count: i64 = if repository_ref_id.is_some() {
+                transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM ref_files WHERE file_id = ?1",
+                        params![&stale_file_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(StoreError::Sqlite)?
+            } else {
+                0
+            };
+            if ref_count > 0 {
+                continue;
+            }
+            transaction
+                .execute(
+                    "DELETE FROM calls
+                     WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM tests WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM chunks WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM symbols WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute("DELETE FROM files WHERE id = ?1", params![&stale_file_id])
+                .map_err(StoreError::Sqlite)?;
+        }
 
         {
             let mut statement = transaction
@@ -353,14 +664,29 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn remove_missing_files(
+    pub fn ref_file_paths(&self, repository_ref_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path
+                   FROM ref_files
+                  WHERE repository_ref_id = ?1
+                  ORDER BY path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_ref_id], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn remove_missing_ref_files(
         &mut self,
-        repository_id: &str,
+        repository_ref_id: &str,
         active_paths: &[String],
     ) -> Result<usize> {
-        let existing = self.file_paths(repository_id)?;
-        let active: std::collections::BTreeSet<&str> =
-            active_paths.iter().map(String::as_str).collect();
+        let existing = self.ref_file_paths(repository_ref_id)?;
+        let active: BTreeSet<&str> = active_paths.iter().map(String::as_str).collect();
         let missing: Vec<String> = existing
             .into_iter()
             .filter(|path| !active.contains(path.as_str()))
@@ -371,32 +697,129 @@ impl SqliteStore {
 
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         for path in &missing {
-            let file_id: Option<String> = transaction
-                .query_row(
-                    "SELECT id FROM files WHERE repository_id = ?1 AND path = ?2",
-                    params![repository_id, path],
-                    |row| row.get(0),
+            transaction
+                .execute(
+                    "DELETE FROM ref_files
+                      WHERE repository_ref_id = ?1
+                        AND path = ?2",
+                    params![repository_ref_id, path],
                 )
-                .optional()
                 .map_err(StoreError::Sqlite)?;
-            if let Some(file_id) = file_id {
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(missing.len())
+    }
+
+    pub fn remove_unreferenced_missing_files(
+        &mut self,
+        repository_id: &str,
+        active_paths: &[String],
+    ) -> Result<usize> {
+        let existing = self.file_paths(repository_id)?;
+        let active: BTreeSet<&str> = active_paths.iter().map(String::as_str).collect();
+        let missing: Vec<String> = existing
+            .into_iter()
+            .filter(|path| !active.contains(path.as_str()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let mut removed = 0usize;
+        for path in &missing {
+            let file_ids = {
+                let mut statement = transaction
+                    .prepare("SELECT id FROM files WHERE repository_id = ?1 AND path = ?2")
+                    .map_err(StoreError::Sqlite)?;
+                let rows = statement
+                    .query_map(params![repository_id, path], |row| row.get::<_, String>(0))
+                    .map_err(StoreError::Sqlite)?;
+                collect_rows(rows)?
+            };
+            for file_id in file_ids {
+                let ref_count: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM ref_files WHERE file_id = ?1",
+                        params![&file_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                if ref_count > 0 {
+                    continue;
+                }
+                transaction
+                    .execute(
+                        "DELETE FROM calls
+                     WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                        params![&file_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM tests WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM chunks WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM symbols WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                removed += transaction
+                    .execute("DELETE FROM files WHERE id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(removed)
+    }
+
+    pub fn remove_missing_files(
+        &mut self,
+        repository_id: &str,
+        active_paths: &[String],
+    ) -> Result<usize> {
+        let existing = self.file_paths(repository_id)?;
+        let active: BTreeSet<&str> = active_paths.iter().map(String::as_str).collect();
+        let missing: Vec<String> = existing
+            .into_iter()
+            .filter(|path| !active.contains(path.as_str()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        for path in &missing {
+            let file_ids = {
+                let mut statement = transaction
+                    .prepare("SELECT id FROM files WHERE repository_id = ?1 AND path = ?2")
+                    .map_err(StoreError::Sqlite)?;
+                let rows = statement
+                    .query_map(params![repository_id, path], |row| row.get::<_, String>(0))
+                    .map_err(StoreError::Sqlite)?;
+                collect_rows(rows)?
+            };
+            for file_id in file_ids {
                 transaction
                     .execute(
                         "DELETE FROM calls
                          WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
-                        params![file_id],
+                        params![&file_id],
                     )
                     .map_err(StoreError::Sqlite)?;
                 transaction
-                    .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
+                    .execute("DELETE FROM tests WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM chunks WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM symbols WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM files WHERE id = ?1", params![&file_id])
                     .map_err(StoreError::Sqlite)?;
             }
-            transaction
-                .execute(
-                    "DELETE FROM files WHERE repository_id = ?1 AND path = ?2",
-                    params![repository_id, path],
-                )
-                .map_err(StoreError::Sqlite)?;
         }
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(missing.len())
@@ -463,6 +886,28 @@ impl SqliteStore {
             semantic_layer,
             &missing,
         )
+    }
+
+    pub fn vector_point_ids_referenced_by_ref_files(
+        &self,
+        repository_id: &str,
+        vector_table: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT vector_points.vector_point_id
+                   FROM vector_points
+                   JOIN ref_files ON ref_files.file_id = vector_points.file_id
+                  WHERE vector_points.vector_store = 'sqlite_vec'
+                    AND vector_points.repository_id = ?1
+                    AND vector_points.vector_table = ?2",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, vector_table], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows).map(|rows: Vec<String>| rows.into_iter().collect())
     }
 
     pub fn expected_vector_points_for_generation_layer(
@@ -543,8 +988,19 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         let embedding = self.latest_embedding_run(repository_id)?;
+        let current_ref = self.current_repository_ref(repository_id)?;
         Ok(RepositoryStatus {
             repository_id: repository_id.to_owned(),
+            current_ref_id: current_ref.as_ref().map(|reference| reference.id.clone()),
+            current_ref_kind: current_ref
+                .as_ref()
+                .map(|reference| reference.ref_kind.clone()),
+            current_ref_name: current_ref
+                .as_ref()
+                .and_then(|reference| reference.ref_name.clone()),
+            current_head_oid: current_ref
+                .as_ref()
+                .and_then(|reference| reference.head_oid.clone()),
             files_indexed,
             chunks_indexed,
             symbols_indexed: self.count_joined(repository_id, "symbols")?,
@@ -780,13 +1236,14 @@ impl SqliteStore {
         let now = timestamp();
         self.connection
             .execute(
-                "INSERT INTO index_runs (
-                   id, repository_id, started_at, finished_at, status, embedding_model,
+                                "INSERT INTO index_runs (
+                                     id, repository_id, repository_ref_id, started_at, finished_at, status, embedding_model,
                    embedding_dimension, files_seen, files_indexed, chunks_embedded,
                    error_summary, parser_version, indexer_version, run_kind
                   )
-                  VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                    VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                   ON CONFLICT(id) DO UPDATE SET
+                                        repository_ref_id = excluded.repository_ref_id,
                     started_at = excluded.started_at,
                     finished_at = NULL,
                     status = excluded.status,
@@ -802,6 +1259,7 @@ impl SqliteStore {
                 params![
                     run.id,
                     run.repository_id,
+                    run.repository_ref_id,
                     now,
                     run.status,
                     run.embedding_model,
@@ -823,13 +1281,14 @@ impl SqliteStore {
         let now = timestamp();
         self.connection
             .execute(
-                "INSERT INTO index_runs (
-                   id, repository_id, started_at, finished_at, status, embedding_model,
+                                "INSERT INTO index_runs (
+                                     id, repository_id, repository_ref_id, started_at, finished_at, status, embedding_model,
                    embedding_dimension, files_seen, files_indexed, chunks_embedded,
                    error_summary, parser_version, indexer_version, run_kind
                   )
-                  VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                    VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                   ON CONFLICT(id) DO UPDATE SET
+                                        repository_ref_id = excluded.repository_ref_id,
                     finished_at = excluded.finished_at,
                     status = excluded.status,
                     embedding_model = excluded.embedding_model,
@@ -844,6 +1303,7 @@ impl SqliteStore {
                 params![
                     run.id,
                     run.repository_id,
+                    run.repository_ref_id,
                     now,
                     run.status,
                     run.embedding_model,
@@ -1091,6 +1551,77 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)
     }
 
+    pub fn link_semantic_generation_to_ref(
+        &mut self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        generation_id: &str,
+        linked_at: &str,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO semantic_generation_refs (
+                   repository_ref_id, repository_id, generation_id, linked_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(repository_ref_id) DO UPDATE SET
+                   repository_id = excluded.repository_id,
+                   generation_id = excluded.generation_id,
+                   linked_at = excluded.linked_at",
+                params![repository_ref_id, repository_id, generation_id, linked_at],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn latest_semantic_generation_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Option<SemanticGenerationRecord>> {
+        self.connection
+            .query_row(
+                "SELECT semantic_generations.id, semantic_generations.repository_id,
+                        semantic_generations.fast_model, semantic_generations.fast_dimension,
+                        semantic_generations.fast_completed_at,
+                        semantic_generations.quality_model,
+                        semantic_generations.quality_dimension,
+                        semantic_generations.quality_status,
+                        semantic_generations.quality_started_at,
+                        semantic_generations.quality_completed_at,
+                        semantic_generations.active_layer,
+                        semantic_generations.files_seen,
+                        semantic_generations.embeddable_chunks,
+                        semantic_generations.fast_embedded_chunks,
+                        semantic_generations.quality_embedded_chunks,
+                        semantic_generations.created_at,
+                        semantic_generations.updated_at
+                   FROM semantic_generation_refs
+                   JOIN semantic_generations
+                     ON semantic_generations.id = semantic_generation_refs.generation_id
+                  WHERE semantic_generation_refs.repository_id = ?1
+                    AND semantic_generation_refs.repository_ref_id = ?2
+                  LIMIT 1",
+                params![repository_id, repository_ref_id],
+                semantic_generation_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn semantic_routing_summary_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Option<SemanticRoutingSummary>> {
+        let Some(generation) =
+            self.latest_semantic_generation_for_ref(repository_id, repository_ref_id)?
+        else {
+            return Ok(None);
+        };
+        self.semantic_routing_summary_for_generation(generation)
+    }
+
     pub fn semantic_routing_summary(
         &self,
         repository_id: &str,
@@ -1098,7 +1629,13 @@ impl SqliteStore {
         let Some(generation) = self.latest_semantic_generation(repository_id)? else {
             return Ok(None);
         };
+        self.semantic_routing_summary_for_generation(generation)
+    }
 
+    fn semantic_routing_summary_for_generation(
+        &self,
+        generation: SemanticGenerationRecord,
+    ) -> Result<Option<SemanticRoutingSummary>> {
         let active_layer = SemanticLayer::parse(&generation.active_layer)
             .map_err(|error| StoreError::UnexpectedResponse(error.to_owned()))?;
         let quality_status = SemanticLayerStatus::parse(&generation.quality_status)
@@ -2273,6 +2810,78 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn find_symbols_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        query: &str,
+    ) -> Result<Vec<SymbolSearchRow>> {
+        let like = format!("%{query}%");
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
+                 FROM symbols
+                 JOIN files ON symbols.file_id = files.id
+                 JOIN ref_files ON ref_files.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND ref_files.repository_ref_id = ?2
+                   AND (symbols.name = ?3 OR symbols.qualified_name = ?3
+                        OR symbols.name LIKE ?4 OR symbols.qualified_name LIKE ?4)
+                 ORDER BY
+                   CASE
+                     WHEN symbols.qualified_name = ?3 THEN 0
+                     WHEN symbols.name = ?3 THEN 1
+                     ELSE 2
+                   END,
+                   files.path,
+                   symbols.start_line
+                 LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, query, like],
+                |row| {
+                    Ok(SymbolSearchRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        qualified_name: row.get(2)?,
+                        kind: row.get(3)?,
+                        path: row.get(4)?,
+                        start_line: row.get::<_, i64>(5)? as usize,
+                        end_line: row.get::<_, i64>(6)? as usize,
+                        provenance: EvidenceProvenance {
+                            content_hash: row.get(7)?,
+                            index_run_id: row.get(8)?,
+                            parser_version: row.get(9)?,
+                            indexed_at: row.get(10)?,
+                            embedding_model: None,
+                            embedding_dimension: None,
+                            embedded_at: None,
+                        },
+                    })
+                },
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn repository_has_ref_file_manifests(&self, repository_id: &str) -> Result<bool> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM ref_files WHERE repository_id = ?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(count > 0)
+    }
+
     pub fn file_provenance(
         &self,
         repository_id: &str,
@@ -2411,6 +3020,44 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn callers_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<CallSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
+                        caller.id, caller.name, caller.qualified_name, caller.kind,
+                        caller_files.path, caller.start_line, caller.end_line,
+                        caller_files.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_files.indexed_at
+                  FROM calls
+                  JOIN symbols target ON calls.callee_symbol_id = target.id
+                  JOIN files target_files ON target.file_id = target_files.id
+                  JOIN ref_files target_ref ON target_ref.file_id = target_files.id
+                  JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                  JOIN files caller_files ON caller.file_id = caller_files.id
+                  JOIN ref_files caller_ref ON caller_ref.file_id = caller_files.id
+                 WHERE caller_files.repository_id = ?1
+                   AND target_ref.repository_ref_id = ?2
+                   AND caller_ref.repository_ref_id = ?2
+                   AND (target.id = ?3 OR target.name = ?3 OR target.qualified_name = ?3)
+                 ORDER BY caller_files.path, calls.call_line
+                 LIMIT 50",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, symbol_query],
+                call_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn tests_matching_name(
         &self,
         repository_id: &str,
@@ -2499,6 +3146,46 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn callees_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<CallSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.callee_text, calls.call_line, calls.confidence, calls.resolution_status,
+                        callee.id, callee.name, callee.qualified_name, callee.kind,
+                        caller_files.path, callee.start_line, callee.end_line,
+                        caller_files.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_files.indexed_at
+                  FROM calls
+                  JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                  JOIN files caller_files ON caller.file_id = caller_files.id
+                  JOIN ref_files caller_ref ON caller_ref.file_id = caller_files.id
+                  LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                  LEFT JOIN files callee_files ON callee.file_id = callee_files.id
+                  LEFT JOIN ref_files callee_ref
+                    ON callee_ref.file_id = callee_files.id
+                   AND callee_ref.repository_ref_id = ?2
+                 WHERE caller_files.repository_id = ?1
+                   AND caller_ref.repository_ref_id = ?2
+                   AND (callee.id IS NULL OR callee_ref.repository_ref_id IS NOT NULL)
+                   AND (caller.id = ?3 OR caller.name = ?3 OR caller.qualified_name = ?3)
+                 ORDER BY calls.call_line, calls.callee_text
+                 LIMIT 50",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, symbol_query],
+                call_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn call_paths(
         &self,
         repository_id: &str,
@@ -2514,6 +3201,56 @@ impl SqliteStore {
             .map(|symbol| symbol.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         let edges = self.call_path_edges(repository_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            trace_call_paths(
+                &source.id,
+                max_depth,
+                &TraceContext {
+                    target_query,
+                    target_ids: &target_ids,
+                    edges_by_caller: &edges_by_caller,
+                },
+                &mut visited,
+                &mut stack,
+                &mut paths,
+            );
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
+    pub fn call_paths_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        source_query: &str,
+        target_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let sources =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, source_query)?;
+        let targets =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, target_query)?;
+        let target_ids = targets
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let edges = self.call_path_edges_for_ref(repository_id, repository_ref_id)?;
         let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
         for edge in edges {
             edges_by_caller
@@ -2597,6 +3334,59 @@ impl SqliteStore {
         Ok(paths)
     }
 
+    pub fn transitive_call_paths_to_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        target_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let targets =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, target_query)?;
+        let target_ids = targets
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let sources = self.all_symbol_refs_for_ref(repository_id, repository_ref_id)?;
+        let edges = self.call_path_edges_for_ref(repository_id, repository_ref_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            if target_ids.contains(&source.id) {
+                continue;
+            }
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            let mut source_paths = Vec::new();
+            trace_call_paths(
+                &source.id,
+                max_depth,
+                &TraceContext {
+                    target_query,
+                    target_ids: &target_ids,
+                    edges_by_caller: &edges_by_caller,
+                },
+                &mut visited,
+                &mut stack,
+                &mut source_paths,
+            );
+            paths.extend(source_paths.into_iter().filter(|path| path.hops > 1));
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
     pub fn transitive_call_paths_from(
         &self,
         repository_id: &str,
@@ -2606,6 +3396,45 @@ impl SqliteStore {
         let max_depth = clamp_call_path_depth(max_depth);
         let sources = self.resolve_symbol_refs(repository_id, source_query)?;
         let edges = self.call_path_edges(repository_id)?;
+        let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
+        for edge in edges {
+            edges_by_caller
+                .entry(edge.caller_symbol_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut paths = Vec::new();
+        for source in sources {
+            let mut visited = std::collections::BTreeSet::from([source.id.clone()]);
+            let mut stack = Vec::new();
+            trace_reachable_call_paths(
+                &source.id,
+                max_depth,
+                &edges_by_caller,
+                &mut visited,
+                &mut stack,
+                &mut paths,
+            );
+            if paths.len() >= 50 {
+                break;
+            }
+        }
+        paths.truncate(50);
+        Ok(paths)
+    }
+
+    pub fn transitive_call_paths_from_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        source_query: &str,
+        max_depth: usize,
+    ) -> Result<Vec<CallPath>> {
+        let max_depth = clamp_call_path_depth(max_depth);
+        let sources =
+            self.resolve_symbol_refs_for_ref(repository_id, repository_ref_id, source_query)?;
+        let edges = self.call_path_edges_for_ref(repository_id, repository_ref_id)?;
         let mut edges_by_caller = std::collections::BTreeMap::<String, Vec<CallPathEdge>>::new();
         for edge in edges {
             edges_by_caller
@@ -2659,6 +3488,35 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    fn resolve_symbol_refs_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<SymbolRef>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id
+                  FROM symbols
+                  JOIN files ON symbols.file_id = files.id
+                  JOIN ref_files ON ref_files.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND ref_files.repository_ref_id = ?2
+                   AND (symbols.id = ?3 OR symbols.name = ?3 OR symbols.qualified_name = ?3)
+                 ORDER BY symbols.qualified_name, files.path, symbols.start_line
+                 LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, repository_ref_id, symbol_query],
+                |row| Ok(SymbolRef { id: row.get(0)? }),
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     fn all_symbol_refs(&self, repository_id: &str) -> Result<Vec<SymbolRef>> {
         let mut statement = self
             .connection
@@ -2673,6 +3531,32 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id], |row| {
+                Ok(SymbolRef { id: row.get(0)? })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn all_symbol_refs_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<SymbolRef>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id
+                  FROM symbols
+                  JOIN files ON symbols.file_id = files.id
+                  JOIN ref_files ON ref_files.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND ref_files.repository_ref_id = ?2
+                 ORDER BY symbols.qualified_name, files.path, symbols.start_line
+                 LIMIT 500",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], |row| {
                 Ok(SymbolRef { id: row.get(0)? })
             })
             .map_err(StoreError::Sqlite)?;
@@ -2703,6 +3587,44 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id], call_path_edge)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    fn call_path_edges_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<CallPathEdge>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT calls.id, calls.callee_text, calls.call_line, calls.confidence,
+                        calls.resolution_status,
+                        caller.id, caller.name, caller.qualified_name, caller.kind,
+                        caller_file.path, caller.start_line, caller.end_line,
+                        callee.id, callee.name, callee.qualified_name, callee.kind,
+                        callee_file.path, callee.start_line, callee.end_line,
+                        caller_file.content_hash, calls.index_run_id, calls.parser_version,
+                        caller_file.indexed_at
+                   FROM calls
+                   JOIN symbols caller ON calls.caller_symbol_id = caller.id
+                   JOIN files caller_file ON caller.file_id = caller_file.id
+                   JOIN ref_files caller_ref ON caller_ref.file_id = caller_file.id
+                   LEFT JOIN symbols callee ON calls.callee_symbol_id = callee.id
+                   LEFT JOIN files callee_file ON callee.file_id = callee_file.id
+                   LEFT JOIN ref_files callee_ref
+                     ON callee_ref.file_id = callee_file.id
+                    AND callee_ref.repository_ref_id = ?2
+                  WHERE caller_file.repository_id = ?1
+                    AND caller_ref.repository_ref_id = ?2
+                    AND (callee.id IS NULL OR callee_ref.repository_ref_id IS NOT NULL)
+                  ORDER BY caller.qualified_name, caller_file.path, calls.call_line,
+                           calls.callee_text, calls.id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], call_path_edge)
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }
@@ -2747,6 +3669,55 @@ impl SqliteStore {
             notes: vec![
                 "metadata_only_no_source_text".to_owned(),
                 "direct_relationships_only".to_owned(),
+            ],
+        })
+    }
+
+    pub fn context_pack_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        symbol_query: &str,
+        limit: usize,
+    ) -> Result<ContextPack> {
+        let limit = limit.clamp(1, 25);
+        let mut focus_symbols =
+            self.find_symbols_for_ref(repository_id, repository_ref_id, symbol_query)?;
+        focus_symbols.truncate(limit);
+        let mut direct_callers =
+            self.callers_for_ref(repository_id, repository_ref_id, symbol_query)?;
+        direct_callers.truncate(limit);
+        let mut direct_callees =
+            self.callees_for_ref(repository_id, repository_ref_id, symbol_query)?;
+        direct_callees.truncate(limit);
+
+        let mut files = std::collections::BTreeSet::new();
+        for symbol in &focus_symbols {
+            files.insert(symbol.path.clone());
+        }
+        for row in direct_callers.iter().chain(direct_callees.iter()) {
+            if let Some(path) = &row.path {
+                files.insert(path.clone());
+            }
+        }
+
+        Ok(ContextPack {
+            format: "symdex.context_pack.v1".to_owned(),
+            repository_id: repository_id.to_owned(),
+            query: symbol_query.to_owned(),
+            focus_symbols,
+            direct_callers,
+            direct_callees,
+            files: files.into_iter().collect(),
+            limits: ContextPackLimits {
+                max_symbols: limit,
+                max_callers: limit,
+                max_callees: limit,
+            },
+            notes: vec![
+                "metadata_only_no_source_text".to_owned(),
+                "direct_relationships_only".to_owned(),
+                "repository_ref_scoped".to_owned(),
             ],
         })
     }
@@ -3270,7 +4241,7 @@ impl SqliteStore {
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
-            .prepare("SELECT path FROM files WHERE repository_id = ?1")
+            .prepare("SELECT DISTINCT path FROM files WHERE repository_id = ?1")
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id], |row| row.get(0))
@@ -3585,6 +4556,75 @@ pub struct RepositoryRecord {
     pub root_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryRefRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub ref_kind: String,
+    pub ref_name: Option<String>,
+    pub ref_identity: String,
+    pub head_oid: Option<String>,
+    pub is_current: bool,
+    pub last_seen_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl RepositoryRefRecord {
+    pub fn from_snapshot(
+        snapshot: &RepositoryRefSnapshot,
+        is_current: bool,
+        timestamp: &str,
+    ) -> Self {
+        let identity = ref_identity(
+            snapshot.kind,
+            snapshot.name.as_deref(),
+            snapshot.head_oid.as_deref(),
+        );
+        Self {
+            id: snapshot.id.clone(),
+            repository_id: snapshot.repository_id.clone(),
+            ref_kind: snapshot.kind.as_str().to_owned(),
+            ref_name: snapshot.name.clone(),
+            ref_identity: identity,
+            head_oid: snapshot.head_oid.clone(),
+            is_current,
+            last_seen_at: Some(timestamp.to_owned()),
+            deleted_at: None,
+            created_at: Some(timestamp.to_owned()),
+            updated_at: Some(timestamp.to_owned()),
+        }
+    }
+
+    pub fn local_branch(repository_id: &str, branch: &str, timestamp: &str) -> Self {
+        Self {
+            id: stable_id(&[
+                "repository-ref",
+                repository_id,
+                RepositoryRefKind::Branch.as_str(),
+                branch,
+            ]),
+            repository_id: repository_id.to_owned(),
+            ref_kind: RepositoryRefKind::Branch.as_str().to_owned(),
+            ref_name: Some(branch.to_owned()),
+            ref_identity: branch.to_owned(),
+            head_oid: None,
+            is_current: false,
+            last_seen_at: Some(timestamp.to_owned()),
+            deleted_at: None,
+            created_at: Some(timestamp.to_owned()),
+            updated_at: Some(timestamp.to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRefSyncSummary {
+    pub current: RepositoryRefRecord,
+    pub deleted_refs: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
     pub id: String,
@@ -3681,6 +4721,10 @@ pub struct TestSearchRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryStatus {
     pub repository_id: String,
+    pub current_ref_id: Option<String>,
+    pub current_ref_kind: Option<String>,
+    pub current_ref_name: Option<String>,
+    pub current_head_oid: Option<String>,
     pub files_indexed: usize,
     pub chunks_indexed: usize,
     pub symbols_indexed: usize,
@@ -3729,6 +4773,7 @@ pub struct WatcherClientRecord {
 pub struct IndexRunRecord {
     pub id: String,
     pub repository_id: String,
+    pub repository_ref_id: Option<String>,
     pub status: String,
     pub embedding_model: String,
     pub embedding_dimension: Option<usize>,
@@ -4504,6 +5549,68 @@ fn collect_rows<T>(
         values.push(row.map_err(StoreError::Sqlite)?);
     }
     Ok(values)
+}
+
+fn ref_identity(kind: RepositoryRefKind, ref_name: Option<&str>, head_oid: Option<&str>) -> String {
+    match kind {
+        RepositoryRefKind::Branch | RepositoryRefKind::Other => ref_name.unwrap_or("unknown"),
+        RepositoryRefKind::Detached => head_oid.unwrap_or("unknown"),
+        RepositoryRefKind::NonGit => "working-tree",
+    }
+    .to_owned()
+}
+
+fn upsert_repository_ref_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &RepositoryRefRecord,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO repository_refs (
+               id, repository_id, ref_kind, ref_name, ref_identity, head_oid,
+               is_current, last_seen_at, deleted_at, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(repository_id, ref_kind, ref_identity) DO UPDATE SET
+               id = excluded.id,
+               ref_name = excluded.ref_name,
+               head_oid = COALESCE(excluded.head_oid, repository_refs.head_oid),
+               is_current = excluded.is_current,
+               last_seen_at = excluded.last_seen_at,
+               deleted_at = excluded.deleted_at,
+               updated_at = excluded.updated_at",
+            params![
+                record.id,
+                record.repository_id,
+                record.ref_kind,
+                record.ref_name,
+                record.ref_identity,
+                record.head_oid,
+                if record.is_current { 1i64 } else { 0i64 },
+                record.last_seen_at,
+                record.deleted_at,
+                record.created_at,
+                record.updated_at,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn repository_ref_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRefRecord> {
+    Ok(RepositoryRefRecord {
+        id: row.get(0)?,
+        repository_id: row.get(1)?,
+        ref_kind: row.get(2)?,
+        ref_name: row.get(3)?,
+        ref_identity: row.get(4)?,
+        head_oid: row.get(5)?,
+        is_current: row.get::<_, i64>(6)? != 0,
+        last_seen_at: row.get(7)?,
+        deleted_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
 }
 
 fn usize_count(value: i64, label: &str) -> Result<usize> {
@@ -5496,6 +6603,11 @@ struct ProvenanceColumn {
 const COMPATIBILITY_COLUMNS: &[ProvenanceColumn] = &[
     ProvenanceColumn {
         table: "index_runs",
+        name: "repository_ref_id",
+        alter_sql: "ALTER TABLE index_runs ADD COLUMN repository_ref_id TEXT",
+    },
+    ProvenanceColumn {
+        table: "index_runs",
         name: "parser_version",
         alter_sql: "ALTER TABLE index_runs ADD COLUMN parser_version TEXT",
     },
@@ -5586,6 +6698,12 @@ const COMPATIBILITY_COLUMNS: &[ProvenanceColumn] = &[
     },
 ];
 
+const FILES_CONTENT_ADDRESSING_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_repository_path_hash
+    ON files(repository_id, path, content_hash);
+"#;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repositories (
   id TEXT PRIMARY KEY,
@@ -5594,9 +6712,53 @@ CREATE TABLE IF NOT EXISTS repositories (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS repository_refs (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    ref_kind TEXT NOT NULL,
+    ref_name TEXT,
+    ref_identity TEXT NOT NULL,
+    head_oid TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    deleted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(repository_id, ref_kind, ref_identity),
+    CHECK(ref_kind IN ('branch', 'detached', 'other', 'non_git')),
+    CHECK(is_current IN (0, 1)),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_repository_refs_current
+    ON repository_refs(repository_id, is_current, deleted_at);
+
+CREATE INDEX IF NOT EXISTS idx_repository_refs_branch_name
+    ON repository_refs(repository_id, ref_kind, ref_name);
+
+CREATE TABLE IF NOT EXISTS ref_files (
+    repository_ref_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    index_run_id TEXT,
+    PRIMARY KEY(repository_ref_id, path),
+    FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE CASCADE,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ref_files_repository_path
+    ON ref_files(repository_id, path);
+
+CREATE INDEX IF NOT EXISTS idx_ref_files_file
+    ON ref_files(file_id);
+
 CREATE TABLE IF NOT EXISTS index_runs (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL,
+    repository_ref_id TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT,
   status TEXT NOT NULL,
@@ -5608,7 +6770,9 @@ CREATE TABLE IF NOT EXISTS index_runs (
   error_summary TEXT,
   parser_version TEXT,
   indexer_version TEXT,
-  run_kind TEXT NOT NULL DEFAULT 'manual'
+    run_kind TEXT NOT NULL DEFAULT 'manual',
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS watchers (
@@ -5656,7 +6820,6 @@ CREATE TABLE IF NOT EXISTS files (
   indexed_at TEXT NOT NULL,
   index_run_id TEXT,
   parser_version TEXT,
-  UNIQUE(repository_id, path),
   FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
 
@@ -5762,6 +6925,16 @@ CREATE TABLE IF NOT EXISTS semantic_generations (
     FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS semantic_generation_refs (
+    repository_ref_id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE CASCADE,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(generation_id) REFERENCES semantic_generations(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -5838,6 +7011,8 @@ CREATE TABLE IF NOT EXISTS quality_embedding_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_repository_path_hash
+    ON files(repository_id, path, content_hash);
 CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -5851,6 +7026,7 @@ CREATE INDEX IF NOT EXISTS idx_tests_symbol_id ON tests(symbol_id);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON semantic_generations(repository_id, fast_completed_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_semantic_generation_refs_generation ON semantic_generation_refs(repository_id, generation_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_generation_chunk ON chunk_embeddings(generation_id, chunk_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_generation_layer_status ON chunk_embeddings(repository_id, generation_id, semantic_layer, status);
@@ -5887,7 +7063,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::params;
-    use symdex_core::{SemanticLayer, SemanticLayerStatus};
+    use symdex_core::{
+        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
+    };
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
@@ -5947,6 +7125,421 @@ mod tests {
     }
 
     #[test]
+    fn sync_repository_ref_tracks_current_branch_and_deleted_branches() {
+        let db = TestDb::new("repository-ref-sync");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+
+        let first = RepositoryRefSnapshot {
+            id: "ref-main".to_owned(),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let summary = store.sync_repository_ref(&first).expect("refs should sync");
+        assert_eq!(summary.current.ref_name.as_deref(), Some("main"));
+        assert_eq!(summary.deleted_refs, 0);
+
+        let second = RepositoryRefSnapshot {
+            id: "ref-main".to_owned(),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned()],
+        };
+        let summary = store
+            .sync_repository_ref(&second)
+            .expect("refs should sync after branch deletion");
+        let current = store
+            .current_repository_ref("repo")
+            .expect("current ref should load")
+            .expect("current ref should exist");
+
+        assert_eq!(summary.deleted_refs, 1);
+        assert_eq!(current.ref_name.as_deref(), Some("main"));
+        assert_eq!(
+            current.head_oid.as_deref(),
+            Some("fedcba9876543210fedcba9876543210fedcba98")
+        );
+    }
+
+    #[test]
+    fn ref_files_track_paths_per_repository_ref() {
+        let db = TestDb::new("ref-files");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+
+        store.sync_repository_ref(&main).expect("main should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file", "src/lib.rs", "hash-main"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("main file should persist");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file", "src/feature.rs", "hash-feature"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("feature file should persist");
+
+        assert_eq!(
+            store
+                .ref_file_paths(&main.id)
+                .expect("main paths should load"),
+            vec!["src/lib.rs".to_owned()]
+        );
+        assert_eq!(
+            store
+                .ref_file_paths(&feature.id)
+                .expect("feature paths should load"),
+            vec!["src/feature.rs".to_owned()]
+        );
+
+        let removed = store
+            .remove_missing_ref_files(&feature.id, &[])
+            .expect("feature manifest cleanup should run");
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store
+                .ref_file_paths(&main.id)
+                .expect("main paths should remain"),
+            vec!["src/lib.rs".to_owned()]
+        );
+        assert!(
+            store
+                .ref_file_paths(&feature.id)
+                .expect("feature paths should be empty")
+                .is_empty()
+        );
+
+        let removed_files = store
+            .remove_unreferenced_missing_files("repo", &[])
+            .expect("unreferenced file cleanup should run");
+        assert_eq!(removed_files, 1);
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.files_indexed, 1);
+        assert_eq!(
+            store
+                .ref_file_paths(&main.id)
+                .expect("main paths should still remain"),
+            vec!["src/lib.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn scoped_queries_filter_through_ref_files() {
+        let db = TestDb::new("ref-scoped-queries");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+
+        store.sync_repository_ref(&main).expect("refs should sync");
+        let main_symbols = vec![
+            sample_symbol_in_file("main-caller", "main-file", "caller", "main::caller"),
+            sample_symbol_in_file("main-helper", "main-file", "helper", "main::helper"),
+        ];
+        let main_calls = vec![sample_call(
+            "main-call",
+            "main-caller",
+            "helper",
+            Some("main-helper"),
+            4,
+        )];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file", "src/main.rs", "hash-main"),
+                &main_symbols,
+                &[],
+                &main_calls,
+                &[],
+            )
+            .expect("main facts should persist");
+
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature ref should sync");
+        let feature_symbols = vec![
+            sample_symbol_in_file(
+                "feature-caller",
+                "feature-file",
+                "caller",
+                "feature::caller",
+            ),
+            sample_symbol_in_file(
+                "feature-helper",
+                "feature-file",
+                "helper",
+                "feature::helper",
+            ),
+        ];
+        let feature_calls = vec![sample_call(
+            "feature-call",
+            "feature-caller",
+            "helper",
+            Some("feature-helper"),
+            8,
+        )];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file", "src/feature.rs", "hash-feature"),
+                &feature_symbols,
+                &[],
+                &feature_calls,
+                &[],
+            )
+            .expect("feature facts should persist");
+
+        assert!(
+            store
+                .repository_has_ref_file_manifests("repo")
+                .expect("manifest check should run")
+        );
+        let main_symbols = store
+            .find_symbols_for_ref("repo", &main.id, "helper")
+            .expect("main symbol search should run");
+        assert_eq!(main_symbols.len(), 1);
+        assert_eq!(main_symbols[0].qualified_name, "main::helper");
+        let feature_symbols = store
+            .find_symbols_for_ref("repo", &feature.id, "helper")
+            .expect("feature symbol search should run");
+        assert_eq!(feature_symbols.len(), 1);
+        assert_eq!(feature_symbols[0].qualified_name, "feature::helper");
+
+        let main_callers = store
+            .callers_for_ref("repo", &main.id, "main::helper")
+            .expect("main callers should run");
+        assert_eq!(main_callers.len(), 1);
+        assert_eq!(
+            main_callers[0].symbol_qualified_name.as_deref(),
+            Some("main::caller")
+        );
+        let feature_callers = store
+            .callers_for_ref("repo", &feature.id, "feature::helper")
+            .expect("feature callers should run");
+        assert_eq!(feature_callers.len(), 1);
+        assert_eq!(
+            feature_callers[0].symbol_qualified_name.as_deref(),
+            Some("feature::caller")
+        );
+        assert!(
+            store
+                .callers_for_ref("repo", &main.id, "feature::helper")
+                .expect("cross-ref callers should run")
+                .is_empty()
+        );
+
+        let pack = store
+            .context_pack_for_ref("repo", &main.id, "helper", 5)
+            .expect("scoped context pack should build");
+        assert_eq!(pack.focus_symbols[0].qualified_name, "main::helper");
+        assert_eq!(pack.direct_callers.len(), 1);
+        assert_eq!(pack.files, vec!["src/main.rs".to_owned()]);
+        assert!(pack.notes.contains(&"repository_ref_scoped".to_owned()));
+    }
+
+    #[test]
+    fn ref_scoped_queries_preserve_same_path_different_content_snapshots() {
+        let db = TestDb::new("ref-same-path-snapshots");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+
+        store
+            .sync_repository_ref(&main)
+            .expect("main ref should sync");
+        let main_symbols = vec![
+            sample_symbol_in_file("main-caller", "main-file-hash", "caller", "main::caller"),
+            sample_symbol_in_file("main-helper", "main-file-hash", "helper", "main::helper"),
+        ];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file-hash", "src/lib.rs", "hash-main"),
+                &main_symbols,
+                &[],
+                &[sample_call(
+                    "main-call",
+                    "main-caller",
+                    "helper",
+                    Some("main-helper"),
+                    3,
+                )],
+                &[],
+            )
+            .expect("main snapshot should persist");
+
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature ref should sync");
+        let feature_symbols = vec![
+            sample_symbol_in_file(
+                "feature-caller",
+                "feature-file-hash",
+                "caller",
+                "feature::caller",
+            ),
+            sample_symbol_in_file(
+                "feature-helper",
+                "feature-file-hash",
+                "helper",
+                "feature::helper",
+            ),
+        ];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file-hash", "src/lib.rs", "hash-feature"),
+                &feature_symbols,
+                &[],
+                &[sample_call(
+                    "feature-call",
+                    "feature-caller",
+                    "helper",
+                    Some("feature-helper"),
+                    7,
+                )],
+                &[],
+            )
+            .expect("feature snapshot should persist");
+
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.files_indexed, 2);
+
+        let main_symbols = store
+            .find_symbols_for_ref("repo", &main.id, "helper")
+            .expect("main symbols should load");
+        assert_eq!(main_symbols.len(), 1);
+        assert_eq!(main_symbols[0].qualified_name, "main::helper");
+        assert_eq!(
+            main_symbols[0].provenance.content_hash,
+            Some("hash-main".to_owned())
+        );
+
+        let feature_symbols = store
+            .find_symbols_for_ref("repo", &feature.id, "helper")
+            .expect("feature symbols should load");
+        assert_eq!(feature_symbols.len(), 1);
+        assert_eq!(feature_symbols[0].qualified_name, "feature::helper");
+        assert_eq!(
+            feature_symbols[0].provenance.content_hash,
+            Some("hash-feature".to_owned())
+        );
+
+        assert!(
+            store
+                .callers_for_ref("repo", &main.id, "feature::helper")
+                .expect("main should not see feature callers")
+                .is_empty()
+        );
+
+        store
+            .remove_missing_ref_files(&main.id, &[])
+            .expect("main manifest should clear");
+        let removed = store
+            .remove_unreferenced_missing_files("repo", &[])
+            .expect("unreferenced main snapshot should be removed");
+        assert_eq!(removed, 1);
+        let status = store
+            .repository_status("repo")
+            .expect("status should reload");
+        assert_eq!(status.files_indexed, 1);
+        assert_eq!(
+            store
+                .find_symbols_for_ref("repo", &feature.id, "helper")
+                .expect("feature snapshot should remain")[0]
+                .qualified_name,
+            "feature::helper"
+        );
+    }
+
+    #[test]
     fn sqlite_vec_upserts_queries_scrolls_and_deletes_points() {
         let db = TestDb::new("sqlite-vec-roundtrip");
         let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
@@ -6003,6 +7596,110 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_vec_queries_filter_through_ref_files() {
+        let db = TestDb::new("sqlite-vec-ref-query");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        store
+            .sync_repository_ref(&main)
+            .expect("main ref should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file", "src/main.rs", "hash-main"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("main file should persist");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature ref should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file", "src/feature.rs", "hash-feature"),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("feature file should persist");
+        drop(store);
+
+        let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
+        let table = vector_table_name("repo", "nomic-embed-text");
+        let main_point = vector_point_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("main point id should format");
+        let feature_point = vector_point_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .expect("feature point id should format");
+        vector_store
+            .upsert_points(
+                &table,
+                &[
+                    VectorPoint {
+                        id: main_point.clone(),
+                        vector: vec![1.0, 0.0],
+                        payload: PointPayload {
+                            file_id: "main-file".to_owned(),
+                            chunk_id: "main-chunk".to_owned(),
+                            path: "src/main.rs".to_owned(),
+                            ..sample_payload()
+                        },
+                    },
+                    VectorPoint {
+                        id: feature_point.clone(),
+                        vector: vec![0.0, 1.0],
+                        payload: PointPayload {
+                            file_id: "feature-file".to_owned(),
+                            chunk_id: "feature-chunk".to_owned(),
+                            path: "src/feature.rs".to_owned(),
+                            ..sample_payload()
+                        },
+                    },
+                ],
+            )
+            .expect("points should upsert");
+
+        let main_results = vector_store
+            .query_points_for_ref(&table, "repo", &main.id, vec![0.0, 1.0], 5)
+            .expect("main scoped query should run");
+        assert_eq!(main_results.len(), 1);
+        assert_eq!(main_results[0].id, main_point);
+        assert_eq!(main_results[0].payload.path, "src/main.rs");
+
+        let feature_results = vector_store
+            .query_points_for_ref(&table, "repo", &feature.id, vec![1.0, 0.0], 5)
+            .expect("feature scoped query should run");
+        assert_eq!(feature_results.len(), 1);
+        assert_eq!(feature_results[0].id, feature_point);
+        assert_eq!(feature_results[0].payload.path, "src/feature.rs");
+    }
+
+    #[test]
     fn freshness_for_hash_labels_evidence_states() {
         assert_eq!(
             crate::freshness_for_hash(Some("same"), Some("same")),
@@ -6044,12 +7741,12 @@ mod tests {
 
         assert!(
             store
-                .file_unchanged("repo", "src/lib.rs", "hash-1", "parser")
+                .file_unchanged("repo", "file", "src/lib.rs", "hash-1", "parser")
                 .expect("unchanged check should run")
         );
         assert!(
             !store
-                .file_unchanged("repo", "src/lib.rs", "hash-1", "next-parser")
+                .file_unchanged("repo", "file", "src/lib.rs", "hash-1", "next-parser")
                 .expect("parser-version check should run")
         );
         let status = store.repository_status("repo").expect("status should load");
@@ -6068,6 +7765,7 @@ mod tests {
 
         for expected in [
             "idx_files_repository_path",
+            "idx_files_repository_path_hash",
             "idx_chunks_file_id",
             "idx_symbols_file_id",
             "idx_symbols_name",
@@ -6081,6 +7779,7 @@ mod tests {
             "idx_index_runs_repository_status",
             "idx_index_runs_repository_model_status",
             "idx_semantic_generations_repository_fast_completed",
+            "idx_semantic_generation_refs_generation",
             "idx_chunk_embeddings_repository_layer_model",
             "idx_chunk_embeddings_generation_chunk",
             "idx_chunk_embeddings_repository_generation_layer_status",
@@ -6094,6 +7793,65 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_migration_removes_legacy_file_path_uniqueness() {
+        let db = TestDb::new("content-addressed-files-migration");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE repositories (
+                   id TEXT PRIMARY KEY,
+                   root_path TEXT NOT NULL UNIQUE,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE files (
+                   id TEXT PRIMARY KEY,
+                   repository_id TEXT NOT NULL,
+                   path TEXT NOT NULL,
+                   language TEXT NOT NULL,
+                   content_hash TEXT NOT NULL,
+                   indexed_at TEXT NOT NULL,
+                   index_run_id TEXT,
+                   parser_version TEXT,
+                   UNIQUE(repository_id, path),
+                   FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO repositories (id, root_path, created_at, updated_at)
+                 VALUES ('repo', '/tmp/repo', '1', '1');
+                 INSERT INTO files (
+                   id, repository_id, path, language, content_hash, indexed_at,
+                   index_run_id, parser_version
+                 )
+                 VALUES ('old-file', 'repo', 'src/lib.rs', 'rust', 'hash-old', '1', 'run', 'parser');",
+            )
+            .expect("legacy schema should be installed");
+
+        store.migrate().expect("migration should run");
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO files (
+                   id, repository_id, path, language, content_hash, indexed_at,
+                   index_run_id, parser_version
+                 )
+                 VALUES ('new-file', 'repo', 'src/lib.rs', 'rust', 'hash-new', '2', 'run', 'parser')",
+                [],
+            )
+            .expect("same path with different content should insert");
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE repository_id = 'repo' AND path = 'src/lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("file count should load");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
     fn sqlite_migration_creates_layered_semantic_tables_idempotently() {
         let db = TestDb::new("layered-semantic-tables");
         let store = SqliteStore::open(&db.config()).expect("store should open");
@@ -6104,6 +7862,7 @@ mod tests {
 
         for expected in [
             "semantic_generations",
+            "semantic_generation_refs",
             "chunk_embeddings",
             "quality_embedding_jobs",
         ] {
@@ -6112,6 +7871,94 @@ mod tests {
                 "missing SQLite table {expected}; found {tables:?}"
             );
         }
+    }
+
+    #[test]
+    fn semantic_generation_refs_route_generations_per_ref() {
+        let db = TestDb::new("semantic-generation-refs");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        store.sync_repository_ref(&main).expect("main should sync");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature should sync");
+
+        let mut main_generation = sample_semantic_generation();
+        main_generation.id = "generation-main".to_owned();
+        main_generation.fast_completed_at = "100".to_owned();
+        main_generation.created_at = "100".to_owned();
+        main_generation.updated_at = "100".to_owned();
+        store
+            .upsert_semantic_generation(&main_generation)
+            .expect("main generation should persist");
+        let mut feature_generation = sample_semantic_generation();
+        feature_generation.id = "generation-feature".to_owned();
+        feature_generation.fast_completed_at = "200".to_owned();
+        feature_generation.created_at = "200".to_owned();
+        feature_generation.updated_at = "200".to_owned();
+        feature_generation.quality_status = "quality_ready".to_owned();
+        feature_generation.active_layer = "quality".to_owned();
+        store
+            .upsert_semantic_generation(&feature_generation)
+            .expect("feature generation should persist");
+
+        store
+            .link_semantic_generation_to_ref("repo", &main.id, &main_generation.id, "101")
+            .expect("main generation should link");
+        store
+            .link_semantic_generation_to_ref("repo", &feature.id, &feature_generation.id, "201")
+            .expect("feature generation should link");
+
+        let repo_latest = store
+            .latest_semantic_generation("repo")
+            .expect("latest repo generation should load")
+            .expect("latest repo generation should exist");
+        assert_eq!(repo_latest.id, "generation-feature");
+        let main_latest = store
+            .latest_semantic_generation_for_ref("repo", &main.id)
+            .expect("main ref generation should load")
+            .expect("main ref generation should exist");
+        assert_eq!(main_latest.id, "generation-main");
+        let feature_latest = store
+            .latest_semantic_generation_for_ref("repo", &feature.id)
+            .expect("feature ref generation should load")
+            .expect("feature ref generation should exist");
+        assert_eq!(feature_latest.id, "generation-feature");
+
+        let main_routing = store
+            .semantic_routing_summary_for_ref("repo", &main.id)
+            .expect("main routing should load")
+            .expect("main routing should exist");
+        assert_eq!(main_routing.generation_id, "generation-main");
+        assert_eq!(main_routing.active_layer, SemanticLayer::Fast);
+        let feature_routing = store
+            .semantic_routing_summary_for_ref("repo", &feature.id)
+            .expect("feature routing should load")
+            .expect("feature routing should exist");
+        assert_eq!(feature_routing.generation_id, "generation-feature");
+        assert_eq!(feature_routing.active_layer, SemanticLayer::Quality);
     }
 
     #[test]
@@ -7331,7 +9178,7 @@ mod tests {
         assert_eq!(status.chunks_indexed, 2);
         assert!(
             !store
-                .file_unchanged("repo", "src/lib.rs", "hash-1", "parser")
+                .file_unchanged("repo", "file", "src/lib.rs", "hash-1", "parser")
                 .expect("unchanged check should run")
         );
 
@@ -8833,10 +10680,14 @@ mod tests {
     }
 
     fn sample_file(content_hash: &str) -> FileRecord {
+        sample_file_at("file", "src/lib.rs", content_hash)
+    }
+
+    fn sample_file_at(id: &str, path: &str, content_hash: &str) -> FileRecord {
         FileRecord {
-            id: "file".to_owned(),
+            id: id.to_owned(),
             repository_id: "repo".to_owned(),
-            path: "src/lib.rs".to_owned(),
+            path: path.to_owned(),
             language: "rust".to_owned(),
             content_hash: content_hash.to_owned(),
             index_run_id: "run".to_owned(),
@@ -8893,9 +10744,18 @@ mod tests {
     }
 
     fn sample_symbol(id: &str, name: &str, qualified_name: &str) -> SymbolRecord {
+        sample_symbol_in_file(id, "file", name, qualified_name)
+    }
+
+    fn sample_symbol_in_file(
+        id: &str,
+        file_id: &str,
+        name: &str,
+        qualified_name: &str,
+    ) -> SymbolRecord {
         SymbolRecord {
             id: id.to_owned(),
-            file_id: "file".to_owned(),
+            file_id: file_id.to_owned(),
             parent_symbol_id: None,
             name: name.to_owned(),
             qualified_name: qualified_name.to_owned(),
@@ -8990,6 +10850,7 @@ mod tests {
         crate::IndexRunRecord {
             id: format!("run-{model}-{dimension}"),
             repository_id: "repo".to_owned(),
+            repository_ref_id: None,
             status: "success".to_owned(),
             embedding_model: model.to_owned(),
             embedding_dimension: Some(dimension),

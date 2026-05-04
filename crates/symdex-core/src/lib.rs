@@ -2,6 +2,7 @@
 
 mod discovery;
 mod error;
+mod git;
 mod hash;
 mod model;
 mod parser;
@@ -12,6 +13,7 @@ pub use discovery::{
     DiscoveredFile, DiscoveryOptions, discover_indexable_files, discover_rust_files,
 };
 pub use error::{CoreError, Result};
+pub use git::{RepositoryRefKind, RepositoryRefSnapshot};
 pub use hash::{content_hash, stable_id};
 pub use model::{
     ByteRange, CallEdge, ChunkKind, CodeChunk, DiscoveredTest, FileFacts, Language, LineRange,

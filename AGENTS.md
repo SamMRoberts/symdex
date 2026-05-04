@@ -26,6 +26,9 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
+- SQLite stores local Git/ref metadata for repository indexes. Branch-aware
+  work must preserve local branch/ref identity, detached HEAD support, and
+  non-Git repository behavior.
 - sqlite-vec stores dense vectors plus filterable payload fields.
 - Ollama generates local embeddings. The default fast semantic layer uses
   `nomic-embed-text`; the deferred quality semantic layer uses
@@ -87,6 +90,22 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Use structured logging for indexing runs and MCP calls.
 - Log summaries, not source text.
 - Use stable IDs derived from normalized repo path plus content or symbol data.
+- Keep repository identity separate from local ref identity: `repository_id`
+  remains rooted in the canonical repo path, while branch-aware state uses
+  explicit repository-ref metadata.
+- Keep active branch file membership in `ref_files`; do not treat repository-wide
+  file facts as sufficient for future branch-scoped query or semantic routing.
+- File IDs are content-addressed from repository identity, path, and content
+  hash; preserve same-path/different-content snapshots across local refs and
+  link unchanged skipped files into the active ref manifest.
+- Structural symbol, call graph, impact, and context-pack query paths should
+  filter through the live worktree ref's `ref_files` manifest when manifests
+  exist, while preserving legacy repo-wide fallback for indexes without
+  manifests.
+- Semantic search should filter sqlite-vec candidates through the live worktree
+  ref's `ref_files` manifest when manifests exist; semantic routing should use
+  the active ref's linked generation from `semantic_generation_refs` with
+  legacy repo-wide fallback for indexes without ref mappings.
 - Hash file contents to skip unchanged work.
 - Keep public APIs boring, explicit, and versionable.
 
@@ -117,6 +136,11 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   CLI clients hold visible watcher leases; when no clients remain, the watcher
   exits after a short grace period.
 - Never execute indexed repository code or follow symlinks outside the configured root.
+- Branch-aware indexing must read only local Git metadata. Do not execute hooks,
+  fetch remotes, contact hosted services, or treat branch names as trusted input.
+- Deleted local branches should be represented as deleted repository refs first;
+  later cleanup must only remove snapshots and vector points no longer reachable
+  from any retained local ref.
 
 ## MCP Rules
 - MCP evidence tools are read-only for the MVP. `symdex_watch_start` is the

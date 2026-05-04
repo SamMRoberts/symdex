@@ -1949,7 +1949,7 @@ fn render_repository_status_panel(frame: &mut ratatui::Frame<'_>, area: Rect, ap
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Min(5),
         ])
@@ -1964,6 +1964,10 @@ fn render_repository_status_panel(frame: &mut ratatui::Frame<'_>, area: Rect, ap
         Line::from(vec![
             Span::styled("id ", Style::new().fg(Color::DarkGray)),
             Span::raw(app.repository_id.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("ref ", Style::new().fg(Color::DarkGray)),
+            Span::raw(index_ref_label(&app.status)),
         ]),
         Line::from(vec![
             Span::styled("last indexed ", Style::new().fg(Color::DarkGray)),
@@ -3029,6 +3033,14 @@ fn index_embedding(status: &RepositoryStatus) -> String {
         (Some(model), Some(dimension)) => format!("{model} ({dimension})"),
         (Some(model), None) => model.clone(),
         _ => "<none>".to_owned(),
+    }
+}
+
+fn index_ref_label(status: &RepositoryStatus) -> String {
+    match (&status.current_ref_kind, &status.current_ref_name) {
+        (Some(kind), Some(name)) => format!("{kind}:{name}"),
+        (Some(kind), None) => kind.clone(),
+        _ => "<unknown>".to_owned(),
     }
 }
 
@@ -6691,6 +6703,10 @@ mod tests {
     fn renders_dashboard_status() {
         let status = RepositoryStatus {
             repository_id: "repo".to_owned(),
+            current_ref_id: Some("ref".to_owned()),
+            current_ref_kind: Some("branch".to_owned()),
+            current_ref_name: Some("main".to_owned()),
+            current_head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             files_indexed: 2,
             chunks_indexed: 3,
             symbols_indexed: 4,
@@ -8975,6 +8991,10 @@ mod tests {
     fn sample_status() -> RepositoryStatus {
         RepositoryStatus {
             repository_id: "repo".to_owned(),
+            current_ref_id: Some("ref".to_owned()),
+            current_ref_kind: Some("branch".to_owned()),
+            current_ref_name: Some("main".to_owned()),
+            current_head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             files_indexed: 2,
             chunks_indexed: 3,
             symbols_indexed: 4,

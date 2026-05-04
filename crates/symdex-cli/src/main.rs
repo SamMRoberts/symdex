@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Read;
 
 use serde_json::json;
-use symdex_core::RepoRoot;
+use symdex_core::{RepoRoot, RepositoryRefSnapshot};
 use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
@@ -297,11 +297,37 @@ fn index_status(repo: &str, output: OutputMode) -> Result<(), String> {
     let store_config = StoreConfig::from_env();
     let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
+    sqlite
+        .upsert_repository(&symdex_store::RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    let repository_ref = RepositoryRefSnapshot::detect(&root).map_err(|error| error.to_string())?;
+    sqlite
+        .sync_repository_ref(&repository_ref)
+        .map_err(|error| error.to_string())?;
     let status = sqlite
         .repository_status(root.id())
         .map_err(|error| error.to_string())?;
 
     println!("repository_id: {}", status.repository_id);
+    println!(
+        "current_ref: {}",
+        status.current_ref_name.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "current_ref_kind: {}",
+        status.current_ref_kind.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "current_ref_id: {}",
+        status.current_ref_id.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "current_head_oid: {}",
+        status.current_head_oid.as_deref().unwrap_or("<none>")
+    );
     println!("files_indexed: {}", status.files_indexed);
     println!("chunks_indexed: {}", status.chunks_indexed);
     println!("symbols_indexed: {}", status.symbols_indexed);

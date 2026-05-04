@@ -54,6 +54,17 @@ The CLI mirrors this envelope when run with top-level `--json` or
 `symdex --json search <repo> <query>` prints the same
 `symdex.mcp.evidence.v1` object that MCP returns in `structuredContent`.
 
+Structural MCP tools resolve the live local worktree ref without writing index
+state. When `ref_files` manifests exist for the repository, symbol search, call
+graph, impact, and context-pack evidence is filtered through the active ref's
+manifest. Older indexes with no `ref_files` manifests fall back to the legacy
+repo-wide structural view. Semantic search uses the same active ref manifest to
+filter sqlite-vec candidates when manifests exist. The manifest points at
+content-addressed file snapshots, so same-path/different-content local refs can
+return distinct structural and vector evidence. Semantic routing also prefers
+the active ref's linked generation from `semantic_generation_refs`, falling back
+to the repo-wide latest generation for older indexes without ref mappings.
+
 ### `symdex_search`
 
 Semantic search over indexed chunks.
@@ -565,7 +576,9 @@ source-free metadata only.
 
 ### `symdex_index_status`
 
-Return local SQLite index counts.
+Return local SQLite index counts. The result also includes persisted current
+repository-ref metadata when available and a metadata-only `worktree_ref`
+snapshot resolved from local Git state for the requested repo.
 
 Input:
 
@@ -580,6 +593,16 @@ Output:
 ```json
 {
   "repository_id": "stable-repo-id",
+  "current_ref_id": "stable-ref-id",
+  "current_ref_kind": "branch",
+  "current_ref_name": "main",
+  "current_head_oid": "0123456789abcdef0123456789abcdef01234567",
+  "worktree_ref": {
+    "id": "stable-ref-id",
+    "kind": "branch",
+    "name": "main",
+    "head_oid": "0123456789abcdef0123456789abcdef01234567"
+  },
   "files_indexed": 42,
   "chunks_indexed": 120,
   "symbols_indexed": 80,

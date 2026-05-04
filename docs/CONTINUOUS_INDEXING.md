@@ -44,6 +44,12 @@ enabled, modified or newly created eligible files are automatically reindexed.
 - Deleted-file cleanup should continue to be handled by the incremental
   indexing path, even though the first continuous MVP is focused on created and
   modified files.
+- Branch-aware indexing is being introduced incrementally. The current local ref
+  can be recorded in SQLite, index-run provenance, and the `ref_files` path
+  manifest. Continuous indexing also links the active ref to the semantic
+  generation recorded by each semantic batch, so status and search can route
+  through the checked-out ref's generation while preserving legacy repo-wide
+  fallback for older indexes.
 
 ## Layered Semantic Indexing
 

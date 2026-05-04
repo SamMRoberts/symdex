@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, NormalizedRepoPath,
-    ParseDiagnostic, RepoRoot, ResolutionStatus, SemanticLayer, Symbol, SymbolKind, content_hash,
-    discover_indexable_files, index_source_file,
+    ParseDiagnostic, RepoRoot, RepositoryRefSnapshot, ResolutionStatus, SemanticLayer, Symbol,
+    SymbolKind, content_hash, discover_indexable_files, index_source_file,
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
@@ -326,6 +326,7 @@ struct RunCounts {
 struct RunScope<'a> {
     index_run_id: &'a str,
     repository_id: &'a str,
+    repository_ref_id: Option<&'a str>,
     embedding_model: &'a str,
     run_kind: &'a str,
 }
@@ -727,6 +728,10 @@ fn run_index_internal(
             root_path: root.path().display().to_string(),
         })
         .map_err(|error| error.to_string())?;
+    let repository_ref = RepositoryRefSnapshot::detect(&root).map_err(|error| error.to_string())?;
+    sqlite
+        .sync_repository_ref(&repository_ref)
+        .map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
         "open",
         1,
@@ -746,6 +751,7 @@ fn run_index_internal(
     let run_scope = RunScope {
         index_run_id: &index_run_id,
         repository_id: root.id(),
+        repository_ref_id: Some(&repository_ref.id),
         embedding_model: &embedding_model,
         run_kind,
     };
@@ -870,6 +876,7 @@ fn run_index_internal(
         &root,
         &collection,
         &index_run_id,
+        run_scope.repository_ref_id,
         &mut on_progress,
     ) {
         Ok(persistence) => persistence,
@@ -916,10 +923,13 @@ fn run_index_internal(
         match finalize_semantic_index(
             &mut sqlite,
             &root,
-            &store_config,
-            &layered_embed_config,
             prepared_semantic.expect("semantic indexing should be prepared when not offline"),
-            &stale_vector_point_ids,
+            SemanticFinalizationContext {
+                store_config: &store_config,
+                layered_embed_config: &layered_embed_config,
+                repository_ref_id: run_scope.repository_ref_id,
+                stale_vector_point_ids: &stale_vector_point_ids,
+            },
             &mut on_progress,
         ) {
             Ok(embedding) => {
@@ -1009,6 +1019,7 @@ fn collect_index_reports(
             && sqlite
                 .file_unchanged(
                     root.id(),
+                    &file.facts.id,
                     &file.facts.relative_path,
                     &file.facts.content_hash,
                     file.facts.language.parser_version(),
@@ -1016,6 +1027,16 @@ fn collect_index_reports(
                 .map_err(|error| error.to_string())?
         {
             files_skipped_unchanged += 1;
+            reports.push(IndexReport {
+                file: file.facts.clone(),
+                chunks: Vec::new(),
+                symbols: Vec::new(),
+                calls: Vec::new(),
+                tests: Vec::new(),
+                parse_diagnostics: Vec::new(),
+                source: String::new(),
+                skipped_unchanged: true,
+            });
             on_progress(IndexProgress::new(
                 "parse",
                 index + 1,
@@ -1038,6 +1059,7 @@ fn collect_index_reports(
             tests: file_index.tests,
             parse_diagnostics: file_index.parse_diagnostics,
             source,
+            skipped_unchanged: false,
         });
         let message = if parse_diagnostic_count == 0 {
             format!("Parsed {}", file.facts.relative_path)
@@ -1067,6 +1089,7 @@ fn collect_index_reports(
 fn file_summaries(reports: &[IndexReport]) -> Vec<FileIndexSummary> {
     reports
         .iter()
+        .filter(|report| !report.skipped_unchanged)
         .map(|report| FileIndexSummary {
             path: report.file.relative_path.clone(),
             language: report.file.language.as_str().to_owned(),
@@ -1543,6 +1566,7 @@ fn persist_structural_index(
     root: &RepoRoot,
     collection: &IndexCollection,
     index_run_id: &str,
+    repository_ref_id: Option<&str>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<PersistenceSummary, String> {
     let mut chunks_indexed = 0usize;
@@ -1587,12 +1611,39 @@ fn persist_structural_index(
                 )
             })
             .collect::<Vec<_>>();
+        if report.skipped_unchanged {
+            if let Some(repository_ref_id) = repository_ref_id {
+                sqlite
+                    .link_file_to_ref(repository_ref_id, &file)
+                    .map_err(|error| error.to_string())?;
+            }
+            on_progress(IndexProgress::new(
+                "sqlite",
+                index + 1,
+                collection.reports.len(),
+                format!("Linked unchanged {}", report.file.relative_path),
+            ));
+            continue;
+        }
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
         calls_indexed += calls.len();
-        sqlite
-            .replace_file_facts_with_tests(&file, &symbols, &chunks, &calls, &tests)
-            .map_err(|error| error.to_string())?;
+        if let Some(repository_ref_id) = repository_ref_id {
+            sqlite
+                .replace_file_facts_for_ref_with_tests(
+                    repository_ref_id,
+                    &file,
+                    &symbols,
+                    &chunks,
+                    &calls,
+                    &tests,
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            sqlite
+                .replace_file_facts_with_tests(&file, &symbols, &chunks, &calls, &tests)
+                .map_err(|error| error.to_string())?;
+        }
         on_progress(IndexProgress::new(
             "sqlite",
             index + 1,
@@ -1601,14 +1652,32 @@ fn persist_structural_index(
         ));
     }
 
-    let files_removed = sqlite
-        .remove_missing_files(root.id(), &collection.active_paths)
-        .map_err(|error| error.to_string())?;
+    let ref_files_removed = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite
+            .remove_missing_ref_files(repository_ref_id, &collection.active_paths)
+            .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let files_removed = if repository_ref_id.is_some() {
+        sqlite
+            .remove_unreferenced_missing_files(root.id(), &collection.active_paths)
+            .map_err(|error| error.to_string())?
+    } else {
+        sqlite
+            .remove_missing_files(root.id(), &collection.active_paths)
+            .map_err(|error| error.to_string())?
+    };
+    let removed_message = if ref_files_removed > 0 {
+        format!("Removed {files_removed} stale files and {ref_files_removed} ref mappings")
+    } else {
+        format!("Removed {files_removed} stale files")
+    };
     on_progress(IndexProgress::new(
         "sqlite",
         collection.reports.len(),
         collection.reports.len(),
-        format!("Removed {files_removed} stale files"),
+        removed_message,
     ));
     Ok(PersistenceSummary {
         files_indexed: collection.reports.len(),
@@ -1764,25 +1833,52 @@ fn prepare_semantic_index(
     ))
 }
 
+struct SemanticFinalizationContext<'a> {
+    store_config: &'a StoreConfig,
+    layered_embed_config: &'a LayeredEmbedConfig,
+    repository_ref_id: Option<&'a str>,
+    stale_vector_point_ids: &'a BTreeSet<String>,
+}
+
 fn finalize_semantic_index(
     sqlite: &mut SqliteStore,
     root: &RepoRoot,
-    store_config: &StoreConfig,
-    layered_embed_config: &LayeredEmbedConfig,
     prepared: PreparedSemanticIndex,
-    stale_vector_point_ids: &BTreeSet<String>,
+    context: SemanticFinalizationContext<'_>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<EmbeddingSummary, String> {
     let prepared = match prepared {
         PreparedSemanticIndex::SkippedNoChunks => {
+            let vector_table = vector_table_name(
+                root.id(),
+                &context.layered_embed_config.fast_embed_config().model,
+            );
+            let protected_point_ids = sqlite
+                .vector_point_ids_referenced_by_ref_files(root.id(), &vector_table)
+                .map_err(|error| error.to_string())?;
             delete_stale_vector_points(
                 root,
-                store_config,
-                &layered_embed_config.fast_embed_config().model,
-                stale_vector_point_ids,
-                &BTreeSet::new(),
+                context.store_config,
+                &context.layered_embed_config.fast_embed_config().model,
+                context.stale_vector_point_ids,
+                &protected_point_ids,
                 on_progress,
             )?;
+            if let Some(repository_ref_id) = context.repository_ref_id
+                && let Some(generation) = sqlite
+                    .latest_semantic_generation(root.id())
+                    .map_err(|error| error.to_string())?
+            {
+                let linked_at = current_timestamp();
+                sqlite
+                    .link_semantic_generation_to_ref(
+                        root.id(),
+                        repository_ref_id,
+                        &generation.id,
+                        &linked_at,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
             return Ok(EmbeddingSummary::SkippedNoChunks);
         }
         PreparedSemanticIndex::Completed(prepared) => prepared,
@@ -1800,19 +1896,35 @@ fn finalize_semantic_index(
             completed_at: &recorded_at,
         })
         .map_err(|error| error.to_string())?;
+    if let Some(repository_ref_id) = context.repository_ref_id {
+        sqlite
+            .link_semantic_generation_to_ref(
+                root.id(),
+                repository_ref_id,
+                &generation.id,
+                &recorded_at,
+            )
+            .map_err(|error| error.to_string())?;
+    }
     queue_quality_jobs_after_fast_indexing(
         sqlite,
         root.id(),
-        layered_embed_config,
+        context.layered_embed_config,
         &generation,
         on_progress,
     )?;
+    let mut protected_point_ids = prepared.point_ids();
+    protected_point_ids.extend(
+        sqlite
+            .vector_point_ids_referenced_by_ref_files(root.id(), &prepared.vector_table)
+            .map_err(|error| error.to_string())?,
+    );
     delete_stale_vector_points(
         root,
-        store_config,
+        context.store_config,
         &prepared.model,
-        stale_vector_point_ids,
-        &prepared.point_ids(),
+        context.stale_vector_point_ids,
+        &protected_point_ids,
         on_progress,
     )?;
     Ok(EmbeddingSummary::Completed {
@@ -2604,6 +2716,7 @@ fn index_run_record(
     IndexRunRecord {
         id: scope.index_run_id.to_owned(),
         repository_id: scope.repository_id.to_owned(),
+        repository_ref_id: scope.repository_ref_id.map(str::to_owned),
         status: status.to_owned(),
         embedding_model: scope.embedding_model.to_owned(),
         embedding_dimension,
@@ -2668,6 +2781,7 @@ struct IndexReport {
     tests: Vec<DiscoveredTest>,
     parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
+    skipped_unchanged: bool,
 }
 
 struct ChunkText<'a> {
@@ -2726,6 +2840,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
+            skipped_unchanged: false,
         };
 
         let reports = [report];
@@ -2855,6 +2970,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
+            skipped_unchanged: false,
         }];
 
         let excluded = apply_embedding_size_limits(&mut reports, 64);
@@ -3031,7 +3147,11 @@ mod tests {
         store
             .replace_file_facts(
                 &FileRecord {
-                    id: stable_id(&[root.id(), "src/lib.rs"]),
+                    id: stable_id(&[
+                        root.id(),
+                        "src/lib.rs",
+                        &content_hash(lib_source.as_bytes()),
+                    ]),
                     repository_id: root.id().to_owned(),
                     path: "src/lib.rs".to_owned(),
                     language: "rust".to_owned(),
@@ -3051,9 +3171,15 @@ mod tests {
 
         assert_eq!(collection.files_seen, 2);
         assert_eq!(collection.files_skipped_unchanged, 1);
-        assert_eq!(collection.reports.len(), 1);
+        assert_eq!(collection.reports.len(), 2);
         assert_eq!(
-            collection.reports[0].file.relative_path,
+            collection
+                .reports
+                .iter()
+                .find(|report| !report.skipped_unchanged)
+                .expect("changed report should be present")
+                .file
+                .relative_path,
             "src/keep.generated.rs"
         );
     }
@@ -3129,6 +3255,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let persisted_helper = sample_symbol_record("worker::helper", "file-worker");
 
@@ -3167,6 +3294,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let outer_helper = sample_symbol_record("outer::helper", "file-outer-helper");
         let root_helper = sample_symbol_record("helper", "file-root-helper");
@@ -3208,6 +3336,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let outer_run = sample_symbol_record("outer::Worker::run", "file-outer-worker");
         let root_run = sample_symbol_record("Worker::run", "file-root-worker");
@@ -3245,6 +3374,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let mut helper = sample_symbol_record("Worker::helper", "file-worker-methods");
         helper.kind = SymbolKind::Method.as_str().to_owned();
@@ -3292,6 +3422,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let parent_helper = sample_symbol_record("outer::worker::helper", "file-parent-worker");
         let root_helper = sample_symbol_record("worker::helper", "file-root-worker");
@@ -3323,6 +3454,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let stale_symbol = sample_symbol_record("worker::helper", &collection_file_id);
 
@@ -3444,6 +3576,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }
     }
 

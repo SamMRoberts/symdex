@@ -6,8 +6,8 @@ use std::path::Path;
 
 use serde::Serialize;
 use symdex_core::{
-    DiscoveryOptions, NormalizedRepoPath, RepoRoot, SemanticLayer, SemanticLayerMode,
-    SemanticLayerStatus, discover_indexable_files,
+    DiscoveryOptions, NormalizedRepoPath, RepoRoot, RepositoryRefSnapshot, SemanticLayer,
+    SemanticLayerMode, SemanticLayerStatus, discover_indexable_files,
 };
 use symdex_embed::{EmbedConfig, LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
@@ -583,9 +583,13 @@ pub fn run_symbol_search(repo: &str, query: &str) -> Result<SymbolSearchSummary,
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    let symbols = sqlite
-        .find_symbols(root.id(), query)
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    let symbols = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        sqlite.find_symbols_for_ref(root.id(), repository_ref_id, query)
+    } else {
+        sqlite.find_symbols(root.id(), query)
+    }
+    .map_err(|error| error.to_string())?;
     Ok(SymbolSearchSummary {
         repository_id: root.id().to_owned(),
         query: query.to_owned(),
@@ -604,9 +608,16 @@ pub fn run_call_graph(
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    let rows = match direction {
-        CallDirection::Callers => sqlite.callers(root.id(), query),
-        CallDirection::Callees => sqlite.callees(root.id(), query),
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    let rows = match (direction, repository_ref_id.as_deref()) {
+        (CallDirection::Callers, Some(repository_ref_id)) => {
+            sqlite.callers_for_ref(root.id(), repository_ref_id, query)
+        }
+        (CallDirection::Callees, Some(repository_ref_id)) => {
+            sqlite.callees_for_ref(root.id(), repository_ref_id, query)
+        }
+        (CallDirection::Callers, None) => sqlite.callers(root.id(), query),
+        (CallDirection::Callees, None) => sqlite.callees(root.id(), query),
     }
     .map_err(|error| error.to_string())?;
 
@@ -635,9 +646,19 @@ pub fn run_call_path(
     let max_depth = clamp_call_path_depth(max_depth);
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    let paths = sqlite
-        .call_paths(root.id(), source_query, target_query, max_depth)
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    let paths = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        sqlite.call_paths_for_ref(
+            root.id(),
+            repository_ref_id,
+            source_query,
+            target_query,
+            max_depth,
+        )
+    } else {
+        sqlite.call_paths(root.id(), source_query, target_query, max_depth)
+    }
+    .map_err(|error| error.to_string())?;
     Ok(CallPathSummary {
         repository_id: root.id().to_owned(),
         source_query: source_query.to_owned(),
@@ -654,32 +675,46 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    build_impact_summary(&root, &sqlite, query)
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    build_impact_summary(&root, &sqlite, repository_ref_id.as_deref(), query)
 }
 
 fn build_impact_summary(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    repository_ref_id: Option<&str>,
     query: &str,
 ) -> Result<ImpactSummary, String> {
     let current_hashes = current_hashes(root)?;
     let max_depth = 4;
-    let direct_callers = sqlite
-        .callers(root.id(), query)
-        .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_caller"))
-        .map_err(|error| error.to_string())?;
-    let direct_callees = sqlite
-        .callees(root.id(), query)
-        .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_callee"))
-        .map_err(|error| error.to_string())?;
-    let transitive_callers = sqlite
-        .transitive_call_paths_to(root.id(), query, max_depth)
-        .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_caller"))
-        .map_err(|error| error.to_string())?;
-    let transitive_callees = sqlite
-        .transitive_call_paths_from(root.id(), query, max_depth)
-        .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_callee"))
-        .map_err(|error| error.to_string())?;
+    let direct_callers = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite.callers_for_ref(root.id(), repository_ref_id, query)
+    } else {
+        sqlite.callers(root.id(), query)
+    }
+    .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_caller"))
+    .map_err(|error| error.to_string())?;
+    let direct_callees = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite.callees_for_ref(root.id(), repository_ref_id, query)
+    } else {
+        sqlite.callees(root.id(), query)
+    }
+    .map(|rows| impact_call_evidence(rows, &current_hashes, "direct_callee"))
+    .map_err(|error| error.to_string())?;
+    let transitive_callers = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite.transitive_call_paths_to_for_ref(root.id(), repository_ref_id, query, max_depth)
+    } else {
+        sqlite.transitive_call_paths_to(root.id(), query, max_depth)
+    }
+    .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_caller"))
+    .map_err(|error| error.to_string())?;
+    let transitive_callees = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite.transitive_call_paths_from_for_ref(root.id(), repository_ref_id, query, max_depth)
+    } else {
+        sqlite.transitive_call_paths_from(root.id(), query, max_depth)
+    }
+    .map(|paths| impact_path_evidence(paths, &current_hashes, "transitive_callee"))
+    .map_err(|error| error.to_string())?;
     let related_files = impact_related_files(
         &direct_callers,
         &direct_callees,
@@ -719,9 +754,13 @@ pub fn run_context_pack(repo: &str, query: &str, limit: usize) -> Result<Context
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
-    sqlite
-        .context_pack(root.id(), query, limit)
-        .map_err(|error| error.to_string())
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        sqlite.context_pack_for_ref(root.id(), repository_ref_id, query, limit)
+    } else {
+        sqlite.context_pack(root.id(), query, limit)
+    }
+    .map_err(|error| error.to_string())
 }
 
 pub fn run_unified_context_pack(
@@ -736,9 +775,13 @@ pub fn run_unified_context_pack(
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let sqlite = sqlite_for_read()?;
     let current_hashes = current_hashes(&root)?;
-    let structural = sqlite
-        .context_pack(root.id(), query, limit)
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    let structural = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        sqlite.context_pack_for_ref(root.id(), repository_ref_id, query, limit)
+    } else {
+        sqlite.context_pack(root.id(), query, limit)
+    }
+    .map_err(|error| error.to_string())?;
     let semantic = semantic_search_for_root(&root, query, limit, SemanticSearchOptions::default());
     Ok(build_unified_context_pack(
         structural,
@@ -1452,9 +1495,9 @@ pub fn run_semantic_status(repo: &str) -> Result<SemanticStatusSummary, String> 
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
-    let routing = sqlite
-        .semantic_routing_summary(root.id())
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    let routing =
+        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
     let quality_progress = match routing.as_ref() {
         Some(summary) => Some(
             sqlite
@@ -1615,9 +1658,9 @@ fn semantic_search_for_root(
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
-    let routing = sqlite
-        .semantic_routing_summary(root.id())
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(root, &sqlite)?;
+    let routing =
+        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
     let target =
         resolve_semantic_search_target(root.id(), options, routing.as_ref(), &layered_config)?;
     let embed_config = embed_config_for_semantic_target(&layered_config, &target);
@@ -1631,12 +1674,19 @@ fn semantic_search_for_root(
     };
 
     let vector_store = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
-    let results = vector_store
-        .query_points(&target.vector_table, query_vector, limit)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(semantic_result_from_point)
-        .collect();
+    let points = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        vector_store.query_points_for_ref(
+            &target.vector_table,
+            root.id(),
+            repository_ref_id,
+            query_vector,
+            limit,
+        )
+    } else {
+        vector_store.query_points(&target.vector_table, query_vector, limit)
+    }
+    .map_err(|error| error.to_string())?;
+    let results = points.into_iter().map(semantic_result_from_point).collect();
 
     Ok(SemanticSearchSummary {
         repository_id: root.id().to_owned(),
@@ -1650,6 +1700,24 @@ fn semantic_search_for_root(
         query: query.to_owned(),
         results,
     })
+}
+
+fn semantic_routing_summary_for_scope(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    repository_ref_id: Option<&str>,
+) -> Result<Option<SemanticRoutingSummary>, String> {
+    if let Some(repository_ref_id) = repository_ref_id {
+        let routing = sqlite
+            .semantic_routing_summary_for_ref(repository_id, repository_ref_id)
+            .map_err(|error| error.to_string())?;
+        if routing.is_some() {
+            return Ok(routing);
+        }
+    }
+    sqlite
+        .semantic_routing_summary(repository_id)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2848,6 +2916,17 @@ fn sqlite_for_read_with_config(store_config: &StoreConfig) -> Result<SqliteStore
     let sqlite = SqliteStore::open(store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     Ok(sqlite)
+}
+
+fn active_ref_scope(root: &RepoRoot, sqlite: &SqliteStore) -> Result<Option<String>, String> {
+    if !sqlite
+        .repository_has_ref_file_manifests(root.id())
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
+    let snapshot = RepositoryRefSnapshot::detect(root).map_err(|error| error.to_string())?;
+    Ok(Some(snapshot.id))
 }
 
 fn current_hashes(root: &RepoRoot) -> Result<BTreeMap<String, String>, String> {
@@ -4143,7 +4222,7 @@ mod tests {
         let repository_id = fixture.root.id().to_owned();
         persist_test_calling_callee(&mut fixture.store, &repository_id);
 
-        let summary = build_impact_summary(&fixture.root, &fixture.store, "callee")
+        let summary = build_impact_summary(&fixture.root, &fixture.store, None, "callee")
             .expect("impact summary should build");
 
         assert_eq!(summary.tests_likely, vec!["crate::tests::covers_callee"]);
@@ -4194,7 +4273,7 @@ mod tests {
         let repository_id = fixture.root.id().to_owned();
         persist_csharp_test_calling_callee(&mut fixture.store, &repository_id);
 
-        let summary = build_impact_summary(&fixture.root, &fixture.store, "callee")
+        let summary = build_impact_summary(&fixture.root, &fixture.store, None, "callee")
             .expect("impact summary should build");
 
         assert_eq!(

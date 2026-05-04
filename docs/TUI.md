@@ -222,6 +222,7 @@ Phase 10.5 implementation status:
 ### Repository Dashboard
 
 - Show selected repository root and repository ID.
+- Show active repository ref metadata when local branch/ref state has been synced.
 - Show SQLite index counts for files, chunks, symbols, and calls.
 - Show latest embedding model and vector dimension when available.
 - Show active semantic layer, quality readiness, fallback state, and compact

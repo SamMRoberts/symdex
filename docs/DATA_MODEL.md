@@ -29,12 +29,65 @@ CREATE TABLE repositories (
 );
 ```
 
+### `repository_refs`
+
+```sql
+CREATE TABLE repository_refs (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  ref_kind TEXT NOT NULL,
+  ref_name TEXT,
+  ref_identity TEXT NOT NULL,
+  head_oid TEXT,
+  is_current INTEGER NOT NULL DEFAULT 0,
+  last_seen_at TEXT,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repository_id, ref_kind, ref_identity)
+);
+```
+
+`repository_refs` stores local worktree ref metadata for branch-aware indexing.
+Attached local branches use `ref_kind = branch`, detached HEADs use `detached`,
+unusual refs use `other`, and non-Git repositories use a stable `non_git`
+working-tree ref. Current indexing records the active ref and attaches it to
+index-run provenance. Local branch refs missing from current Git metadata are
+marked with `deleted_at`; full branch-specific snapshot and vector garbage
+collection is a later branch-aware indexing slice.
+
+### `ref_files`
+
+```sql
+CREATE TABLE ref_files (
+  repository_ref_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  indexed_at TEXT NOT NULL,
+  index_run_id TEXT,
+  PRIMARY KEY(repository_ref_id, path)
+);
+```
+
+`ref_files` records the current file manifest for each local repository ref.
+Indexing upserts a path mapping for each active file it persists and removes
+paths missing from that ref's latest discovery result. `file_id` points at the
+content-addressed `files` snapshot for that path, so two local refs can retain
+different indexed facts for the same repo-relative path when their content
+hashes differ. Branch-aware cleanup removes file snapshots only after no
+remaining ref manifest points at them. Structural symbol, call graph, impact,
+and context-pack query paths use the live worktree ref when `ref_files`
+manifests exist. Semantic search also filters sqlite-vec candidates through the
+active ref manifest when manifests exist.
+
 ### `index_runs`
 
 ```sql
 CREATE TABLE index_runs (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL,
+  repository_ref_id TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT,
   status TEXT NOT NULL,
@@ -51,6 +104,13 @@ CREATE TABLE index_runs (
 ```
 
 Indexing records a row when a run starts and finalizes it when the run finishes.
+New index runs record `repository_ref_id` when the active local ref is known.
+The current branch-awareness slices record active ref metadata, populate
+`ref_files`, and route structural and semantic evidence queries through the
+active ref manifest when available. File facts are content-addressed snapshots,
+while semantic routing prefers the active ref's linked generation from
+`semantic_generation_refs` and falls back to the repo-wide latest generation for
+legacy indexes without ref mappings.
 Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
 Successful semantic runs include the embedding model, vector dimension, and
 embedded chunk count. Semantic runs with no changed embeddable chunks finish as
@@ -77,10 +137,17 @@ CREATE TABLE files (
   content_hash TEXT NOT NULL,
   indexed_at TEXT NOT NULL,
   index_run_id TEXT,
-  parser_version TEXT,
-  UNIQUE(repository_id, path)
+  parser_version TEXT
 );
 ```
+
+`id` is derived from repository identity, repo-relative path, and content hash.
+This lets branch-specific manifests preserve same-path/different-content file
+snapshots without reindexing or overwriting another local ref's structural
+facts. A unique index on `(repository_id, path, content_hash)` prevents duplicate
+snapshots for identical content, while ordinary path indexes keep current-path
+lookups fast. Older local databases with the legacy `(repository_id, path)`
+unique constraint are migrated to the snapshot shape during `migrate`.
 
 `language` stores a stable language slug such as `rust`, `csharp`,
 `javascript`, or `typescript`. The schema is intentionally language-neutral; no
@@ -242,6 +309,26 @@ eligible coverage remains `quality_pending`; terminal failures become
 latest-generation `skipped_stale` jobs keep default routing on fast until a
 later generation can complete cleanly.
 `quality_completed_at` is set only by successful activation.
+
+### `semantic_generation_refs`
+
+```sql
+CREATE TABLE semantic_generation_refs (
+  repository_ref_id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  linked_at TEXT NOT NULL
+);
+```
+
+This table records the current semantic generation associated with each local
+repository ref. Semantic indexing links the active ref to the generation it
+records. If a run has no changed embeddable chunks, the active ref is relinked
+to the latest known generation when one exists. Semantic status and search use
+this mapping when `ref_files` manifests are present, then fall back to the
+legacy repo-wide latest generation for older indexes that have no ref mapping.
+The mapping stores only metadata and is removed when the repository ref row is
+removed.
 
 ### `chunk_embeddings`
 
