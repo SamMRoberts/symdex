@@ -54,7 +54,7 @@ use terminal::{enter_terminal, leave_terminal};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WATCHER_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const INDEX_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const INDEX_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct TuiOptions {
     pub repo: String,
@@ -586,22 +586,36 @@ impl App {
     fn apply_status_refresh(&mut self, snapshot: StatusRefreshSnapshot) {
         self.status = snapshot.status;
         self.semantic_status = snapshot.semantic_status;
-        self.storage.explorer = snapshot.explorer;
-        self.storage.coverage = snapshot.coverage;
+        if let Some(explorer) = snapshot.explorer {
+            self.storage.explorer = explorer;
+        }
+        if let Some(coverage) = snapshot.coverage {
+            self.storage.coverage = coverage;
+        }
         if let Some(outline) = snapshot.outline {
             self.storage.outline = outline;
         }
         if let Some(calls) = snapshot.calls {
             self.storage.calls = calls;
         }
-        self.storage.embeddings = snapshot.embeddings;
-        self.storage.runs = snapshot.runs;
-        self.storage.freshness = snapshot.freshness;
+        if let Some(embeddings) = snapshot.embeddings {
+            self.storage.embeddings = embeddings;
+        }
+        if let Some(runs) = snapshot.runs {
+            self.storage.runs = runs;
+        }
+        if let Some(freshness) = snapshot.freshness {
+            self.storage.freshness = freshness;
+        }
         if let Some(neighborhood) = snapshot.neighborhood {
             self.storage.neighborhood = neighborhood;
         }
-        self.storage.health = snapshot.health;
-        self.storage.selection = 0;
+        if let Some(health) = snapshot.health {
+            self.storage.health = health;
+        }
+        if matches!(snapshot.scope, StatusRefreshScope::Full) {
+            self.storage.selection = 0;
+        }
     }
 
     fn start_status_refresh(
@@ -1302,9 +1316,10 @@ impl App {
                 self.last_index_summary = Some(*summary);
                 self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
-                if self
-                    .start_status_refresh(StatusRefreshScope::Full, Some(completed_message.clone()))
-                {
+                if self.start_status_refresh(
+                    StatusRefreshScope::Index,
+                    Some(completed_message.clone()),
+                ) {
                     self.last_index_status_refresh = Some(Instant::now());
                 } else {
                     self.message = completed_message;
@@ -1375,6 +1390,9 @@ impl App {
     }
 
     fn refresh_index_status_on_interval(&mut self) {
+        if !matches!(self.view, View::Overview | View::Indexing) {
+            return;
+        }
         if self.index_receiver.is_some() || self.status_refresh_receiver.is_some() {
             return;
         }
@@ -1469,7 +1487,7 @@ impl App {
                     "Continuous indexing updated {} file events.",
                     changes.event_count()
                 );
-                if self.start_status_refresh(StatusRefreshScope::Full, Some(completed_message)) {
+                if self.start_status_refresh(StatusRefreshScope::Index, Some(completed_message)) {
                     self.last_index_status_refresh = Some(Instant::now());
                 }
             }
@@ -3006,15 +3024,24 @@ fn collect_status_refresh(
     let semantic_status = run_semantic_status(repo_input)?;
 
     Ok(StatusRefreshSnapshot {
+        scope,
         status,
         semantic_status,
-        explorer: match run_storage_explorer(repo_input) {
-            Ok(summary) => StorageStatus::Completed(summary),
-            Err(error) => StorageStatus::Failed(error),
+        explorer: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_storage_explorer(repo_input) {
+                Ok(summary) => StorageStatus::Completed(summary),
+                Err(error) => StorageStatus::Failed(error),
+            })
+        } else {
+            None
         },
-        coverage: match run_index_coverage(repo_input) {
-            Ok(summary) => CoverageStatus::Completed(summary),
-            Err(error) => CoverageStatus::Failed(error),
+        coverage: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_index_coverage(repo_input) {
+                Ok(summary) => CoverageStatus::Completed(summary),
+                Err(error) => CoverageStatus::Failed(error),
+            })
+        } else {
+            None
         },
         outline: if matches!(scope, StatusRefreshScope::Full) {
             Some(match run_symbol_outline(repo_input) {
@@ -3032,17 +3059,29 @@ fn collect_status_refresh(
         } else {
             None
         },
-        embeddings: match run_embedding_coverage(repo_input) {
-            Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
-            Err(error) => EmbeddingCoverageStatus::Failed(error),
+        embeddings: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_embedding_coverage(repo_input) {
+                Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
+                Err(error) => EmbeddingCoverageStatus::Failed(error),
+            })
+        } else {
+            None
         },
-        runs: match run_index_runs_timeline(repo_input) {
-            Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
-            Err(error) => IndexRunsTimelineStatus::Failed(error),
+        runs: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_index_runs_timeline(repo_input) {
+                Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
+                Err(error) => IndexRunsTimelineStatus::Failed(error),
+            })
+        } else {
+            None
         },
-        freshness: match run_freshness_report(repo_input, None) {
-            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
-            Err(error) => FreshnessStatus::Failed(error),
+        freshness: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_freshness_report(repo_input, None) {
+                Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
+                Err(error) => FreshnessStatus::Failed(error),
+            })
+        } else {
+            None
         },
         neighborhood: if matches!(scope, StatusRefreshScope::Full) {
             Some(match run_semantic_neighborhood(repo_input) {
@@ -3052,9 +3091,13 @@ fn collect_status_refresh(
         } else {
             None
         },
-        health: match run_cross_store_health(repo_input) {
-            Ok(summary) => CrossStoreHealthStatus::Completed(summary),
-            Err(error) => CrossStoreHealthStatus::Failed(error),
+        health: if matches!(scope, StatusRefreshScope::Full) {
+            Some(match run_cross_store_health(repo_input) {
+                Ok(summary) => CrossStoreHealthStatus::Completed(summary),
+                Err(error) => CrossStoreHealthStatus::Failed(error),
+            })
+        } else {
+            None
         },
     })
 }
@@ -6564,17 +6607,18 @@ enum StatusRefreshScope {
 }
 
 struct StatusRefreshSnapshot {
+    scope: StatusRefreshScope,
     status: RepositoryStatus,
     semantic_status: SemanticStatusSummary,
-    explorer: StorageStatus,
-    coverage: CoverageStatus,
+    explorer: Option<StorageStatus>,
+    coverage: Option<CoverageStatus>,
     outline: Option<OutlineStatus>,
     calls: Option<CallResolutionStatus>,
-    embeddings: EmbeddingCoverageStatus,
-    runs: IndexRunsTimelineStatus,
-    freshness: FreshnessStatus,
+    embeddings: Option<EmbeddingCoverageStatus>,
+    runs: Option<IndexRunsTimelineStatus>,
+    freshness: Option<FreshnessStatus>,
     neighborhood: Option<SemanticNeighborhoodStatus>,
-    health: CrossStoreHealthStatus,
+    health: Option<CrossStoreHealthStatus>,
 }
 
 enum StatusRefreshMessage {
@@ -6745,7 +6789,7 @@ impl ContinuousIndexStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crossterm::event::KeyCode;
     use ratatui::Terminal;
@@ -8310,6 +8354,8 @@ mod tests {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         let now = Instant::now();
 
+        assert_eq!(INDEX_STATUS_REFRESH_INTERVAL, Duration::from_secs(5));
+
         app.last_index_status_refresh = None;
         assert!(app.index_status_refresh_due(now));
 
@@ -8318,6 +8364,18 @@ mod tests {
 
         app.last_index_status_refresh = Some(now);
         assert!(!app.index_status_refresh_due(now));
+    }
+
+    #[test]
+    fn index_status_refresh_skips_non_index_views() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.last_index_status_refresh = None;
+
+        app.refresh_index_status_on_interval();
+
+        assert!(app.status_refresh_receiver.is_none());
+        assert!(app.last_index_status_refresh.is_none());
     }
 
     #[test]
