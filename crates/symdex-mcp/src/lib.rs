@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
-use symdex_core::{NormalizedRepoPath, RepoRoot, content_hash};
+use symdex_core::{NormalizedRepoPath, RepoRoot, RepositoryRefSnapshot, content_hash};
 use symdex_query::{
     ContextPackMode, FreshnessScope, SemanticSearchSummary, evidence_trust, run_context_pack,
     run_debug_context_pack, run_scoped_freshness_report_with_store_config, run_semantic_search,
@@ -554,11 +554,22 @@ fn tool_index_status_with_store(
 ) -> Result<Value, String> {
     let repo = required_string(arguments, "repo")?;
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let worktree_ref = RepositoryRefSnapshot::detect(&root).map_err(|error| error.to_string())?;
     let status = sqlite_with_config(store_config)?
         .repository_status(root.id())
         .map_err(|error| error.to_string())?;
     Ok(json!({
         "repository_id": status.repository_id,
+        "current_ref_id": status.current_ref_id,
+        "current_ref_kind": status.current_ref_kind,
+        "current_ref_name": status.current_ref_name,
+        "current_head_oid": status.current_head_oid,
+        "worktree_ref": {
+            "id": worktree_ref.id,
+            "kind": worktree_ref.kind.as_str(),
+            "name": worktree_ref.name,
+            "head_oid": worktree_ref.head_oid
+        },
         "files_indexed": status.files_indexed,
         "chunks_indexed": status.chunks_indexed,
         "symbols_indexed": status.symbols_indexed,

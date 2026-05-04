@@ -4,6 +4,7 @@
 
 ```text
 repo root
+  -> resolve local Git/ref metadata
   -> discover files
   -> apply ignore rules
   -> hash contents
@@ -25,6 +26,13 @@ repo root
 ```
 
 ## File discovery
+
+Before discovery, indexing resolves local repository-ref metadata without
+executing repository code. Attached local branches are recorded by branch name,
+detached HEADs by object ID, unusual refs as `other`, and non-Git repositories
+as a stable `non_git` working-tree ref. This first slice stores the ref metadata
+and attaches it to index-run provenance; branch-specific file manifests and
+semantic routing are planned follow-up work.
 
 Respect:
 

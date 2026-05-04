@@ -9,7 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use symdex_core::{SemanticLayer, SemanticLayerStatus, stable_id};
+use symdex_core::{
+    RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
+};
 
 pub use vector::{
     PointPayload, RetrievedPoint, ScoredPoint, SqliteVectorStore, VectorPoint, vector_point_id,
@@ -123,6 +125,101 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         Ok(())
+    }
+
+    pub fn sync_repository_ref(
+        &self,
+        snapshot: &RepositoryRefSnapshot,
+    ) -> Result<RepositoryRefSyncSummary> {
+        let now = timestamp();
+        let current = RepositoryRefRecord::from_snapshot(snapshot, true, &now);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE repository_refs
+                    SET is_current = 0,
+                        updated_at = ?2
+                  WHERE repository_id = ?1",
+                params![snapshot.repository_id, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        for branch in &snapshot.local_branches {
+            let record = RepositoryRefRecord::local_branch(&snapshot.repository_id, branch, &now);
+            upsert_repository_ref_in_transaction(&transaction, &record)?;
+        }
+        upsert_repository_ref_in_transaction(&transaction, &current)?;
+
+        let mut deleted_refs = 0usize;
+        {
+            if !snapshot.local_branches.is_empty() {
+                let active = snapshot
+                    .local_branches
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT id, ref_name
+                           FROM repository_refs
+                          WHERE repository_id = ?1
+                            AND ref_kind = 'branch'
+                            AND deleted_at IS NULL",
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                let rows = statement
+                    .query_map(params![snapshot.repository_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(StoreError::Sqlite)?;
+                for row in rows {
+                    let (id, ref_name) = row.map_err(StoreError::Sqlite)?;
+                    if ref_name
+                        .as_deref()
+                        .is_some_and(|name| !active.contains(name))
+                    {
+                        deleted_refs += transaction
+                            .execute(
+                                "UPDATE repository_refs
+                                    SET deleted_at = ?2,
+                                        is_current = 0,
+                                        updated_at = ?2
+                                  WHERE id = ?1",
+                                params![id, now],
+                            )
+                            .map_err(StoreError::Sqlite)?;
+                    }
+                }
+            }
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(RepositoryRefSyncSummary {
+            current,
+            deleted_refs,
+        })
+    }
+
+    pub fn current_repository_ref(
+        &self,
+        repository_id: &str,
+    ) -> Result<Option<RepositoryRefRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_id, ref_kind, ref_name, ref_identity, head_oid,
+                        is_current, last_seen_at, deleted_at, created_at, updated_at
+                   FROM repository_refs
+                  WHERE repository_id = ?1
+                    AND is_current = 1
+                    AND deleted_at IS NULL
+                  ORDER BY last_seen_at DESC, updated_at DESC, id DESC
+                  LIMIT 1",
+                params![repository_id],
+                repository_ref_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
     }
 
     pub fn file_unchanged(
@@ -543,8 +640,19 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         let embedding = self.latest_embedding_run(repository_id)?;
+        let current_ref = self.current_repository_ref(repository_id)?;
         Ok(RepositoryStatus {
             repository_id: repository_id.to_owned(),
+            current_ref_id: current_ref.as_ref().map(|reference| reference.id.clone()),
+            current_ref_kind: current_ref
+                .as_ref()
+                .map(|reference| reference.ref_kind.clone()),
+            current_ref_name: current_ref
+                .as_ref()
+                .and_then(|reference| reference.ref_name.clone()),
+            current_head_oid: current_ref
+                .as_ref()
+                .and_then(|reference| reference.head_oid.clone()),
             files_indexed,
             chunks_indexed,
             symbols_indexed: self.count_joined(repository_id, "symbols")?,
@@ -780,13 +888,14 @@ impl SqliteStore {
         let now = timestamp();
         self.connection
             .execute(
-                "INSERT INTO index_runs (
-                   id, repository_id, started_at, finished_at, status, embedding_model,
+                                "INSERT INTO index_runs (
+                                     id, repository_id, repository_ref_id, started_at, finished_at, status, embedding_model,
                    embedding_dimension, files_seen, files_indexed, chunks_embedded,
                    error_summary, parser_version, indexer_version, run_kind
                   )
-                  VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                    VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                   ON CONFLICT(id) DO UPDATE SET
+                                        repository_ref_id = excluded.repository_ref_id,
                     started_at = excluded.started_at,
                     finished_at = NULL,
                     status = excluded.status,
@@ -802,6 +911,7 @@ impl SqliteStore {
                 params![
                     run.id,
                     run.repository_id,
+                    run.repository_ref_id,
                     now,
                     run.status,
                     run.embedding_model,
@@ -823,13 +933,14 @@ impl SqliteStore {
         let now = timestamp();
         self.connection
             .execute(
-                "INSERT INTO index_runs (
-                   id, repository_id, started_at, finished_at, status, embedding_model,
+                                "INSERT INTO index_runs (
+                                     id, repository_id, repository_ref_id, started_at, finished_at, status, embedding_model,
                    embedding_dimension, files_seen, files_indexed, chunks_embedded,
                    error_summary, parser_version, indexer_version, run_kind
                   )
-                  VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                    VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                   ON CONFLICT(id) DO UPDATE SET
+                                        repository_ref_id = excluded.repository_ref_id,
                     finished_at = excluded.finished_at,
                     status = excluded.status,
                     embedding_model = excluded.embedding_model,
@@ -844,6 +955,7 @@ impl SqliteStore {
                 params![
                     run.id,
                     run.repository_id,
+                    run.repository_ref_id,
                     now,
                     run.status,
                     run.embedding_model,
@@ -3585,6 +3697,75 @@ pub struct RepositoryRecord {
     pub root_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryRefRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub ref_kind: String,
+    pub ref_name: Option<String>,
+    pub ref_identity: String,
+    pub head_oid: Option<String>,
+    pub is_current: bool,
+    pub last_seen_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl RepositoryRefRecord {
+    pub fn from_snapshot(
+        snapshot: &RepositoryRefSnapshot,
+        is_current: bool,
+        timestamp: &str,
+    ) -> Self {
+        let identity = ref_identity(
+            snapshot.kind,
+            snapshot.name.as_deref(),
+            snapshot.head_oid.as_deref(),
+        );
+        Self {
+            id: snapshot.id.clone(),
+            repository_id: snapshot.repository_id.clone(),
+            ref_kind: snapshot.kind.as_str().to_owned(),
+            ref_name: snapshot.name.clone(),
+            ref_identity: identity,
+            head_oid: snapshot.head_oid.clone(),
+            is_current,
+            last_seen_at: Some(timestamp.to_owned()),
+            deleted_at: None,
+            created_at: Some(timestamp.to_owned()),
+            updated_at: Some(timestamp.to_owned()),
+        }
+    }
+
+    pub fn local_branch(repository_id: &str, branch: &str, timestamp: &str) -> Self {
+        Self {
+            id: stable_id(&[
+                "repository-ref",
+                repository_id,
+                RepositoryRefKind::Branch.as_str(),
+                branch,
+            ]),
+            repository_id: repository_id.to_owned(),
+            ref_kind: RepositoryRefKind::Branch.as_str().to_owned(),
+            ref_name: Some(branch.to_owned()),
+            ref_identity: branch.to_owned(),
+            head_oid: None,
+            is_current: false,
+            last_seen_at: Some(timestamp.to_owned()),
+            deleted_at: None,
+            created_at: Some(timestamp.to_owned()),
+            updated_at: Some(timestamp.to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRefSyncSummary {
+    pub current: RepositoryRefRecord,
+    pub deleted_refs: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
     pub id: String,
@@ -3681,6 +3862,10 @@ pub struct TestSearchRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryStatus {
     pub repository_id: String,
+    pub current_ref_id: Option<String>,
+    pub current_ref_kind: Option<String>,
+    pub current_ref_name: Option<String>,
+    pub current_head_oid: Option<String>,
     pub files_indexed: usize,
     pub chunks_indexed: usize,
     pub symbols_indexed: usize,
@@ -3729,6 +3914,7 @@ pub struct WatcherClientRecord {
 pub struct IndexRunRecord {
     pub id: String,
     pub repository_id: String,
+    pub repository_ref_id: Option<String>,
     pub status: String,
     pub embedding_model: String,
     pub embedding_dimension: Option<usize>,
@@ -4504,6 +4690,68 @@ fn collect_rows<T>(
         values.push(row.map_err(StoreError::Sqlite)?);
     }
     Ok(values)
+}
+
+fn ref_identity(kind: RepositoryRefKind, ref_name: Option<&str>, head_oid: Option<&str>) -> String {
+    match kind {
+        RepositoryRefKind::Branch | RepositoryRefKind::Other => ref_name.unwrap_or("unknown"),
+        RepositoryRefKind::Detached => head_oid.unwrap_or("unknown"),
+        RepositoryRefKind::NonGit => "working-tree",
+    }
+    .to_owned()
+}
+
+fn upsert_repository_ref_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &RepositoryRefRecord,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO repository_refs (
+               id, repository_id, ref_kind, ref_name, ref_identity, head_oid,
+               is_current, last_seen_at, deleted_at, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(repository_id, ref_kind, ref_identity) DO UPDATE SET
+               id = excluded.id,
+               ref_name = excluded.ref_name,
+               head_oid = COALESCE(excluded.head_oid, repository_refs.head_oid),
+               is_current = excluded.is_current,
+               last_seen_at = excluded.last_seen_at,
+               deleted_at = excluded.deleted_at,
+               updated_at = excluded.updated_at",
+            params![
+                record.id,
+                record.repository_id,
+                record.ref_kind,
+                record.ref_name,
+                record.ref_identity,
+                record.head_oid,
+                if record.is_current { 1i64 } else { 0i64 },
+                record.last_seen_at,
+                record.deleted_at,
+                record.created_at,
+                record.updated_at,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn repository_ref_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRefRecord> {
+    Ok(RepositoryRefRecord {
+        id: row.get(0)?,
+        repository_id: row.get(1)?,
+        ref_kind: row.get(2)?,
+        ref_name: row.get(3)?,
+        ref_identity: row.get(4)?,
+        head_oid: row.get(5)?,
+        is_current: row.get::<_, i64>(6)? != 0,
+        last_seen_at: row.get(7)?,
+        deleted_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
 }
 
 fn usize_count(value: i64, label: &str) -> Result<usize> {
@@ -5496,6 +5744,11 @@ struct ProvenanceColumn {
 const COMPATIBILITY_COLUMNS: &[ProvenanceColumn] = &[
     ProvenanceColumn {
         table: "index_runs",
+        name: "repository_ref_id",
+        alter_sql: "ALTER TABLE index_runs ADD COLUMN repository_ref_id TEXT",
+    },
+    ProvenanceColumn {
+        table: "index_runs",
         name: "parser_version",
         alter_sql: "ALTER TABLE index_runs ADD COLUMN parser_version TEXT",
     },
@@ -5594,9 +5847,34 @@ CREATE TABLE IF NOT EXISTS repositories (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS repository_refs (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    ref_kind TEXT NOT NULL,
+    ref_name TEXT,
+    ref_identity TEXT NOT NULL,
+    head_oid TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    deleted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(repository_id, ref_kind, ref_identity),
+    CHECK(ref_kind IN ('branch', 'detached', 'other', 'non_git')),
+    CHECK(is_current IN (0, 1)),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_repository_refs_current
+    ON repository_refs(repository_id, is_current, deleted_at);
+
+CREATE INDEX IF NOT EXISTS idx_repository_refs_branch_name
+    ON repository_refs(repository_id, ref_kind, ref_name);
+
 CREATE TABLE IF NOT EXISTS index_runs (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL,
+    repository_ref_id TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT,
   status TEXT NOT NULL,
@@ -5608,7 +5886,9 @@ CREATE TABLE IF NOT EXISTS index_runs (
   error_summary TEXT,
   parser_version TEXT,
   indexer_version TEXT,
-  run_kind TEXT NOT NULL DEFAULT 'manual'
+    run_kind TEXT NOT NULL DEFAULT 'manual',
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS watchers (
@@ -5887,7 +6167,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::params;
-    use symdex_core::{SemanticLayer, SemanticLayerStatus};
+    use symdex_core::{
+        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus,
+    };
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
@@ -5944,6 +6226,54 @@ mod tests {
             .health_check()
             .expect("sqlite-vec should report a version");
         assert!(version.starts_with("v"));
+    }
+
+    #[test]
+    fn sync_repository_ref_tracks_current_branch_and_deleted_branches() {
+        let db = TestDb::new("repository-ref-sync");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+
+        let first = RepositoryRefSnapshot {
+            id: "ref-main".to_owned(),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let summary = store.sync_repository_ref(&first).expect("refs should sync");
+        assert_eq!(summary.current.ref_name.as_deref(), Some("main"));
+        assert_eq!(summary.deleted_refs, 0);
+
+        let second = RepositoryRefSnapshot {
+            id: "ref-main".to_owned(),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned()],
+        };
+        let summary = store
+            .sync_repository_ref(&second)
+            .expect("refs should sync after branch deletion");
+        let current = store
+            .current_repository_ref("repo")
+            .expect("current ref should load")
+            .expect("current ref should exist");
+
+        assert_eq!(summary.deleted_refs, 1);
+        assert_eq!(current.ref_name.as_deref(), Some("main"));
+        assert_eq!(
+            current.head_oid.as_deref(),
+            Some("fedcba9876543210fedcba9876543210fedcba98")
+        );
     }
 
     #[test]
@@ -8990,6 +9320,7 @@ mod tests {
         crate::IndexRunRecord {
             id: format!("run-{model}-{dimension}"),
             repository_id: "repo".to_owned(),
+            repository_ref_id: None,
             status: "success".to_owned(),
             embedding_model: model.to_owned(),
             embedding_dimension: Some(dimension),

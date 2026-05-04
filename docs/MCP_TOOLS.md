@@ -565,7 +565,9 @@ source-free metadata only.
 
 ### `symdex_index_status`
 
-Return local SQLite index counts.
+Return local SQLite index counts. The result also includes persisted current
+repository-ref metadata when available and a metadata-only `worktree_ref`
+snapshot resolved from local Git state for the requested repo.
 
 Input:
 
@@ -580,6 +582,16 @@ Output:
 ```json
 {
   "repository_id": "stable-repo-id",
+  "current_ref_id": "stable-ref-id",
+  "current_ref_kind": "branch",
+  "current_ref_name": "main",
+  "current_head_oid": "0123456789abcdef0123456789abcdef01234567",
+  "worktree_ref": {
+    "id": "stable-ref-id",
+    "kind": "branch",
+    "name": "main",
+    "head_oid": "0123456789abcdef0123456789abcdef01234567"
+  },
   "files_indexed": 42,
   "chunks_indexed": 120,
   "symbols_indexed": 80,

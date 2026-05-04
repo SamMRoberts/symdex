@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, NormalizedRepoPath,
-    ParseDiagnostic, RepoRoot, ResolutionStatus, SemanticLayer, Symbol, SymbolKind, content_hash,
-    discover_indexable_files, index_source_file,
+    ParseDiagnostic, RepoRoot, RepositoryRefSnapshot, ResolutionStatus, SemanticLayer, Symbol,
+    SymbolKind, content_hash, discover_indexable_files, index_source_file,
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
@@ -326,6 +326,7 @@ struct RunCounts {
 struct RunScope<'a> {
     index_run_id: &'a str,
     repository_id: &'a str,
+    repository_ref_id: Option<&'a str>,
     embedding_model: &'a str,
     run_kind: &'a str,
 }
@@ -727,6 +728,10 @@ fn run_index_internal(
             root_path: root.path().display().to_string(),
         })
         .map_err(|error| error.to_string())?;
+    let repository_ref = RepositoryRefSnapshot::detect(&root).map_err(|error| error.to_string())?;
+    sqlite
+        .sync_repository_ref(&repository_ref)
+        .map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
         "open",
         1,
@@ -746,6 +751,7 @@ fn run_index_internal(
     let run_scope = RunScope {
         index_run_id: &index_run_id,
         repository_id: root.id(),
+        repository_ref_id: Some(&repository_ref.id),
         embedding_model: &embedding_model,
         run_kind,
     };
@@ -2604,6 +2610,7 @@ fn index_run_record(
     IndexRunRecord {
         id: scope.index_run_id.to_owned(),
         repository_id: scope.repository_id.to_owned(),
+        repository_ref_id: scope.repository_ref_id.map(str::to_owned),
         status: status.to_owned(),
         embedding_model: scope.embedding_model.to_owned(),
         embedding_dimension,

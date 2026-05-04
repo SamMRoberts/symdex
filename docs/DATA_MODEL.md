@@ -29,12 +29,40 @@ CREATE TABLE repositories (
 );
 ```
 
+### `repository_refs`
+
+```sql
+CREATE TABLE repository_refs (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  ref_kind TEXT NOT NULL,
+  ref_name TEXT,
+  ref_identity TEXT NOT NULL,
+  head_oid TEXT,
+  is_current INTEGER NOT NULL DEFAULT 0,
+  last_seen_at TEXT,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repository_id, ref_kind, ref_identity)
+);
+```
+
+`repository_refs` stores local worktree ref metadata for branch-aware indexing.
+Attached local branches use `ref_kind = branch`, detached HEADs use `detached`,
+unusual refs use `other`, and non-Git repositories use a stable `non_git`
+working-tree ref. Current indexing records the active ref and attaches it to
+index-run provenance. Local branch refs missing from current Git metadata are
+marked with `deleted_at`; full branch-specific snapshot and vector garbage
+collection is a later branch-aware indexing slice.
+
 ### `index_runs`
 
 ```sql
 CREATE TABLE index_runs (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL,
+  repository_ref_id TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT,
   status TEXT NOT NULL,
@@ -51,6 +79,10 @@ CREATE TABLE index_runs (
 ```
 
 Indexing records a row when a run starts and finalizes it when the run finishes.
+New index runs record `repository_ref_id` when the active local ref is known.
+This is metadata only in the first branch-awareness slice; structural files,
+chunks, symbols, calls, and semantic generations still use the current
+repo-wide view until the branch manifest/snapshot migration lands.
 Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
 Successful semantic runs include the embedding model, vector dimension, and
 embedded chunk count. Semantic runs with no changed embeddable chunks finish as
