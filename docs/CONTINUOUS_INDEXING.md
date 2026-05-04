@@ -184,6 +184,9 @@ Current implementation status:
 - Do not log source text.
 - Record index run summaries for continuous indexing batches so storage views
   can show when watch-driven updates occurred.
+- Record per-file `file_index_events` for watch batches so created, modified,
+  deleted, skipped unchanged, and paths removed from discovery by ignore or
+  support rules can be debugged from local metadata.
 - Surface watch health in diagnostics when available, including watcher active
   state and the most recent error.
 - Surface quality-layer status separately from fast-layer indexing status.

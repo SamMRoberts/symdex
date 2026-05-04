@@ -301,6 +301,26 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)
     }
 
+    pub fn latest_file_state_for_path(
+        &self,
+        repository_id: &str,
+        path: &str,
+    ) -> Result<Option<FileStateRecord>> {
+        self.connection
+            .query_row(
+                "SELECT path, content_hash
+                   FROM files
+                  WHERE repository_id = ?1
+                    AND path = ?2
+                  ORDER BY indexed_at DESC, index_run_id DESC, id DESC
+                  LIMIT 1",
+                params![repository_id, path],
+                file_state_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
     pub fn file_unchanged(
         &self,
         repository_id: &str,
@@ -326,6 +346,83 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         Ok(unchanged != 0)
+    }
+
+    pub fn file_index_states(&self, repository_id: &str) -> Result<Vec<FileStateRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path, content_hash
+                   FROM files
+                  WHERE repository_id = ?1
+                  ORDER BY path, indexed_at DESC, index_run_id DESC, id DESC",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], file_state_record)
+            .map_err(StoreError::Sqlite)?;
+        let mut latest = Vec::new();
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let state = row.map_err(StoreError::Sqlite)?;
+            if seen.insert(state.path.clone()) {
+                latest.push(state);
+            }
+        }
+        Ok(latest)
+    }
+
+    pub fn ref_file_index_states(&self, repository_ref_id: &str) -> Result<Vec<FileStateRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ref_files.path, files.content_hash
+                   FROM ref_files
+                   JOIN files ON files.id = ref_files.file_id
+                  WHERE ref_files.repository_ref_id = ?1
+                  ORDER BY ref_files.path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_ref_id], file_state_record)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn record_file_index_events(&mut self, events: &[FileIndexEventRecord]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let occurred_at = timestamp();
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        for event in events {
+            transaction
+                .execute(
+                    "INSERT INTO file_index_events (
+                       id, index_run_id, repository_id, repository_ref_id, path,
+                       old_content_hash, new_content_hash, action, reason, status,
+                       error_summary, occurred_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        event.id,
+                        event.index_run_id,
+                        event.repository_id,
+                        event.repository_ref_id,
+                        event.path,
+                        event.old_content_hash,
+                        event.new_content_hash,
+                        event.action,
+                        event.reason,
+                        event.status,
+                        event.error_summary,
+                        occurred_at,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(())
     }
 
     pub fn link_file_to_ref(&mut self, repository_ref_id: &str, file: &FileRecord) -> Result<()> {
@@ -4776,6 +4873,27 @@ pub struct FileRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStateRecord {
+    pub path: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIndexEventRecord {
+    pub id: String,
+    pub index_run_id: String,
+    pub repository_id: String,
+    pub repository_ref_id: Option<String>,
+    pub path: String,
+    pub old_content_hash: Option<String>,
+    pub new_content_hash: Option<String>,
+    pub action: String,
+    pub reason: String,
+    pub status: String,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkRecord {
     pub id: String,
     pub file_id: String,
@@ -5750,6 +5868,13 @@ fn repository_ref_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repository
         deleted_at: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+    })
+}
+
+fn file_state_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileStateRecord> {
+    Ok(FileStateRecord {
+        path: row.get(0)?,
+        content_hash: row.get(1)?,
     })
 }
 
@@ -6973,6 +7098,26 @@ CREATE TABLE IF NOT EXISTS index_runs (
     FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS file_index_events (
+  id TEXT PRIMARY KEY,
+  index_run_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  repository_ref_id TEXT,
+  path TEXT NOT NULL,
+  old_content_hash TEXT,
+  new_content_hash TEXT,
+  action TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL,
+  error_summary TEXT,
+  occurred_at TEXT NOT NULL,
+  CHECK(action IN ('created', 'updated', 'deleted', 'skipped', 'failed')),
+  CHECK(status IN ('success', 'failed', 'skipped')),
+  FOREIGN KEY(index_run_id) REFERENCES index_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+  FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS watchers (
   repository_id TEXT PRIMARY KEY,
   root_path TEXT NOT NULL,
@@ -7223,6 +7368,9 @@ CREATE INDEX IF NOT EXISTS idx_tests_file_id ON tests(file_id);
 CREATE INDEX IF NOT EXISTS idx_tests_symbol_id ON tests(symbol_id);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_run_path ON file_index_events(index_run_id, path);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_path_time ON file_index_events(repository_id, path, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_action_status ON file_index_events(repository_id, action, status, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON semantic_generations(repository_id, fast_completed_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_semantic_generation_refs_generation ON semantic_generation_refs(repository_id, generation_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
@@ -7267,12 +7415,13 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
-        FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus, FileRecord,
-        PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
-        RepositoryRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
-        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, TestRecord, VectorPoint,
-        WatcherClientRecord, WatcherStatusRecord, validate_vector_table_name, vector_point_id,
-        vector_rowid, vector_table_name,
+        FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus,
+        FileIndexEventRecord, FileRecord, PointPayload, QualityActivationReason,
+        QualityEmbeddingJobRecord, QualityJobCompletion, RepositoryRecord,
+        SemanticGenerationRecord, SqliteStore, SqliteVectorStore, StorageHealthStatus, StoreConfig,
+        StoreError, SymbolRecord, TestRecord, VectorPoint, WatcherClientRecord,
+        WatcherStatusRecord, validate_vector_table_name, vector_point_id, vector_rowid,
+        vector_table_name,
     };
 
     #[test]
@@ -8038,6 +8187,9 @@ mod tests {
             "idx_tests_symbol_id",
             "idx_index_runs_repository_status",
             "idx_index_runs_repository_model_status",
+            "idx_file_index_events_run_path",
+            "idx_file_index_events_repository_path_time",
+            "idx_file_index_events_repository_action_status",
             "idx_semantic_generations_repository_fast_completed",
             "idx_semantic_generation_refs_generation",
             "idx_chunk_embeddings_repository_layer_model",
@@ -8121,6 +8273,7 @@ mod tests {
         let tables = sqlite_table_names(&store);
 
         for expected in [
+            "file_index_events",
             "semantic_generations",
             "semantic_generation_refs",
             "chunk_embeddings",
@@ -10550,6 +10703,100 @@ mod tests {
         assert_eq!(finished.2, 4);
         assert_eq!(finished.3, 3);
         assert_eq!(finished.4.as_deref(), Some("vector store unavailable"));
+    }
+
+    #[test]
+    fn sqlite_records_per_file_index_events() {
+        let db = TestDb::new("file-index-events");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let mut run = sample_index_run("offline", 0);
+        run.id = "run-events".to_owned();
+        store
+            .start_index_run(&run)
+            .expect("index run should persist");
+
+        store
+            .record_file_index_events(&[
+                FileIndexEventRecord {
+                    id: "event-created".to_owned(),
+                    index_run_id: "run-events".to_owned(),
+                    repository_id: "repo".to_owned(),
+                    repository_ref_id: None,
+                    path: "src/lib.rs".to_owned(),
+                    old_content_hash: None,
+                    new_content_hash: Some("hash-new".to_owned()),
+                    action: "created".to_owned(),
+                    reason: "new_file".to_owned(),
+                    status: "success".to_owned(),
+                    error_summary: None,
+                },
+                FileIndexEventRecord {
+                    id: "event-skipped".to_owned(),
+                    index_run_id: "run-events".to_owned(),
+                    repository_id: "repo".to_owned(),
+                    repository_ref_id: None,
+                    path: "src/unchanged.rs".to_owned(),
+                    old_content_hash: Some("hash-same".to_owned()),
+                    new_content_hash: Some("hash-same".to_owned()),
+                    action: "skipped".to_owned(),
+                    reason: "unchanged_content_hash".to_owned(),
+                    status: "skipped".to_owned(),
+                    error_summary: None,
+                },
+            ])
+            .expect("file events should persist");
+
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+        )> = store
+            .connection
+            .prepare(
+                "SELECT path, old_content_hash, new_content_hash, action, reason, status
+                   FROM file_index_events
+                  WHERE index_run_id = 'run-events'
+                  ORDER BY path",
+            )
+            .expect("query should prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .expect("query should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows should load");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (
+                "src/lib.rs".to_owned(),
+                None,
+                Some("hash-new".to_owned()),
+                "created".to_owned(),
+                "new_file".to_owned(),
+                "success".to_owned(),
+            )
+        );
+        assert_eq!(rows[1].3, "skipped");
+        assert_eq!(rows[1].5, "skipped");
     }
 
     #[test]

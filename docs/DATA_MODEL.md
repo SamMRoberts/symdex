@@ -126,6 +126,53 @@ timestamps, files seen/indexed, chunks embedded, model, dimension, and any
 metadata-only error summary. Watch-driven batches are currently recorded with
 `run_kind = watch`.
 
+### `file_index_events`
+
+```sql
+CREATE TABLE file_index_events (
+  id TEXT PRIMARY KEY,
+  index_run_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  repository_ref_id TEXT,
+  path TEXT NOT NULL,
+  old_content_hash TEXT,
+  new_content_hash TEXT,
+  action TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL,
+  error_summary TEXT,
+  occurred_at TEXT NOT NULL
+);
+```
+
+`file_index_events` records the per-file decisions that make up an index run.
+The table is append-only telemetry keyed by `index_run_id`, repo-relative path,
+and action. It complements `index_runs`: the run row answers whether a batch
+finished, while file events answer why each path was created, updated, deleted,
+or skipped.
+
+Current indexing writes events for:
+
+- `created` with reason `new_file` when a discovered path has no prior indexed
+  hash.
+- `updated` with reason `content_changed` when a discovered path replaces a
+  prior indexed hash.
+- `updated` with reason `parsed_with_diagnostics` when syntax-aware parsing
+  produced usable facts with parser diagnostics.
+- `skipped` with reason `unchanged_content_hash` when incremental indexing
+  links the existing file snapshot into the active ref manifest.
+- `deleted` with reason `missing_from_discovery` when a previously indexed path
+  is absent from the current discovery result because it was removed, ignored,
+  unsupported, or no longer inside the configured indexing scope.
+- `failed` with reason `read_failed` or `parse_failed` when collection aborts
+  on a path-specific file read or parser error.
+
+Events store `old_content_hash` and `new_content_hash` when available, plus
+`repository_ref_id` for branch-aware runs. Source text is never stored in this
+table. Parser or read failures that abort collection record `status = failed`
+and a metadata-only `error_summary` when the failing path is known; aggregate
+failure status remains in `index_runs`.
+
 ### `files`
 
 ```sql

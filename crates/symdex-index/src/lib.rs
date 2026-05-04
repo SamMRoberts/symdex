@@ -16,7 +16,7 @@ use symdex_core::{
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkEmbeddingRecord, ChunkRecord, FastEmbeddingManifestRecord,
-    FastSemanticGenerationInput, FileRecord, IndexRunRecord, PointPayload,
+    FastSemanticGenerationInput, FileIndexEventRecord, FileRecord, IndexRunRecord, PointPayload,
     QualityActivationSummary, QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow,
     QualityQueueSummary, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
     SymbolRecord, TestRecord, VectorPoint, current_timestamp, vector_point_id, vector_table_name,
@@ -807,24 +807,22 @@ fn run_index_internal(
         ))
         .map_err(|error| error.to_string())?;
 
-    let mut collection = match collect_index_reports(
-        &root,
-        if skip_unchanged { Some(&sqlite) } else { None },
-        &mut on_progress,
-    ) {
-        Ok(collection) => collection,
-        Err(error) => {
-            finish_failed_index_run(
-                &sqlite,
-                &run_scope,
-                "unknown",
-                RunCounts::default(),
-                "failed",
-                &error,
-            )?;
-            return Err(error);
-        }
-    };
+    let mut collection =
+        match collect_index_reports(&root, Some(&sqlite), skip_unchanged, &mut on_progress) {
+            Ok(collection) => collection,
+            Err(error) => {
+                record_collect_failure_file_event(&mut sqlite, &run_scope, &error)?;
+                finish_failed_index_run(
+                    &sqlite,
+                    &run_scope,
+                    "unknown",
+                    RunCounts::default(),
+                    "failed",
+                    &error,
+                )?;
+                return Err(error);
+            }
+        };
     let persisted_rust_symbols = match sqlite.rust_symbols_for_repository(root.id()) {
         Ok(symbols) => symbols,
         Err(error) => {
@@ -1042,14 +1040,22 @@ fn index_run_kind(offline: bool, override_kind: Option<&'static str>) -> &'stati
 fn collect_index_reports(
     root: &RepoRoot,
     sqlite: Option<&SqliteStore>,
+    skip_unchanged: bool,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<IndexCollection, String> {
-    collect_index_reports_with_options(root, sqlite, &DiscoveryOptions::from_env(), on_progress)
+    collect_index_reports_with_options(
+        root,
+        sqlite,
+        skip_unchanged,
+        &DiscoveryOptions::from_env(),
+        on_progress,
+    )
 }
 
 fn collect_index_reports_with_options(
     root: &RepoRoot,
     sqlite: Option<&SqliteStore>,
+    skip_unchanged: bool,
     discovery_options: &DiscoveryOptions,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<IndexCollection, String> {
@@ -1065,7 +1071,17 @@ fn collect_index_reports_with_options(
     let mut reports = Vec::new();
     let mut files_skipped_unchanged = 0usize;
     for (index, file) in files.iter().enumerate() {
-        if let Some(sqlite) = sqlite
+        let old_content_hash = sqlite
+            .map(|sqlite| {
+                sqlite
+                    .latest_file_state_for_path(root.id(), &file.facts.relative_path)
+                    .map(|state| state.map(|state| state.content_hash))
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if skip_unchanged
+            && let Some(sqlite) = sqlite
             && sqlite
                 .file_unchanged(
                     root.id(),
@@ -1086,6 +1102,7 @@ fn collect_index_reports_with_options(
                 parse_diagnostics: Vec::new(),
                 source: String::new(),
                 skipped_unchanged: true,
+                old_content_hash,
             });
             on_progress(IndexProgress::new(
                 "parse",
@@ -1098,8 +1115,8 @@ fn collect_index_reports_with_options(
 
         let source = fs::read_to_string(&file.absolute_path)
             .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
-        let file_index =
-            index_source_file(&file.facts, &source).map_err(|error| error.to_string())?;
+        let file_index = index_source_file(&file.facts, &source)
+            .map_err(|error| format!("parse {}: {error}", file.facts.relative_path))?;
         let parse_diagnostic_count = file_index.parse_diagnostics.len();
         reports.push(IndexReport {
             file: file.facts.clone(),
@@ -1110,6 +1127,7 @@ fn collect_index_reports_with_options(
             parse_diagnostics: file_index.parse_diagnostics,
             source,
             skipped_unchanged: false,
+            old_content_hash,
         });
         let message = if parse_diagnostic_count == 0 {
             format!("Parsed {}", file.facts.relative_path)
@@ -1637,6 +1655,7 @@ fn persist_structural_index(
     let mut chunks_indexed = 0usize;
     let mut symbols_indexed = 0usize;
     let mut calls_indexed = 0usize;
+    let mut file_index_events = Vec::new();
     for (index, report) in collection.reports.iter().enumerate() {
         let file = FileRecord {
             id: report.file.id.clone(),
@@ -1677,6 +1696,21 @@ fn persist_structural_index(
             })
             .collect::<Vec<_>>();
         if report.skipped_unchanged {
+            file_index_events.push(file_index_event(FileIndexEventInput {
+                index_run_id,
+                repository_id: root.id(),
+                repository_ref_id,
+                path: &report.file.relative_path,
+                old_content_hash: report
+                    .old_content_hash
+                    .clone()
+                    .or_else(|| Some(report.file.content_hash.clone())),
+                new_content_hash: Some(report.file.content_hash.clone()),
+                action: "skipped",
+                reason: "unchanged_content_hash",
+                status: "skipped",
+                error_summary: None,
+            }));
             if let Some(repository_ref_id) = repository_ref_id {
                 sqlite
                     .link_file_to_ref(repository_ref_id, &file)
@@ -1690,6 +1724,30 @@ fn persist_structural_index(
             ));
             continue;
         }
+        let action = if report.old_content_hash.is_some() {
+            "updated"
+        } else {
+            "created"
+        };
+        let reason = if !report.parse_diagnostics.is_empty() {
+            "parsed_with_diagnostics"
+        } else if report.old_content_hash.is_some() {
+            "content_changed"
+        } else {
+            "new_file"
+        };
+        file_index_events.push(file_index_event(FileIndexEventInput {
+            index_run_id,
+            repository_id: root.id(),
+            repository_ref_id,
+            path: &report.file.relative_path,
+            old_content_hash: report.old_content_hash.clone(),
+            new_content_hash: Some(report.file.content_hash.clone()),
+            action,
+            reason,
+            status: "success",
+            error_summary: None,
+        }));
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
         calls_indexed += calls.len();
@@ -1716,6 +1774,40 @@ fn persist_structural_index(
             format!("Persisted {}", report.file.relative_path),
         ));
     }
+
+    let active_paths: BTreeSet<&str> = collection.active_paths.iter().map(String::as_str).collect();
+    let deleted_states = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite
+            .ref_file_index_states(repository_ref_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|state| !active_paths.contains(state.path.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        sqlite
+            .file_index_states(root.id())
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|state| !active_paths.contains(state.path.as_str()))
+            .collect::<Vec<_>>()
+    };
+    for deleted in deleted_states {
+        file_index_events.push(file_index_event(FileIndexEventInput {
+            index_run_id,
+            repository_id: root.id(),
+            repository_ref_id,
+            path: &deleted.path,
+            old_content_hash: Some(deleted.content_hash),
+            new_content_hash: None,
+            action: "deleted",
+            reason: "missing_from_discovery",
+            status: "success",
+            error_summary: None,
+        }));
+    }
+    sqlite
+        .record_file_index_events(&file_index_events)
+        .map_err(|error| error.to_string())?;
 
     let ref_files_removed = if let Some(repository_ref_id) = repository_ref_id {
         sqlite
@@ -1751,6 +1843,41 @@ fn persist_structural_index(
         calls_indexed,
         files_removed,
     })
+}
+
+struct FileIndexEventInput<'a> {
+    index_run_id: &'a str,
+    repository_id: &'a str,
+    repository_ref_id: Option<&'a str>,
+    path: &'a str,
+    old_content_hash: Option<String>,
+    new_content_hash: Option<String>,
+    action: &'a str,
+    reason: &'a str,
+    status: &'a str,
+    error_summary: Option<String>,
+}
+
+fn file_index_event(input: FileIndexEventInput<'_>) -> FileIndexEventRecord {
+    FileIndexEventRecord {
+        id: symdex_core::stable_id(&[
+            "file-index-event",
+            input.index_run_id,
+            input.path,
+            input.action,
+            input.status,
+        ]),
+        index_run_id: input.index_run_id.to_owned(),
+        repository_id: input.repository_id.to_owned(),
+        repository_ref_id: input.repository_ref_id.map(str::to_owned),
+        path: input.path.to_owned(),
+        old_content_hash: input.old_content_hash,
+        new_content_hash: input.new_content_hash,
+        action: input.action.to_owned(),
+        reason: input.reason.to_owned(),
+        status: input.status.to_owned(),
+        error_summary: input.error_summary,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2818,6 +2945,48 @@ fn finish_failed_index_run(
         })
 }
 
+fn record_collect_failure_file_event(
+    sqlite: &mut SqliteStore,
+    scope: &RunScope<'_>,
+    error: &str,
+) -> Result<(), String> {
+    let Some((reason, path)) = collect_failure_reason_and_path(error) else {
+        return Ok(());
+    };
+    let event = file_index_event(FileIndexEventInput {
+        index_run_id: scope.index_run_id,
+        repository_id: scope.repository_id,
+        repository_ref_id: scope.repository_ref_id,
+        path,
+        old_content_hash: None,
+        new_content_hash: None,
+        action: "failed",
+        reason,
+        status: "failed",
+        error_summary: Some(error_summary(error)),
+    });
+    sqlite
+        .record_file_index_events(&[event])
+        .map_err(|record_error| {
+            format!("{error}; additionally failed to record file index event: {record_error}")
+        })
+}
+
+fn collect_failure_reason_and_path(error: &str) -> Option<(&'static str, &str)> {
+    let (reason, rest) = if let Some(rest) = error.strip_prefix("read ") {
+        ("read_failed", rest)
+    } else if let Some(rest) = error.strip_prefix("parse ") {
+        ("parse_failed", rest)
+    } else {
+        return None;
+    };
+    let (path, _) = rest.split_once(": ")?;
+    if path.is_empty() {
+        return None;
+    }
+    Some((reason, path))
+}
+
 fn error_summary(error: &str) -> String {
     let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
     const MAX_ERROR_SUMMARY_CHARS: usize = 512;
@@ -2848,6 +3017,7 @@ struct IndexReport {
     parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
     skipped_unchanged: bool,
+    old_content_hash: Option<String>,
 }
 
 struct ChunkText<'a> {
@@ -2894,6 +3064,22 @@ mod tests {
     }
 
     #[test]
+    fn collect_failure_reason_extracts_path_specific_failures() {
+        assert_eq!(
+            super::collect_failure_reason_and_path("read src/lib.rs: permission denied"),
+            Some(("read_failed", "src/lib.rs"))
+        );
+        assert_eq!(
+            super::collect_failure_reason_and_path("parse src/lib.rs: parser unavailable"),
+            Some(("parse_failed", "src/lib.rs"))
+        );
+        assert_eq!(
+            super::collect_failure_reason_and_path("database unavailable"),
+            None
+        );
+    }
+
+    #[test]
     fn chunk_texts_skip_secret_excluded_chunks() {
         let file = sample_file();
         let source = "pub fn public() {}\npub fn secret() {}\n".to_owned();
@@ -2908,6 +3094,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source,
             skipped_unchanged: false,
+            old_content_hash: None,
         };
 
         let reports = [report];
@@ -3038,6 +3225,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source,
             skipped_unchanged: false,
+            old_content_hash: None,
         }];
 
         let excluded = apply_embedding_size_limits(&mut reports, 64);
@@ -3297,7 +3485,7 @@ mod tests {
             )
             .expect("file facts should persist");
 
-        let collection = collect_index_reports(&root, Some(&store), &mut |_| {})
+        let collection = collect_index_reports(&root, Some(&store), true, &mut |_| {})
             .expect("collection should succeed");
         let _ = fs::remove_dir_all(db_dir);
 
@@ -3321,7 +3509,7 @@ mod tests {
         let repo = TestRepo::new("partial-parse-diagnostics");
         repo.write("src/lib.rs", "pub fn ok() {}\npub fn broken( {}\n");
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
-        let collection = collect_index_reports(&root, None, &mut |_| {})
+        let collection = collect_index_reports(&root, None, false, &mut |_| {})
             .expect("syntax errors should not abort collection");
 
         assert_eq!(collection.reports.len(), 1);
@@ -3342,6 +3530,7 @@ mod tests {
         let collection = collect_index_reports_with_options(
             &root,
             None,
+            false,
             &DiscoveryOptions::default(),
             &mut |_| {},
         )
@@ -3370,7 +3559,7 @@ mod tests {
         );
         repo.write("src/worker.rs", "pub fn helper() {}\n");
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
-        let mut collection = collect_index_reports(&root, None, &mut |_| {})
+        let mut collection = collect_index_reports(&root, None, false, &mut |_| {})
             .expect("collection should parse both files");
 
         resolve_cross_file_rust_calls(&mut collection, &[]);
@@ -3418,6 +3607,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let persisted_helper = sample_symbol_record("worker::helper", "file-worker");
 
@@ -3457,6 +3647,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let outer_helper = sample_symbol_record("outer::helper", "file-outer-helper");
         let root_helper = sample_symbol_record("helper", "file-root-helper");
@@ -3499,6 +3690,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let outer_run = sample_symbol_record("outer::Worker::run", "file-outer-worker");
         let root_run = sample_symbol_record("Worker::run", "file-root-worker");
@@ -3537,6 +3729,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let mut helper = sample_symbol_record("Worker::helper", "file-worker-methods");
         helper.kind = SymbolKind::Method.as_str().to_owned();
@@ -3585,6 +3778,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let parent_helper = sample_symbol_record("outer::worker::helper", "file-parent-worker");
         let root_helper = sample_symbol_record("worker::helper", "file-root-worker");
@@ -3617,6 +3811,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let stale_symbol = sample_symbol_record("worker::helper", &collection_file_id);
 
@@ -3774,6 +3969,7 @@ mod tests {
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }
     }
 

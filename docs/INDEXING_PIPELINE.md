@@ -20,6 +20,7 @@ repo root
   -> embed allowed chunks with Ollama
   -> upsert new vectors to sqlite-vec
   -> persist facts to SQLite
+  -> record per-file indexing decisions
   -> record the fast semantic generation and queue quality work
   -> delete stale sqlite-vec points not reused by the new manifest
   -> finish index run summary as success, skipped, partial, or failed
@@ -183,6 +184,12 @@ metadata-only error summaries. Before upserting vectors, semantic indexing
 rejects a same-repository, same-model dimension change so an existing sqlite-vec
 collection is not reused with incompatible vector sizes. Different model names
 map to different sqlite-vec collection names.
+Indexing also records per-file decisions in `file_index_events`. Each event
+links back to the run and active repository ref when known, and stores the path,
+old content hash, new content hash, action, reason, status, and metadata-only
+error summary. This makes created, updated, deleted, skipped unchanged,
+ignored or unsupported-by-discovery, and parser-diagnostic paths debuggable
+without reading source text.
 Continuous watch batches use the same incremental indexing path and are recorded
 with `run_kind = watch` in index-run metadata.
 
