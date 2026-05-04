@@ -1,9 +1,6 @@
 //! Shared continuous-indexing watcher control plane.
 
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,7 +16,7 @@ use symdex_index::{
 };
 use symdex_store::{
     RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord, WatcherStatusRecord,
-    current_timestamp, sqlite_parent,
+    current_timestamp,
 };
 
 const HEARTBEAT_STALE_SECONDS: u64 = 10;
@@ -244,8 +241,8 @@ fn start_daemon_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
     if status.is_active() {
         return Ok(status);
     }
-    if let Some(socket_path) = status.socket_path.as_deref() {
-        let _ = fs::remove_file(socket_path);
+    if let Some(endpoint) = status.socket_path.as_deref() {
+        control_ipc::cleanup_control_endpoint(endpoint);
     }
     let store = open_store()?;
     let starting = WatcherStatus {
@@ -304,16 +301,8 @@ fn start_daemon_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
 pub fn stop_daemon(repo: &str) -> Result<WatcherStatus, String> {
     let root = open_repo_and_migrate(repo)?;
     let status = status_for_root(&root)?;
-    if let Some(socket_path) = status.socket_path.as_deref()
-        && UnixStream::connect(socket_path)
-            .and_then(|mut stream| {
-                stream.write_all(b"stop\n")?;
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                let mut response = String::new();
-                let _ = BufReader::new(stream).read_line(&mut response);
-                Ok(())
-            })
-            .is_ok()
+    if let Some(endpoint) = status.socket_path.as_deref()
+        && control_ipc::send_control_command(endpoint, "stop")
     {
         wait_for_stopped(&root)?;
         return status_for_root(&root);
@@ -332,12 +321,10 @@ pub fn status(repo: &str) -> Result<WatcherStatus, String> {
 
 pub fn run_daemon(repo: &str) -> Result<(), String> {
     let root = open_repo_and_migrate(repo)?;
-    let socket_path = socket_path_for_repo(root.id())?;
-    let _ = fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|error| format!("bind watcher socket {}: {error}", socket_path.display()))?;
+    let endpoint = control_ipc::control_endpoint_for_repo(root.id())?;
+    let listener = control_ipc::bind_control_listener(&endpoint)?;
     let should_continue = Arc::new(AtomicBool::new(true));
-    start_control_listener(listener, Arc::clone(&should_continue));
+    control_ipc::start_control_listener(listener, Arc::clone(&should_continue));
 
     let store = open_store()?;
     let initial = WatcherStatus {
@@ -346,7 +333,7 @@ pub fn run_daemon(repo: &str) -> Result<(), String> {
         mode: "semantic".to_owned(),
         owner_kind: "daemon".to_owned(),
         owner_pid: Some(std::process::id() as i32),
-        socket_path: Some(socket_path.display().to_string()),
+        socket_path: Some(endpoint.clone()),
         state: "starting".to_owned(),
         started_at: Some(current_timestamp()),
         updated_at: None,
@@ -383,7 +370,7 @@ pub fn run_daemon(repo: &str) -> Result<(), String> {
                 && clients_allow_continuing(root.id(), &mut no_clients_since)
         },
     );
-    let _ = fs::remove_file(&socket_path);
+    control_ipc::cleanup_control_endpoint(&endpoint);
     match result {
         Ok(()) => store
             .mark_watcher_stopped(root.id())
@@ -563,31 +550,6 @@ fn attach_clients(
     Ok(())
 }
 
-fn socket_path_for_repo(repository_id: &str) -> Result<PathBuf, String> {
-    let config = StoreConfig::from_env();
-    let parent = sqlite_parent(&config).unwrap_or_else(|| PathBuf::from(".symdex"));
-    fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
-    Ok(parent.join(format!("watch-{repository_id}.sock")))
-}
-
-fn start_control_listener(listener: UnixListener, should_continue: Arc<AtomicBool>) {
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
-                continue;
-            };
-            let mut command = String::new();
-            let _ = BufReader::new(&stream).read_line(&mut command);
-            if command.trim() == "stop" {
-                should_continue.store(false, Ordering::SeqCst);
-                let _ = stream.write_all(b"stopping\n");
-                break;
-            }
-            let _ = stream.write_all(b"ok\n");
-        }
-    });
-}
-
 fn wait_for_stopped(root: &RepoRoot) -> Result<(), String> {
     let started = Instant::now();
     while started.elapsed() < START_WAIT {
@@ -726,6 +688,166 @@ fn latest_changed_path(changes: &WatchChangeSet) -> Option<String> {
         .cloned()
 }
 
+fn handle_control_stream(mut stream: impl Read + Write, should_continue: &AtomicBool) -> bool {
+    let mut command = String::new();
+    {
+        let mut reader = BufReader::new(&mut stream);
+        let _ = reader.read_line(&mut command);
+    }
+    if command.trim() == "stop" {
+        should_continue.store(false, Ordering::SeqCst);
+        let _ = stream.write_all(b"stopping\n");
+        true
+    } else {
+        let _ = stream.write_all(b"ok\n");
+        false
+    }
+}
+
+#[cfg(any(test, windows))]
+fn watcher_endpoint_name(repository_id: &str) -> String {
+    let suffix = repository_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("symdex-watch-{suffix}")
+}
+
+#[cfg(unix)]
+mod control_ipc {
+    use std::fs;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use super::{BufRead, BufReader, StoreConfig, Write, handle_control_stream};
+    use symdex_store::sqlite_parent;
+
+    pub type ControlListener = UnixListener;
+
+    pub fn control_endpoint_for_repo(repository_id: &str) -> Result<String, String> {
+        let config = StoreConfig::from_env();
+        let parent = sqlite_parent(&config).unwrap_or_else(|| PathBuf::from(".symdex"));
+        fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
+        Ok(parent
+            .join(format!("watch-{repository_id}.sock"))
+            .display()
+            .to_string())
+    }
+
+    pub fn bind_control_listener(endpoint: &str) -> Result<ControlListener, String> {
+        cleanup_control_endpoint(endpoint);
+        UnixListener::bind(endpoint)
+            .map_err(|error| format!("bind watcher socket {endpoint}: {error}"))
+    }
+
+    pub fn cleanup_control_endpoint(endpoint: &str) {
+        let _ = fs::remove_file(endpoint);
+    }
+
+    pub fn send_control_command(endpoint: &str, command: &str) -> bool {
+        UnixStream::connect(endpoint)
+            .and_then(|mut stream| {
+                stream.write_all(format!("{command}\n").as_bytes())?;
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut response = String::new();
+                let _ = BufReader::new(stream).read_line(&mut response);
+                Ok(())
+            })
+            .is_ok()
+    }
+
+    pub fn start_control_listener(listener: ControlListener, should_continue: Arc<AtomicBool>) {
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                if handle_control_stream(stream, &should_continue) {
+                    break;
+                }
+                if !should_continue.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+mod control_ipc {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use interprocess::local_socket::{
+        GenericNamespaced, ListenerOptions,
+        prelude::{LocalSocketListener, LocalSocketStream, ToNsName as _},
+        traits::{ListenerExt as _, Stream as _},
+    };
+
+    use super::{BufRead, BufReader, handle_control_stream, watcher_endpoint_name};
+
+    pub type ControlListener = LocalSocketListener;
+
+    pub fn control_endpoint_for_repo(repository_id: &str) -> Result<String, String> {
+        Ok(watcher_endpoint_name(repository_id))
+    }
+
+    pub fn bind_control_listener(endpoint: &str) -> Result<ControlListener, String> {
+        let name = endpoint
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|error| format!("watcher local socket name {endpoint}: {error}"))?;
+        ListenerOptions::new()
+            .name(name)
+            .create_sync()
+            .map_err(|error| format!("bind watcher local socket {endpoint}: {error}"))
+    }
+
+    pub fn cleanup_control_endpoint(_endpoint: &str) {}
+
+    pub fn send_control_command(endpoint: &str, command: &str) -> bool {
+        let name = match endpoint.to_ns_name::<GenericNamespaced>() {
+            Ok(name) => name,
+            Err(_) => return false,
+        };
+        let Ok(mut stream) = LocalSocketStream::connect(name) else {
+            return false;
+        };
+        if stream.write_all(format!("{command}\n").as_bytes()).is_err() {
+            return false;
+        }
+        let _ = stream.flush();
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).is_ok()
+    }
+
+    pub fn start_control_listener(listener: ControlListener, should_continue: Arc<AtomicBool>) {
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                if handle_control_stream(stream, &should_continue) {
+                    break;
+                }
+                if !should_continue.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -733,6 +855,7 @@ mod tests {
     use super::{
         HEARTBEAT_STALE_SECONDS, NO_CLIENT_GRACE, WatcherStatus,
         clients_allow_continuing_with_count, heartbeat_is_stale, timestamp_minus,
+        watcher_endpoint_name,
     };
 
     #[test]
@@ -783,6 +906,33 @@ mod tests {
             &mut no_clients_since
         ));
         assert!(no_clients_since.is_none());
+    }
+
+    #[test]
+    fn watcher_endpoint_name_is_deterministic_and_namespaced() {
+        assert_eq!(watcher_endpoint_name("repo/id"), "symdex-watch-repo_id");
+        assert_eq!(
+            watcher_endpoint_name("abc-123_DEF"),
+            "symdex-watch-abc-123_DEF"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_control_endpoint_uses_state_socket_path() {
+        let endpoint = super::control_ipc::control_endpoint_for_repo("repo")
+            .unwrap_or_else(|error| panic!("control endpoint should be generated: {error}"));
+
+        assert!(endpoint.ends_with("watch-repo.sock"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_control_endpoint_uses_namespaced_socket_name() {
+        let endpoint = super::control_ipc::control_endpoint_for_repo("repo")
+            .unwrap_or_else(|error| panic!("control endpoint should be generated: {error}"));
+
+        assert_eq!(endpoint, "symdex-watch-repo");
     }
 
     fn sample_status(state: &str) -> symdex_store::WatcherStatusRecord {
