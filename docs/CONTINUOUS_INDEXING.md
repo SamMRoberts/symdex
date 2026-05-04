@@ -156,6 +156,12 @@ Current implementation status:
   protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
+- Quality progress and activation are evaluated against the current fast
+  embedding manifest. Superseded terminal quality jobs are retained as history
+  but do not keep the latest generation stale, and manual quality catch-up queues
+  missing current-fast quality jobs before claiming work. Continuous quality
+  catch-up also treats current stale quality jobs as work because the worker
+  requeues those terminal rows before claiming the next batch.
 - Watch-driven batches are recorded with `run_kind = watch` in local index-run
   metadata so storage views can distinguish watch updates from manual runs.
 - In semantic watch mode, when `SYMDEX_QUALITY_INDEX` is enabled, watch mode

@@ -195,7 +195,7 @@ pub struct ContinuousQualityState {
 
 impl ContinuousQualityState {
     fn has_work(&self) -> bool {
-        self.pending_jobs > 0 || self.running_jobs > 0
+        self.pending_jobs > 0 || self.running_jobs > 0 || self.skipped_stale_jobs > 0
     }
 }
 
@@ -395,14 +395,36 @@ fn run_quality_index_limited_with_progress(
     let batch_size = layered_embed_config.quality_batch_size.max(1);
     let requeued_at = current_timestamp();
     let requeued_stale_jobs = sqlite
-        .requeue_current_stale_quality_embedding_jobs(root.id(), &generation.id, &requeued_at)
+        .requeue_current_terminal_quality_embedding_jobs(root.id(), &generation.id, &requeued_at)
         .map_err(|error| error.to_string())?;
+    let queued_jobs = sqlite
+        .quality_embedding_jobs_for_fast_generation(
+            root.id(),
+            &generation.id,
+            &quality_model,
+            &requeued_at,
+        )
+        .map_err(|error| error.to_string())?;
+    let queued_missing_jobs = queued_jobs.len();
+    if queued_missing_jobs > 0 {
+        sqlite
+            .queue_quality_embedding_jobs(&generation, &quality_model, &queued_jobs, &requeued_at)
+            .map_err(|error| error.to_string())?;
+    }
     if requeued_stale_jobs > 0 {
         on_progress(IndexProgress::new(
             "quality_index",
             0,
             requeued_stale_jobs,
-            format!("Requeued {requeued_stale_jobs} current stale quality jobs"),
+            format!("Requeued {requeued_stale_jobs} current terminal quality jobs"),
+        ));
+    }
+    if queued_missing_jobs > 0 {
+        on_progress(IndexProgress::new(
+            "quality_index",
+            0,
+            queued_missing_jobs,
+            format!("Queued {queued_missing_jobs} missing current quality jobs"),
         ));
     }
 
@@ -1931,6 +1953,7 @@ fn finalize_semantic_index(
     let generation = sqlite
         .record_fast_semantic_generation(FastSemanticGenerationInput {
             repository_id: root.id(),
+            repository_ref_id: context.repository_ref_id,
             fast_model: &prepared.model,
             fast_dimension: prepared.dimension,
             vector_table: &prepared.vector_table,
@@ -2852,13 +2875,14 @@ mod tests {
     };
 
     use crate::{
-        ContinuousIndexOptions, IndexCollection, IndexReport, IndexScope, QualityJobPreparation,
-        RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness,
-        WatchSnapshot, apply_embedding_size_limits, chunk_record, chunk_texts,
-        collect_index_reports, collect_index_reports_with_options, detect_watch_changes,
-        diff_watch_snapshots, index_run_kind, plan_rust_analyzer_enrichment, prepare_quality_job,
-        quality_chunk_embedding_record, quality_vector_point, resolve_cross_file_rust_calls,
-        should_run_continuous_quality_catch_up, watch_snapshot, watch_snapshot_with_options,
+        ContinuousIndexOptions, ContinuousQualityState, IndexCollection, IndexReport, IndexScope,
+        QualityJobPreparation, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
+        RustAnalyzerReadiness, WatchSnapshot, apply_embedding_size_limits, chunk_record,
+        chunk_texts, collect_index_reports, collect_index_reports_with_options,
+        detect_watch_changes, diff_watch_snapshots, index_run_kind, plan_rust_analyzer_enrichment,
+        prepare_quality_job, quality_chunk_embedding_record, quality_vector_point,
+        resolve_cross_file_rust_calls, should_run_continuous_quality_catch_up, watch_snapshot,
+        watch_snapshot_with_options,
     };
 
     #[test]
@@ -3094,6 +3118,32 @@ mod tests {
             &no_catch_up,
             &enabled
         ));
+    }
+
+    #[test]
+    fn continuous_quality_state_treats_stale_jobs_as_work() {
+        let mut state = ContinuousQualityState {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            active_layer: "fast".to_owned(),
+            quality_status: "quality_pending".to_owned(),
+            activation_reason: None,
+            embeddable_chunks: 1,
+            quality_eligible_chunks: 1,
+            quality_ineligible_chunks: 0,
+            quality_embedded_chunks: 0,
+            pending_jobs: 0,
+            running_jobs: 0,
+            succeeded_jobs: 0,
+            failed_jobs: 0,
+            skipped_stale_jobs: 0,
+            skipped_excluded_jobs: 0,
+        };
+
+        assert!(!state.has_work());
+        state.skipped_stale_jobs = 1;
+
+        assert!(state.has_work());
     }
 
     #[test]

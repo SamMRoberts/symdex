@@ -217,6 +217,12 @@ text in sqlite-vec payloads or cleanup reports, and it preserves the previous
 complete manifest if local embedding or vector upsert fails before SQLite
 replacement.
 
+When an active `ref_files` manifest is available, fast semantic generation
+recording carries forward only fast `chunk_embeddings` whose file snapshot is
+linked by that active ref manifest. Historical same-path snapshots can remain in
+`files`, chunks, and older embedding rows, but they must not become members of
+the latest ref-linked fast generation or drive quality job readiness.
+
 ### `calls`
 
 ```sql

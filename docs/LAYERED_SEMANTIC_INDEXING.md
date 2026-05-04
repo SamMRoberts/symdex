@@ -94,7 +94,10 @@ A quality-layer failure must not disable a valid fast layer.
 ## Semantic generation lifecycle
 
 A semantic generation represents one coherent fast semantic index projection for
-the current SQLite structural facts.
+the current SQLite structural facts. When branch-aware `ref_files` manifests are
+present, the fast manifest is scoped to the active ref's linked file snapshots;
+historical same-path snapshots are preserved as facts but excluded from the
+latest ref-linked generation and its quality job accounting.
 
 State transitions:
 

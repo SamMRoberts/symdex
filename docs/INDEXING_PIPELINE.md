@@ -191,7 +191,10 @@ The SQLite schema also includes additive layered semantic tables for
 After a successful fast sqlite-vec upsert, semantic indexing records a deterministic
 fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
 The older chunk-level vector columns remain nullable compatibility schema, but
-new indexing does not use them as the authoritative fast manifest.
+new indexing does not use them as the authoritative fast manifest. When the
+active ref has a `ref_files` manifest, carried-forward fast embeddings are
+filtered through that manifest so superseded same-path file snapshots do not
+enter the latest ref-linked generation.
 When quality indexing is enabled and the quality model is locally available,
 semantic indexing then marks superseded pending/running quality jobs stale and
 first carries forward current quality `chunk_embeddings` rows whose chunk ID,
