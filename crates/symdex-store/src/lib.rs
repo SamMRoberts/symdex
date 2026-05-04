@@ -62,15 +62,15 @@ impl SqliteStore {
             .busy_timeout(Duration::from_secs(30))
             .map_err(StoreError::Sqlite)?;
         connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA foreign_keys = ON;",
-            )
+            .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(StoreError::Sqlite)?;
         Ok(Self { connection })
     }
 
     pub fn migrate(&self) -> Result<()> {
+        self.connection
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .map_err(StoreError::Sqlite)?;
         self.connection
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;

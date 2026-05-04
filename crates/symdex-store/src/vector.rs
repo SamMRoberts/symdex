@@ -359,10 +359,7 @@ impl SqliteVectorStore {
             .busy_timeout(Duration::from_secs(30))
             .map_err(StoreError::Sqlite)?;
         connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA foreign_keys = ON;",
-            )
+            .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(StoreError::Sqlite)?;
         Ok(connection)
     }
