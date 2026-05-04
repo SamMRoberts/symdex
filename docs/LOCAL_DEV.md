@@ -5,7 +5,6 @@
 - Rust toolchain
 - SQLite available through Rust crate bindings
 - `cargo-audit` installed for local dependency audits
-- Qdrant running locally
 - Ollama running locally
 - `nomic-embed-text` pulled into Ollama
 
@@ -14,27 +13,23 @@
 ```bash
 cargo install cargo-audit --locked
 ollama pull nomic-embed-text
-docker pull qdrant/qdrant
-docker run -p 6333:6333 -p 6334:6334 \
-  -v "$(pwd)/qdrant_storage:/qdrant/storage:z" \
-  qdrant/qdrant
 ```
 
 ## Environment variables
 
 ```bash
 SYMDEX_DB_PATH=.symdex/symdex.sqlite
-SYMDEX_QDRANT_URL=http://localhost:6333
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
 SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
-SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
+SYMDEX_QUALITY_EMBED_MODEL=mxbai-embed-large
 SYMDEX_QUALITY_INDEX=1
 SYMDEX_QUALITY_BATCH_SIZE=16
 SYMDEX_QUALITY_WORKERS=1
 SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_EMBED_BATCH_SIZE=16
-SYMDEX_EMBED_MAX_CHUNK_BYTES=32768
+SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
+SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
 SYMDEX_RUST_ANALYZER=0
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 ```
@@ -46,9 +41,9 @@ plan for changed Rust files, but does not run rust-analyzer project analysis by
 default.
 
 `SYMDEX_EMBED_TRUNCATE` defaults to `true`, matching Ollama's embedding API
-behavior for oversized local inputs. Set it to `false` only when you want
-semantic indexing to fail instead of truncating chunks that exceed the embedding
-model context window.
+behavior for oversized local inputs. Symdex still excludes large chunks before
+embedding because some Ollama/model combinations return context-length errors
+instead of truncating.
 
 `SYMDEX_EMBED_BATCH_SIZE` defaults to `16`. Symdex splits semantic indexing
 requests into batches before calling Ollama `/api/embed`, which avoids oversized
@@ -56,12 +51,13 @@ request payloads while preserving result order.
 
 Layered semantic indexing helpers also recognize `SYMDEX_FAST_EMBED_MODEL`,
 `SYMDEX_QUALITY_EMBED_MODEL`, `SYMDEX_QUALITY_INDEX`,
-`SYMDEX_QUALITY_BATCH_SIZE`, and `SYMDEX_QUALITY_WORKERS`. The fast model
-defaults to `nomic-embed-text`; the quality model defaults to
-`nomic-embed-text-v2-moe`. `SYMDEX_EMBED_MODEL` remains the compatibility
-setting for the current single-model path and is used as the fast-model fallback
-when `SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality
-jobs when quality indexing is enabled and the quality model is available.
+`SYMDEX_QUALITY_BATCH_SIZE`, `SYMDEX_QUALITY_WORKERS`, and
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES`. The fast model defaults to
+`nomic-embed-text`; the quality model defaults to `mxbai-embed-large`.
+`SYMDEX_EMBED_MODEL` remains the compatibility setting for the current
+single-model path and is used as the fast-model fallback when
+`SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality jobs
+when quality indexing is enabled and the quality model is available.
 `symdex index-quality <repo>` manually drains those queued jobs in bounded
 batches, then reports whether SQLite activation made quality the active layer or
 kept default search on fast. `symdex index --watch <repo>` also performs
@@ -69,9 +65,11 @@ cooperative quality catch-up in semantic watch mode when quality indexing is
 enabled, processing bounded quality batches during post-batch and idle watch
 ticks.
 
-`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `32768`. Chunks larger than this are
-persisted as metadata-only structural evidence with
-`chunk_too_large_for_embedding` and are not sent to Ollama.
+`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `2048` for fast indexing.
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` defaults to `512` for quality indexing.
+Chunks larger than the active layer limit are persisted as metadata-only
+structural evidence with `chunk_too_large_for_embedding` and are not sent to
+Ollama.
 
 ## Expected commands
 
@@ -91,6 +89,9 @@ cargo run -p symdex-cli -- index --incremental .
 cargo run -p symdex-cli -- index-quality .
 cargo run -p symdex-cli -- index --offline .
 cargo run -p symdex-cli -- index --watch .
+cargo run -p symdex-cli -- watch start .
+cargo run -p symdex-cli -- watch status .
+cargo run -p symdex-cli -- watch stop .
 cargo run -p symdex-cli -- index-status .
 cargo run -p symdex-cli -- semantic-status .
 cargo run -p symdex-cli -- staleness .
@@ -105,6 +106,7 @@ cargo run -p symdex-cli -- debug-context . panic.log
 cargo run -p symdex-cli -- search . "retry logic"
 cargo run -p symdex-cli -- tui .
 cargo run -p symdex-cli -- serve-mcp
+cargo run -p symdex-cli -- serve-mcp --watch .
 ```
 
 Implemented CLI commands currently include:
@@ -124,30 +126,34 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 - `index <repo>`: discovers eligible Rust, C#, JavaScript, and TypeScript files,
   applies built-in excludes and scoped glob-aware `.gitignore` rules with
   negation, hashes file contents, extracts tree-sitter function and method chunks where supported,
-  embeds chunk text with local Ollama, creates the Qdrant collection if needed,
+  embeds chunk text with local Ollama, creates the sqlite-vec collection if needed,
   and upserts semantic vectors. Use `index --full <repo>` to force all eligible
   files through parsing and embedding, or `index --incremental <repo>` to skip
   unchanged files by content hash. Use `index --offline <repo>` for
   SQLite-backed discovery and chunking without service calls; offline still
   accepts `--full` or `--incremental`. Chunks flagged as
   likely sensitive are counted as `chunks_excluded_from_embedding`, persisted as
-  metadata, and omitted from Ollama/Qdrant embedding.
+  metadata, and omitted from Ollama/sqlite-vec embedding.
   When `SYMDEX_RUST_ANALYZER=1` is set, index output also reports optional
   rust-analyzer enrichment readiness and eligible Rust file, symbol, and call
   counts without applying rust-analyzer facts.
-- `index --watch <repo>`: starts continuous indexing. It polls local eligible
-  Rust, C#, JavaScript, and TypeScript files, debounces event bursts, detects
-  created/modified/deleted paths by content-hash snapshots, and reindexes
-  changed content through the incremental indexing path until stopped with
-  `Ctrl+C`. Watch mode is always incremental; use a separate manual
-  `index --full <repo>` when a forced rebuild is needed. Semantic watch batches
-  queue quality jobs when quality indexing is
+- `watch start|status|stop <repo>`: manages the single background watcher for a
+  repository. Watchers are client-scoped: TUI, MCP, and CLI attachments keep
+  them alive, and they exit after about 10 seconds with no live clients. The
+  watcher polls local eligible Rust, C#, JavaScript, and TypeScript files,
+  debounces event bursts, detects created/modified/deleted paths by content-hash
+  snapshots, and reindexes changed content through the incremental semantic
+  indexing path.
+- `index --watch <repo>`: starts the legacy foreground continuous-indexing loop,
+  guarded by the same one-watcher-per-repo state. Watch mode is always
+  incremental; use a separate manual `index --full <repo>` when a forced rebuild
+  is needed. Semantic watch batches queue quality jobs when quality indexing is
   enabled, then process bounded quality catch-up batches between fast watch
   work. Watch output includes metadata-only quality state, progress,
   completion, and failure events.
 - `index-quality <repo>`: manually processes queued quality semantic embedding
   jobs for the latest generation. It claims bounded batches, re-reads files
-  from disk, verifies file and chunk hashes, writes quality Qdrant points and
+  from disk, verifies file and chunk hashes, writes quality sqlite-vec points and
   quality `chunk_embeddings` rows, and reports succeeded, failed, and stale
   counts along with `quality_status`, `active_layer`, and
   `activation_reason`. Fast search remains active for partial, stale, blocked,
@@ -165,14 +171,14 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   current eligible files for implemented languages and reports fresh, stale,
   deleted, missing, and unknown evidence states. With a symbol query, the report
   is scoped to files involved in the matching symbols and compact context pack.
-- `qdrant-verify <repo>`: compares SQLite vector metadata with Qdrant payloads
+- `vector-verify <repo>`: compares SQLite vector metadata with sqlite-vec payloads
   for the selected semantic layer and reports missing, stale, or orphaned
   points without returning source text. Use `--semantic-layer fast`,
   `--semantic-layer quality`, or `--semantic-layer all` to verify the fast and
   quality collections independently. Verification expects latest-generation
   `chunk_embeddings` manifests; older single-model local databases should run
   `symdex index <repo>` first to create layered fast metadata.
-- `qdrant-repair <repo>`: deletes Qdrant orphan points, then re-runs semantic
+- `vector-repair <repo>`: deletes sqlite-vec orphan points, then re-runs semantic
   indexing when missing or stale fast vector metadata requires rebuilding
   points. With `--semantic-layer quality`, repair runs the quality worker path
   instead so hash verification, quality job state, and activation refresh remain
@@ -213,17 +219,18 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   matches include trust scores and reason tags, and the pack does not include
   source text.
 - `search <repo> <query>`: embeds the query locally through the active semantic
-  routing path and returns ranked Qdrant matches with scores, paths, line
+  routing path and returns ranked sqlite-vec matches with scores, paths, line
   ranges, symbol names, active layer metadata, fallback reason, and provenance
   metadata. Text output also prints compact reason tags for each match.
-- `tui [repo]`: launches the local terminal UI control panel. The current TUI
-  opens an Overview tab backed by SQLite metadata and local service
-  configuration, then uses a compact repository summary beside or above the
-  active workflow on other tabs. Use `Tab` / `Shift+Tab` on the Index tab to
-  select full or incremental scope (default incremental), `o` to confirm
-  offline indexing, `s` to confirm semantic indexing, `c` to toggle continuous
-  indexing, and inspect fast/quality readiness progress bars plus fast/quality
-  pending, running, and skipped-stale job sparklines. Use `[` / `]` to
+- `tui [repo]`: launches the local terminal UI control panel and starts
+  continuous semantic indexing. The current TUI opens an Overview tab backed by
+  SQLite metadata and local service configuration, then uses a compact
+  repository summary beside or above the active workflow on other tabs. Use
+  `Tab` / `Shift+Tab` on the Index tab to select full or incremental scope
+  (default incremental), `o` to confirm offline indexing, `s` to confirm
+  semantic indexing, `c` to stop or restart continuous indexing, and inspect
+  fast/quality readiness progress bars plus fast/quality pending, running, and
+  skipped-stale job sparklines. Use `[` / `]` to
   move between the Overview, Index, Storage, Doctor, Query, Calls, and Impact
   tabs, and `Tab` / `Shift+Tab` to toggle view-local
   modes including impact, call-path, context-pack, and debug-context evidence
@@ -235,14 +242,18 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   timeline/evidence freshness/semantic neighborhood/cross-store health. Use `r`
   outside the Doctor tab to refresh repository/storage status, and `q` or `Esc`
   to quit.
-- `serve-mcp`: runs the read-only MCP server over stdio. The server exposes
+- `serve-mcp [--watch <repo>]`: runs the MCP server over stdio. With
+  `--watch <repo>`, it starts or attaches the repository background watcher
+  before serving tools and holds that watcher lease until the MCP process exits.
+  The server exposes
   `symdex_search`, `symdex_find_symbol`, `symdex_callers`, `symdex_callees`,
   `symdex_call_path`, `symdex_impact`, `symdex_context_pack`, and
-  `symdex_debug_context`, `symdex_staleness_check`, and
-  `symdex_index_status`. `symdex_context_pack` accepts `mode: "unified"` for
+  `symdex_debug_context`, `symdex_staleness_check`, `symdex_index_status`,
+  `symdex_watch_status`, and `symdex_watch_start`. `symdex_context_pack` accepts
+  `mode: "unified"` for
   combined structural and semantic context-pack evidence.
 
-`doctor` checks whether Qdrant is reachable over REST, whether Ollama is
+`doctor` checks whether sqlite-vec is reachable over REST, whether Ollama is
 reachable, whether the configured embedding model is present, and whether vector
 dimension probing succeeds. These checks report diagnostic status and do not
 mutate repository data.
@@ -259,7 +270,7 @@ pushes to `main`:
 - `cargo audit`
 
 The TUI should surface these same diagnostics. Semantic search and semantic
-indexing views require local Ollama and Qdrant; status, structural queries, and
+indexing views require local Ollama and sqlite-vec; status, structural queries, and
 offline indexing should remain usable without those services.
 
 ## Local-only rule
@@ -272,11 +283,12 @@ The app should not require network access beyond local loopback services during 
 
 - SQLite database path is writable
 - SQLite database file exists after `symdex init`
-- Qdrant is reachable
+- sqlite-vec is reachable
 - Ollama is reachable
 - embedding model is available
 - vector dimension can be determined
-- active MCP evidence contract version is local-only and read-only
+- active MCP evidence contract version and watcher-start exception
 - optional rust-analyzer enrichment readiness when `SYMDEX_RUST_ANALYZER=1`
 - configured repo root exists
-- repo-specific index freshness and provenance consistency when a repo is passed
+- repo-specific index freshness, provenance consistency, and watcher status
+  when a repo is passed

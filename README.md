@@ -1,24 +1,36 @@
 # symdex
 
-symdex is a local-first codebase intelligence system for AI coding agents.
+symdex is a local-first codebase intelligence system for AI coding agents. It
+indexes repositories structurally and semantically so agents can reason from
+compact, source-free evidence instead of guessing.
 
-It indexes Rust, C#, JavaScript, and TypeScript repositories structurally and
-semantically so agents can reason from compact local evidence: paths, line
-ranges, symbols, calls, scores, diagnostics, freshness, provenance, and context
-packs. Source text stays local and is not shown by default in agent-facing
-outputs or the TUI.
+symdex stores structural facts in SQLite and vector projections in sqlite-vec in
+the same local database. Ollama provides local embeddings. The CLI, TUI, and MCP
+server all read the same local index.
 
-Current implementation status: Rust workspace with tree-sitter indexing for
-Rust, C#, JavaScript, and TypeScript, deterministic hashing, path normalization,
-SQLite storage, Qdrant vector storage, local Ollama embeddings, structural and
-semantic CLI queries, continuous indexing, a native terminal UI, debug context
-packs, compact context packs, and a read-only MCP stdio server.
+## Current Status
 
-## Try it
+Implemented today:
+
+- Syntax-aware indexing for Rust, C#, JavaScript, and TypeScript.
+- SQLite storage for repositories, files, chunks, symbols, calls, tests,
+  provenance, semantic generations, and index runs.
+- sqlite-vec vector storage for semantic search.
+- Fast semantic indexing with `nomic-embed-text`.
+- Deferred quality indexing with `mxbai-embed-large`.
+- Structural queries: symbols, callers, callees, call paths, impact, staleness,
+  context packs, and debug context packs.
+- Semantic search with fast/quality layer routing and fallback metadata.
+- Continuous indexing through a single background watcher per repository.
+- Terminal UI built with `ratatui` and `crossterm`.
+- MCP stdio server for local agents, with evidence tools read-only except the
+  explicit local `symdex_watch_start` watcher-start tool.
+
+## Quickstart
 
 ```bash
 cargo run -p symdex-cli -- init
-cargo run -p symdex-cli -- doctor
+cargo run -p symdex-cli -- doctor .
 cargo run -p symdex-cli -- index --offline tests/fixtures/rust_basic
 cargo run -p symdex-cli -- index-status tests/fixtures/rust_basic
 cargo run -p symdex-cli -- symbol tests/fixtures/rust_basic add
@@ -26,87 +38,173 @@ cargo run -p symdex-cli -- callers tests/fixtures/rust_basic add
 cargo run -p symdex-cli -- impact tests/fixtures/rust_basic add
 cargo run -p symdex-cli -- context-pack tests/fixtures/rust_basic add
 cargo run -p symdex-cli -- staleness tests/fixtures/rust_basic
-cargo run -p symdex-cli -- tui tests/fixtures/rust_basic
-cargo run -p symdex-cli -- serve-mcp
 ```
 
-With Ollama and Qdrant running locally, `index <repo>` embeds Rust chunks and
-upserts vectors, and `search <repo> <query>` returns ranked path and line-range
-evidence. Use `index --offline <repo>` for SQLite-backed structural indexing
-without service calls. Add `--full` to force all eligible files through the
-indexer, or `--incremental` to skip unchanged files by content hash.
+Offline indexing builds the SQLite structural index without Ollama. For semantic
+indexing and search, start Ollama and install the embedding models:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull mxbai-embed-large
+cargo run -p symdex-cli -- index .
+cargo run -p symdex-cli -- index-quality .
+cargo run -p symdex-cli -- search . "retry logic"
+```
 
 ## Commands
 
 ```bash
-cargo run -p symdex-cli -- index <repo>
-cargo run -p symdex-cli -- index --full <repo>
-cargo run -p symdex-cli -- index --incremental <repo>
-cargo run -p symdex-cli -- index --watch <repo>
-cargo run -p symdex-cli -- search <repo> "retry logic"
-cargo run -p symdex-cli -- symbol <repo> <symbol>
+cargo run -p symdex-cli -- init
+cargo run -p symdex-cli -- doctor [repo]
+cargo run -p symdex-cli -- index [--full|--incremental] [--offline] [--watch] <repo>
+cargo run -p symdex-cli -- index-quality <repo>
+cargo run -p symdex-cli -- index-status <repo>
+cargo run -p symdex-cli -- semantic-status <repo>
+cargo run -p symdex-cli -- staleness <repo> [symbol]
+cargo run -p symdex-cli -- vector-verify <repo> [--semantic-layer fast|quality|all]
+cargo run -p symdex-cli -- vector-repair <repo> [--semantic-layer fast|quality|all]
+cargo run -p symdex-cli -- search <repo> "query"
+cargo run -p symdex-cli -- symbol <repo> <query>
 cargo run -p symdex-cli -- callers <repo> <symbol>
 cargo run -p symdex-cli -- callees <repo> <symbol>
+cargo run -p symdex-cli -- call-path <repo> <source> <target> [depth]
 cargo run -p symdex-cli -- impact <repo> <symbol>
-cargo run -p symdex-cli -- context-pack <repo> <symbol>
-cargo run -p symdex-cli -- context-pack <repo> <symbol> --mode unified
+cargo run -p symdex-cli -- context-pack <repo> <symbol> [--mode structural|unified]
+cargo run -p symdex-cli -- debug-context <repo> <runtime-input|file|->
+cargo run -p symdex-cli -- watch start|status|stop <repo>
 cargo run -p symdex-cli -- tui [repo]
-cargo run -p symdex-cli -- serve-mcp
+cargo run -p symdex-cli -- serve-mcp [--watch <repo>]
 ```
 
-`index --watch <repo>` runs continuous indexing for created or modified eligible
-Rust, C#, JavaScript, and TypeScript files. It uses polling, debounce, content
-hashes, and the same ignore and path-boundary rules as manual indexing. Stop the
-non-interactive watch process with `Ctrl+C`.
+Deprecated `qdrant-verify` and `qdrant-repair` aliases still route to the vector
+maintenance commands for compatibility. Qdrant is no longer the vector backend.
+
+## Indexing Model
+
+Manual indexing has two modes:
+
+- `index --offline <repo>` updates SQLite structural data only.
+- `index <repo>` also embeds eligible chunks through local Ollama and writes
+  sqlite-vec vector rows.
+
+Index scope is explicit:
+
+- `--incremental` skips unchanged files by content hash.
+- `--full` reparses all eligible files.
+
+Semantic indexing is layered:
+
+- The fast layer uses `nomic-embed-text`, default max chunk size `2048` bytes.
+- The quality layer uses `mxbai-embed-large`, default max chunk size `512` bytes.
+- Default semantic search uses fast until quality is complete and current.
+- If quality is missing, stale, partial, failed, or blocked, search falls back
+  to fast and reports why.
+
+Useful environment variables:
+
+```bash
+SYMDEX_DB_PATH=.symdex/symdex.sqlite
+SYMDEX_OLLAMA_URL=http://localhost:11434
+SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
+SYMDEX_QUALITY_EMBED_MODEL=mxbai-embed-large
+SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
+SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
+SYMDEX_QUALITY_INDEX=1
+```
+
+## Continuous Indexing
+
+symdex enforces one watcher per repository. The watcher polls eligible files,
+debounces changes, respects ignore/path-boundary rules, and runs incremental
+indexing for changed content.
+
+Watcher lifetime is client-scoped:
+
+- `symdex tui [repo]` starts or attaches the watcher and holds a lease while
+  the TUI is open.
+- `symdex serve-mcp --watch <repo>` starts or attaches the watcher and holds a
+  lease while the MCP process is running.
+- `symdex_watch_start` starts or attaches the watcher for the lifetime of that
+  MCP server process.
+- `symdex watch start <repo>` is attach-scoped; without another live TUI, MCP,
+  or foreground client, the watcher exits after about 10 seconds.
+- `symdex watch stop <repo>` explicitly asks the daemon to stop.
+
+Use `symdex watch status <repo>` or `doctor <repo>` to inspect watcher state,
+attached clients, shutdown grace, latest indexed path, and errors.
 
 ## TUI
 
-`symdex tui [repo]` opens a local terminal control panel built with `ratatui` and
-`crossterm`.
+```bash
+cargo run -p symdex-cli -- tui .
+```
 
-- `[` / `]` move between primary tabs: Index, Storage, Doctor, Query, Calls,
-  and Impact.
-- `Tab` / `Shift+Tab` switch modes inside the active view, such as storage
-  panes, query modes, callers/callees, impact/context-pack, or full/incremental
-  scope on the Index tab.
-- `o` starts offline indexing confirmation, `s` starts semantic indexing
-  confirmation, and `c` toggles continuous indexing confirmation. Manual offline
-  and semantic indexing use the selected full/incremental scope.
-- Continuous indexing shows an animated activity indicator while enabled.
-- The footer separates shortcut hints from status messages into distinct
-  terminal containers.
-- Storage visualizations include explorer, index coverage, symbol outline, call
-  resolution, embedding coverage, index runs, semantic neighborhood, and
-  cross-store health.
+The TUI is terminal-only and local-only. It shows repository status, indexing
+controls, storage views, diagnostics, semantic search, structural queries, call
+graphs, impact, context packs, debug context, freshness, provenance, and
+sqlite-vec health.
 
-## Local Services
+Core keys:
 
-Semantic indexing and semantic search require:
+- `[` / `]`: switch primary tabs.
+- `Tab` / `Shift+Tab`: switch mode inside the active tab.
+- `o`: confirm offline indexing.
+- `s`: confirm semantic indexing.
+- `c`: stop or restart the shared watcher.
+- `r`: refresh status or run doctor from the Doctor tab.
+- `q` / `Esc`: quit or back out of the current interaction.
 
-- Qdrant on `localhost:6333`
-- Ollama on `localhost:11434`
-- the `nomic-embed-text` model installed in Ollama
-
-Structural indexing, SQLite status, symbol queries, call queries, impact, context
-packs, diagnostics, and offline TUI workflows remain local and usable without
-Qdrant or Ollama.
+The Index tab auto-refreshes shared watcher and semantic readiness state because
+continuous indexing is owned by the background watcher daemon, not the TUI
+process itself.
 
 ## MCP
 
-`serve-mcp` exposes the same read-only evidence surface to coding agents through
+```bash
+cargo run -p symdex-cli -- serve-mcp
+cargo run -p symdex-cli -- serve-mcp --watch .
+```
+
 MCP tools:
 
 - `symdex_search`
 - `symdex_find_symbol`
 - `symdex_callers`
 - `symdex_callees`
+- `symdex_call_path`
 - `symdex_impact`
 - `symdex_context_pack`
-- `symdex_index_status`
 - `symdex_debug_context`
+- `symdex_staleness_check`
+- `symdex_index_status`
+- `symdex_watch_status`
+- `symdex_watch_start`
 
-`symdex_context_pack` defaults to structural `symdex.context_pack.v1` output and
-accepts `mode: "unified"` for `symdex.context_pack.v2` output that merges
-structural context-pack evidence with semantic search metadata. The next planned
-MCP addition is a read-only `symdex_staleness_check` tool, followed by
-`.gitignore` glob correctness and broader test/runtime mapping work.
+Successful tool responses use the stable `symdex.mcp.evidence.v1` envelope.
+Evidence tools are read-only and metadata-first: paths, line ranges, scores,
+freshness, provenance, active semantic layer, quality status, and compact
+relationship evidence. They do not return full source files, vectors, or
+embeddings. `symdex_watch_start` is the explicit local write-capable exception
+for starting or attaching the scoped background watcher.
+
+## Privacy And Safety
+
+- All storage is local.
+- SQLite and sqlite-vec live under the configured symdex state directory.
+- Ollama calls go to the configured local Ollama URL.
+- symdex does not add hosted services, telemetry, or remote embeddings.
+- Indexed source is treated as sensitive and untrusted.
+- Likely secret chunks are excluded from embeddings.
+- Repository path boundaries are enforced; symlink escapes are rejected.
+- TUI and MCP outputs are compact metadata by default, not source previews.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+```
+
+Docs live under [`docs/`](docs/). Start with [`docs/README.md`](docs/README.md)
+for task-specific reading paths.

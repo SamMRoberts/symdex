@@ -120,7 +120,7 @@ CREATE TABLE chunks (
   end_line INTEGER NOT NULL,
   start_byte INTEGER NOT NULL,
   end_byte INTEGER NOT NULL,
-  qdrant_point_id TEXT,
+  vector_point_id TEXT,
   excluded_reason TEXT,
   index_run_id TEXT,
   parser_version TEXT,
@@ -131,7 +131,7 @@ CREATE TABLE chunks (
 ```
 
 `excluded_reason` is set when a chunk is kept as metadata but withheld from
-embedding. The chunk-level `qdrant_point_id`, `embedding_model`,
+embedding. The chunk-level `vector_point_id`, `embedding_model`,
 `embedding_dimension`, and `embedded_at` columns are retained only as nullable
 compatibility fields for local databases created before layered semantic
 manifests. New indexing leaves them unset and records vector provenance in
@@ -140,11 +140,11 @@ manifests. New indexing leaves them unset and records vector provenance in
 Before semantic indexing replaces changed-file chunk rows or removes deleted
 files, it reads current fast `chunk_embeddings` point IDs for those paths from
 the latest semantic generation. New fast embeddings are staged and upserted to
-Qdrant before SQLite mutation; after structural facts and the new semantic
+sqlite-vec before SQLite mutation; after structural facts and the new semantic
 generation are persisted, the previously collected stale point IDs are deleted
 unless the new manifest reused the same deterministic point ID. This keeps
 SQLite as the source of truth for vector lifecycle cleanup while avoiding source
-text in Qdrant payloads or cleanup reports, and it preserves the previous
+text in sqlite-vec payloads or cleanup reports, and it preserves the previous
 complete manifest if local embedding or vector upsert fails before SQLite
 replacement.
 
@@ -222,7 +222,7 @@ CREATE TABLE semantic_generations (
 ```
 
 This table tracks metadata for a semantic generation. Current semantic indexing
-records the fast layer after successful fast Qdrant upsert with
+records the fast layer after successful fast sqlite-vec upsert with
 `active_layer = fast` and `quality_status = fast_ready`. Generation IDs are
 deterministic over the current fast manifest, so unchanged manifests reuse the
 same generation ID and preserve existing quality fields such as
@@ -234,11 +234,13 @@ not contain source text.
 The manual quality worker refreshes activation state from SQLite manifests and
 job counts. A latest generation becomes `quality_ready` with
 `active_layer = quality` only when the current quality manifest covers every
-embeddable chunk, the quality model and dimension are known, and no pending,
-running, failed, or `skipped_stale` jobs remain. Partial coverage remains
-`quality_pending`; terminal failures become `quality_failed`; blocked
-generations remain `quality_blocked`; and latest-generation `skipped_stale`
-jobs keep default routing on fast until a later generation can complete cleanly.
+quality-eligible chunk, the remaining fast-embeddable chunks are explicitly
+accounted for as `skipped_excluded`, the quality model and dimension are known,
+and no pending, running, failed, or `skipped_stale` jobs remain. Partial
+eligible coverage remains `quality_pending`; terminal failures become
+`quality_failed`; blocked generations remain `quality_blocked`; and
+latest-generation `skipped_stale` jobs keep default routing on fast until a
+later generation can complete cleanly.
 `quality_completed_at` is set only by successful activation.
 
 ### `chunk_embeddings`
@@ -254,8 +256,8 @@ CREATE TABLE chunk_embeddings (
   embedding_dimension INTEGER NOT NULL,
   content_hash TEXT NOT NULL,
   text_hash TEXT NOT NULL,
-  qdrant_collection TEXT NOT NULL,
-  qdrant_point_id TEXT NOT NULL,
+  vector_table TEXT NOT NULL,
+  vector_point_id TEXT NOT NULL,
   generation_id TEXT NOT NULL,
   embedded_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'current',
@@ -264,14 +266,14 @@ CREATE TABLE chunk_embeddings (
 ```
 
 This table is the per-layer vector manifest. Current semantic indexing writes
-`fast` rows directly from the successful fast Qdrant upsert and writes `quality`
+`fast` rows directly from the successful fast sqlite-vec upsert and writes `quality`
 rows from the deferred quality worker. It keeps fast and quality metadata
 separate by `semantic_layer`, model, dimension, generation, collection, and
-point ID so the two layers do not share one Qdrant collection. `status` is
+point ID so the two layers do not share one sqlite-vec collection. `status` is
 metadata-only and currently supports `current`, `stale`, `blocked`, and
 `failed`.
 
-Layer-aware Qdrant verification builds expected fast and quality point manifests
+Layer-aware sqlite-vec verification builds expected fast and quality point manifests
 from `current` rows in this table for the latest semantic generation. Older
 single-model local databases that predate layered manifests should run
 `symdex index <repo>` to create fast `chunk_embeddings` rows before using
@@ -317,8 +319,10 @@ marks them `running`, increments `attempts`, and then revalidates current file
 and chunk metadata before embedding. Successful jobs transactionally write a
 quality-layer `chunk_embeddings` row and move to `succeeded`. Service or vector
 write failures move to `failed` with a compact metadata-only error summary.
-Stale jobs, including chunks that now have an `excluded_reason`, move to
-`skipped_stale` and are not embedded.
+Stale jobs move to `skipped_stale` and are not embedded. Chunks that are current
+but not eligible for the quality layer, such as chunks over the quality model's
+size limit or chunks that now have an `excluded_reason`, move to
+`skipped_excluded`.
 
 After worker progress, `semantic_generations.quality_embedded_chunks` is
 refreshed from current quality manifest rows. The first successful quality
@@ -327,6 +331,7 @@ running jobs remain for the latest generation, `quality_status` becomes
 `quality_failed`; otherwise a complete, clean latest generation is atomically
 marked `quality_ready` with `active_layer = quality`. Latest-generation
 `skipped_stale` jobs are treated as incomplete work, not successful coverage.
+`skipped_excluded` jobs reduce the quality layer's eligible chunk count.
 
 Provenance columns are nullable for compatibility with existing local SQLite
 databases. New indexing writes `index_run_id` and parser version metadata for
@@ -336,7 +341,7 @@ longer authoritative and are left unset by new indexing.
 `parser_version` must include the per-language parser identity and symdex
 indexer/chunker version so mixed-language indexes remain auditable.
 
-## Qdrant collection
+## sqlite-vec collection
 
 Collection name pattern:
 
@@ -367,7 +372,7 @@ Payload fields:
 - `embedding_dimension`
 - `indexed_at`
 
-Do not store source text in Qdrant payloads.
+Do not store source text in sqlite-vec payloads.
 
 Returned evidence rows now include compact provenance metadata where available:
 content hash, index run ID, parser version, indexed timestamp, embedding model,
@@ -394,9 +399,9 @@ storage schema. Examples include `semantic_vector_match`,
 Unified context packs are also query-time derived metadata. Structural
 context-pack mode preserves the `symdex.context_pack.v1` shape. Unified mode
 returns `symdex.context_pack.v2`, merging SQLite symbol/call/file evidence with
-Qdrant semantic chunk evidence and annotating rows with `evidence_source` values
+sqlite-vec semantic chunk evidence and annotating rows with `evidence_source` values
 of `structural`, `semantic`, or `both`. This does not add storage tables or
-persist merged rows; the v2 pack is assembled from existing SQLite and Qdrant
+persist merged rows; the v2 pack is assembled from existing SQLite and sqlite-vec
 metadata for each query.
 
 Use cosine distance unless a selected embedding model requires otherwise.
@@ -404,25 +409,25 @@ Use cosine distance unless a selected embedding model requires otherwise.
 Before writing vectors, symdex checks the latest successful run for the same
 repository and embedding model. If the vector dimension changed, indexing fails
 closed with a reset/reindex message instead of mixing incompatible points in the
-same Qdrant collection. Different model names use different collection names.
+same sqlite-vec collection. Different model names use different collection names.
 
-The Qdrant verifier treats SQLite as the expected vector manifest. It compares
+The sqlite-vec verifier treats SQLite as the expected vector manifest. It compares
 latest-generation `chunk_embeddings` rows for the selected semantic layer with
-Qdrant payload rows filtered by `repository_id`, checking point ID, chunk ID,
+sqlite-vec payload rows filtered by `repository_id`, checking point ID, chunk ID,
 path, line range, text hash, embedding model, and embedding dimension. Missing
 collections and missing points are errors; stale payload fields and orphaned
-Qdrant points are warnings. The report is metadata-only and does not request
+sqlite-vec points are warnings. The report is metadata-only and does not request
 vectors or source text.
 
-The Qdrant repair command uses verifier metadata as its repair plan. Orphaned
-point IDs are deleted from Qdrant. Missing or stale expected points, including
+The sqlite-vec repair command uses verifier metadata as its repair plan. Orphaned
+point IDs are deleted from sqlite-vec. Missing or stale expected points, including
 payload model or dimension drift, are rebuilt through semantic indexing rather
 than by a separate write path so SQLite remains the structural source of truth.
 
 ## TUI visualization mapping
 
 The TUI should visualize storage metadata without showing source text by
-default. Treat SQLite as the structural source of truth and Qdrant as the
+default. Treat SQLite as the structural source of truth and sqlite-vec as the
 semantic projection of embeddable chunks.
 
 ### Storage explorer
@@ -437,7 +442,7 @@ Use SQLite tables to show repository structure:
   and exclusion reasons.
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
 
-Use Qdrant metadata to show semantic storage:
+Use sqlite-vec metadata to show semantic storage:
 
 - collection name and expected embedding model/dimension
 - point counts for the selected repository collection
@@ -483,26 +488,26 @@ caller symbol, callee text, call line, path, confidence, and resolution status.
 
 ### Embedding coverage view
 
-Compare SQLite chunk metadata with Qdrant collection metadata:
+Compare SQLite chunk metadata with sqlite-vec collection metadata:
 
 - chunks with `excluded_reason` are metadata-only and intentionally unembedded
-- current fast `chunk_embeddings` rows should have matching Qdrant points
+- current fast `chunk_embeddings` rows should have matching sqlite-vec points
 - chunks without a current fast `chunk_embeddings` row and without
   `excluded_reason` are missing vectors
 - latest successful `index_runs.embedding_model` and `embedding_dimension`
-  should match the selected Qdrant collection metadata
+  should match the selected sqlite-vec collection metadata
 
-Surface missing collections, missing points, model drift, and dimension drift
+Surface missing vector tables, missing points, model drift, and dimension drift
 as warning or error rows.
 
-The CLI `qdrant-verify` command implements this live comparison against Qdrant.
+The CLI `vector-verify` command implements this live comparison against sqlite-vec.
 The TUI can use the same status labels when it grows live cross-store actions.
 
 The first TUI implementation uses SQLite metadata and latest-generation fast
 `chunk_embeddings` rows to show total, embeddable, vector-backed,
 missing-vector, and excluded chunk counts plus latest model, dimension,
 collection, run count, exclusion reasons, and health notes. It does not require
-a live Qdrant service for deterministic offline rendering.
+a live sqlite-vec service for deterministic offline rendering.
 
 The cross-store health view consolidates these checks into selectable warning
 rows. It flags missing collection metadata when embeddable chunks have no
@@ -525,7 +530,7 @@ the stored error summary when present.
 
 ### Semantic neighborhood view
 
-When visualizing nearby Qdrant points, show payload metadata only:
+When visualizing nearby sqlite-vec points, show payload metadata only:
 
 - path
 - line range
@@ -538,7 +543,7 @@ When visualizing nearby Qdrant points, show payload metadata only:
 Do not show full chunk text in semantic-neighborhood rows.
 
 The first TUI implementation uses vector-backed chunk records as the
-deterministic Qdrant payload projection and does not require a live Qdrant
+deterministic sqlite-vec payload projection and does not require a live sqlite-vec
 service. Rows show path, line range, symbol name, chunk kind, language, text
 hash, collection, and point ID. Score is labeled `metadata` until a future live
 nearest-neighbor interaction supplies real scores.

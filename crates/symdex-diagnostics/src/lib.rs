@@ -4,12 +4,11 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_embed::{EmbedConfig, OllamaClient};
 use symdex_query::FreshnessSummary;
-use symdex_store::{EvidenceFreshness, QdrantClient, StoreConfig, sqlite_parent};
+use symdex_store::{EvidenceFreshness, SqliteVectorStore, StoreConfig, sqlite_parent};
 
 const RUST_ANALYZER_ENABLE_ENV: &str = "SYMDEX_RUST_ANALYZER";
 const RUST_ANALYZER_CMD_ENV: &str = "SYMDEX_RUST_ANALYZER_CMD";
@@ -18,7 +17,7 @@ const RUST_ANALYZER_CMD_ENV: &str = "SYMDEX_RUST_ANALYZER_CMD";
 pub struct DiagnosticReport {
     pub workspace: String,
     pub sqlite_path: String,
-    pub qdrant_url: String,
+    pub vector_store: String,
     pub ollama_url: String,
     pub embed_model: String,
     pub checks: Vec<DiagnosticCheck>,
@@ -72,7 +71,7 @@ pub fn run_diagnostics_for_repo(repo: Option<&str>) -> Result<DiagnosticReport, 
     });
     checks.push(sqlite_database_check(&store.sqlite_path));
     checks.extend(ollama_checks(&embed));
-    checks.push(qdrant_check(&store));
+    checks.push(sqlite_vec_check(&store));
     checks.push(rust_analyzer_check(
         &RustAnalyzerDiagnosticsConfig::from_env(),
     ));
@@ -82,7 +81,7 @@ pub fn run_diagnostics_for_repo(repo: Option<&str>) -> Result<DiagnosticReport, 
     Ok(DiagnosticReport {
         workspace: cwd.display().to_string(),
         sqlite_path: store.sqlite_path.display().to_string(),
-        qdrant_url: store.qdrant_url,
+        vector_store: "sqlite_vec".to_owned(),
         ollama_url: embed.ollama_url,
         embed_model: embed.model,
         checks,
@@ -117,7 +116,7 @@ fn mcp_contract_check() -> DiagnosticCheck {
         label: "mcp_evidence_contract".to_owned(),
         state: DiagnosticState::Ok,
         message: format!(
-            "{EVIDENCE_CONTRACT_SCHEMA} version={EVIDENCE_CONTRACT_VERSION} read_only local_only"
+            "{EVIDENCE_CONTRACT_SCHEMA} version={EVIDENCE_CONTRACT_VERSION} local_only evidence_read_only watcher_start_explicit"
         ),
     }
 }
@@ -135,26 +134,81 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 state: DiagnosticState::Skipped,
                 message: "pass a repository path to check indexed evidence provenance".to_owned(),
             },
+            DiagnosticCheck {
+                label: "watcher_status".to_owned(),
+                state: DiagnosticState::Skipped,
+                message: "pass a repository path to check watcher status".to_owned(),
+            },
         ];
     };
 
     match symdex_query::run_freshness_report(repo, None) {
-        Ok(summary) => vec![
-            index_freshness_check(&summary),
-            provenance_consistency_check(&summary),
-        ],
-        Err(error) => vec![
+        Ok(summary) => {
+            let mut checks = vec![
+                index_freshness_check(&summary),
+                provenance_consistency_check(&summary),
+            ];
+            checks.push(watcher_status_check(repo));
+            checks
+        }
+        Err(error) => {
+            let mut checks = vec![
+                DiagnosticCheck {
+                    label: "index_freshness".to_owned(),
+                    state: DiagnosticState::Error,
+                    message: error.clone(),
+                },
+                DiagnosticCheck {
+                    label: "provenance_consistency".to_owned(),
+                    state: DiagnosticState::Error,
+                    message: error,
+                },
+            ];
+            checks.push(watcher_status_check(repo));
+            checks
+        }
+    }
+}
+
+fn watcher_status_check(repo: &str) -> DiagnosticCheck {
+    match symdex_watch::status(repo) {
+        Ok(status) => {
+            let state = match status.state.as_str() {
+                "running" | "pending" | "indexing" | "starting" => DiagnosticState::Ok,
+                "inactive" | "stopped" => DiagnosticState::Skipped,
+                "stale" => DiagnosticState::Unreachable,
+                "failed" => DiagnosticState::Error,
+                _ => DiagnosticState::Skipped,
+            };
             DiagnosticCheck {
-                label: "index_freshness".to_owned(),
-                state: DiagnosticState::Error,
-                message: error.clone(),
-            },
-            DiagnosticCheck {
-                label: "provenance_consistency".to_owned(),
-                state: DiagnosticState::Error,
-                message: error,
-            },
-        ],
+                label: "watcher_status".to_owned(),
+                state,
+                message: format!(
+                    "state={} owner={} clients={} client_kinds={} shutdown_after={} files_seen={} queued={} last={} error={}",
+                    status.state,
+                    status.owner_kind,
+                    status.attached_clients,
+                    if status.client_kinds.is_empty() {
+                        "<none>".to_owned()
+                    } else {
+                        status.client_kinds.join(",")
+                    },
+                    status
+                        .shutdown_after_seconds
+                        .map(|seconds| seconds.to_string())
+                        .unwrap_or_else(|| "<none>".to_owned()),
+                    status.files_seen,
+                    status.queued_events,
+                    status.last_indexed_path.as_deref().unwrap_or("<none>"),
+                    status.last_error.as_deref().unwrap_or("<none>")
+                ),
+            }
+        }
+        Err(error) => DiagnosticCheck {
+            label: "watcher_status".to_owned(),
+            state: DiagnosticState::Error,
+            message: error,
+        },
     }
 }
 
@@ -299,12 +353,12 @@ fn ollama_checks(config: &EmbedConfig) -> Vec<DiagnosticCheck> {
     }
 }
 
-fn qdrant_check(config: &StoreConfig) -> DiagnosticCheck {
-    let client = match QdrantClient::with_timeout(config, Duration::from_secs(3)) {
+fn sqlite_vec_check(config: &StoreConfig) -> DiagnosticCheck {
+    let client = match SqliteVectorStore::new(config) {
         Ok(client) => client,
         Err(error) => {
             return DiagnosticCheck {
-                label: "qdrant_status".to_owned(),
+                label: "sqlite_vec_status".to_owned(),
                 state: DiagnosticState::Error,
                 message: error.to_string(),
             };
@@ -312,13 +366,13 @@ fn qdrant_check(config: &StoreConfig) -> DiagnosticCheck {
     };
 
     match client.health_check() {
-        Ok(()) => DiagnosticCheck {
-            label: "qdrant_status".to_owned(),
+        Ok(version) => DiagnosticCheck {
+            label: "sqlite_vec_status".to_owned(),
             state: DiagnosticState::Ok,
-            message: String::new(),
+            message: version,
         },
         Err(error) => DiagnosticCheck {
-            label: "qdrant_status".to_owned(),
+            label: "sqlite_vec_status".to_owned(),
             state: DiagnosticState::Unreachable,
             message: error.to_string(),
         },

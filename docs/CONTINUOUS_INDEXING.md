@@ -8,20 +8,22 @@ enabled, modified or newly created eligible files are automatically reindexed.
 
 ## Product Contract
 
-- Continuous indexing is off by default.
-- Users must be able to toggle it on and off from the TUI.
+- `symdex tui [repo]` starts or attaches to the single background watcher for
+  the repository.
+- Users must be able to toggle it off and back on from the TUI, CLI, and
+  explicit watcher MCP tools.
 - A CLI launch path should also exist for non-interactive use, such as
   `symdex index --watch <repo>` or an equivalent command.
 - Watch mode must never execute indexed repository code.
 - Watch mode must never send source text, embeddings, paths, or metadata to
   remote services.
 - Watch mode must obey the same local service configuration as manual indexing.
-- Offline continuous indexing should remain possible without Ollama or Qdrant.
-- Semantic continuous indexing requires local Ollama and Qdrant, just like
+- Offline continuous indexing should remain possible without Ollama or sqlite-vec.
+- Semantic continuous indexing requires local Ollama and sqlite-vec, just like
   manual semantic indexing.
 - When layered semantic indexing is enabled, continuous indexing must update the
   fast `nomic-embed-text` layer synchronously and queue the quality
-  `nomic-embed-text-v2-moe` layer as deferred work.
+  `mxbai-embed-large` layer as deferred work.
 - Continuous indexing must not wait for quality indexing before returning to
   watch mode.
 
@@ -37,7 +39,7 @@ enabled, modified or newly created eligible files are automatically reindexed.
 - Reindex only files whose content hash changed.
 - Created files should be discovered, parsed, persisted to SQLite, and embedded
   when semantic indexing is enabled and chunks are embeddable.
-- Modified files should replace prior SQLite facts and Qdrant points
+- Modified files should replace prior SQLite facts and sqlite-vec points
   atomically where practical.
 - Deleted-file cleanup should continue to be handled by the incremental
   indexing path, even though the first continuous MVP is focused on created and
@@ -56,7 +58,7 @@ file changes
   -> debounce/coalesce
   -> structural SQLite update
   -> fast nomic-embed-text embedding
-  -> fast Qdrant upsert
+  -> fast sqlite-vec upsert
   -> mark quality stale when needed
   -> enqueue quality jobs
   -> return to watching
@@ -68,8 +70,8 @@ The quality layer must be treated as eventual precision work:
 quality queue
   -> background worker
   -> verify hashes
-  -> embed with nomic-embed-text-v2-moe
-  -> quality Qdrant upsert
+  -> embed with mxbai-embed-large
+  -> quality sqlite-vec upsert
   -> activate quality only after complete/current
 ```
 
@@ -99,13 +101,16 @@ outputs to distinguish these states:
   already completed index updates intact.
 - The status row should show the latest watch event, latest reindexed file,
   pending debounce state, current indexing state, and any error.
+- Because the shared watcher daemon owns continuous indexing, the TUI should
+  refresh watcher status and semantic/index readiness from shared state on an
+  interval rather than relying only on in-process events.
 - Continuous indexing must not block query, storage, or diagnostics views.
 - Manual indexing should remain available while continuous mode is off.
 - If a manual indexing job is running, continuous indexing should queue or
   coalesce file events instead of running concurrent writes.
 - When layered semantic indexing is enabled, the TUI should show active semantic
   layer, fast readiness, quality status, quality job counts, and fallback-to-fast
-  state without requiring a live Qdrant query for deterministic rendering.
+  state without requiring a live sqlite-vec query for deterministic rendering.
 
 ## Implementation Boundaries
 
@@ -116,7 +121,7 @@ outputs to distinguish these states:
 - `symdex-core` owns path normalization, ignore decisions, parsing, chunking,
   hashing, symbol extraction, and call extraction.
 - `symdex-store` owns SQLite updates, semantic generation state,
-  quality-job persistence, Qdrant point replacement, and index run metadata.
+  quality-job persistence, sqlite-vec point replacement, and index run metadata.
 - `symdex-query` owns active semantic layer routing for search. It must not
   decide to use a partial quality layer unless an explicit future diagnostic
   mode is added.
@@ -124,15 +129,23 @@ outputs to distinguish these states:
 - `symdex-tui` owns toggle state, rendering, confirmation, and event display.
 - The TUI and CLI must call shared Rust APIs directly. They must not shell out
   to `symdex` subprocesses.
-- The MCP server remains read-only for the MVP and must not start or stop
-  continuous indexing.
+- MCP evidence tools remain read-only. `symdex_watch_start` is the explicit
+  local-only watcher-start exception; MCP does not expose watcher stop.
 
 Current implementation status:
 
 - `symdex-index` exposes shared watch snapshot, diff, and continuous polling
   APIs.
-- `symdex index --watch <repo>` starts the non-interactive watch loop and uses
-  the shared indexing APIs directly.
+- `symdex watch start <repo>` starts or attaches the background watcher and
+  prints status. Watchers are client-scoped, so this command alone does not make
+  a permanent daemon; without a live TUI, MCP server, or foreground watcher the
+  daemon exits after about 10 seconds. `symdex watch status <repo>` reads shared
+  SQLite watcher state. `symdex watch stop <repo>` asks the daemon to stop.
+- `symdex index --watch <repo>` remains a foreground watch loop, but it refuses
+  to run while a background or foreground watcher is already active.
+- `symdex serve-mcp --watch <repo>` starts or attaches the single background
+  watcher before serving MCP and holds a client lease until the MCP process
+  exits. MCP stdout remains protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
 - Watch-driven batches are recorded with `run_kind = watch` in local index-run
@@ -142,11 +155,11 @@ Current implementation status:
   idle ticks. Each catch-up tick uses the same hash-verifying quality worker
   path as `symdex index-quality <repo>` and is bounded by
   `SYMDEX_QUALITY_BATCH_SIZE` before returning to watch polling.
-- The TUI Indexing view exposes a `c` toggle with first-enable confirmation,
-  explicit `on` / `off` labels, pending debounce state, queued event count,
-  last reindexed file, active semantic layer, quality status, quality job
-  counts, latest watch and quality errors, and an animated activity indicator
-  while continuous indexing is on.
+- The TUI starts continuous indexing on launch and exposes a `c` toggle to stop
+  or confirm restarting watch mode, with explicit `on` / `off` labels, pending
+  debounce state, queued event count, last reindexed file, active semantic
+  layer, quality status, quality job counts, latest watch and quality errors,
+  and an animated activity indicator while continuous indexing is on.
 - CLI watch output prints metadata-only quality state, progress, completion,
   and failure events alongside fast watch events.
 
@@ -173,8 +186,8 @@ Current implementation status:
 - Integration test that a modified eligible implemented-language file replaces
   stale SQLite facts.
 - Integration test that unchanged content after a filesystem event is skipped.
-- Test offline continuous indexing without Qdrant or Ollama.
-- Test semantic continuous indexing with mocked or opt-in local Ollama/Qdrant.
+- Test offline continuous indexing without sqlite-vec or Ollama.
+- Test semantic continuous indexing with mocked or opt-in local Ollama/sqlite-vec.
 - Test that continuous indexing marks quality stale, queues quality jobs, and
   returns without waiting for the quality worker.
 - Test that default semantic search routes to fast while quality is pending or

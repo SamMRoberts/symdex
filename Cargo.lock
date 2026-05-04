@@ -1468,6 +1468,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "sqlite-wasm-rs"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1544,6 +1553,7 @@ dependencies = [
  "symdex-query",
  "symdex-store",
  "symdex-tui",
+ "symdex-watch",
 ]
 
 [[package]]
@@ -1566,6 +1576,7 @@ dependencies = [
  "symdex-embed",
  "symdex-query",
  "symdex-store",
+ "symdex-watch",
 ]
 
 [[package]]
@@ -1595,6 +1606,7 @@ dependencies = [
  "symdex-embed",
  "symdex-query",
  "symdex-store",
+ "symdex-watch",
 ]
 
 [[package]]
@@ -1609,14 +1621,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "symdex-sqlite-vec"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "sqlite-vec",
+]
+
+[[package]]
 name = "symdex-store"
 version = "0.1.0"
 dependencies = [
- "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "symdex-core",
+ "symdex-sqlite-vec",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1630,6 +1651,18 @@ dependencies = [
  "symdex-embed",
  "symdex-index",
  "symdex-query",
+ "symdex-store",
+ "symdex-watch",
+]
+
+[[package]]
+name = "symdex-watch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "symdex-core",
+ "symdex-index",
  "symdex-store",
 ]
 

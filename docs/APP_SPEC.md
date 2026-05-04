@@ -35,7 +35,7 @@ It answers questions such as:
 4. User can optionally enable continuous indexing so modified or newly created eligible files are automatically reindexed.
 5. User asks semantic or structural questions through CLI, TUI, or MCP.
 6. User can inspect local status, diagnostics, indexing controls, queries, and context packs in the TUI.
-7. User can visualize SQLite structural data and Qdrant semantic coverage in the TUI without exposing source text.
+7. User can visualize SQLite structural data and sqlite-vec semantic coverage in the TUI without exposing source text.
 8. Agent receives compact ranked evidence with file paths and line ranges.
 
 ## Primary commands
@@ -44,6 +44,9 @@ It answers questions such as:
 symdex init
 symdex index <repo>
 symdex index --watch <repo>
+symdex watch start <repo>
+symdex watch status <repo>
+symdex watch stop <repo>
 symdex search <repo> "query"
 symdex symbol <repo> <symbol>
 symdex callers <repo> <symbol>
@@ -53,6 +56,7 @@ symdex context-pack <repo> <symbol>
 symdex tui [repo]
 symdex doctor [repo]
 symdex serve-mcp
+symdex serve-mcp --watch <repo>
 ```
 
 ## Success criteria
@@ -61,7 +65,10 @@ symdex serve-mcp
 - C#, JavaScript, and TypeScript indexing use the same local-only contracts as
   Rust for discovery, parsing, chunking, symbols, calls, provenance, and
   continuous indexing.
-- Continuous indexing can be toggled on and off and reindexes modified or newly created eligible files without source execution.
+- Continuous indexing uses one local background watcher per repository. Watchers
+  run only while TUI, MCP, or CLI clients hold leases, can be toggled on and
+  off, and reindex modified or newly created eligible files without source
+  execution.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.

@@ -8,20 +8,20 @@ use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousIndexOptions, EmbeddingSummary, IndexOptions, IndexScope,
-    IndexSummary, QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary,
-    WatchChangeSet, run_continuous_index, run_index, run_quality_index,
-    run_quality_index_with_progress,
+    ContinuousIndexEvent, EmbeddingSummary, IndexOptions, IndexScope, IndexSummary,
+    QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
+    run_index, run_quality_index, run_quality_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
-    ImpactSummary, QdrantVerifyOptions, QdrantVerifySemanticLayer, QdrantVerifySummary,
-    SemanticStatusLayerSummary, SemanticStatusSummary, run_call_graph, run_call_path,
+    ImpactSummary, SemanticStatusLayerSummary, SemanticStatusSummary, VectorVerifyOptions,
+    VectorVerifySemanticLayer, VectorVerifySummary, run_call_graph, run_call_path,
     run_context_pack, run_debug_context_pack, run_freshness_report, run_impact,
-    run_qdrant_verify_with_options, run_semantic_search, run_semantic_status, run_symbol_search,
-    run_unified_context_pack,
+    run_semantic_search, run_semantic_status, run_symbol_search, run_unified_context_pack,
+    run_vector_verify_with_options,
 };
-use symdex_store::{EvidenceFreshness, QdrantClient, SqliteStore, StoreConfig, sqlite_parent};
+use symdex_store::{EvidenceFreshness, SqliteStore, SqliteVectorStore, StoreConfig, sqlite_parent};
+use symdex_watch::{WatcherClientKind, WatcherStatus};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -53,6 +53,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let index_args = parse_index_args(&args[1..])?;
             index(&index_args)
         }
+        "watch" => {
+            require_text_output(command, output)?;
+            let watch_args = parse_watch_args(&args[1..])?;
+            watch(&watch_args)
+        }
+        "watch-daemon" => {
+            require_text_output(command, output)?;
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            symdex_watch::run_daemon(repo)
+        }
         "index-quality" => {
             require_text_output(command, output)?;
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -72,15 +82,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let symbol_query = args.get(2).map(String::as_str);
             staleness(repo, symbol_query)
         }
+        "vector-verify" => {
+            require_text_output(command, output)?;
+            let verify_args = parse_vector_maintenance_args(&args[1..])?;
+            vector_verify(&verify_args)
+        }
         "qdrant-verify" => {
             require_text_output(command, output)?;
-            let verify_args = parse_qdrant_maintenance_args(&args[1..])?;
-            qdrant_verify(&verify_args)
+            println!("warning: qdrant-verify is deprecated; use vector-verify");
+            let verify_args = parse_vector_maintenance_args(&args[1..])?;
+            vector_verify(&verify_args)
+        }
+        "vector-repair" => {
+            require_text_output(command, output)?;
+            let repair_args = parse_vector_maintenance_args(&args[1..])?;
+            vector_repair(&repair_args)
         }
         "qdrant-repair" => {
             require_text_output(command, output)?;
-            let repair_args = parse_qdrant_maintenance_args(&args[1..])?;
-            qdrant_repair(&repair_args)
+            println!("warning: qdrant-repair is deprecated; use vector-repair");
+            let repair_args = parse_vector_maintenance_args(&args[1..])?;
+            vector_repair(&repair_args)
         }
         "symbol" => {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
@@ -138,7 +160,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "serve-mcp" => {
             require_text_output(command, output)?;
-            serve_mcp()
+            let serve_args = parse_serve_mcp_args(&args[1..])?;
+            serve_mcp(&serve_args)
         }
         "help" | "--help" | "-h" => {
             print_help();
@@ -263,10 +286,7 @@ fn continuous_index(args: &IndexArgs) -> Result<(), String> {
         if args.offline { "offline" } else { "semantic" }
     );
     println!("press Ctrl+C to stop");
-    run_continuous_index(
-        &ContinuousIndexOptions::new(args.repo.clone(), args.offline),
-        print_continuous_index_event,
-    )
+    symdex_watch::run_foreground(&args.repo, args.offline, print_continuous_index_event)
 }
 
 fn index_status(repo: &str, output: OutputMode) -> Result<(), String> {
@@ -339,6 +359,14 @@ fn print_semantic_status_summary(summary: &SemanticStatusSummary) {
         println!("quality_progress:");
         println!("  embeddable_chunks: {}", progress.embeddable_chunks);
         println!(
+            "  quality_eligible_chunks: {}",
+            progress.quality_eligible_chunks
+        );
+        println!(
+            "  quality_ineligible_chunks: {}",
+            progress.quality_ineligible_chunks
+        );
+        println!(
             "  quality_embedded_chunks: {}",
             progress.quality_embedded_chunks
         );
@@ -367,7 +395,8 @@ fn print_semantic_status_layer(label: &str, layer: &SemanticStatusLayerSummary) 
             .map(|dimension| dimension.to_string())
             .unwrap_or_else(|| "<none>".to_owned())
     );
-    println!("  qdrant_collection: {}", layer.qdrant_collection);
+    println!("  vector_store: sqlite_vec");
+    println!("  vector_table: {}", layer.vector_table);
     println!("  expected_chunks: {}", layer.expected_chunks);
     println!("  current_chunks: {}", layer.current_chunks);
     println!("  stale_chunks: {}", layer.stale_chunks);
@@ -393,6 +422,8 @@ fn semantic_status_json(summary: &SemanticStatusSummary) -> serde_json::Value {
             "repository_id": progress.repository_id.as_str(),
             "generation_id": progress.generation_id.as_str(),
             "embeddable_chunks": progress.embeddable_chunks,
+            "quality_eligible_chunks": progress.quality_eligible_chunks,
+            "quality_ineligible_chunks": progress.quality_ineligible_chunks,
             "quality_embedded_chunks": progress.quality_embedded_chunks,
             "pending_jobs": progress.pending_jobs,
             "running_jobs": progress.running_jobs,
@@ -409,7 +440,8 @@ fn semantic_status_layer_json(layer: &SemanticStatusLayerSummary) -> serde_json:
         "semantic_layer": layer.semantic_layer.as_str(),
         "embedding_model": layer.embedding_model.as_str(),
         "embedding_dimension": layer.embedding_dimension,
-        "qdrant_collection": layer.qdrant_collection.as_str(),
+        "vector_store": "sqlite_vec",
+        "vector_table": layer.vector_table.as_str(),
         "expected_chunks": layer.expected_chunks,
         "current_chunks": layer.current_chunks,
         "stale_chunks": layer.stale_chunks,
@@ -427,40 +459,55 @@ fn staleness(repo: &str, symbol_query: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn qdrant_verify(args: &QdrantMaintenanceArgs) -> Result<(), String> {
-    let summary = run_qdrant_verify_with_options(
+fn watch(args: &WatchArgs) -> Result<(), String> {
+    let status = match args.action {
+        WatchAction::Start => {
+            let attachment = symdex_watch::start_or_attach(&args.repo, WatcherClientKind::Cli)?;
+            let status = attachment.status()?;
+            drop(attachment);
+            status
+        }
+        WatchAction::Status => symdex_watch::status(&args.repo)?,
+        WatchAction::Stop => symdex_watch::stop_daemon(&args.repo)?,
+    };
+    print_watcher_status(&status);
+    Ok(())
+}
+
+fn vector_verify(args: &VectorMaintenanceArgs) -> Result<(), String> {
+    let summary = run_vector_verify_with_options(
         &args.repo,
-        QdrantVerifyOptions {
+        VectorVerifyOptions {
             semantic_layer: args.semantic_layer,
         },
     )?;
-    print_qdrant_verify_summary(&summary);
+    print_vector_verify_summary(&summary);
     Ok(())
 }
 
-fn qdrant_repair(args: &QdrantMaintenanceArgs) -> Result<(), String> {
-    let options = QdrantVerifyOptions {
+fn vector_repair(args: &VectorMaintenanceArgs) -> Result<(), String> {
+    let options = VectorVerifyOptions {
         semantic_layer: args.semantic_layer,
     };
-    let before = run_qdrant_verify_with_options(&args.repo, options)?;
+    let before = run_vector_verify_with_options(&args.repo, options)?;
     println!("pre_repair_verify:");
-    print_qdrant_verify_summary(&before);
+    print_vector_verify_summary(&before);
 
-    let orphaned_points_deleted = delete_orphaned_qdrant_points(&before)?;
+    let orphaned_points_deleted = delete_orphaned_vector_points(&before)?;
     println!("orphaned_points_deleted: {orphaned_points_deleted}");
 
-    repair_qdrant_summary(&args.repo, &before)?;
+    repair_vector_summary(&args.repo, &before)?;
 
-    let after = run_qdrant_verify_with_options(&args.repo, options)?;
+    let after = run_vector_verify_with_options(&args.repo, options)?;
     println!("post_repair_verify:");
-    print_qdrant_verify_summary(&after);
+    print_vector_verify_summary(&after);
     Ok(())
 }
 
-fn repair_qdrant_summary(repo: &str, summary: &QdrantVerifySummary) -> Result<(), String> {
+fn repair_vector_summary(repo: &str, summary: &VectorVerifySummary) -> Result<(), String> {
     if !summary.layer_summaries.is_empty() {
         for layer_summary in &summary.layer_summaries {
-            repair_qdrant_summary(repo, layer_summary)?;
+            repair_vector_summary(repo, layer_summary)?;
         }
         return Ok(());
     }
@@ -474,8 +521,8 @@ fn repair_qdrant_summary(repo: &str, summary: &QdrantVerifySummary) -> Result<()
         return Ok(());
     }
 
-    match QdrantVerifySemanticLayer::parse(&summary.semantic_layer)? {
-        QdrantVerifySemanticLayer::Fast => {
+    match VectorVerifySemanticLayer::parse(&summary.semantic_layer)? {
+        VectorVerifySemanticLayer::Fast => {
             println!("semantic_repair layer=fast action=reindex_started");
             let index_summary = run_index(&IndexOptions {
                 repo: repo.to_owned(),
@@ -484,33 +531,33 @@ fn repair_qdrant_summary(repo: &str, summary: &QdrantVerifySummary) -> Result<()
             })?;
             print_index_summary(&index_summary);
         }
-        QdrantVerifySemanticLayer::Quality => {
+        VectorVerifySemanticLayer::Quality => {
             println!("semantic_repair layer=quality action=quality_worker_started");
             let quality_summary = run_quality_index(&QualityIndexOptions {
                 repo: repo.to_owned(),
             })?;
             print_quality_index_summary(&quality_summary);
         }
-        QdrantVerifySemanticLayer::All => {}
+        VectorVerifySemanticLayer::All => {}
     }
     Ok(())
 }
 
-fn delete_orphaned_qdrant_points(summary: &QdrantVerifySummary) -> Result<usize, String> {
+fn delete_orphaned_vector_points(summary: &VectorVerifySummary) -> Result<usize, String> {
     if !summary.layer_summaries.is_empty() {
         return summary
             .layer_summaries
             .iter()
             .try_fold(0usize, |deleted, layer_summary| {
-                Ok(deleted + delete_orphaned_qdrant_points(layer_summary)?)
+                Ok(deleted + delete_orphaned_vector_points(layer_summary)?)
             });
     }
-    if !summary.collection_exists || summary.orphaned_point_ids.is_empty() {
+    if !summary.table_exists || summary.orphaned_point_ids.is_empty() {
         return Ok(0);
     }
     let store_config = StoreConfig::from_env();
-    let qdrant = QdrantClient::new(&store_config).map_err(|error| error.to_string())?;
-    qdrant
+    let vector = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
+    vector
         .delete_points(&summary.collection_name, &summary.orphaned_point_ids)
         .map_err(|error| error.to_string())?;
     Ok(summary.orphaned_point_ids.len())
@@ -755,27 +802,28 @@ fn print_impact_path_evidence(evidence: &symdex_query::ImpactPathEvidence) {
     }
 }
 
-fn print_qdrant_verify_summary(summary: &QdrantVerifySummary) {
-    print_qdrant_verify_summary_with_prefix(summary, "");
+fn print_vector_verify_summary(summary: &VectorVerifySummary) {
+    print_vector_verify_summary_with_prefix(summary, "");
     for layer_summary in &summary.layer_summaries {
         println!("layer_summary: {}", layer_summary.semantic_layer);
-        print_qdrant_verify_summary_with_prefix(layer_summary, "  ");
+        print_vector_verify_summary_with_prefix(layer_summary, "  ");
     }
 }
 
-fn print_qdrant_verify_summary_with_prefix(summary: &QdrantVerifySummary, prefix: &str) {
+fn print_vector_verify_summary_with_prefix(summary: &VectorVerifySummary, prefix: &str) {
     println!("{prefix}repository_id: {}", summary.repository_id);
     println!("{prefix}semantic_layer: {}", summary.semantic_layer);
-    println!("{prefix}collection: {}", summary.collection_name);
+    println!("{prefix}vector_store: sqlite_vec");
+    println!("{prefix}vector_table: {}", summary.collection_name);
     println!("{prefix}embedding_model: {}", summary.embedding_model);
-    println!("{prefix}collection_exists: {}", summary.collection_exists);
+    println!("{prefix}table_exists: {}", summary.table_exists);
     println!(
         "{prefix}expected_vector_points: {}",
         summary.expected_vector_points
     );
     println!(
-        "{prefix}qdrant_payload_points: {}",
-        summary.qdrant_payload_points
+        "{prefix}vector_payload_points: {}",
+        summary.vector_payload_points
     );
     println!("{prefix}missing_points: {}", summary.missing_points);
     println!(
@@ -907,7 +955,8 @@ fn search(repo: &str, query_parts: &[String], output: OutputMode) -> Result<(), 
     })?;
 
     println!("repository_id: {}", summary.repository_id);
-    println!("qdrant_collection: {}", summary.qdrant_collection);
+    println!("vector_store: sqlite_vec");
+    println!("vector_table: {}", summary.vector_table);
     println!("results: {}", summary.results.len());
     for result in summary.results {
         println!(
@@ -1063,21 +1112,22 @@ fn print_index_summary(summary: &IndexSummary) {
     match &summary.embedding {
         EmbeddingSummary::SkippedOffline => {
             println!("embedding: skipped (--offline)");
-            println!("qdrant: skipped (--offline)");
+            println!("vector_store: skipped (--offline)");
         }
         EmbeddingSummary::SkippedNoChunks => {
             println!("chunks_embedded: 0");
-            println!("qdrant: skipped (no chunks)");
+            println!("vector_store: skipped (no chunks)");
         }
         EmbeddingSummary::Completed {
             model,
             dimension,
-            qdrant_collection,
+            vector_table,
             chunks_embedded,
         } => {
             println!("embedding_model: {model}");
             println!("embedding_dimension: {dimension}");
-            println!("qdrant_collection: {qdrant_collection}");
+            println!("vector_store: sqlite_vec");
+            println!("vector_table: {vector_table}");
             println!("chunks_embedded: {chunks_embedded}");
         }
     }
@@ -1097,15 +1147,19 @@ fn print_quality_index_summary(summary: &QualityIndexSummary) {
     println!("quality_status: {}", summary.quality_status);
     println!("active_layer: {}", summary.active_layer);
     println!("activation_reason: {}", summary.activation_reason);
-    println!("qdrant_collection: {}", summary.qdrant_collection);
+    println!("vector_store: sqlite_vec");
+    println!("vector_table: {}", summary.vector_table);
     println!("claimed_jobs: {}", summary.claimed_jobs);
     println!("succeeded_jobs: {}", summary.succeeded_jobs);
     println!("failed_jobs: {}", summary.failed_jobs);
     println!("skipped_stale_jobs: {}", summary.skipped_stale_jobs);
+    println!("skipped_excluded_jobs: {}", summary.skipped_excluded_jobs);
     println!("remaining_pending_jobs: {}", summary.remaining_pending_jobs);
     println!(
-        "progress: embeddable_chunks={} quality_embedded_chunks={} pending={} running={} succeeded={} failed={} skipped_stale={} skipped_excluded={}",
+        "progress: embeddable_chunks={} quality_eligible_chunks={} quality_ineligible_chunks={} quality_embedded_chunks={} pending={} running={} succeeded={} failed={} skipped_stale={} skipped_excluded={}",
         summary.progress.embeddable_chunks,
+        summary.progress.quality_eligible_chunks,
+        summary.progress.quality_ineligible_chunks,
         summary.progress.quality_embedded_chunks,
         summary.progress.pending_jobs,
         summary.progress.running_jobs,
@@ -1120,7 +1174,7 @@ fn print_diagnostic_report(report: &DiagnosticReport) {
     println!("symdex doctor");
     println!("workspace: {}", report.workspace);
     println!("sqlite: {}", report.sqlite_path);
-    println!("qdrant: {}", report.qdrant_url);
+    println!("vector_store: {}", report.vector_store);
     println!("ollama: {}", report.ollama_url);
     println!("embed_model: {}", report.embed_model);
     for check in &report.checks {
@@ -1248,9 +1302,59 @@ fn parse_context_pack_args(args: &[String]) -> Result<ContextPackArgs, String> {
     })
 }
 
-fn parse_qdrant_maintenance_args(args: &[String]) -> Result<QdrantMaintenanceArgs, String> {
+fn parse_serve_mcp_args(args: &[String]) -> Result<ServeMcpArgs, String> {
+    let mut watch_repo = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--watch" {
+            if watch_repo.is_some() {
+                return Err("serve-mcp accepts at most one --watch repository".to_owned());
+            }
+            index += 1;
+            let Some(repo) = args.get(index) else {
+                return Err("serve-mcp --watch requires a repository path".to_owned());
+            };
+            if repo.starts_with("--") {
+                return Err("serve-mcp --watch requires a repository path".to_owned());
+            }
+            watch_repo = Some(repo.clone());
+        } else if arg == "--offline" {
+            return Err(
+                "serve-mcp --watch runs semantic indexing; use `symdex index --offline --watch <repo>` for offline watch mode"
+                    .to_owned(),
+            );
+        } else if arg.starts_with("--") {
+            return Err(format!("unsupported serve-mcp option `{arg}`"));
+        } else {
+            return Err(format!("unexpected serve-mcp argument `{arg}`"));
+        }
+        index += 1;
+    }
+
+    Ok(ServeMcpArgs { watch_repo })
+}
+
+fn parse_watch_args(args: &[String]) -> Result<WatchArgs, String> {
+    let Some(action) = args.first() else {
+        return Err("watch requires an action: start, status, or stop".to_owned());
+    };
+    let action = match action.as_str() {
+        "start" => WatchAction::Start,
+        "status" => WatchAction::Status,
+        "stop" => WatchAction::Stop,
+        other => return Err(format!("unsupported watch action `{other}`")),
+    };
+    let repo = args.get(1).cloned().unwrap_or_else(|| ".".to_owned());
+    if args.len() > 2 {
+        return Err("watch accepts at most one repository path".to_owned());
+    }
+    Ok(WatchArgs { action, repo })
+}
+
+fn parse_vector_maintenance_args(args: &[String]) -> Result<VectorMaintenanceArgs, String> {
     let mut positional = Vec::new();
-    let mut semantic_layer = QdrantVerifySemanticLayer::Fast;
+    let mut semantic_layer = VectorVerifySemanticLayer::Fast;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1259,20 +1363,20 @@ fn parse_qdrant_maintenance_args(args: &[String]) -> Result<QdrantMaintenanceArg
             let Some(value) = args.get(index) else {
                 return Err("--semantic-layer requires a value".to_owned());
             };
-            semantic_layer = QdrantVerifySemanticLayer::parse(value)?;
+            semantic_layer = VectorVerifySemanticLayer::parse(value)?;
         } else if let Some(value) = arg.strip_prefix("--semantic-layer=") {
-            semantic_layer = QdrantVerifySemanticLayer::parse(value)?;
+            semantic_layer = VectorVerifySemanticLayer::parse(value)?;
         } else if arg == "--all-semantic-layers" {
-            semantic_layer = QdrantVerifySemanticLayer::All;
+            semantic_layer = VectorVerifySemanticLayer::All;
         } else if arg.starts_with("--") {
-            return Err(format!("unsupported qdrant maintenance option `{arg}`"));
+            return Err(format!("unsupported vector maintenance option `{arg}`"));
         } else {
             positional.push(arg.clone());
         }
         index += 1;
     }
 
-    Ok(QdrantMaintenanceArgs {
+    Ok(VectorMaintenanceArgs {
         repo: positional
             .first()
             .cloned()
@@ -1290,9 +1394,27 @@ struct IndexArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct QdrantMaintenanceArgs {
+struct ServeMcpArgs {
+    watch_repo: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchArgs {
+    action: WatchAction,
     repo: String,
-    semantic_layer: QdrantVerifySemanticLayer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchAction {
+    Start,
+    Status,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VectorMaintenanceArgs {
+    repo: String,
+    semantic_layer: VectorVerifySemanticLayer,
 }
 
 struct ContextPackArgs {
@@ -1375,14 +1497,77 @@ fn print_continuous_index_event(event: ContinuousIndexEvent) {
     }
 }
 
+fn print_watcher_status(status: &WatcherStatus) {
+    println!("watcher_state: {}", status.state);
+    println!("repository_id: {}", status.repository_id);
+    println!("root_path: {}", status.root_path);
+    println!("mode: {}", status.mode);
+    println!("owner_kind: {}", status.owner_kind);
+    println!(
+        "owner_pid: {}",
+        status
+            .owner_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
+    println!(
+        "socket_path: {}",
+        status.socket_path.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "heartbeat_at: {}",
+        status.heartbeat_at.as_deref().unwrap_or("<none>")
+    );
+    println!("files_seen: {}", status.files_seen);
+    println!("queued_events: {}", status.queued_events);
+    println!(
+        "last_indexed_path: {}",
+        status.last_indexed_path.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "last_error: {}",
+        status.last_error.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "active_layer: {}",
+        status.active_layer.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "quality_status: {}",
+        status.quality_status.as_deref().unwrap_or("<none>")
+    );
+    println!("quality_pending_jobs: {}", status.quality_pending_jobs);
+    println!("quality_running_jobs: {}", status.quality_running_jobs);
+    println!("quality_failed_jobs: {}", status.quality_failed_jobs);
+    println!("quality_stale_jobs: {}", status.quality_stale_jobs);
+    println!("attached_clients: {}", status.attached_clients);
+    println!(
+        "client_kinds: {}",
+        if status.client_kinds.is_empty() {
+            "<none>".to_owned()
+        } else {
+            status.client_kinds.join(",")
+        }
+    );
+    println!(
+        "shutdown_after_seconds: {}",
+        status
+            .shutdown_after_seconds
+            .map(|seconds| seconds.to_string())
+            .unwrap_or_else(|| "<none>".to_owned())
+    );
+}
+
 fn continuous_quality_summary(state: &symdex_index::ContinuousQualityState) -> String {
     format!(
-        "generation_id={} active_layer={} quality_status={} activation_reason={} embeddable_chunks={} quality_embedded_chunks={} pending_jobs={} running_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} skipped_excluded_jobs={}",
+        "generation_id={} active_layer={} quality_status={} activation_reason={} embeddable_chunks={} quality_eligible_chunks={} quality_ineligible_chunks={} quality_embedded_chunks={} pending_jobs={} running_jobs={} succeeded_jobs={} failed_jobs={} skipped_stale_jobs={} skipped_excluded_jobs={}",
         state.generation_id,
         state.active_layer,
         state.quality_status,
         state.activation_reason.as_deref().unwrap_or("<none>"),
         state.embeddable_chunks,
+        state.quality_eligible_chunks,
+        state.quality_ineligible_chunks,
         state.quality_embedded_chunks,
         state.pending_jobs,
         state.running_jobs,
@@ -1414,8 +1599,18 @@ fn chunks_embedded(embedding: &EmbeddingSummary) -> usize {
     }
 }
 
-fn serve_mcp() -> Result<(), String> {
-    symdex_mcp::serve_stdio()
+fn serve_mcp(args: &ServeMcpArgs) -> Result<(), String> {
+    if let Some(repo) = &args.watch_repo {
+        let attachment = symdex_watch::start_or_attach(repo, WatcherClientKind::Mcp)?;
+        let status = attachment.status()?;
+        eprintln!(
+            "mcp_watch_attached repository_id={} state={} owner_kind={} attached_clients={}",
+            status.repository_id, status.state, status.owner_kind, status.attached_clients
+        );
+        symdex_mcp::serve_stdio_with_attachment(attachment)
+    } else {
+        symdex_mcp::serve_stdio()
+    }
 }
 
 fn tui(repo: &str) -> Result<(), String> {
@@ -1430,7 +1625,9 @@ fn tui(repo: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--full|--incremental] [--offline] [--watch] <repo>  Index code with explicit full or incremental scope\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against Qdrant payloads\n    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Repair Qdrant orphaned, missing, and stale vector metadata\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp              Run the read-only MCP server over stdio\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+        "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--full|--incremental] [--offline] [--watch] <repo>  Index code with explicit full or incremental scope\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    vector-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against sqlite-vec rows
+    qdrant-verify <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-verify\n    vector-repair <repo> [--semantic-layer fast|quality|all]  Repair sqlite-vec orphaned, missing, and stale vector metadata
+    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-repair\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    watch start|status|stop <repo>  Manage the single background watcher for a repository\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp [--watch <repo>]  Run the MCP server, optionally attaching the repository watcher\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1438,9 +1635,9 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextPackMode, OutputMode, QdrantVerifySemanticLayer, parse_cli_invocation,
-        parse_context_pack_args, parse_index_args, parse_qdrant_maintenance_args,
-        require_text_output, semantic_status_json,
+        ContextPackMode, OutputMode, VectorVerifySemanticLayer, WatchAction, parse_cli_invocation,
+        parse_context_pack_args, parse_index_args, parse_serve_mcp_args,
+        parse_vector_maintenance_args, parse_watch_args, require_text_output, semantic_status_json,
     };
     use symdex_core::{SemanticLayer, SemanticLayerStatus};
     use symdex_index::IndexScope;
@@ -1537,6 +1734,64 @@ mod tests {
     }
 
     #[test]
+    fn serve_mcp_args_parse_without_watch() {
+        let args = parse_serve_mcp_args(&[]).expect("serve args should parse");
+
+        assert_eq!(args.watch_repo, None);
+    }
+
+    #[test]
+    fn serve_mcp_args_parse_watch_repo() {
+        let args = parse_serve_mcp_args(&["--watch".to_owned(), "repo".to_owned()])
+            .expect("serve args should parse");
+
+        assert_eq!(args.watch_repo.as_deref(), Some("repo"));
+    }
+
+    #[test]
+    fn serve_mcp_args_reject_missing_watch_repo() {
+        let error =
+            parse_serve_mcp_args(&["--watch".to_owned()]).expect_err("missing repo should fail");
+
+        assert!(error.contains("--watch requires a repository path"));
+    }
+
+    #[test]
+    fn serve_mcp_args_reject_offline_watch() {
+        let error = parse_serve_mcp_args(&[
+            "--watch".to_owned(),
+            "repo".to_owned(),
+            "--offline".to_owned(),
+        ])
+        .expect_err("offline serve watch should fail");
+
+        assert!(error.contains("semantic indexing"));
+    }
+
+    #[test]
+    fn watch_args_parse_start_status_and_stop() {
+        let start =
+            parse_watch_args(&["start".to_owned(), "repo".to_owned()]).expect("start should parse");
+        let status = parse_watch_args(&["status".to_owned(), "repo".to_owned()])
+            .expect("status should parse");
+        let stop =
+            parse_watch_args(&["stop".to_owned(), "repo".to_owned()]).expect("stop should parse");
+
+        assert_eq!(start.action, WatchAction::Start);
+        assert_eq!(status.action, WatchAction::Status);
+        assert_eq!(stop.action, WatchAction::Stop);
+        assert_eq!(start.repo, "repo");
+    }
+
+    #[test]
+    fn watch_args_reject_unknown_action() {
+        let error =
+            parse_watch_args(&["restart".to_owned(), "repo".to_owned()]).expect_err("bad action");
+
+        assert!(error.contains("unsupported watch action"));
+    }
+
+    #[test]
     fn context_pack_args_parse_unified_mode() {
         let args = parse_context_pack_args(&[
             "repo".to_owned(),
@@ -1560,34 +1815,34 @@ mod tests {
     }
 
     #[test]
-    fn qdrant_maintenance_args_parse_semantic_layer_flag() {
-        let args = parse_qdrant_maintenance_args(&[
+    fn vector_maintenance_args_parse_semantic_layer_flag() {
+        let args = parse_vector_maintenance_args(&[
             "repo".to_owned(),
             "--semantic-layer".to_owned(),
             "quality".to_owned(),
         ])
-        .expect("qdrant args should parse");
+        .expect("vector args should parse");
 
         assert_eq!(args.repo, "repo");
-        assert_eq!(args.semantic_layer, QdrantVerifySemanticLayer::Quality);
+        assert_eq!(args.semantic_layer, VectorVerifySemanticLayer::Quality);
     }
 
     #[test]
-    fn qdrant_maintenance_args_parse_all_alias() {
+    fn vector_maintenance_args_parse_all_alias() {
         let args =
-            parse_qdrant_maintenance_args(&["--semantic-layer=all".to_owned(), "repo".to_owned()])
-                .expect("qdrant args should parse");
+            parse_vector_maintenance_args(&["--semantic-layer=all".to_owned(), "repo".to_owned()])
+                .expect("vector args should parse");
 
         assert_eq!(args.repo, "repo");
-        assert_eq!(args.semantic_layer, QdrantVerifySemanticLayer::All);
+        assert_eq!(args.semantic_layer, VectorVerifySemanticLayer::All);
     }
 
     #[test]
-    fn qdrant_maintenance_args_reject_unknown_option() {
-        let error = parse_qdrant_maintenance_args(&["--bad".to_owned()])
-            .expect_err("unknown qdrant option should fail");
+    fn vector_maintenance_args_reject_unknown_option() {
+        let error = parse_vector_maintenance_args(&["--bad".to_owned()])
+            .expect_err("unknown vector maintenance option should fail");
 
-        assert!(error.contains("unsupported qdrant maintenance option"));
+        assert!(error.contains("unsupported vector maintenance option"));
     }
 
     #[test]
@@ -1628,6 +1883,8 @@ mod tests {
                 repository_id: "repo".to_owned(),
                 generation_id: "generation-1".to_owned(),
                 embeddable_chunks: 1,
+                quality_eligible_chunks: 1,
+                quality_ineligible_chunks: 0,
                 quality_embedded_chunks: 0,
                 pending_jobs: 1,
                 running_jobs: 0,
@@ -1650,7 +1907,7 @@ mod tests {
             semantic_layer,
             embedding_model: embedding_model.to_owned(),
             embedding_dimension: Some(768),
-            qdrant_collection: format!("symdex_repo_{embedding_model}"),
+            vector_table: format!("symdex_repo_{embedding_model}"),
             current_chunks: usize::from(is_complete),
             stale_chunks: usize::from(!is_complete),
             blocked_chunks: 0,

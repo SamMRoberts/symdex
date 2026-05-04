@@ -5,14 +5,16 @@ index without each agent rebuilding or inventing its own evidence model.
 
 ## Contract
 
-- The shared index is local SQLite plus local Qdrant.
-- The supported agent-facing protocol is read-only MCP over stdio.
+- The shared index is local SQLite plus local sqlite-vec.
+- The supported agent-facing protocol is MCP over stdio. Evidence tools are
+  read-only; `symdex_watch_start` is the explicit local-only watcher-start
+  exception.
 - Successful MCP tool results use the stable envelope
   `symdex.mcp.evidence.v1`.
 - The envelope carries:
   - `schema_version`
   - `contract_version`
-  - local-only/read-only/source-text policy
+  - local-only/read-only/source-text policy for evidence tools
   - freshness/provenance availability
   - the actual tool payload under `data`
 - Tool names use underscores and must remain stable unless a new contract
@@ -25,22 +27,27 @@ index without each agent rebuilding or inventing its own evidence model.
 - Agents receive metadata evidence, not source text by default.
 - Repository roots are explicit inputs and must be valid directory roots.
 - Paths are normalized relative to the repository root before use.
-- MCP tools must not start indexing, continuous indexing, reset, delete, or
-  mutate repository data.
+- MCP evidence tools must not start indexing, reset, delete, or mutate
+  repository data. `symdex_watch_start` may start or attach the single local
+  background watcher for an explicit repo.
 - The local service choices remain under user control:
   - SQLite path from `SYMDEX_DB_PATH`
-  - Qdrant URL from `SYMDEX_QDRANT_URL`
+  - sqlite-vec URL from `SYMDEX_DB_PATH`
   - Ollama URL and model from embed configuration
 
 ## Read-Only Access Pattern
 
-1. One user process indexes a repository with the CLI or TUI.
+1. One user process indexes a repository or starts the shared watcher with the
+   TUI, an MCP server, foreground watch, or `symdex_watch_start`.
 2. One or more local agents connect to `symdex serve-mcp`.
-3. Agents call read-only tools with an explicit `repo` root.
+3. Agents call evidence tools with an explicit `repo` root, and may call
+   `symdex_watch_status` or `symdex_watch_start` to manage watcher readiness.
+   Watcher leases are held by live TUI/MCP/CLI clients; when none remain the
+   watcher exits after about 10 seconds.
 4. Tool responses include compact evidence under `data` plus contract metadata.
 5. Agents inspect `freshness` and `provenance` before trusting evidence.
 
-The MCP server may read SQLite and Qdrant, embed semantic search queries through
+The MCP server may read SQLite and sqlite-vec, embed semantic search queries through
 local Ollama, and compute freshness from current file hashes. It must not
 execute indexed repository code or expose source text by default.
 
@@ -49,7 +56,7 @@ execute indexed repository code or expose source text by default.
 `symdex doctor [repo]` makes these facts visible:
 
 - SQLite database path and parent directory health.
-- Qdrant endpoint health.
+- sqlite-vec extension health.
 - Ollama endpoint, model, and vector dimension health.
 - Index freshness and provenance consistency.
 - Whether an agent is receiving stale, missing, deleted, unknown, or fresh

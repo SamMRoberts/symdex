@@ -4,10 +4,10 @@ mod navigation;
 mod terminal;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 pub(crate) use navigation::{IndexMode, ManualIndexRequest, Screen, UiAction, reduce_screen};
@@ -27,9 +27,8 @@ use symdex_diagnostics::{
 };
 use symdex_embed::EmbedConfig;
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, EmbeddingSummary,
-    IndexOptions, IndexProgress, IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary,
-    run_continuous_index_until, run_index_with_progress,
+    ContinuousIndexEvent, ContinuousQualityState, EmbeddingSummary, IndexOptions, IndexProgress,
+    IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary, run_index_with_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
@@ -44,21 +43,27 @@ use symdex_store::{
     CallResolutionSummary, ChunkVectorStatus, ConfidenceBucket, ContextPack,
     CrossStoreHealthSummary, EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance,
     FileCoverageStatus, FileDetailSummary, IndexCoverageSummary, IndexRunTimelineRow,
-    IndexRunsTimelineSummary, QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
-    SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore,
-    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
-    SymbolOutlineSummary, qdrant_collection_name,
+    IndexRunsTimelineSummary, QualityGenerationProgress, RepositoryStatus, SemanticNeighborhoodRow,
+    SemanticNeighborhoodSummary, SqliteStorageSummary, SqliteStore, StorageExplorerSummary,
+    StorageHealthRow, StorageHealthStatus, StoreConfig, SymbolOutlineSummary,
+    VectorStorageProjection, vector_table_name,
 };
+use symdex_watch::{WatcherAttachment, WatcherClientKind, WatcherStatus};
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
+
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WATCHER_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const INDEX_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct TuiOptions {
     pub repo: String,
 }
 
 pub fn run(options: TuiOptions) -> Result<(), String> {
-    let app = App::load(&options.repo)?;
+    let mut app = App::load(&options.repo)?;
     let mut terminal = enter_terminal()?;
+    app.start_continuous_index();
     let result = run_app(&mut terminal, app);
     leave_terminal(&mut terminal)?;
     result
@@ -69,7 +74,7 @@ pub struct App {
     repo_root: String,
     repository_id: String,
     sqlite_path: String,
-    qdrant_url: String,
+    vector_store_label: String,
     ollama_url: String,
     embed_model: String,
     status: RepositoryStatus,
@@ -82,6 +87,7 @@ pub struct App {
     index_progress: Option<IndexProgress>,
     animation_tick: usize,
     continuous: ContinuousIndexState,
+    watcher_attachment: Option<WatcherAttachment>,
     diagnostics: DiagnosticsState,
     diagnostics_selection: usize,
     diagnostics_details_expanded: bool,
@@ -90,6 +96,8 @@ pub struct App {
     graph: GraphBrowserState,
     evidence: EvidenceViewerState,
     last_error: Option<String>,
+    last_watcher_status_refresh: Option<Instant>,
+    last_index_status_refresh: Option<Instant>,
     index_receiver: Option<Receiver<IndexJobMessage>>,
     continuous_receiver: Option<Receiver<ContinuousIndexMessage>>,
     continuous_stop: Option<Arc<AtomicBool>>,
@@ -135,13 +143,14 @@ impl App {
             .cross_store_health_summary(root.id(), &embed_config.model)
             .map_err(|error| error.to_string())?;
         let semantic_status = run_semantic_status(repo)?;
+        let now = Instant::now();
 
         Ok(Self {
             repo_input: repo.to_owned(),
             repo_root: root.path().display().to_string(),
             repository_id: root.id().to_owned(),
             sqlite_path: store_config.sqlite_path.display().to_string(),
-            qdrant_url: store_config.qdrant_url,
+            vector_store_label: "sqlite_vec".to_owned(),
             ollama_url: embed_config.ollama_url,
             embed_model: embed_config.model,
             status,
@@ -154,6 +163,7 @@ impl App {
             index_progress: None,
             animation_tick: 0,
             continuous: ContinuousIndexState::default(),
+            watcher_attachment: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
@@ -172,6 +182,8 @@ impl App {
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
             last_error: None,
+            last_watcher_status_refresh: Some(now),
+            last_index_status_refresh: Some(now),
             index_receiver: None,
             continuous_receiver: None,
             continuous_stop: None,
@@ -200,12 +212,13 @@ impl App {
             semantic_neighborhood_summary_from_status(&repository_id, &status);
         let cross_store_health = cross_store_health_summary_from_status(&repository_id, &status);
         let semantic_status = semantic_status_summary_from_status(&repository_id, &status);
+        let now = Instant::now();
         Self {
             repo_input: repo_root.clone(),
             repo_root,
             repository_id,
             sqlite_path: ".symdex/symdex.sqlite".to_owned(),
-            qdrant_url: "http://localhost:6333".to_owned(),
+            vector_store_label: "sqlite_vec".to_owned(),
             ollama_url: "http://localhost:11434".to_owned(),
             embed_model: "nomic-embed-text".to_owned(),
             status,
@@ -218,6 +231,7 @@ impl App {
             index_progress: None,
             animation_tick: 0,
             continuous: ContinuousIndexState::default(),
+            watcher_attachment: None,
             diagnostics: DiagnosticsState::Idle,
             diagnostics_selection: 0,
             diagnostics_details_expanded: false,
@@ -236,6 +250,8 @@ impl App {
             graph: GraphBrowserState::default(),
             evidence: EvidenceViewerState::default(),
             last_error: None,
+            last_watcher_status_refresh: Some(now),
+            last_index_status_refresh: Some(now),
             index_receiver: None,
             continuous_receiver: None,
             continuous_stop: None,
@@ -613,6 +629,41 @@ impl App {
         Ok(())
     }
 
+    fn refresh_index_status(&mut self) -> Result<(), String> {
+        let store_config = StoreConfig::from_env();
+        let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+        sqlite.migrate().map_err(|error| error.to_string())?;
+        self.status = sqlite
+            .repository_status(&self.repository_id)
+            .map_err(|error| error.to_string())?;
+        self.refresh_semantic_status()?;
+        self.storage.explorer = match run_storage_explorer(&self.repo_input) {
+            Ok(summary) => StorageStatus::Completed(summary),
+            Err(error) => StorageStatus::Failed(error),
+        };
+        self.storage.coverage = match run_index_coverage(&self.repo_input) {
+            Ok(summary) => CoverageStatus::Completed(summary),
+            Err(error) => CoverageStatus::Failed(error),
+        };
+        self.storage.embeddings = match run_embedding_coverage(&self.repo_input) {
+            Ok(summary) => EmbeddingCoverageStatus::Completed(summary),
+            Err(error) => EmbeddingCoverageStatus::Failed(error),
+        };
+        self.storage.runs = match run_index_runs_timeline(&self.repo_input) {
+            Ok(summary) => IndexRunsTimelineStatus::Completed(summary),
+            Err(error) => IndexRunsTimelineStatus::Failed(error),
+        };
+        self.storage.freshness = match run_freshness_report(&self.repo_input, None) {
+            Ok(summary) => FreshnessStatus::Completed(Box::new(summary)),
+            Err(error) => FreshnessStatus::Failed(error),
+        };
+        self.storage.health = match run_cross_store_health(&self.repo_input) {
+            Ok(summary) => CrossStoreHealthStatus::Completed(summary),
+            Err(error) => CrossStoreHealthStatus::Failed(error),
+        };
+        Ok(())
+    }
+
     fn refresh_semantic_status(&mut self) -> Result<(), String> {
         self.semantic_status = run_semantic_status(&self.repo_input)?;
         Ok(())
@@ -816,6 +867,8 @@ impl App {
 
         if let Err(error) = self.refresh_status() {
             self.message = format!("Refresh failed: {error}");
+        } else {
+            self.last_index_status_refresh = Some(Instant::now());
         }
     }
 
@@ -823,6 +876,22 @@ impl App {
         if self.continuous.is_on() {
             self.animation_tick = self.animation_tick.wrapping_add(1);
         }
+    }
+
+    fn watcher_status_refresh_due(&self, now: Instant) -> bool {
+        refresh_due(
+            self.last_watcher_status_refresh,
+            now,
+            WATCHER_STATUS_REFRESH_INTERVAL,
+        )
+    }
+
+    fn index_status_refresh_due(&self, now: Instant) -> bool {
+        refresh_due(
+            self.last_index_status_refresh,
+            now,
+            INDEX_STATUS_REFRESH_INTERVAL,
+        )
     }
 
     fn continuous_activity_span(&self) -> Option<Span<'static>> {
@@ -1053,46 +1122,71 @@ impl App {
     }
 
     fn start_continuous_index(&mut self) {
-        let repo = self.repo_input.clone();
-        let active = Arc::new(AtomicBool::new(true));
-        let worker_active = Arc::clone(&active);
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let result = run_continuous_index_until(
-                &ContinuousIndexOptions::new(repo, false),
-                |event| {
-                    let _ = sender.send(ContinuousIndexMessage::Event(Box::new(event)));
-                },
-                || worker_active.load(Ordering::SeqCst),
-            );
-            match result {
-                Ok(()) => {
-                    let _ = sender.send(ContinuousIndexMessage::Stopped);
-                }
-                Err(error) => {
-                    let _ = sender.send(ContinuousIndexMessage::Failed(error));
-                }
+        match symdex_watch::start_or_attach(&self.repo_input, WatcherClientKind::Tui) {
+            Ok(attachment) => {
+                let status = attachment
+                    .status()
+                    .unwrap_or_else(|_| self.continuous_watcher_status_fallback());
+                self.watcher_attachment = Some(attachment);
+                self.apply_watcher_status(&status);
+                self.last_watcher_status_refresh = Some(Instant::now());
+                self.message = "Continuous indexing watcher attached.".to_owned();
             }
-        });
-        self.continuous = ContinuousIndexState {
-            enabled: true,
-            status: ContinuousIndexStatus::Starting,
-            ..ContinuousIndexState::default()
-        };
-        self.continuous_receiver = Some(receiver);
-        self.continuous_stop = Some(active);
+            Err(error) => {
+                self.continuous.enabled = false;
+                self.continuous.status = ContinuousIndexStatus::Failed;
+                self.continuous.latest_error = Some(error);
+                self.message = "Continuous indexing failed.".to_owned();
+            }
+        }
         self.screen = reduce_screen(self.screen, UiAction::Confirm);
-        self.message = "Continuous indexing started.".to_owned();
     }
 
     fn stop_continuous_index(&mut self) {
-        if let Some(active) = &self.continuous_stop {
-            active.store(false, Ordering::SeqCst);
+        self.watcher_attachment = None;
+        match symdex_watch::stop_daemon(&self.repo_input) {
+            Ok(status) => {
+                self.apply_watcher_status(&status);
+                self.last_watcher_status_refresh = Some(Instant::now());
+                self.message = "Continuous indexing stopped.".to_owned();
+            }
+            Err(error) => {
+                self.continuous.status = ContinuousIndexStatus::Failed;
+                self.continuous.latest_error = Some(error);
+                self.message = "Continuous indexing stop failed.".to_owned();
+            }
         }
-        self.continuous = ContinuousIndexState::default();
         self.continuous_receiver = None;
         self.continuous_stop = None;
-        self.message = "Continuous indexing stopped.".to_owned();
+    }
+
+    fn continuous_watcher_status_fallback(&self) -> WatcherStatus {
+        WatcherStatus {
+            repository_id: self.repository_id.clone(),
+            root_path: self.repo_root.clone(),
+            mode: "semantic".to_owned(),
+            owner_kind: "unknown".to_owned(),
+            owner_pid: None,
+            socket_path: None,
+            state: "starting".to_owned(),
+            started_at: None,
+            updated_at: None,
+            heartbeat_at: None,
+            files_seen: self.continuous.files_seen,
+            queued_events: self.continuous.queued_events,
+            last_indexed_path: self.continuous.last_reindexed_file.clone(),
+            last_error: None,
+            active_layer: self.continuous.active_layer.clone(),
+            quality_status: self.continuous.quality_status.clone(),
+            quality_pending_jobs: self.continuous.quality_pending_jobs,
+            quality_running_jobs: self.continuous.quality_running_jobs,
+            quality_failed_jobs: self.continuous.quality_failed_jobs,
+            quality_stale_jobs: self.continuous.quality_stale_jobs,
+            attached_clients: 1,
+            client_kinds: vec!["tui".to_owned()],
+            clients: Vec::new(),
+            shutdown_after_seconds: None,
+        }
     }
 
     fn start_diagnostics(&mut self) {
@@ -1114,6 +1208,37 @@ impl App {
         self.diagnostics_details_expanded = false;
         self.diagnostics_receiver = Some(receiver);
         self.message = "Doctor diagnostics started.".to_owned();
+    }
+
+    fn apply_watcher_status(&mut self, status: &WatcherStatus) {
+        self.continuous.enabled = matches!(
+            status.state.as_str(),
+            "starting" | "running" | "pending" | "indexing" | "failed" | "stale"
+        );
+        self.continuous.status = match status.state.as_str() {
+            "starting" => ContinuousIndexStatus::Starting,
+            "running" => ContinuousIndexStatus::Watching,
+            "pending" => ContinuousIndexStatus::Pending,
+            "indexing" => ContinuousIndexStatus::Indexing,
+            "failed" | "stale" => ContinuousIndexStatus::Failed,
+            _ => ContinuousIndexStatus::Off,
+        };
+        self.continuous.files_seen = status.files_seen;
+        self.continuous.queued_events = status.queued_events;
+        self.continuous.last_reindexed_file = status.last_indexed_path.clone();
+        self.continuous.latest_error = status.last_error.clone();
+        if status.state == "stale" && self.continuous.latest_error.is_none() {
+            self.continuous.latest_error = Some("watcher heartbeat stale".to_owned());
+        }
+        self.continuous.active_layer = status.active_layer.clone();
+        self.continuous.quality_status = status.quality_status.clone();
+        self.continuous.quality_pending_jobs = status.quality_pending_jobs;
+        self.continuous.quality_running_jobs = status.quality_running_jobs;
+        self.continuous.quality_failed_jobs = status.quality_failed_jobs;
+        self.continuous.quality_stale_jobs = status.quality_stale_jobs;
+        self.continuous.attached_clients = status.attached_clients;
+        self.continuous.client_kinds = status.client_kinds.clone();
+        self.continuous.shutdown_after_seconds = status.shutdown_after_seconds;
     }
 
     fn start_query(&mut self) {
@@ -1220,6 +1345,7 @@ impl App {
                     self.message =
                         format!("Indexing completed, but status refresh failed: {error}");
                 } else {
+                    self.last_index_status_refresh = Some(Instant::now());
                     self.message = completed_message;
                 }
             }
@@ -1242,6 +1368,13 @@ impl App {
 
     fn poll_continuous_index(&mut self) {
         let Some(receiver) = &self.continuous_receiver else {
+            let now = Instant::now();
+            if self.watcher_status_refresh_due(now) {
+                self.last_watcher_status_refresh = Some(now);
+                if let Ok(status) = symdex_watch::status(&self.repo_input) {
+                    self.apply_watcher_status(&status);
+                }
+            }
             return;
         };
         match receiver.try_recv() {
@@ -1277,6 +1410,20 @@ impl App {
                     self.message = "Continuous indexing failed.".to_owned();
                 }
             }
+        }
+    }
+
+    fn refresh_index_status_on_interval(&mut self) {
+        if self.index_receiver.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if !self.index_status_refresh_due(now) {
+            return;
+        }
+        self.last_index_status_refresh = Some(now);
+        if let Err(error) = self.refresh_index_status() {
+            self.last_error = Some(error);
         }
     }
 
@@ -1331,6 +1478,7 @@ impl App {
                     self.message =
                         format!("Continuous indexing completed, but refresh failed: {error}");
                 } else {
+                    self.last_index_status_refresh = Some(Instant::now());
                     self.message = format!(
                         "Continuous indexing updated {} file events.",
                         changes.event_count()
@@ -1402,6 +1550,8 @@ impl App {
             repository_id: state.repository_id.clone(),
             generation_id: state.generation_id.clone(),
             embeddable_chunks: state.embeddable_chunks,
+            quality_eligible_chunks: state.quality_eligible_chunks,
+            quality_ineligible_chunks: state.quality_ineligible_chunks,
             quality_embedded_chunks: state.quality_embedded_chunks,
             pending_jobs: state.pending_jobs,
             running_jobs: state.running_jobs,
@@ -1415,7 +1565,7 @@ impl App {
         self.semantic_status.quality_status = quality_status;
         self.semantic_status.quality.current_chunks = state.quality_embedded_chunks;
         self.semantic_status.quality.total_chunks = state.quality_embedded_chunks;
-        self.semantic_status.quality.expected_chunks = state.embeddable_chunks;
+        self.semantic_status.quality.expected_chunks = quality_progress.quality_eligible_chunks;
         self.semantic_status.quality.is_complete = quality_progress_is_complete(&quality_progress);
         self.semantic_status.quality_progress = Some(quality_progress);
         self.semantic_status.fallback_reason = semantic_fallback_reason_for_status(
@@ -1438,10 +1588,10 @@ impl App {
         self.semantic_status.quality_status = quality_status;
         self.semantic_status.quality.embedding_model = summary.quality_model.clone();
         self.semantic_status.quality.embedding_dimension = summary.quality_dimension;
-        self.semantic_status.quality.qdrant_collection = summary.qdrant_collection.clone();
+        self.semantic_status.quality.vector_table = summary.vector_table.clone();
         self.semantic_status.quality.current_chunks = summary.progress.quality_embedded_chunks;
         self.semantic_status.quality.total_chunks = summary.progress.quality_embedded_chunks;
-        self.semantic_status.quality.expected_chunks = summary.progress.embeddable_chunks;
+        self.semantic_status.quality.expected_chunks = summary.progress.quality_eligible_chunks;
         self.semantic_status.quality.is_complete = quality_progress_is_complete(&summary.progress);
         self.semantic_status.quality_progress = Some(summary.progress.clone());
         self.semantic_status.latest_quality_error = None;
@@ -1880,7 +2030,7 @@ fn render_repository_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, a
             Span::styled("services ", metadata_style()),
             status_span("sqlite", StatusTone::Success),
             Span::raw(" local  "),
-            status_span("qdrant", StatusTone::Success),
+            status_span("vector", StatusTone::Success),
             Span::raw(" local  "),
             status_span("ollama", StatusTone::Success),
             Span::raw(" local"),
@@ -1978,9 +2128,9 @@ fn render_overview_focus_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
             Cell::from(app.sqlite_path.clone()),
         ]),
         Row::new(vec![
-            Cell::from("Qdrant"),
+            Cell::from("sqlite-vec"),
             Cell::from(status_span("local", StatusTone::Success)),
-            Cell::from(app.qdrant_url.clone()),
+            Cell::from(app.vector_store_label.clone()),
         ]),
         Row::new(vec![
             Cell::from("Ollama"),
@@ -2844,18 +2994,25 @@ fn scroll_viewport_rows(area: Rect) -> usize {
     usize::from(area.height.saturating_sub(3).max(1))
 }
 
+fn refresh_due(last_refresh: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    last_refresh
+        .map(|last_refresh| now.duration_since(last_refresh) >= interval)
+        .unwrap_or(true)
+}
+
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> Result<(), String> {
     let mut app = app;
     loop {
         app.tick_animation();
         app.poll_index_job();
         app.poll_continuous_index();
+        app.refresh_index_status_on_interval();
         app.poll_diagnostics();
         app.poll_query();
         app.poll_graph();
         app.poll_evidence();
         render(terminal, &app)?;
-        if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
+        if !event::poll(EVENT_POLL_INTERVAL).map_err(|error| error.to_string())? {
             continue;
         }
         let Event::Key(key) = event::read().map_err(|error| error.to_string())? else {
@@ -2949,7 +3106,7 @@ fn semantic_fallback_state(summary: &SemanticStatusSummary) -> &'static str {
 }
 
 fn quality_progress_is_complete(progress: &QualityGenerationProgress) -> bool {
-    progress.embeddable_chunks == progress.quality_embedded_chunks
+    progress.quality_eligible_chunks == progress.quality_embedded_chunks
         && progress.pending_jobs == 0
         && progress.running_jobs == 0
         && progress.failed_jobs == 0
@@ -3025,7 +3182,7 @@ fn semantic_status_summary_from_status(
             semantic_layer: SemanticLayer::Fast,
             embedding_model: fast_model.clone(),
             embedding_dimension: status.embedding_dimension,
-            qdrant_collection: qdrant_collection_name(repository_id, &fast_model),
+            vector_table: vector_table_name(repository_id, &fast_model),
             current_chunks: if status.embedding_model.is_some() {
                 status.chunks_indexed
             } else {
@@ -3045,9 +3202,9 @@ fn semantic_status_summary_from_status(
         },
         quality: SemanticStatusLayerSummary {
             semantic_layer: SemanticLayer::Quality,
-            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
+            embedding_model: "mxbai-embed-large".to_owned(),
             embedding_dimension: None,
-            qdrant_collection: qdrant_collection_name(repository_id, "nomic-embed-text-v2-moe"),
+            vector_table: vector_table_name(repository_id, "mxbai-embed-large"),
             current_chunks: 0,
             stale_chunks: 0,
             blocked_chunks: 0,
@@ -3082,8 +3239,8 @@ fn storage_summary_from_status(
             calls: status.calls_indexed,
             index_runs: usize::from(status.embedding_model.is_some()),
         },
-        qdrant: QdrantStorageProjection {
-            collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        vector: VectorStorageProjection {
+            collection_name: vector_table_name(repository_id, &embedding_model),
             embedding_model,
             embedding_dimension: status.embedding_dimension,
             embeddable_chunks: status.chunks_indexed,
@@ -3184,7 +3341,7 @@ fn embedding_coverage_summary_from_status(
     let missing_vector_chunks = status.chunks_indexed.saturating_sub(vector_backed_chunks);
     EmbeddingCoverageSummary {
         repository_id: repository_id.to_owned(),
-        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        collection_name: vector_table_name(repository_id, &embedding_model),
         configured_embedding_model: "nomic-embed-text".to_owned(),
         embedding_model,
         embedding_dimension: status.embedding_dimension,
@@ -3271,7 +3428,7 @@ fn semantic_neighborhood_summary_from_status(
         .to_owned();
     let rows = if status.embedding_model.is_some() && status.chunks_indexed > 0 {
         vec![SemanticNeighborhoodRow {
-            qdrant_point_id: "sample-point".to_owned(),
+            vector_point_id: "sample-point".to_owned(),
             path: "<sample>".to_owned(),
             start_line: 1,
             end_line: 1,
@@ -3286,7 +3443,7 @@ fn semantic_neighborhood_summary_from_status(
     };
     SemanticNeighborhoodSummary {
         repository_id: repository_id.to_owned(),
-        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        collection_name: vector_table_name(repository_id, &embedding_model),
         embedding_model,
         health: vec![StorageHealthRow {
             status: if rows.is_empty() {
@@ -3330,12 +3487,12 @@ fn cross_store_health_summary_from_status(
         rows.push(StorageHealthRow {
             status: StorageHealthStatus::Ok,
             label: "cross_store_ok".to_owned(),
-            detail: "Sample SQLite and Qdrant projection metadata are aligned.".to_owned(),
+            detail: "Sample SQLite and sqlite-vec projection metadata are aligned.".to_owned(),
         });
     }
     CrossStoreHealthSummary {
         repository_id: repository_id.to_owned(),
-        collection_name: qdrant_collection_name(repository_id, &embedding_model),
+        collection_name: vector_table_name(repository_id, &embedding_model),
         rows,
     }
 }
@@ -3417,8 +3574,8 @@ fn diagnostic_report_lines(report: &DiagnosticReport) -> Vec<Line<'_>> {
             Span::raw(report.sqlite_path.as_str()),
         ]),
         Line::from(vec![
-            Span::styled("Qdrant: ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(report.qdrant_url.as_str()),
+            Span::styled("sqlite-vec: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(report.vector_store.as_str()),
         ]),
         Line::from(vec![
             Span::styled("Ollama: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -3480,7 +3637,7 @@ fn query_result_lines(result: &QueryResult) -> Vec<Line<'_>> {
         QueryResult::Semantic(summary) => {
             let mut lines = vec![
                 Line::from(format!("Semantic results: {}", summary.results.len())),
-                Line::from(format!("Collection: {}", summary.qdrant_collection)),
+                Line::from(format!("Collection: {}", summary.vector_table)),
             ];
             if summary.results.is_empty() {
                 lines.push(Line::from("No semantic matches returned."));
@@ -3787,7 +3944,7 @@ fn index_counts_table(app: &App) -> Table<'_> {
 fn local_services_table(app: &App) -> Table<'_> {
     let rows = vec![
         service_row("SQLite", "local", app.sqlite_path.as_str()),
-        service_row("Qdrant", "local", app.qdrant_url.as_str()),
+        service_row("sqlite-vec", "local", app.vector_store_label.as_str()),
         service_row("Ollama", "local", app.ollama_url.as_str()),
         Row::new(vec![
             Cell::from("Embedding"),
@@ -3896,9 +4053,9 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
     } else {
         ("ok", StatusTone::Success)
     };
-    let qdrant_status = if summary.qdrant.missing_vector_chunks > 0 {
+    let sqlite_vec_status = if summary.vector.missing_vector_chunks > 0 {
         ("missing-vector", StatusTone::Warning)
-    } else if summary.qdrant.vector_backed_chunks > 0 {
+    } else if summary.vector.vector_backed_chunks > 0 {
         ("covered", StatusTone::Success)
     } else {
         ("metadata-only", StatusTone::Warning)
@@ -3952,28 +4109,28 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
             "Historical index run metadata.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "collection",
-            summary.qdrant.collection_name.clone(),
-            qdrant_status,
+            summary.vector.collection_name.clone(),
+            sqlite_vec_status,
             "Expected local vector collection for the selected repository and model.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "model",
-            summary.qdrant.embedding_model.clone(),
+            summary.vector.embedding_model.clone(),
             ("metadata", StatusTone::Info),
             "Embedding model used to derive the collection name.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "dimension",
             summary
-                .qdrant
+                .vector
                 .embedding_dimension
                 .map(|dimension| dimension.to_string())
                 .unwrap_or_else(|| "<unknown>".to_owned()),
-            if summary.qdrant.embedding_dimension.is_some() {
+            if summary.vector.embedding_dimension.is_some() {
                 ("recorded", StatusTone::Success)
             } else {
                 ("unknown", StatusTone::Warning)
@@ -3981,24 +4138,24 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
             "Latest recorded vector dimension for successful semantic indexing.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "embeddable",
-            summary.qdrant.embeddable_chunks.to_string(),
+            summary.vector.embeddable_chunks.to_string(),
             ("metadata", StatusTone::Info),
             "Chunks eligible for semantic embedding.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "vector-backed",
-            summary.qdrant.vector_backed_chunks.to_string(),
-            qdrant_status,
-            "SQLite chunks with Qdrant point IDs.",
+            summary.vector.vector_backed_chunks.to_string(),
+            sqlite_vec_status,
+            "SQLite chunks with sqlite-vec point IDs.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "excluded",
-            summary.qdrant.excluded_chunks.to_string(),
-            if summary.qdrant.excluded_chunks == 0 {
+            summary.vector.excluded_chunks.to_string(),
+            if summary.vector.excluded_chunks == 0 {
                 ("none", StatusTone::Success)
             } else {
                 ("metadata-only", StatusTone::Warning)
@@ -4006,15 +4163,15 @@ fn storage_rows(summary: &StorageExplorerSummary) -> Vec<StorageDisplayRow> {
             "Chunks intentionally excluded from embeddings.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "missing vectors",
-            summary.qdrant.missing_vector_chunks.to_string(),
-            if summary.qdrant.missing_vector_chunks == 0 {
+            summary.vector.missing_vector_chunks.to_string(),
+            if summary.vector.missing_vector_chunks == 0 {
                 ("ok", StatusTone::Success)
             } else {
                 ("warning", StatusTone::Warning)
             },
-            "Embeddable chunks without recorded Qdrant point IDs.",
+            "Embeddable chunks without recorded sqlite-vec point IDs.",
         ),
     ]
 }
@@ -4116,7 +4273,7 @@ fn coverage_detail_panel(summary: &IndexCoverageSummary, selection: usize) -> Pa
         ]),
         Line::from(vec![
             Span::styled(
-                "Qdrant projection: ",
+                "sqlite-vec projection: ",
                 Style::new().add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
@@ -4555,28 +4712,28 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
 
     vec![
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "total chunks",
             summary.total_chunks.to_string(),
             ("indexed", StatusTone::Info),
             "SQLite chunk rows for the selected repository.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "embeddable",
             summary.embeddable_chunks.to_string(),
             ("eligible", StatusTone::Info),
             "Chunks eligible for semantic embedding.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "vector-backed",
             summary.vector_backed_chunks.to_string(),
             vector_status,
-            "Chunks with recorded Qdrant point IDs.",
+            "Chunks with recorded sqlite-vec point IDs.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "missing vectors",
             summary.missing_vector_chunks.to_string(),
             if summary.missing_vector_chunks == 0 {
@@ -4587,7 +4744,7 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
             "Embeddable chunks without vector point metadata.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "excluded",
             summary.excluded_chunks.to_string(),
             if summary.excluded_chunks == 0 {
@@ -4598,14 +4755,14 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
             "Chunks intentionally withheld from embeddings.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "model",
             summary.embedding_model.clone(),
             model_status,
             "Latest indexed embedding model compared with configured model.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "dimension",
             summary
                 .embedding_dimension
@@ -4619,7 +4776,7 @@ fn embedding_coverage_rows(summary: &EmbeddingCoverageSummary) -> Vec<StorageDis
             "Latest recorded vector dimension.",
         ),
         storage_row(
-            "Qdrant",
+            "sqlite-vec",
             "run embedded",
             summary
                 .latest_chunks_embedded
@@ -4932,7 +5089,7 @@ fn semantic_neighborhood_detail_panel(
 ) -> Paragraph<'_> {
     let Some(row) = selected_semantic_neighborhood_row(summary, selection) else {
         return Paragraph::new(vec![Line::from(
-            "No vector-backed Qdrant payload metadata recorded.",
+            "No vector-backed sqlite-vec payload metadata recorded.",
         )])
         .wrap(Wrap { trim: true })
         .block(
@@ -4962,7 +5119,7 @@ fn semantic_neighborhood_detail_panel(
         ]),
         Line::from(vec![
             Span::styled("Point: ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(row.qdrant_point_id.as_str()),
+            Span::raw(row.vector_point_id.as_str()),
         ]),
         Line::from(vec![
             Span::styled("Text hash: ", Style::new().add_modifier(Modifier::BOLD)),
@@ -5237,7 +5394,7 @@ fn semantic_table(summary: &SemanticSearchSummary) -> Table<'_> {
     .block(Block::default().borders(Borders::ALL).title(format!(
         "Query Workbench | Semantic results: {} | Collection: {}",
         summary.results.len(),
-        summary.qdrant_collection
+        summary.vector_table
     )))
     .column_spacing(1)
 }
@@ -6332,6 +6489,7 @@ enum IndexJobMessage {
     Finished(Result<Box<IndexSummary>, String>),
 }
 
+#[allow(dead_code)]
 enum ContinuousIndexMessage {
     Event(Box<ContinuousIndexEvent>),
     Failed(String),
@@ -6354,6 +6512,9 @@ struct ContinuousIndexState {
     quality_failed_jobs: usize,
     quality_stale_jobs: usize,
     latest_quality_error: Option<String>,
+    attached_clients: usize,
+    client_kinds: Vec<String>,
+    shutdown_after_seconds: Option<u64>,
 }
 
 impl Default for ContinuousIndexState {
@@ -6373,6 +6534,9 @@ impl Default for ContinuousIndexState {
             quality_failed_jobs: 0,
             quality_stale_jobs: 0,
             latest_quality_error: None,
+            attached_clients: 0,
+            client_kinds: Vec::new(),
+            shutdown_after_seconds: None,
         }
     }
 }
@@ -6391,11 +6555,23 @@ impl ContinuousIndexState {
     }
 
     fn summary(&self) -> String {
+        let client_kinds = if self.client_kinds.is_empty() {
+            "<none>".to_owned()
+        } else {
+            self.client_kinds.join(",")
+        };
+        let shutdown_after = self
+            .shutdown_after_seconds
+            .map(|seconds| seconds.to_string())
+            .unwrap_or_else(|| "<none>".to_owned());
         let base = format!(
-            "state={} files={} queued={} last={} err={}",
+            "state={} files={} queued={} clients={} kinds={} shutdown_after={} last={} err={}",
             self.status.label(),
             self.files_seen,
             self.queued_events,
+            self.attached_clients,
+            client_kinds,
+            shutdown_after,
             self.last_reindexed_file.as_deref().unwrap_or("<none>"),
             self.latest_error.as_deref().unwrap_or("<none>")
         );
@@ -6474,6 +6650,8 @@ impl ContinuousIndexStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -6495,17 +6673,18 @@ mod tests {
         EvidenceFreshness, EvidenceProvenance, FileCallDetailRow, FileChunkDetailRow,
         FileCoverageRow, FileCoverageStatus, FileDetailSummary, FileSymbolDetailRow,
         IndexCoverageSummary, IndexRunTimelineRow, IndexRunsTimelineSummary,
-        QdrantStorageProjection, QualityGenerationProgress, RepositoryStatus,
-        SemanticNeighborhoodRow, SemanticNeighborhoodSummary, SqliteStorageSummary,
-        StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, SymbolOutlineRow,
-        SymbolOutlineSummary, SymbolSearchRow,
+        QualityGenerationProgress, RepositoryStatus, SemanticNeighborhoodRow,
+        SemanticNeighborhoodSummary, SqliteStorageSummary, StorageExplorerSummary,
+        StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
+        SymbolSearchRow, VectorStorageProjection,
     };
 
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
-        GraphStatus, IndexMode, ManualIndexRequest, QueryStatus, Screen, StorageExplorerState,
-        StorageMode, UiAction, View, continuous_activity_frame, layer_count_percent,
-        layer_readiness_percent, parse_call_path_input, progress_percent, reduce_screen, render,
+        GraphStatus, INDEX_STATUS_REFRESH_INTERVAL, IndexMode, ManualIndexRequest, QueryStatus,
+        Screen, StorageExplorerState, StorageMode, UiAction, View, WATCHER_STATUS_REFRESH_INTERVAL,
+        continuous_activity_frame, layer_count_percent, layer_readiness_percent,
+        parse_call_path_input, progress_percent, reduce_screen, render,
     };
 
     #[test]
@@ -6721,7 +6900,7 @@ mod tests {
         assert!(rendered.contains("Near"));
         assert!(rendered.contains("Storage Explorer"));
         assert!(rendered.contains("SQLite"));
-        assert!(rendered.contains("Qdrant"));
+        assert!(rendered.contains("sqlite-vec"));
         assert!(rendered.contains("missing-vector"));
         assert!(rendered.contains("Storage Detail"));
         assert!(rendered.contains("Health"));
@@ -7423,7 +7602,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Selected"));
         assert!(rendered.contains("vector-backed"));
-        assert!(rendered.contains("Chunks with recorded Qdrant point IDs."));
+        assert!(rendered.contains("Chunks with recorded sqlite-vec point IDs."));
         assert!(rendered.contains("symdex_repo_nomic_embed_text"));
     }
 
@@ -7483,7 +7662,7 @@ mod tests {
         assert!(rendered.contains("2026-01-02T00:00:00Z"));
         assert!(rendered.contains("failed"));
         assert!(rendered.contains("Index Run Detail"));
-        assert!(rendered.contains("qdrant unavailable"));
+        assert!(rendered.contains("sqlite-vec unavailable"));
         assert!(!rendered.contains("source_text"));
         assert_eq!(cell_fg_for_text(buffer, "failed", None), Some(Color::Red));
     }
@@ -7820,7 +7999,9 @@ mod tests {
 
     #[test]
     fn continuous_indexing_toggle_stops_when_enabled() {
-        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let repo = std::env::temp_dir().join(format!("symdex-tui-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).expect("temp repo should be created");
+        let mut app = App::from_status(repo.display().to_string(), "repo", sample_status());
         app.continuous.enabled = true;
         app.continuous.status = ContinuousIndexStatus::Watching;
         app.continuous.queued_events = 2;
@@ -7882,6 +8063,8 @@ mod tests {
             quality_status: "quality_pending".to_owned(),
             activation_reason: None,
             embeddable_chunks: 2,
+            quality_eligible_chunks: 2,
+            quality_ineligible_chunks: 0,
             quality_embedded_chunks: 1,
             pending_jobs: 1,
             running_jobs: 0,
@@ -7915,13 +8098,14 @@ mod tests {
             summary: Box::new(symdex_index::QualityIndexSummary {
                 repository_id: "repo".to_owned(),
                 generation_id: "generation-1".to_owned(),
-                quality_model: "nomic-embed-text-v2-moe".to_owned(),
+                quality_model: "mxbai-embed-large".to_owned(),
                 quality_dimension: Some(768),
-                qdrant_collection: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
+                vector_table: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
                 claimed_jobs: 1,
                 succeeded_jobs: 1,
                 failed_jobs: 0,
                 skipped_stale_jobs: 0,
+                skipped_excluded_jobs: 0,
                 remaining_pending_jobs: 0,
                 quality_status: "quality_ready".to_owned(),
                 active_layer: "quality".to_owned(),
@@ -7930,6 +8114,8 @@ mod tests {
                     repository_id: "repo".to_owned(),
                     generation_id: "generation-1".to_owned(),
                     embeddable_chunks: 2,
+                    quality_eligible_chunks: 2,
+                    quality_ineligible_chunks: 0,
                     quality_embedded_chunks: 2,
                     pending_jobs: 0,
                     running_jobs: 0,
@@ -8021,6 +8207,36 @@ mod tests {
     }
 
     #[test]
+    fn index_status_refresh_uses_interval() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let now = Instant::now();
+
+        app.last_index_status_refresh = None;
+        assert!(app.index_status_refresh_due(now));
+
+        app.last_index_status_refresh = Some(now - INDEX_STATUS_REFRESH_INTERVAL);
+        assert!(app.index_status_refresh_due(now));
+
+        app.last_index_status_refresh = Some(now);
+        assert!(!app.index_status_refresh_due(now));
+    }
+
+    #[test]
+    fn watcher_status_refresh_uses_shorter_interval() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        let now = Instant::now();
+
+        app.last_watcher_status_refresh = None;
+        assert!(app.watcher_status_refresh_due(now));
+
+        app.last_watcher_status_refresh = Some(now - WATCHER_STATUS_REFRESH_INTERVAL);
+        assert!(app.watcher_status_refresh_due(now));
+
+        app.last_watcher_status_refresh = Some(now);
+        assert!(!app.watcher_status_refresh_due(now));
+    }
+
+    #[test]
     fn renders_index_semantic_readiness_gauges() {
         let mut app = App::from_status("/tmp/repo", "repo", sample_status());
         app.view = View::Indexing;
@@ -8035,6 +8251,8 @@ mod tests {
             repository_id: "repo".to_owned(),
             generation_id: "generation-1".to_owned(),
             embeddable_chunks: 4,
+            quality_eligible_chunks: 4,
+            quality_ineligible_chunks: 0,
             quality_embedded_chunks: 1,
             pending_jobs: 2,
             running_jobs: 1,
@@ -8134,7 +8352,7 @@ mod tests {
     #[test]
     fn progress_percent_clamps_to_complete() {
         let progress = symdex_index::IndexProgress {
-            phase: "qdrant",
+            phase: "vector",
             completed: 6,
             total: 5,
             message: "Upserted vector points".to_owned(),
@@ -8181,7 +8399,7 @@ mod tests {
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Doctor Diagnostics"));
         assert!(rendered.contains("sqlite_parent"));
-        assert!(rendered.contains("qdrant_status"));
+        assert!(rendered.contains("sqlite_vec_status"));
         assert!(rendered.contains("unreachable"));
         assert!(rendered.contains("Selected Check Details"));
     }
@@ -8203,7 +8421,7 @@ mod tests {
 
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Selected Check Details"));
-        assert!(rendered.contains("qdrant_status"));
+        assert!(rendered.contains("sqlite_vec_status"));
         assert!(rendered.contains("connection refused"));
         assert!(rendered.contains("Start the local service"));
     }
@@ -8778,7 +8996,7 @@ mod tests {
                 calls: 1,
                 index_runs: 1,
             },
-            qdrant: QdrantStorageProjection {
+            vector: VectorStorageProjection {
                 collection_name: "symdex_repo_nomic_embed_text".to_owned(),
                 embedding_model: "nomic-embed-text".to_owned(),
                 embedding_dimension: Some(768),
@@ -8791,7 +9009,7 @@ mod tests {
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "missing_vectors".to_owned(),
-                    detail: "1 embeddable chunks do not have Qdrant point IDs.".to_owned(),
+                    detail: "1 embeddable chunks do not have sqlite-vec point IDs.".to_owned(),
                 },
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
@@ -8969,7 +9187,7 @@ mod tests {
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "missing_vectors".to_owned(),
-                    detail: "1 embeddable chunk has no recorded Qdrant point ID.".to_owned(),
+                    detail: "1 embeddable chunk has no recorded sqlite-vec point ID.".to_owned(),
                 },
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
@@ -8994,7 +9212,7 @@ mod tests {
                     files_seen: 5,
                     files_indexed: 2,
                     chunks_embedded: 1,
-                    error_summary: Some("qdrant unavailable".to_owned()),
+                    error_summary: Some("sqlite-vec unavailable".to_owned()),
                     run_kind: "watch".to_owned(),
                 },
                 IndexRunTimelineRow {
@@ -9050,7 +9268,7 @@ mod tests {
             embedding_model: "nomic-embed-text".to_owned(),
             rows: vec![
                 SemanticNeighborhoodRow {
-                    qdrant_point_id: "point-add".to_owned(),
+                    vector_point_id: "point-add".to_owned(),
                     path: "src/lib.rs".to_owned(),
                     start_line: 1,
                     end_line: 3,
@@ -9061,7 +9279,7 @@ mod tests {
                     text_hash: "hash-vector".to_owned(),
                 },
                 SemanticNeighborhoodRow {
-                    qdrant_point_id: "point-worker".to_owned(),
+                    vector_point_id: "point-worker".to_owned(),
                     path: "src/worker.rs".to_owned(),
                     start_line: 10,
                     end_line: 18,
@@ -9075,7 +9293,7 @@ mod tests {
             health: vec![StorageHealthRow {
                 status: StorageHealthStatus::Ok,
                 label: "metadata_only".to_owned(),
-                detail: "2 Qdrant payload metadata rows are available without source text."
+                detail: "2 sqlite-vec payload metadata rows are available without source text."
                     .to_owned(),
             }],
         }
@@ -9089,7 +9307,7 @@ mod tests {
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
                     label: "missing_vectors".to_owned(),
-                    detail: "1 embeddable chunk is missing a recorded Qdrant point ID.".to_owned(),
+                    detail: "1 embeddable chunk is missing a recorded sqlite-vec point ID.".to_owned(),
                 },
                 StorageHealthRow {
                     status: StorageHealthStatus::Warning,
@@ -9115,7 +9333,7 @@ mod tests {
         DiagnosticReport {
             workspace: "/tmp/repo".to_owned(),
             sqlite_path: ".symdex/symdex.sqlite".to_owned(),
-            qdrant_url: "http://localhost:6333".to_owned(),
+            vector_store: "sqlite_vec".to_owned(),
             ollama_url: "http://localhost:11434".to_owned(),
             embed_model: "nomic-embed-text".to_owned(),
             checks: vec![
@@ -9125,7 +9343,7 @@ mod tests {
                     message: ".symdex".to_owned(),
                 },
                 DiagnosticCheck {
-                    label: "qdrant_status".to_owned(),
+                    label: "sqlite_vec_status".to_owned(),
                     state: DiagnosticState::Unreachable,
                     message: "connection refused".to_owned(),
                 },

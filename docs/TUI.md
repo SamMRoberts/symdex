@@ -183,7 +183,7 @@ Phase 10.5 implementation status:
   by the backing query or summary, even when the terminal cannot display all
   rows at once.
 - In the Storage view, row selection should drive a visible detail panel for
-  the selected SQLite/Qdrant metric and nearby storage health notes.
+  the selected SQLite/sqlite-vec metric and nearby storage health notes.
 - In the Storage view, always show a self-contained storage tab header above
   the active storage visualization so users can see every storage subview
   without relying on footer help.
@@ -226,7 +226,7 @@ Phase 10.5 implementation status:
 - Show latest embedding model and vector dimension when available.
 - Show active semantic layer, quality readiness, fallback state, and compact
   quality job counts.
-- Show local service status for SQLite path, Ollama, and Qdrant.
+- Show local service status for SQLite path, Ollama, and sqlite-vec.
 - Use status-colored labels for local service health and index freshness.
 - Use compact table rows for index counts and local service targets instead of
   plain paragraphs.
@@ -242,7 +242,7 @@ Phase 10.5 implementation status:
 
 ### Storage Explorer
 
-The TUI should add a storage-focused view for inspecting how SQLite and Qdrant
+The TUI should add a storage-focused view for inspecting how SQLite and sqlite-vec
 represent the indexed repository.
 
 - Treat SQLite as the structural source of truth:
@@ -252,7 +252,7 @@ represent the indexed repository.
   - `symbols`
   - `chunks`
   - `calls`
-- Treat Qdrant as the semantic projection of eligible chunks:
+- Treat sqlite-vec as the semantic projection of eligible chunks:
   - collection name
   - embedding model
   - vector dimension
@@ -264,7 +264,7 @@ represent the indexed repository.
 - Surface cross-store mismatches as warning/error rows rather than hidden
   implementation details.
 - The first implementation is a Storage tab that renders a selectable
-  SQLite/Qdrant metric table plus a detail/health panel.
+  SQLite/sqlite-vec metric table plus a detail/health panel.
 - The Storage tab must always render a nested tab header for its storage
   visualizations. The first labels may be compact for narrow terminals, such as
   `Store`, `Files`, `Syms`, `Calls`, `Vecs`, `Runs`, `Fresh`, `Near`, and
@@ -338,13 +338,13 @@ represent the indexed repository.
 
 ### Embedding Coverage View
 
-- Compare SQLite chunks against Qdrant-backed semantic coverage:
+- Compare SQLite chunks against sqlite-vec-backed semantic coverage:
   - total chunks
   - chunks excluded from embedding
   - chunks with current fast `chunk_embeddings` rows
   - chunks missing vector metadata
   - latest model and dimension
-  - Qdrant collection name
+  - sqlite-vec collection name
 - Show model or dimension drift as an error state.
 - Show excluded chunks by reason so secret filtering remains auditable without
   exposing source text.
@@ -370,12 +370,12 @@ represent the indexed repository.
 
 ### Semantic Neighborhood View
 
-- Future semantic-neighborhood features may use Qdrant metadata to inspect
+- Future semantic-neighborhood features may use sqlite-vec metadata to inspect
   semantically related chunks, but must remain metadata-first.
 - The first version should show path, line range, symbol, chunk kind, score, and
   text hash only.
 - The first implementation lives in the Storage tab mode cycle and shows
-  vector-backed chunk payload metadata from the Qdrant projection: path, line
+  vector-backed chunk payload metadata from the sqlite-vec projection: path, line
   range, symbol, chunk kind, language, text hash, point ID, collection, and a
   `metadata` score label when no live nearest-neighbor score is available.
 - Do not fetch or display full source text as part of this view.
@@ -391,8 +391,8 @@ represent the indexed repository.
 - Selecting a health row should show the expected collection name, status, and
   detailed warning text.
 - The first implementation lives in the Storage tab mode cycle and uses
-  SQLite metadata plus recorded Qdrant point IDs. It does not require live
-  Qdrant service checks.
+  SQLite metadata plus recorded sqlite-vec point IDs. It does not require live
+  sqlite-vec service checks.
 
 ### Indexing Controls
 
@@ -407,20 +407,26 @@ represent the indexed repository.
 - Show fast and quality pending-job, running-job, and skipped-stale-job
   sparklines in the Index tab, using each job count as a percentage of the
   total expected chunk count.
-- Offer continuous indexing as a toggleable mode.
-- Continuous indexing is off by default.
+- Start or attach the single background watcher when `symdex tui [repo]`
+  launches, and hold a watcher lease until the TUI exits.
+- Poll shared watcher status and index readiness on a short interval so the
+  Index tab stays current even though the watcher daemon owns continuous
+  indexing outside the TUI process.
+- Offer continuous indexing as a toggleable mode so users can stop and restart
+  the repository watcher during the TUI session.
 - When continuous indexing is on, modified or newly created eligible files are
   automatically reindexed after debounce.
 - Continuous indexing must use the same ignore, path-boundary, hashing,
   parsing, secret-detection, and embedding rules as manual indexing.
 - Require explicit `y` confirmation before starting an indexing job.
-- Require explicit confirmation before enabling continuous indexing for the
-  first time in a session because it starts an ongoing local job.
+- Starting the TUI is the explicit opt-in for the ongoing local watch job.
+  Manual toggles back on during the same session still require confirmation.
 - Toggling continuous indexing off should stop the watcher promptly without
   deleting index data.
 - Show running, completed, failed, and cancelled states.
 - Show continuous indexing state with explicit `on` / `off` labels, pending
-  debounce state, last reindexed file, queued event count, and latest error.
+  debounce state, attached client count, shutdown grace state, last reindexed
+  file, queued event count, and latest error.
 - When continuous indexing is on, show an animated ratatui-rendered activity
   indicator in the Indexing controls and the global footer status row.
 - Show final counts for files, chunks, symbols, calls, excluded chunks, and
@@ -429,7 +435,7 @@ represent the indexed repository.
 - Use a progress gauge while indexing is running, backed by local indexing
   progress events.
 - The first progress gauge is phase-based: discovery/parsing, SQLite
-  persistence, embedding, and Qdrant upload. It must show the phase name and
+  persistence, embedding, and sqlite-vec upload. It must show the phase name and
   completed/total counts so the gauge is not color-only.
 - Do not add reset/delete actions until matching CLI support exists.
 
@@ -512,7 +518,8 @@ Current dashboard keys:
 
 - `o`: request offline indexing confirmation
 - `s`: request semantic indexing confirmation
-- `c`: toggle continuous indexing confirmation
+- `c`: stop continuous indexing when it is on, or confirm restarting it when it
+  is off
 - `[`: move to the previous primary tab
 - `]`: move to the next primary tab
 - `Tab`: switch to the next mode in the active view

@@ -1,0 +1,10 @@
+[package]
+name = "symdex-sqlite-vec"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = "0.39.0"
+sqlite-vec = "0.1.9"

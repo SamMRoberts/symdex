@@ -22,3 +22,4 @@ symdex-mcp = { path = "../symdex-mcp" }
 symdex-query = { path = "../symdex-query" }
 symdex-store = { path = "../symdex-store" }
 symdex-tui = { path = "../symdex-tui" }
+symdex-watch = { path = "../symdex-watch" }

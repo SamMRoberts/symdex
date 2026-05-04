@@ -16,7 +16,7 @@ Tasks:
   `quality_failed`.
 - Add config helpers for:
   - fast model default: `nomic-embed-text`
-  - quality model default: `nomic-embed-text-v2-moe`
+  - quality model default: `mxbai-embed-large`
   - quality enabled flag
   - quality batch size
   - quality worker count
@@ -27,7 +27,7 @@ Acceptance:
 
 - Existing indexing/search behavior is unchanged.
 - New types are available to index/query/store layers.
-- Tests pass without Ollama or Qdrant.
+- Tests pass without Ollama or sqlite-vec.
 
 ## Slice 2 — SQLite schema migration
 
@@ -44,7 +44,7 @@ Tasks:
   - embeddings by generation/chunk
   - jobs by repository/generation/status
   - latest generation by repository
-- Keep current `chunks.qdrant_point_id` fields as nullable compatibility schema
+- Keep current `chunks.vector_point_id` fields as nullable compatibility schema
   until migration is fully adopted.
 - Add migration tests.
 
@@ -61,11 +61,11 @@ Goal: keep current fast indexing behavior but record semantic generation state.
 Tasks:
 
 - Treat current `nomic-embed-text` semantic indexing as the `fast` layer.
-- After a successful fast Qdrant upsert, create/update the latest
+- After a successful fast sqlite-vec upsert, create/update the latest
   `semantic_generations` row.
 - Record fast model, dimension, chunk count, and active layer.
 - Record fast `chunk_embeddings` rows for current embeddable chunks.
-- Initially keep existing `chunks.qdrant_point_id` writes for compatibility.
+- Initially keep existing `chunks.vector_point_id` writes for compatibility.
 
 Acceptance:
 
@@ -147,8 +147,8 @@ Tasks:
   - verify file content hash
   - extract chunk text by byte range
   - verify chunk text hash
-  - embed with `nomic-embed-text-v2-moe`
-  - upsert quality Qdrant point
+  - embed with `mxbai-embed-large`
+  - upsert quality sqlite-vec point
   - write `chunk_embeddings` row for quality
   - mark job succeeded or failed
 - Stale jobs become `skipped_stale` and are not embedded.
@@ -156,7 +156,8 @@ Tasks:
 Acceptance:
 
 - Worker can complete quality embeddings for a stable repo.
-- Worker skips stale jobs after file changes.
+- Worker skips stale jobs after file changes and excluded jobs for chunks outside
+  quality eligibility.
 - Fast search remains active until activation rules pass.
 
 ## Slice 7 — Quality activation and fallback
@@ -165,10 +166,10 @@ Goal: default search shifts to quality only when quality is complete/current.
 
 Tasks:
 
-- Count current embeddable chunks for the latest fast generation.
+- Count quality-eligible chunks for the latest fast generation.
 - Count current quality embeddings for the same generation.
 - Verify no pending/running jobs remain for that generation.
-- Defer layer-aware Qdrant manifest verification to Slice 9 verify/repair work.
+- Defer layer-aware sqlite-vec manifest verification to Slice 9 verify/repair work.
 - Atomically set active layer to `quality` when complete.
 - Set active layer back to `fast` when a new fast generation makes quality
   stale.
@@ -202,7 +203,7 @@ after fast watch batches and during idle watch ticks.
 
 Acceptance:
 
-- Continuous indexing does not wait for `nomic-embed-text-v2-moe`.
+- Continuous indexing does not wait for `mxbai-embed-large`.
 - Default search falls back to fast immediately after watched changes.
 - Quality can catch up after edits stop.
 
@@ -217,13 +218,13 @@ Tasks:
 - Build expected manifests from layered metadata and isolate quality health from
   fast health.
 - Repair missing/stale quality points through the quality worker path, not a
-  separate ad-hoc Qdrant write path.
+  separate ad-hoc sqlite-vec write path.
 - Keep orphan cleanup metadata-only.
 
 Implementation note: Slice 9 adds `--semantic-layer fast|quality|all` to
-`qdrant-verify` and `qdrant-repair`. Verification reads current expected points
+`vector-verify` and `vector-repair`. Verification reads current expected points
 from latest-generation `chunk_embeddings` for the selected layer. Slice Q10
-removed the fast-layer fallback to legacy `chunks.qdrant_point_id`; legacy-only
+removed the fast-layer fallback to legacy `chunks.vector_point_id`; legacy-only
 local databases must run `symdex index <repo>` to create layered manifests.
 Repair dispatches fast work through normal semantic indexing and quality work
 through the quality worker path.
@@ -265,8 +266,8 @@ Acceptance:
 
 ## Testing rules for every slice
 
-- Unit-test state transitions without live Ollama/Qdrant.
-- Keep service-dependent Ollama/Qdrant tests opt-in.
+- Unit-test state transitions without live Ollama/sqlite-vec.
+- Keep service-dependent Ollama/sqlite-vec tests opt-in.
 - Add migration tests for every schema change.
 - Add regression tests for source-text exclusion in outputs and payloads.
 - Keep existing single-model workflows working until a deliberate migration

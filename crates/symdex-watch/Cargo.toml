@@ -1,5 +1,5 @@
 [package]
-name = "symdex-mcp"
+name = "symdex-watch"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 symdex-core = { path = "../symdex-core" }
-symdex-embed = { path = "../symdex-embed" }
-symdex-query = { path = "../symdex-query" }
+symdex-index = { path = "../symdex-index" }
 symdex-store = { path = "../symdex-store" }
-symdex-watch = { path = "../symdex-watch" }

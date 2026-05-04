@@ -12,12 +12,10 @@ Verified sources for the chosen stack.
 
 ## Vector database
 
-- Qdrant docs: https://qdrant.tech/documentation/
-- Qdrant local quickstart: https://qdrant.tech/documentation/quickstart/
-- Qdrant create collection API: https://api.qdrant.tech/api-reference/collections/create-collection
-- Qdrant upsert points API: https://api.qdrant.tech/api-reference/points/upsert-points
-- Qdrant query points API: https://api.qdrant.tech/api-reference/search/query-points
-- Qdrant Rust client: https://docs.rs/qdrant-client
+- sqlite-vec docs: https://alexgarcia.xyz/sqlite-vec/
+- sqlite-vec Rust usage: https://alexgarcia.xyz/sqlite-vec/rust.html
+- sqlite-vec KNN queries: https://alexgarcia.xyz/sqlite-vec/features/knn.html
+- sqlite-vec repository: https://github.com/asg017/sqlite-vec
 
 ## Local embeddings
 
@@ -40,4 +38,4 @@ Verified sources for the chosen stack.
 
 ## Maintenance rule
 
-When updating crate versions, MCP behavior, TUI behavior, embedding models, or Qdrant collection behavior, re-check the relevant upstream docs and update this file if assumptions changed.
+When updating crate versions, MCP behavior, TUI behavior, embedding models, or sqlite-vec collection behavior, re-check the relevant upstream docs and update this file if assumptions changed.

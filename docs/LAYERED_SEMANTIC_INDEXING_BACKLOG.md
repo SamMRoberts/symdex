@@ -22,7 +22,7 @@ This backlog is specific to the `quality-index` branch. It supplements
   `quality_failed` states.
 - [x] Add layer-specific model configuration with defaults:
   - fast: `nomic-embed-text`
-  - quality: `nomic-embed-text-v2-moe`
+  - quality: `mxbai-embed-large`
 - [x] Preserve current `SYMDEX_EMBED_MODEL` behavior for compatibility.
 - [x] Add tests for config defaults, env overrides, and status transitions.
 
@@ -38,7 +38,7 @@ This backlog is specific to the `quality-index` branch. It supplements
 ## Phase Q4 — Fast-layer generation tracking
 
 - [x] Treat existing semantic indexing as the `fast` layer.
-- [x] Record fast semantic generation rows after successful fast Qdrant upsert.
+- [x] Record fast semantic generation rows after successful fast sqlite-vec upsert.
 - [x] Record fast `chunk_embeddings` rows for embeddable chunks.
 - [x] Make unchanged fast indexing idempotent.
 - [x] Keep semantic search behavior unchanged except for added metadata.
@@ -60,7 +60,7 @@ This backlog is specific to the `quality-index` branch. It supplements
 - [x] Mark old jobs stale when a new fast generation supersedes them.
 - [x] Add manual `symdex index-quality <repo>` command.
 - [x] Implement worker hash verification before embedding.
-- [x] Upsert quality vectors to the quality Qdrant collection.
+- [x] Upsert quality vectors to the quality sqlite-vec collection.
 - [x] Record quality `chunk_embeddings` rows.
 
 ## Phase Q7 — Quality activation
@@ -76,14 +76,14 @@ This backlog is specific to the `quality-index` branch. It supplements
 ## Phase Q8 — Continuous indexing integration
 
 - [x] Ensure watch batches update fast synchronously and queue quality work.
-- [x] Ensure watch batches do not wait for `nomic-embed-text-v2-moe`.
+- [x] Ensure watch batches do not wait for `mxbai-embed-large`.
 - [x] Mark quality stale on changed/deleted embeddable chunks.
 - [x] Add optional background quality worker behavior for watch mode.
 - [x] Surface fast/quality state in watch events and TUI state.
 
 ## Phase Q9 — Verification, repair, TUI, and MCP
 
-- [x] Add layer-aware Qdrant verify and repair flags.
+- [x] Add layer-aware sqlite-vec verify and repair flags.
 - [x] Build expected manifests from `chunk_embeddings`.
 - [x] Keep missing quality points isolated from fast-layer health.
 - [x] Add `semantic-status` CLI output.
@@ -92,7 +92,7 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 ## Phase Q10 — Cleanup and compatibility removal
 
-- [x] Audit old `chunks.qdrant_point_id` compatibility behavior.
+- [x] Audit old `chunks.vector_point_id` compatibility behavior.
 - [x] Decide whether to keep compatibility fields, migrate them, or deprecate
   them after layered manifests are stable.
 - [x] Update docs once implementation behavior replaces planned behavior.
@@ -102,6 +102,6 @@ This backlog is specific to the `quality-index` branch. It supplements
 
 - Do not route default search to partial quality results.
 - Do not block continuous indexing on quality work.
-- Do not store source text in Qdrant or long-lived job rows.
-- Do not mix fast and quality vectors in one Qdrant collection.
+- Do not store source text in sqlite-vec or long-lived job rows.
+- Do not mix fast and quality vectors in one sqlite-vec collection.
 - Do not make quality failures degrade valid fast search.

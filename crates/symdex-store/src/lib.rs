@@ -1,6 +1,6 @@
-//! Persistence boundary for SQLite and Qdrant adapters.
+//! Persistence boundary for SQLite and sqlite-vec adapters.
 
-mod qdrant;
+mod vector;
 
 use std::env;
 use std::fmt::{Display, Formatter};
@@ -11,17 +11,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use symdex_core::{SemanticLayer, SemanticLayerStatus, stable_id};
 
-pub use qdrant::{
-    PointPayload, QdrantClient, RetrievedPoint, ScoredPoint, VectorPoint, qdrant_collection_name,
-    qdrant_point_id,
+pub use vector::{
+    PointPayload, RetrievedPoint, ScoredPoint, SqliteVectorStore, VectorPoint, vector_point_id,
+    vector_rowid, vector_table_name,
 };
 
 #[cfg(test)]
-pub(crate) use qdrant::{
-    CreateCollectionRequest, DeletePointsRequest, Distance, MatchValue, QueryPointsRequest,
-    RepositoryFilter, RepositoryFilterCondition, ScrollPointsRequest, UpsertPointsRequest,
-    VectorParams, validate_collection_name,
-};
+pub(crate) use vector::validate_vector_table_name;
 
 pub const MAX_CALL_PATH_DEPTH: usize = 8;
 
@@ -32,7 +28,6 @@ pub fn clamp_call_path_depth(depth: usize) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub sqlite_path: PathBuf,
-    pub qdrant_url: String,
 }
 
 impl StoreConfig {
@@ -40,8 +35,6 @@ impl StoreConfig {
         Self {
             sqlite_path: env_path("SYMDEX_DB_PATH", "symdex_DB_PATH")
                 .unwrap_or_else(|| PathBuf::from(".symdex/symdex.sqlite")),
-            qdrant_url: env_value("SYMDEX_QDRANT_URL", "symdex_QDRANT_URL")
-                .unwrap_or_else(|| "http://localhost:6333".to_owned()),
         }
     }
 }
@@ -57,6 +50,7 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(config: &StoreConfig) -> Result<Self> {
+        symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         if let Some(parent) = sqlite_parent(config) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
@@ -71,12 +65,12 @@ impl SqliteStore {
         self.connection
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;
-        self.ensure_provenance_columns()?;
+        self.ensure_compatibility_columns()?;
         Ok(())
     }
 
-    fn ensure_provenance_columns(&self) -> Result<()> {
-        for column in PROVENANCE_COLUMNS {
+    fn ensure_compatibility_columns(&self) -> Result<()> {
+        for column in COMPATIBILITY_COLUMNS {
             self.ensure_column(column)?;
         }
         Ok(())
@@ -93,12 +87,20 @@ impl SqliteStore {
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        if !table
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(StoreError::UnexpectedResponse(format!(
+                "invalid SQLite table name `{table}`"
+            )));
+        }
         let mut statement = self
             .connection
-            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .prepare(&format!("PRAGMA table_info({table})"))
             .map_err(StoreError::Sqlite)?;
         let rows = statement
-            .query_map(params![table], |row| row.get::<_, String>(0))
+            .query_map([], |row| row.get::<_, String>(1))
             .map_err(StoreError::Sqlite)?;
         for row in rows {
             if row.map_err(StoreError::Sqlite)? == column {
@@ -246,7 +248,7 @@ impl SqliteStore {
                      "INSERT INTO chunks (
                         id, file_id, symbol_id, kind, text_hash,
                         start_line, end_line, start_byte, end_byte,
-                        qdrant_point_id, excluded_reason, index_run_id, parser_version,
+                        vector_point_id, excluded_reason, index_run_id, parser_version,
                         embedding_model, embedding_dimension, embedded_at
                       )
                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
@@ -264,7 +266,7 @@ impl SqliteStore {
                         chunk.end_line as i64,
                         chunk.start_byte as i64,
                         chunk.end_byte as i64,
-                        chunk.qdrant_point_id,
+                        chunk.vector_point_id,
                         chunk.excluded_reason,
                         chunk.index_run_id,
                         chunk.parser_version,
@@ -400,7 +402,7 @@ impl SqliteStore {
         Ok(missing.len())
     }
 
-    pub fn qdrant_point_ids_for_latest_generation_layer_paths(
+    pub fn vector_point_ids_for_latest_generation_layer_paths(
         &self,
         repository_id: &str,
         semantic_layer: SemanticLayer,
@@ -416,7 +418,7 @@ impl SqliteStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT chunk_embeddings.qdrant_point_id
+                "SELECT chunk_embeddings.vector_point_id
                  FROM chunk_embeddings
                  JOIN files ON chunk_embeddings.file_id = files.id
                  WHERE files.repository_id = ?1
@@ -424,8 +426,9 @@ impl SqliteStore {
                    AND chunk_embeddings.repository_id = ?1
                    AND chunk_embeddings.generation_id = ?3
                    AND chunk_embeddings.semantic_layer = ?4
+                   AND chunk_embeddings.vector_store = 'sqlite_vec'
                    AND chunk_embeddings.status = 'current'
-                 ORDER BY chunk_embeddings.qdrant_point_id",
+                 ORDER BY chunk_embeddings.vector_point_id",
             )
             .map_err(StoreError::Sqlite)?;
         for path in paths {
@@ -442,7 +445,7 @@ impl SqliteStore {
         Ok(point_ids.into_iter().collect())
     }
 
-    pub fn qdrant_point_ids_for_latest_generation_layer_missing_files(
+    pub fn vector_point_ids_for_latest_generation_layer_missing_files(
         &self,
         repository_id: &str,
         semantic_layer: SemanticLayer,
@@ -455,23 +458,23 @@ impl SqliteStore {
             .into_iter()
             .filter(|path| !active.contains(path.as_str()))
             .collect();
-        self.qdrant_point_ids_for_latest_generation_layer_paths(
+        self.vector_point_ids_for_latest_generation_layer_paths(
             repository_id,
             semantic_layer,
             &missing,
         )
     }
 
-    pub fn qdrant_expected_points_for_generation_layer(
+    pub fn expected_vector_points_for_generation_layer(
         &self,
         repository_id: &str,
         generation_id: &str,
         semantic_layer: SemanticLayer,
-    ) -> Result<Vec<QdrantExpectedPoint>> {
+    ) -> Result<Vec<ExpectedVectorPoint>> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT chunk_embeddings.qdrant_point_id, chunks.id, files.path,
+                "SELECT chunk_embeddings.vector_point_id, chunks.id, files.path,
                         chunks.start_line, chunks.end_line, chunk_embeddings.text_hash,
                         chunk_embeddings.embedding_model, chunk_embeddings.embedding_dimension
                  FROM chunk_embeddings
@@ -482,6 +485,7 @@ impl SqliteStore {
                    AND files.repository_id = ?1
                    AND chunk_embeddings.generation_id = ?2
                    AND chunk_embeddings.semantic_layer = ?3
+                   AND chunk_embeddings.vector_store = 'sqlite_vec'
                    AND chunk_embeddings.status = 'current'
                  ORDER BY files.path, chunks.start_line, chunks.id",
             )
@@ -490,8 +494,8 @@ impl SqliteStore {
             .query_map(
                 params![repository_id, generation_id, semantic_layer.as_str()],
                 |row| {
-                    Ok(QdrantExpectedPoint {
-                        qdrant_point_id: row.get(0)?,
+                    Ok(ExpectedVectorPoint {
+                        vector_point_id: row.get(0)?,
                         chunk_id: row.get(1)?,
                         path: row.get(2)?,
                         start_line: row.get::<_, i64>(3)? as usize,
@@ -549,6 +553,204 @@ impl SqliteStore {
             embedding_model: embedding.as_ref().map(|run| run.embedding_model.clone()),
             embedding_dimension: embedding.and_then(|run| run.embedding_dimension),
         })
+    }
+
+    pub fn watcher_status(&self, repository_id: &str) -> Result<Option<WatcherStatusRecord>> {
+        self.connection
+            .query_row(
+                "SELECT repository_id, root_path, mode, owner_kind, owner_pid, socket_path,
+                        state, started_at, updated_at, heartbeat_at, files_seen, queued_events,
+                        last_indexed_path, last_error, active_layer, quality_status,
+                        quality_pending_jobs, quality_running_jobs, quality_failed_jobs,
+                        quality_stale_jobs
+                   FROM watchers
+                  WHERE repository_id = ?1",
+                params![repository_id],
+                watcher_status_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn upsert_watcher_status(&self, status: &WatcherStatusRecord) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO watchers (
+                   repository_id, root_path, mode, owner_kind, owner_pid, socket_path,
+                   state, started_at, updated_at, heartbeat_at, files_seen, queued_events,
+                   last_indexed_path, last_error, active_layer, quality_status,
+                   quality_pending_jobs, quality_running_jobs, quality_failed_jobs,
+                   quality_stale_jobs
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                 ON CONFLICT(repository_id) DO UPDATE SET
+                   root_path = excluded.root_path,
+                   mode = excluded.mode,
+                   owner_kind = excluded.owner_kind,
+                   owner_pid = excluded.owner_pid,
+                   socket_path = excluded.socket_path,
+                   state = excluded.state,
+                   started_at = excluded.started_at,
+                   updated_at = excluded.updated_at,
+                   heartbeat_at = excluded.heartbeat_at,
+                   files_seen = excluded.files_seen,
+                   queued_events = excluded.queued_events,
+                   last_indexed_path = excluded.last_indexed_path,
+                   last_error = excluded.last_error,
+                   active_layer = excluded.active_layer,
+                   quality_status = excluded.quality_status,
+                   quality_pending_jobs = excluded.quality_pending_jobs,
+                   quality_running_jobs = excluded.quality_running_jobs,
+                   quality_failed_jobs = excluded.quality_failed_jobs,
+                   quality_stale_jobs = excluded.quality_stale_jobs",
+                params![
+                    status.repository_id,
+                    status.root_path,
+                    status.mode,
+                    status.owner_kind,
+                    status.owner_pid.map(i64::from),
+                    status.socket_path,
+                    status.state,
+                    status.started_at.as_deref().unwrap_or(&now),
+                    now,
+                    status.heartbeat_at.as_deref().unwrap_or(&now),
+                    status.files_seen as i64,
+                    status.queued_events as i64,
+                    status.last_indexed_path,
+                    status.last_error,
+                    status.active_layer,
+                    status.quality_status,
+                    status.quality_pending_jobs as i64,
+                    status.quality_running_jobs as i64,
+                    status.quality_failed_jobs as i64,
+                    status.quality_stale_jobs as i64,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn mark_watcher_stopped(&self, repository_id: &str) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "UPDATE watchers
+                    SET state = 'stopped',
+                        updated_at = ?2,
+                        heartbeat_at = ?2,
+                        owner_pid = NULL,
+                        socket_path = NULL,
+                        queued_events = 0
+                  WHERE repository_id = ?1",
+                params![repository_id, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn mark_watcher_failed(&self, repository_id: &str, error: &str) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "UPDATE watchers
+                    SET state = 'failed',
+                        updated_at = ?2,
+                        heartbeat_at = ?2,
+                        last_error = ?3,
+                        owner_pid = NULL,
+                        socket_path = NULL
+                  WHERE repository_id = ?1",
+                params![repository_id, now, error],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn upsert_watcher_client(&self, client: &WatcherClientRecord) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO watcher_clients (
+                   repository_id, client_id, client_kind, pid, started_at,
+                   heartbeat_at, last_seen_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(repository_id, client_id) DO UPDATE SET
+                   client_kind = excluded.client_kind,
+                   pid = excluded.pid,
+                   heartbeat_at = excluded.heartbeat_at,
+                   last_seen_at = excluded.last_seen_at",
+                params![
+                    client.repository_id,
+                    client.client_id,
+                    client.client_kind,
+                    client.pid.map(i64::from),
+                    client.started_at.as_deref().unwrap_or(&now),
+                    client.heartbeat_at.as_deref().unwrap_or(&now),
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn heartbeat_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
+        let now = timestamp();
+        self.connection
+            .execute(
+                "UPDATE watcher_clients
+                    SET heartbeat_at = ?3,
+                        last_seen_at = ?3
+                  WHERE repository_id = ?1 AND client_id = ?2",
+                params![repository_id, client_id, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn remove_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM watcher_clients
+                  WHERE repository_id = ?1 AND client_id = ?2",
+                params![repository_id, client_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn watcher_clients(&self, repository_id: &str) -> Result<Vec<WatcherClientRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT repository_id, client_id, client_kind, pid, started_at,
+                        heartbeat_at, last_seen_at
+                   FROM watcher_clients
+                  WHERE repository_id = ?1
+                  ORDER BY client_kind, started_at, client_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], watcher_client_record)
+            .map_err(StoreError::Sqlite)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn prune_stale_watcher_clients(
+        &self,
+        repository_id: &str,
+        stale_before_timestamp: &str,
+    ) -> Result<usize> {
+        let removed = self
+            .connection
+            .execute(
+                "DELETE FROM watcher_clients
+                  WHERE repository_id = ?1 AND heartbeat_at < ?2",
+                params![repository_id, stale_before_timestamp],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(removed)
     }
 
     pub fn ensure_embedding_compatible(
@@ -755,10 +957,11 @@ impl SqliteStore {
                 .prepare(
                     "INSERT INTO chunk_embeddings (
                        id, repository_id, file_id, chunk_id, semantic_layer, embedding_model,
-                       embedding_dimension, content_hash, text_hash, qdrant_collection,
-                       qdrant_point_id, generation_id, embedded_at, status
+                       embedding_dimension, content_hash, text_hash, vector_table,
+                       vector_point_id, vector_store, vector_rowid,
+                       generation_id, embedded_at, status
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'sqlite_vec', ?12, ?13, ?14, ?15)
                      ON CONFLICT(chunk_id, semantic_layer, embedding_model, embedding_dimension)
                      DO UPDATE SET
                        id = excluded.id,
@@ -766,8 +969,10 @@ impl SqliteStore {
                        file_id = excluded.file_id,
                        content_hash = excluded.content_hash,
                        text_hash = excluded.text_hash,
-                       qdrant_collection = excluded.qdrant_collection,
-                       qdrant_point_id = excluded.qdrant_point_id,
+                       vector_table = excluded.vector_table,
+                       vector_point_id = excluded.vector_point_id,
+                       vector_store = excluded.vector_store,
+                       vector_rowid = excluded.vector_rowid,
                        generation_id = excluded.generation_id,
                        embedded_at = excluded.embedded_at,
                        status = excluded.status",
@@ -793,8 +998,9 @@ impl SqliteStore {
                         input.fast_dimension as i64,
                         row.content_hash,
                         row.text_hash,
-                        input.qdrant_collection,
-                        row.qdrant_point_id,
+                        input.vector_table,
+                        row.vector_point_id,
+                        vector_rowid(&row.vector_point_id)?,
                         generation_id,
                         input.completed_at,
                         "current",
@@ -902,7 +1108,10 @@ impl SqliteStore {
             SemanticLayer::Fast,
             &generation.fast_model,
             generation.fast_dimension,
+            generation.embeddable_chunks,
         )?;
+        let quality_expected_chunks =
+            self.quality_expected_chunks(&generation.repository_id, &generation.id)?;
 
         let quality = match (&generation.quality_model, generation.quality_dimension) {
             (Some(model), Some(dimension)) => Some(self.semantic_layer_manifest_summary(
@@ -910,13 +1119,14 @@ impl SqliteStore {
                 SemanticLayer::Quality,
                 model,
                 dimension,
+                quality_expected_chunks,
             )?),
             _ => self
                 .semantic_layer_manifest_aggregate(&generation, SemanticLayer::Quality)?
                 .map(|aggregate| {
                     SemanticLayerManifestSummary::from_aggregate(
                         SemanticLayer::Quality,
-                        generation.embeddable_chunks,
+                        quality_expected_chunks,
                         aggregate,
                     )
                 })
@@ -942,23 +1152,25 @@ impl SqliteStore {
         semantic_layer: SemanticLayer,
         embedding_model: &str,
         embedding_dimension: usize,
+        expected_chunks: usize,
     ) -> Result<SemanticLayerManifestSummary> {
         let Some(aggregate) = self.semantic_layer_manifest_aggregate(generation, semantic_layer)?
         else {
             return Ok(SemanticLayerManifestSummary::empty(
                 semantic_layer,
-                generation.embeddable_chunks,
+                expected_chunks,
                 embedding_model.to_owned(),
                 embedding_dimension,
-                qdrant_collection_name(&generation.repository_id, embedding_model),
+                vector_table_name(&generation.repository_id, embedding_model),
             ));
         };
 
-        SemanticLayerManifestSummary::from_aggregate(
-            semantic_layer,
-            generation.embeddable_chunks,
-            aggregate,
-        )
+        SemanticLayerManifestSummary::from_aggregate(semantic_layer, expected_chunks, aggregate)
+    }
+
+    fn quality_expected_chunks(&self, repository_id: &str, generation_id: &str) -> Result<usize> {
+        let progress = self.quality_generation_progress(repository_id, generation_id)?;
+        Ok(progress.quality_eligible_chunks)
     }
 
     fn semantic_layer_manifest_aggregate(
@@ -968,7 +1180,7 @@ impl SqliteStore {
     ) -> Result<Option<SemanticLayerManifestAggregate>> {
         self.connection
             .query_row(
-                "SELECT embedding_model, embedding_dimension, qdrant_collection,
+                "SELECT embedding_model, embedding_dimension, vector_table,
                         SUM(CASE WHEN status = 'current' THEN 1 ELSE 0 END),
                         SUM(CASE WHEN status = 'stale' THEN 1 ELSE 0 END),
                         SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END),
@@ -979,8 +1191,9 @@ impl SqliteStore {
                  WHERE repository_id = ?1
                    AND generation_id = ?2
                    AND semantic_layer = ?3
-                 GROUP BY embedding_model, embedding_dimension, qdrant_collection
-                 ORDER BY 4 DESC, 9 DESC, embedding_model, qdrant_collection
+                   AND vector_store = 'sqlite_vec'
+                 GROUP BY embedding_model, embedding_dimension, vector_table
+                 ORDER BY 4 DESC, 9 DESC, embedding_model, vector_table
                  LIMIT 1",
                 params![
                     generation.repository_id,
@@ -991,7 +1204,7 @@ impl SqliteStore {
                     Ok(SemanticLayerManifestAggregate {
                         embedding_model: row.get(0)?,
                         embedding_dimension: row.get::<_, i64>(1)?,
-                        qdrant_collection: row.get(2)?,
+                        vector_table: row.get(2)?,
                         current_chunks: row.get::<_, i64>(3)?,
                         stale_chunks: row.get::<_, i64>(4)?,
                         blocked_chunks: row.get::<_, i64>(5)?,
@@ -1010,10 +1223,11 @@ impl SqliteStore {
             .execute(
                 "INSERT INTO chunk_embeddings (
                    id, repository_id, file_id, chunk_id, semantic_layer, embedding_model,
-                   embedding_dimension, content_hash, text_hash, qdrant_collection,
-                   qdrant_point_id, generation_id, embedded_at, status
+                   embedding_dimension, content_hash, text_hash, vector_table,
+                   vector_point_id, vector_store, vector_rowid,
+                   generation_id, embedded_at, status
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'sqlite_vec', ?12, ?13, ?14, ?15)
                  ON CONFLICT(chunk_id, semantic_layer, embedding_model, embedding_dimension)
                  DO UPDATE SET
                    id = excluded.id,
@@ -1021,8 +1235,10 @@ impl SqliteStore {
                    file_id = excluded.file_id,
                    content_hash = excluded.content_hash,
                    text_hash = excluded.text_hash,
-                   qdrant_collection = excluded.qdrant_collection,
-                   qdrant_point_id = excluded.qdrant_point_id,
+                   vector_table = excluded.vector_table,
+                   vector_point_id = excluded.vector_point_id,
+                   vector_store = excluded.vector_store,
+                   vector_rowid = excluded.vector_rowid,
                    generation_id = excluded.generation_id,
                    embedded_at = excluded.embedded_at,
                    status = excluded.status",
@@ -1036,8 +1252,9 @@ impl SqliteStore {
                     embedding.embedding_dimension as i64,
                     embedding.content_hash,
                     embedding.text_hash,
-                    embedding.qdrant_collection,
-                    embedding.qdrant_point_id,
+                    embedding.vector_table,
+                    embedding.vector_point_id,
+                    vector_rowid(&embedding.vector_point_id)?,
                     embedding.generation_id,
                     embedding.embedded_at,
                     embedding.status,
@@ -1057,8 +1274,8 @@ impl SqliteStore {
             .connection
             .prepare(
                 "SELECT id, repository_id, file_id, chunk_id, semantic_layer, embedding_model,
-                        embedding_dimension, content_hash, text_hash, qdrant_collection,
-                        qdrant_point_id, generation_id, embedded_at, status
+                        embedding_dimension, content_hash, text_hash, vector_table,
+                        vector_point_id, generation_id, embedded_at, status
                  FROM chunk_embeddings
                  WHERE repository_id = ?1
                    AND generation_id = ?2
@@ -1220,8 +1437,8 @@ impl SqliteStore {
             let mut statement = transaction
                 .prepare(
                     "SELECT fast.file_id, fast.chunk_id, fast.content_hash, fast.text_hash,
-                            quality.embedding_dimension, quality.qdrant_collection,
-                            quality.qdrant_point_id, quality.embedded_at
+                            quality.embedding_dimension, quality.vector_table,
+                            quality.vector_point_id, quality.embedded_at
                      FROM chunk_embeddings AS fast
                      JOIN chunk_embeddings AS quality
                        ON quality.repository_id = fast.repository_id
@@ -1261,8 +1478,8 @@ impl SqliteStore {
                             embedding_dimension: dimension,
                             content_hash: row.get(2)?,
                             text_hash: row.get(3)?,
-                            qdrant_collection: row.get(5)?,
-                            qdrant_point_id: row.get(6)?,
+                            vector_table: row.get(5)?,
+                            vector_point_id: row.get(6)?,
                             generation_id: generation_id.to_owned(),
                             embedded_at: row.get(7)?,
                             status: "current".to_owned(),
@@ -1556,6 +1773,16 @@ impl SqliteStore {
                     )
                     .map_err(StoreError::Sqlite)?;
             }
+            QualityJobCompletion::SkippedExcluded { reason } => {
+                transaction
+                    .execute(
+                        "UPDATE quality_embedding_jobs
+                         SET status = 'skipped_excluded', error_summary = ?2, updated_at = ?3
+                         WHERE id = ?1",
+                        params![job_id, reason, completed_at],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+            }
         }
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(())
@@ -1590,14 +1817,16 @@ impl SqliteStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(StoreError::Sqlite)?;
+        let embeddable_chunks = usize_count(embeddable_chunks, "embeddable chunk count")?;
+        let quality_embedded_chunks =
+            usize_count(quality_embedded_chunks, "quality embedded chunk count")?;
         let mut progress = QualityGenerationProgress {
             repository_id: repository_id.to_owned(),
             generation_id: generation_id.to_owned(),
-            embeddable_chunks: usize_count(embeddable_chunks, "embeddable chunk count")?,
-            quality_embedded_chunks: usize_count(
-                quality_embedded_chunks,
-                "quality embedded chunk count",
-            )?,
+            embeddable_chunks,
+            quality_eligible_chunks: embeddable_chunks,
+            quality_ineligible_chunks: 0,
+            quality_embedded_chunks,
             pending_jobs: 0,
             running_jobs: 0,
             succeeded_jobs: 0,
@@ -1633,6 +1862,10 @@ impl SqliteStore {
                 _ => {}
             }
         }
+        progress.quality_ineligible_chunks = progress.skipped_excluded_jobs;
+        progress.quality_eligible_chunks = progress
+            .embeddable_chunks
+            .saturating_sub(progress.quality_ineligible_chunks);
 
         Ok(progress)
     }
@@ -1895,7 +2128,9 @@ impl SqliteStore {
                 QualityActivationReason::QualityJobsStale,
                 None,
             )
-        } else if quality_embedded_chunks == generation.embeddable_chunks {
+        } else if quality_embedded_chunks + counts.skipped_excluded_jobs
+            == generation.embeddable_chunks
+        {
             (
                 SemanticLayerStatus::QualityReady,
                 SemanticLayer::Quality,
@@ -1959,6 +2194,10 @@ impl SqliteStore {
             repository_id: repository_id.to_owned(),
             generation_id: generation_id.to_owned(),
             embeddable_chunks: generation.embeddable_chunks,
+            quality_eligible_chunks: generation
+                .embeddable_chunks
+                .saturating_sub(counts.skipped_excluded_jobs),
+            quality_ineligible_chunks: counts.skipped_excluded_jobs,
             quality_embedded_chunks,
             pending_jobs: counts.pending_jobs,
             running_jobs: counts.running_jobs,
@@ -2532,8 +2771,8 @@ impl SqliteStore {
             .as_ref()
             .map(|run| run.embedding_model.as_str())
             .unwrap_or(embedding_model);
-        let qdrant = QdrantStorageProjection {
-            collection_name: qdrant_collection_name(repository_id, projected_model),
+        let vector = VectorStorageProjection {
+            collection_name: vector_table_name(repository_id, projected_model),
             embedding_model: projected_model.to_owned(),
             embedding_dimension: latest_embedding
                 .as_ref()
@@ -2543,11 +2782,11 @@ impl SqliteStore {
             excluded_chunks: chunk_projection.excluded_chunks,
             missing_vector_chunks: chunk_projection.missing_vector_chunks,
         };
-        let warnings = storage_warnings(&sqlite, &qdrant);
+        let warnings = storage_warnings(&sqlite, &vector);
         Ok(StorageExplorerSummary {
             repository_id: repository_id.to_owned(),
             sqlite,
-            qdrant,
+            vector,
             warnings,
         })
     }
@@ -2751,7 +2990,7 @@ impl SqliteStore {
 
         Ok(EmbeddingCoverageSummary {
             repository_id: repository_id.to_owned(),
-            collection_name: qdrant_collection_name(repository_id, projected_model),
+            collection_name: vector_table_name(repository_id, projected_model),
             configured_embedding_model: configured_embedding_model.to_owned(),
             embedding_model: projected_model.to_owned(),
             embedding_dimension,
@@ -2827,7 +3066,7 @@ impl SqliteStore {
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT chunk_embeddings.qdrant_point_id, files.path, chunks.start_line,
+                    "SELECT chunk_embeddings.vector_point_id, files.path, chunks.start_line,
                             chunks.end_line, symbols.qualified_name, chunks.kind,
                             files.language, chunk_embeddings.text_hash
                      FROM chunk_embeddings
@@ -2847,7 +3086,7 @@ impl SqliteStore {
             let rows = statement
                 .query_map(params![repository_id, generation.id], |row| {
                     Ok(SemanticNeighborhoodRow {
-                        qdrant_point_id: row.get(0)?,
+                        vector_point_id: row.get(0)?,
                         path: row.get(1)?,
                         start_line: row.get::<_, i64>(2)? as usize,
                         end_line: row.get::<_, i64>(3)? as usize,
@@ -2866,7 +3105,7 @@ impl SqliteStore {
         let health = semantic_neighborhood_health(&rows);
         Ok(SemanticNeighborhoodSummary {
             repository_id: repository_id.to_owned(),
-            collection_name: qdrant_collection_name(repository_id, &projected_model),
+            collection_name: vector_table_name(repository_id, &projected_model),
             embedding_model: projected_model,
             rows,
             health,
@@ -2896,7 +3135,7 @@ impl SqliteStore {
             rows.push(StorageHealthRow {
                 status: StorageHealthStatus::Error,
                 label: "missing_collection".to_owned(),
-                detail: "Embeddable chunks exist, but no chunks have recorded Qdrant point IDs."
+                detail: "Embeddable chunks exist, but no chunks have recorded vector point IDs."
                     .to_owned(),
             });
         }
@@ -2905,7 +3144,7 @@ impl SqliteStore {
                 status: StorageHealthStatus::Warning,
                 label: "missing_vectors".to_owned(),
                 detail: format!(
-                    "{} embeddable chunks are missing recorded Qdrant point IDs.",
+                    "{} embeddable chunks are missing recorded vector point IDs.",
                     projection.missing_vector_chunks
                 ),
             });
@@ -2952,14 +3191,14 @@ impl SqliteStore {
                 status: StorageHealthStatus::Ok,
                 label: "cross_store_ok".to_owned(),
                 detail:
-                    "SQLite chunk metadata and recorded Qdrant projection metadata are aligned."
+                    "SQLite chunk metadata and recorded vector projection metadata are aligned."
                         .to_owned(),
             });
         }
 
         Ok(CrossStoreHealthSummary {
             repository_id: repository_id.to_owned(),
-            collection_name: qdrant_collection_name(repository_id, projected_model),
+            collection_name: vector_table_name(repository_id, projected_model),
             rows,
         })
     }
@@ -3111,10 +3350,10 @@ impl SqliteStore {
             .query_row(
                 "SELECT
                    COALESCE(SUM(CASE WHEN chunks.excluded_reason IS NULL THEN 1 ELSE 0 END), 0),
-                                     COALESCE(SUM(CASE WHEN chunk_embeddings.qdrant_point_id IS NOT NULL THEN 1 ELSE 0 END), 0),
+                                     COALESCE(SUM(CASE WHEN chunk_embeddings.vector_point_id IS NOT NULL THEN 1 ELSE 0 END), 0),
                    COALESCE(SUM(CASE WHEN chunks.excluded_reason IS NOT NULL THEN 1 ELSE 0 END), 0),
                    COALESCE(SUM(CASE
-                                         WHEN chunks.excluded_reason IS NULL AND chunk_embeddings.qdrant_point_id IS NULL
+                                         WHEN chunks.excluded_reason IS NULL AND chunk_embeddings.vector_point_id IS NULL
                      THEN 1 ELSE 0 END), 0)
                  FROM chunks
                  JOIN files ON chunks.file_id = files.id
@@ -3368,7 +3607,7 @@ pub struct ChunkRecord {
     pub end_line: usize,
     pub start_byte: usize,
     pub end_byte: usize,
-    pub qdrant_point_id: Option<String>,
+    pub vector_point_id: Option<String>,
     pub excluded_reason: Option<String>,
     pub index_run_id: String,
     pub parser_version: String,
@@ -3451,6 +3690,41 @@ pub struct RepositoryStatus {
     pub embedding_dimension: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WatcherStatusRecord {
+    pub repository_id: String,
+    pub root_path: String,
+    pub mode: String,
+    pub owner_kind: String,
+    pub owner_pid: Option<i32>,
+    pub socket_path: Option<String>,
+    pub state: String,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub files_seen: usize,
+    pub queued_events: usize,
+    pub last_indexed_path: Option<String>,
+    pub last_error: Option<String>,
+    pub active_layer: Option<String>,
+    pub quality_status: Option<String>,
+    pub quality_pending_jobs: usize,
+    pub quality_running_jobs: usize,
+    pub quality_failed_jobs: usize,
+    pub quality_stale_jobs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WatcherClientRecord {
+    pub repository_id: String,
+    pub client_id: String,
+    pub client_kind: String,
+    pub pid: Option<i32>,
+    pub started_at: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub last_seen_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRunRecord {
     pub id: String,
@@ -3494,7 +3768,7 @@ pub struct FastEmbeddingManifestRecord {
     pub chunk_id: String,
     pub content_hash: String,
     pub text_hash: String,
-    pub qdrant_point_id: String,
+    pub vector_point_id: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3502,7 +3776,7 @@ pub struct FastSemanticGenerationInput<'a> {
     pub repository_id: &'a str,
     pub fast_model: &'a str,
     pub fast_dimension: usize,
-    pub qdrant_collection: &'a str,
+    pub vector_table: &'a str,
     pub upserted_embeddings: &'a [FastEmbeddingManifestRecord],
     pub files_seen: usize,
     pub completed_at: &'a str,
@@ -3526,7 +3800,7 @@ pub struct SemanticLayerManifestSummary {
     pub semantic_layer: SemanticLayer,
     pub embedding_model: String,
     pub embedding_dimension: usize,
-    pub qdrant_collection: String,
+    pub vector_table: String,
     pub current_chunks: usize,
     pub stale_chunks: usize,
     pub blocked_chunks: usize,
@@ -3543,13 +3817,13 @@ impl SemanticLayerManifestSummary {
         expected_chunks: usize,
         embedding_model: String,
         embedding_dimension: usize,
-        qdrant_collection: String,
+        vector_table: String,
     ) -> Self {
         Self {
             semantic_layer,
             embedding_model,
             embedding_dimension,
-            qdrant_collection,
+            vector_table,
             current_chunks: 0,
             stale_chunks: 0,
             blocked_chunks: 0,
@@ -3585,7 +3859,7 @@ impl SemanticLayerManifestSummary {
             semantic_layer,
             embedding_model: aggregate.embedding_model,
             embedding_dimension,
-            qdrant_collection: aggregate.qdrant_collection,
+            vector_table: aggregate.vector_table,
             current_chunks,
             stale_chunks,
             blocked_chunks,
@@ -3602,7 +3876,7 @@ impl SemanticLayerManifestSummary {
 struct SemanticLayerManifestAggregate {
     embedding_model: String,
     embedding_dimension: i64,
-    qdrant_collection: String,
+    vector_table: String,
     current_chunks: i64,
     stale_chunks: i64,
     blocked_chunks: i64,
@@ -3622,8 +3896,8 @@ pub struct ChunkEmbeddingRecord {
     pub embedding_dimension: usize,
     pub content_hash: String,
     pub text_hash: String,
-    pub qdrant_collection: String,
-    pub qdrant_point_id: String,
+    pub vector_table: String,
+    pub vector_point_id: String,
     pub generation_id: String,
     pub embedded_at: String,
     pub status: String,
@@ -3693,6 +3967,9 @@ pub enum QualityJobCompletion {
         error_summary: String,
     },
     SkippedStale,
+    SkippedExcluded {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3700,6 +3977,8 @@ pub struct QualityGenerationProgress {
     pub repository_id: String,
     pub generation_id: String,
     pub embeddable_chunks: usize,
+    pub quality_eligible_chunks: usize,
+    pub quality_ineligible_chunks: usize,
     pub quality_embedded_chunks: usize,
     pub pending_jobs: usize,
     pub running_jobs: usize,
@@ -3764,7 +4043,7 @@ pub struct EmbeddingIndexMetadata {
 pub struct StorageExplorerSummary {
     pub repository_id: String,
     pub sqlite: SqliteStorageSummary,
-    pub qdrant: QdrantStorageProjection,
+    pub vector: VectorStorageProjection,
     pub warnings: Vec<StorageHealthRow>,
 }
 
@@ -3779,7 +4058,7 @@ pub struct SqliteStorageSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QdrantStorageProjection {
+pub struct VectorStorageProjection {
     pub collection_name: String,
     pub embedding_model: String,
     pub embedding_dimension: Option<usize>,
@@ -3790,8 +4069,8 @@ pub struct QdrantStorageProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QdrantExpectedPoint {
-    pub qdrant_point_id: String,
+pub struct ExpectedVectorPoint {
+    pub vector_point_id: String,
     pub chunk_id: String,
     pub path: String,
     pub start_line: usize,
@@ -3986,7 +4265,7 @@ pub struct SemanticNeighborhoodSummary {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticNeighborhoodRow {
-    pub qdrant_point_id: String,
+    pub vector_point_id: String,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -4167,11 +4446,8 @@ fn env_value(upper: &str, legacy: &str) -> Option<String> {
 pub enum StoreError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
-    HttpClient(reqwest::Error),
-    HttpRequest(reqwest::Error),
-    HttpStatus(reqwest::Error),
-    Decode(reqwest::Error),
-    InvalidCollectionName(String),
+    SqliteVecRegistration(symdex_sqlite_vec::SqliteVecRegistrationError),
+    InvalidVectorTableName(String),
     InvalidPointId(String),
     InvalidVectorSize(usize),
     InvalidLimit(usize),
@@ -4190,18 +4466,15 @@ impl Display for StoreError {
         match self {
             Self::Io(error) => write!(f, "filesystem error: {error}"),
             Self::Sqlite(error) => write!(f, "SQLite error: {error}"),
-            Self::HttpClient(error) => write!(f, "failed to create HTTP client: {error}"),
-            Self::HttpRequest(error) => write!(f, "Qdrant request failed: {error}"),
-            Self::HttpStatus(error) => write!(f, "Qdrant returned an error status: {error}"),
-            Self::Decode(error) => write!(f, "failed to decode Qdrant response: {error}"),
-            Self::InvalidCollectionName(name) => {
-                write!(f, "invalid Qdrant collection name `{name}`")
+            Self::SqliteVecRegistration(error) => write!(f, "{error}"),
+            Self::InvalidVectorTableName(name) => {
+                write!(f, "invalid sqlite-vec table name `{name}`")
             }
-            Self::InvalidPointId(id) => write!(f, "invalid Qdrant point id source `{id}`"),
-            Self::InvalidVectorSize(size) => write!(f, "invalid Qdrant vector size `{size}`"),
-            Self::InvalidLimit(limit) => write!(f, "invalid Qdrant query limit `{limit}`"),
+            Self::InvalidPointId(id) => write!(f, "invalid vector point id source `{id}`"),
+            Self::InvalidVectorSize(size) => write!(f, "invalid vector size `{size}`"),
+            Self::InvalidLimit(limit) => write!(f, "invalid vector query limit `{limit}`"),
             Self::InconsistentVectorDimensions => {
-                write!(f, "Qdrant points have inconsistent vector dimensions")
+                write!(f, "vector points have inconsistent vector dimensions")
             }
             Self::EmbeddingDimensionChanged {
                 repository_id,
@@ -4212,7 +4485,9 @@ impl Display for StoreError {
                 f,
                 "embedding dimension changed for repository `{repository_id}` and model `{embedding_model}`: previous={previous_dimension} current={current_dimension}; reset the collection or use a new model name before reindexing"
             ),
-            Self::UnexpectedResponse(message) => write!(f, "unexpected Qdrant response: {message}"),
+            Self::UnexpectedResponse(message) => {
+                write!(f, "unexpected vector store response: {message}")
+            }
         }
     }
 }
@@ -4427,10 +4702,11 @@ fn upsert_chunk_embedding_in_transaction(
         .execute(
             "INSERT INTO chunk_embeddings (
                id, repository_id, file_id, chunk_id, semantic_layer, embedding_model,
-               embedding_dimension, content_hash, text_hash, qdrant_collection,
-               qdrant_point_id, generation_id, embedded_at, status
+               embedding_dimension, content_hash, text_hash, vector_table,
+               vector_point_id, vector_store, vector_rowid,
+               generation_id, embedded_at, status
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'sqlite_vec', ?12, ?13, ?14, ?15)
              ON CONFLICT(chunk_id, semantic_layer, embedding_model, embedding_dimension)
              DO UPDATE SET
                id = excluded.id,
@@ -4438,8 +4714,10 @@ fn upsert_chunk_embedding_in_transaction(
                file_id = excluded.file_id,
                content_hash = excluded.content_hash,
                text_hash = excluded.text_hash,
-               qdrant_collection = excluded.qdrant_collection,
-               qdrant_point_id = excluded.qdrant_point_id,
+               vector_table = excluded.vector_table,
+               vector_point_id = excluded.vector_point_id,
+               vector_store = excluded.vector_store,
+               vector_rowid = excluded.vector_rowid,
                generation_id = excluded.generation_id,
                embedded_at = excluded.embedded_at,
                status = excluded.status",
@@ -4453,8 +4731,9 @@ fn upsert_chunk_embedding_in_transaction(
                 embedding.embedding_dimension as i64,
                 embedding.content_hash,
                 embedding.text_hash,
-                embedding.qdrant_collection,
-                embedding.qdrant_point_id,
+                embedding.vector_table,
+                embedding.vector_point_id,
+                vector_rowid(&embedding.vector_point_id)?,
                 embedding.generation_id,
                 embedding.embedded_at,
                 embedding.status,
@@ -4477,7 +4756,7 @@ fn current_fast_embedding_manifest(
     let mut statement = transaction
         .prepare(
             "SELECT chunk_embeddings.file_id, chunk_embeddings.chunk_id,
-                    files.content_hash, chunks.text_hash, chunk_embeddings.qdrant_point_id
+                    files.content_hash, chunks.text_hash, chunk_embeddings.vector_point_id
              FROM chunk_embeddings
              JOIN chunks ON chunk_embeddings.chunk_id = chunks.id
              JOIN files ON chunk_embeddings.file_id = files.id
@@ -4487,6 +4766,7 @@ fn current_fast_embedding_manifest(
                AND chunk_embeddings.semantic_layer = 'fast'
                AND chunk_embeddings.embedding_model = ?2
                AND chunk_embeddings.embedding_dimension = ?3
+               AND chunk_embeddings.vector_store = 'sqlite_vec'
                AND chunk_embeddings.status = 'current'
                AND chunks.excluded_reason IS NULL
              ORDER BY chunk_embeddings.chunk_id",
@@ -4501,7 +4781,7 @@ fn current_fast_embedding_manifest(
                     chunk_id: row.get(1)?,
                     content_hash: row.get(2)?,
                     text_hash: row.get(3)?,
-                    qdrant_point_id: row.get(4)?,
+                    vector_point_id: row.get(4)?,
                 })
             },
         )
@@ -4595,8 +4875,8 @@ fn chunk_embedding_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkEmbe
         embedding_dimension: row.get::<_, i64>(6)? as usize,
         content_hash: row.get(7)?,
         text_hash: row.get(8)?,
-        qdrant_collection: row.get(9)?,
-        qdrant_point_id: row.get(10)?,
+        vector_table: row.get(9)?,
+        vector_point_id: row.get(10)?,
         generation_id: row.get(11)?,
         embedded_at: row.get(12)?,
         status: row.get(13)?,
@@ -4654,6 +4934,43 @@ fn quality_job_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QualityJo
         symbol_name: row.get(24)?,
         index_run_id: row.get(25)?,
         parser_version: row.get(26)?,
+    })
+}
+
+fn watcher_status_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatcherStatusRecord> {
+    Ok(WatcherStatusRecord {
+        repository_id: row.get(0)?,
+        root_path: row.get(1)?,
+        mode: row.get(2)?,
+        owner_kind: row.get(3)?,
+        owner_pid: row.get::<_, Option<i64>>(4)?.map(|pid| pid as i32),
+        socket_path: row.get(5)?,
+        state: row.get(6)?,
+        started_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        heartbeat_at: row.get(9)?,
+        files_seen: row.get::<_, i64>(10)? as usize,
+        queued_events: row.get::<_, i64>(11)? as usize,
+        last_indexed_path: row.get(12)?,
+        last_error: row.get(13)?,
+        active_layer: row.get(14)?,
+        quality_status: row.get(15)?,
+        quality_pending_jobs: row.get::<_, i64>(16)? as usize,
+        quality_running_jobs: row.get::<_, i64>(17)? as usize,
+        quality_failed_jobs: row.get::<_, i64>(18)? as usize,
+        quality_stale_jobs: row.get::<_, i64>(19)? as usize,
+    })
+}
+
+fn watcher_client_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatcherClientRecord> {
+    Ok(WatcherClientRecord {
+        repository_id: row.get(0)?,
+        client_id: row.get(1)?,
+        client_kind: row.get(2)?,
+        pid: row.get::<_, Option<i64>>(3)?.map(|pid| pid as i32),
+        started_at: row.get(4)?,
+        heartbeat_at: row.get(5)?,
+        last_seen_at: row.get(6)?,
     })
 }
 
@@ -4911,7 +5228,7 @@ struct SymbolOutlineBaseRow {
 
 fn storage_warnings(
     sqlite: &SqliteStorageSummary,
-    qdrant: &QdrantStorageProjection,
+    vector: &VectorStorageProjection,
 ) -> Vec<StorageHealthRow> {
     let mut rows = Vec::new();
     if sqlite.repositories == 0 {
@@ -4928,23 +5245,23 @@ fn storage_warnings(
             detail: "No index run metadata has been recorded yet.".to_owned(),
         });
     }
-    if qdrant.missing_vector_chunks > 0 {
+    if vector.missing_vector_chunks > 0 {
         rows.push(StorageHealthRow {
             status: StorageHealthStatus::Warning,
             label: "missing_vectors".to_owned(),
             detail: format!(
-                "{} embeddable chunks do not have Qdrant point IDs.",
-                qdrant.missing_vector_chunks
+                "{} embeddable chunks do not have vector point IDs.",
+                vector.missing_vector_chunks
             ),
         });
     }
-    if qdrant.excluded_chunks > 0 {
+    if vector.excluded_chunks > 0 {
         rows.push(StorageHealthRow {
             status: StorageHealthStatus::Warning,
             label: "excluded_chunks".to_owned(),
             detail: format!(
                 "{} chunks are intentionally metadata-only.",
-                qdrant.excluded_chunks
+                vector.excluded_chunks
             ),
         });
     }
@@ -4970,7 +5287,7 @@ fn embedding_coverage_health(
             status: StorageHealthStatus::Warning,
             label: "missing_vectors".to_owned(),
             detail: format!(
-                "{} embeddable chunks have no recorded Qdrant point ID.",
+                "{} embeddable chunks have no recorded vector point ID.",
                 projection.missing_vector_chunks
             ),
         });
@@ -5046,7 +5363,7 @@ fn semantic_neighborhood_health(rows: &[SemanticNeighborhoodRow]) -> Vec<Storage
         status: StorageHealthStatus::Ok,
         label: "metadata_only".to_owned(),
         detail: format!(
-            "{} Qdrant payload metadata rows are available without source text.",
+            "{} vector metadata metadata rows are available without source text.",
             rows.len()
         ),
     }]
@@ -5176,7 +5493,7 @@ struct ProvenanceColumn {
     alter_sql: &'static str,
 }
 
-const PROVENANCE_COLUMNS: &[ProvenanceColumn] = &[
+const COMPATIBILITY_COLUMNS: &[ProvenanceColumn] = &[
     ProvenanceColumn {
         table: "index_runs",
         name: "parser_version",
@@ -5247,6 +5564,26 @@ const PROVENANCE_COLUMNS: &[ProvenanceColumn] = &[
         name: "parser_version",
         alter_sql: "ALTER TABLE calls ADD COLUMN parser_version TEXT",
     },
+    ProvenanceColumn {
+        table: "chunk_embeddings",
+        name: "vector_store",
+        alter_sql: "ALTER TABLE chunk_embeddings ADD COLUMN vector_store TEXT NOT NULL DEFAULT 'legacy_qdrant'",
+    },
+    ProvenanceColumn {
+        table: "chunk_embeddings",
+        name: "vector_table",
+        alter_sql: "ALTER TABLE chunk_embeddings ADD COLUMN vector_table TEXT",
+    },
+    ProvenanceColumn {
+        table: "chunk_embeddings",
+        name: "vector_point_id",
+        alter_sql: "ALTER TABLE chunk_embeddings ADD COLUMN vector_point_id TEXT",
+    },
+    ProvenanceColumn {
+        table: "chunk_embeddings",
+        name: "vector_rowid",
+        alter_sql: "ALTER TABLE chunk_embeddings ADD COLUMN vector_rowid INTEGER",
+    },
 ];
 
 const SCHEMA: &str = r#"
@@ -5272,6 +5609,42 @@ CREATE TABLE IF NOT EXISTS index_runs (
   parser_version TEXT,
   indexer_version TEXT,
   run_kind TEXT NOT NULL DEFAULT 'manual'
+);
+
+CREATE TABLE IF NOT EXISTS watchers (
+  repository_id TEXT PRIMARY KEY,
+  root_path TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  owner_kind TEXT NOT NULL,
+  owner_pid INTEGER,
+  socket_path TEXT,
+  state TEXT NOT NULL,
+  started_at TEXT,
+  updated_at TEXT,
+  heartbeat_at TEXT,
+  files_seen INTEGER NOT NULL DEFAULT 0,
+  queued_events INTEGER NOT NULL DEFAULT 0,
+  last_indexed_path TEXT,
+  last_error TEXT,
+  active_layer TEXT,
+  quality_status TEXT,
+  quality_pending_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_running_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_failed_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_stale_jobs INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS watcher_clients (
+  repository_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  client_kind TEXT NOT NULL,
+  pid INTEGER,
+  started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  PRIMARY KEY(repository_id, client_id),
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -5314,7 +5687,7 @@ CREATE TABLE IF NOT EXISTS chunks (
   end_line INTEGER NOT NULL,
   start_byte INTEGER NOT NULL,
   end_byte INTEGER NOT NULL,
-  qdrant_point_id TEXT,
+  vector_point_id TEXT,
   excluded_reason TEXT,
   index_run_id TEXT,
   parser_version TEXT,
@@ -5399,8 +5772,10 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
     embedding_dimension INTEGER NOT NULL,
     content_hash TEXT NOT NULL,
     text_hash TEXT NOT NULL,
-    qdrant_collection TEXT NOT NULL,
-    qdrant_point_id TEXT NOT NULL,
+    vector_table TEXT NOT NULL,
+    vector_point_id TEXT NOT NULL,
+    vector_store TEXT NOT NULL DEFAULT 'sqlite_vec',
+    vector_rowid INTEGER,
     generation_id TEXT NOT NULL,
     embedded_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'current',
@@ -5411,6 +5786,32 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
     FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
     FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE,
     FOREIGN KEY(generation_id) REFERENCES semantic_generations(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS vector_points (
+  vector_store TEXT NOT NULL,
+  vector_table TEXT NOT NULL,
+  vector_rowid INTEGER NOT NULL,
+  vector_point_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  symbol_id TEXT,
+  symbol_name TEXT,
+  path TEXT NOT NULL,
+  language TEXT NOT NULL,
+  chunk_kind TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  text_hash TEXT NOT NULL,
+  parser_version TEXT,
+  content_hash TEXT,
+  index_run_id TEXT,
+  embedding_model TEXT,
+  embedding_dimension INTEGER,
+  indexed_at TEXT,
+  PRIMARY KEY(vector_store, vector_table, vector_point_id),
+  UNIQUE(vector_store, vector_table, vector_rowid)
 );
 
 CREATE TABLE IF NOT EXISTS quality_embedding_jobs (
@@ -5453,7 +5854,11 @@ CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_generation_chunk ON chunk_embeddings(generation_id, chunk_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_generation_layer_status ON chunk_embeddings(repository_id, generation_id, semantic_layer, status);
+CREATE INDEX IF NOT EXISTS idx_vector_points_repository_table ON vector_points(repository_id, vector_store, vector_table);
+CREATE INDEX IF NOT EXISTS idx_vector_points_chunk ON vector_points(chunk_id);
 CREATE INDEX IF NOT EXISTS idx_quality_embedding_jobs_repository_generation_status ON quality_embedding_jobs(repository_id, generation_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_watcher_clients_repository_heartbeat ON watcher_clients(repository_id, heartbeat_at);
 "#;
 
 pub fn current_timestamp() -> String {
@@ -5486,51 +5891,115 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
-        CreateCollectionRequest, DeletePointsRequest, Distance, FastEmbeddingManifestRecord,
-        FastSemanticGenerationInput, FileCoverageStatus, FileRecord, MatchValue, PointPayload,
-        QdrantClient, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
-        QueryPointsRequest, RepositoryFilter, RepositoryFilterCondition, RepositoryRecord,
-        ScrollPointsRequest, SemanticGenerationRecord, SqliteStore, StorageHealthStatus,
-        StoreConfig, StoreError, SymbolRecord, TestRecord, UpsertPointsRequest, VectorParams,
-        VectorPoint, qdrant_collection_name, qdrant_point_id, validate_collection_name,
+        FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus, FileRecord,
+        PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
+        RepositoryRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
+        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, TestRecord, VectorPoint,
+        WatcherClientRecord, WatcherStatusRecord, validate_vector_table_name, vector_point_id,
+        vector_rowid, vector_table_name,
     };
 
     #[test]
     fn collection_name_is_deterministic_and_safe() {
         assert_eq!(
-            qdrant_collection_name("Repo-ID_123", "nomic-embed-text:latest"),
+            vector_table_name("Repo-ID_123", "nomic-embed-text:latest"),
             "symdex_repo_id_123_nomic_embed_text_latest"
         );
     }
 
     #[test]
     fn validates_collection_names() {
-        assert!(validate_collection_name("symdex_repo_model").is_ok());
-        assert!(validate_collection_name("").is_err());
-        assert!(validate_collection_name("../bad").is_err());
+        assert!(validate_vector_table_name("symdex_repo_model").is_ok());
+        assert!(validate_vector_table_name("").is_err());
+        assert!(validate_vector_table_name("../bad").is_err());
     }
 
     #[test]
-    fn create_collection_request_uses_cosine_vectors() {
-        let request = CreateCollectionRequest {
-            vectors: VectorParams {
-                size: 768,
-                distance: Distance::Cosine,
-            },
-        };
-
-        let json = serde_json::to_value(request).expect("request should serialize");
-        assert_eq!(json["vectors"]["size"], 768);
-        assert_eq!(json["vectors"]["distance"], "Cosine");
-    }
-
-    #[test]
-    fn qdrant_point_id_formats_stable_hash_as_uuid() {
+    fn vector_point_id_formats_stable_hash_as_uuid() {
         assert_eq!(
-            qdrant_point_id("0123456789abcdeffedcba9876543210").expect("point id should format"),
+            vector_point_id("0123456789abcdeffedcba9876543210").expect("point id should format"),
             "01234567-89ab-cdef-fedc-ba9876543210"
         );
-        assert!(qdrant_point_id("not-hex").is_err());
+        assert!(vector_point_id("not-hex").is_err());
+    }
+
+    #[test]
+    fn vector_rowid_is_stable_and_positive() {
+        assert_eq!(
+            vector_rowid("01234567-89ab-cdef-fedc-ba9876543210").expect("rowid should derive"),
+            81_985_529_216_486_895
+        );
+        assert_eq!(
+            vector_rowid("point-chunk-1").expect("arbitrary point ids should derive"),
+            vector_rowid("point-chunk-1").expect("arbitrary point ids should derive")
+        );
+        assert!(vector_rowid("").is_err());
+    }
+
+    #[test]
+    fn sqlite_vec_health_check_reports_version() {
+        let db = TestDb::new("sqlite-vec-health");
+        let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
+        let version = vector_store
+            .health_check()
+            .expect("sqlite-vec should report a version");
+        assert!(version.starts_with("v"));
+    }
+
+    #[test]
+    fn sqlite_vec_upserts_queries_scrolls_and_deletes_points() {
+        let db = TestDb::new("sqlite-vec-roundtrip");
+        let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
+        let table = vector_table_name("repo", "nomic-embed-text");
+        vector_store
+            .ensure_table(&table, 2)
+            .expect("vector table should be created");
+
+        let first = vector_point_id("0123456789abcdeffedcba9876543210")
+            .expect("first point id should format");
+        let second = vector_point_id("11111111111111112222222222222222")
+            .expect("second point id should format");
+        vector_store
+            .upsert_points(
+                &table,
+                &[
+                    VectorPoint {
+                        id: first.clone(),
+                        vector: vec![1.0, 0.0],
+                        payload: sample_payload(),
+                    },
+                    VectorPoint {
+                        id: second.clone(),
+                        vector: vec![0.0, 1.0],
+                        payload: PointPayload {
+                            chunk_id: "chunk-2".to_owned(),
+                            text_hash: "hash-2".to_owned(),
+                            ..sample_payload()
+                        },
+                    },
+                ],
+            )
+            .expect("points should upsert");
+
+        let results = vector_store
+            .query_points(&table, vec![1.0, 0.0], 1)
+            .expect("query should run");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, first);
+        assert_eq!(results[0].payload.path, "src/lib.rs");
+
+        let scrolled = vector_store
+            .scroll_points_for_repository(&table, "repo")
+            .expect("points should scroll");
+        assert_eq!(scrolled.len(), 2);
+
+        vector_store
+            .delete_points(&table, &[first.clone(), second])
+            .expect("points should delete");
+        let scrolled = vector_store
+            .scroll_points_for_repository(&table, "repo")
+            .expect("empty points should scroll");
+        assert!(scrolled.is_empty());
     }
 
     #[test]
@@ -5555,89 +6024,6 @@ mod tests {
             crate::freshness_for_hash(None, None),
             crate::EvidenceFreshness::Unknown
         );
-    }
-
-    #[test]
-    fn upsert_points_request_uses_payload_without_source_text() {
-        let point = VectorPoint {
-            id: "01234567-89ab-cdef-fedc-ba9876543210".to_owned(),
-            vector: vec![0.1, 0.2],
-            payload: sample_payload(),
-        };
-        let points = vec![point];
-        let request = UpsertPointsRequest { points: &points };
-
-        let json = serde_json::to_value(request).expect("request should serialize");
-
-        assert_eq!(
-            json["points"][0]["id"],
-            "01234567-89ab-cdef-fedc-ba9876543210"
-        );
-        assert_eq!(
-            json["points"][0]["vector"].as_array().expect("vector")[0]
-                .as_f64()
-                .expect("number") as f32,
-            0.1
-        );
-        assert_eq!(json["points"][0]["payload"]["path"], "src/lib.rs");
-        assert!(json["points"][0]["payload"].get("source_text").is_none());
-    }
-
-    #[test]
-    fn query_points_request_asks_for_payload_not_vectors() {
-        let request = QueryPointsRequest {
-            query: vec![0.1, 0.2],
-            limit: 5,
-            with_payload: true,
-            with_vector: false,
-        };
-
-        let json = serde_json::to_value(request).expect("request should serialize");
-
-        assert_eq!(
-            json["query"].as_array().expect("query")[1]
-                .as_f64()
-                .expect("number") as f32,
-            0.2
-        );
-        assert_eq!(json["limit"], 5);
-        assert_eq!(json["with_payload"], true);
-        assert_eq!(json["with_vector"], false);
-    }
-
-    #[test]
-    fn delete_points_request_uses_point_ids_without_source_text() {
-        let point_ids = vec!["01234567-89ab-cdef-fedc-ba9876543210".to_owned()];
-        let request = DeletePointsRequest { points: &point_ids };
-
-        let json = serde_json::to_value(request).expect("request should serialize");
-
-        assert_eq!(json["points"][0], "01234567-89ab-cdef-fedc-ba9876543210");
-        assert!(json.get("source_text").is_none());
-    }
-
-    #[test]
-    fn scroll_points_request_filters_by_repository_without_source_text() {
-        let request = ScrollPointsRequest {
-            filter: RepositoryFilter {
-                must: vec![RepositoryFilterCondition {
-                    key: "repository_id",
-                    value_match: MatchValue { value: "repo" },
-                }],
-            },
-            limit: 256,
-            with_payload: true,
-            with_vector: false,
-            offset: None,
-        };
-
-        let json = serde_json::to_value(request).expect("request should serialize");
-
-        assert_eq!(json["filter"]["must"][0]["key"], "repository_id");
-        assert_eq!(json["filter"]["must"][0]["match"]["value"], "repo");
-        assert_eq!(json["with_payload"], true);
-        assert_eq!(json["with_vector"], false);
-        assert!(json.get("source_text").is_none());
     }
 
     #[test]
@@ -5813,16 +6199,11 @@ mod tests {
         job.id = SqliteStore::quality_embedding_job_id("repo", "generation-1", "chunk-1");
 
         let first = store
-            .queue_quality_embedding_jobs(
-                &generation,
-                "nomic-embed-text-v2-moe",
-                &[job.clone()],
-                "200",
-            )
+            .queue_quality_embedding_jobs(&generation, "mxbai-embed-large", &[job.clone()], "200")
             .expect("quality jobs should queue");
         job.updated_at = "201".to_owned();
         let second = store
-            .queue_quality_embedding_jobs(&generation, "nomic-embed-text-v2-moe", &[job], "201")
+            .queue_quality_embedding_jobs(&generation, "mxbai-embed-large", &[job], "201")
             .expect("quality jobs should upsert idempotently");
 
         assert_eq!(first.queued_jobs, 1);
@@ -5840,7 +6221,7 @@ mod tests {
         assert_eq!(generation.quality_status, "quality_pending");
         assert_eq!(
             generation.quality_model.as_deref(),
-            Some("nomic-embed-text-v2-moe")
+            Some("mxbai-embed-large")
         );
         assert_eq!(generation.quality_dimension, None);
         assert_eq!(generation.active_layer, "fast");
@@ -5961,7 +6342,7 @@ mod tests {
             .expect("generation should persist");
 
         let summary = store
-            .mark_quality_generation_blocked(&generation, "nomic-embed-text-v2-moe", "400")
+            .mark_quality_generation_blocked(&generation, "mxbai-embed-large", "400")
             .expect("generation should be marked blocked");
 
         assert_eq!(summary.quality_status, SemanticLayerStatus::QualityBlocked);
@@ -5980,7 +6361,7 @@ mod tests {
         assert_eq!(generation.quality_status, "quality_blocked");
         assert_eq!(
             generation.quality_model.as_deref(),
-            Some("nomic-embed-text-v2-moe")
+            Some("mxbai-embed-large")
         );
         assert_eq!(generation.quality_dimension, None);
         assert_eq!(generation.active_layer, "fast");
@@ -6180,7 +6561,7 @@ mod tests {
                 id: "fast-embedding-2".to_owned(),
                 chunk_id: "chunk-2".to_owned(),
                 text_hash: "text-chunk-2".to_owned(),
-                qdrant_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
+                vector_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
                 ..sample_chunk_embedding()
             })
             .expect("second fast embedding should persist");
@@ -6189,7 +6570,7 @@ mod tests {
             .quality_embedding_jobs_for_fast_generation(
                 "repo",
                 "generation-1",
-                "nomic-embed-text-v2-moe",
+                "mxbai-embed-large",
                 "500",
             )
             .expect("quality jobs should load");
@@ -6239,7 +6620,7 @@ mod tests {
                 generation_id: "generation-2".to_owned(),
                 chunk_id: "chunk-2".to_owned(),
                 text_hash: "text-chunk-2".to_owned(),
-                qdrant_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
+                vector_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
                 ..sample_chunk_embedding()
             })
             .expect("second fast embedding should persist");
@@ -6248,14 +6629,14 @@ mod tests {
             .carry_forward_quality_embeddings_for_fast_generation(
                 "repo",
                 "generation-2",
-                "nomic-embed-text-v2-moe",
+                "mxbai-embed-large",
             )
             .expect("quality embeddings should carry forward");
         let jobs = store
             .quality_embedding_jobs_for_fast_generation(
                 "repo",
                 "generation-2",
-                "nomic-embed-text-v2-moe",
+                "mxbai-embed-large",
                 "500",
             )
             .expect("quality jobs should load");
@@ -6371,6 +6752,53 @@ mod tests {
             QualityActivationReason::QualityCoverageIncomplete
         );
         assert_eq!(summary.progress.quality_embedded_chunks, 1);
+    }
+
+    #[test]
+    fn quality_activation_treats_skipped_excluded_jobs_as_complete_coverage() {
+        let db = TestDb::new("quality-activation-excluded-coverage");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        let mut generation = sample_semantic_generation();
+        generation.embeddable_chunks = 2;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
+            .expect("quality embedding should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-2",
+                "skipped_excluded",
+            ))
+            .expect("excluded job should persist");
+
+        let summary = store
+            .refresh_quality_activation("repo", "generation-1", Some(768), "700")
+            .expect("activation should refresh");
+
+        assert_eq!(summary.quality_status, SemanticLayerStatus::QualityReady);
+        assert_eq!(summary.active_layer, SemanticLayer::Quality);
+        assert_eq!(summary.reason, QualityActivationReason::QualityComplete);
+        assert_eq!(summary.progress.embeddable_chunks, 2);
+        assert_eq!(summary.progress.quality_eligible_chunks, 1);
+        assert_eq!(summary.progress.quality_ineligible_chunks, 1);
+        assert_eq!(summary.progress.quality_embedded_chunks, 1);
+
+        let routing = store
+            .semantic_routing_summary("repo")
+            .expect("routing summary should load")
+            .expect("routing summary should exist");
+        let quality = routing.quality.expect("quality manifest should exist");
+        assert_eq!(quality.expected_chunks, 1);
+        assert_eq!(quality.current_chunks, 1);
+        assert!(quality.is_complete);
     }
 
     #[test]
@@ -6498,14 +6926,14 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                qdrant_collection: "nomic-embed-text-v2-moe",
+                vector_table: "mxbai-embed-large",
                 upserted_embeddings: &fast_manifest,
                 files_seen: 1,
                 completed_at: "100",
             })
             .expect("generation should be recorded");
         let mut quality_generation = generation.clone();
-        quality_generation.quality_model = Some("nomic-embed-text-v2-moe".to_owned());
+        quality_generation.quality_model = Some("mxbai-embed-large".to_owned());
         quality_generation.quality_dimension = Some(768);
         quality_generation.quality_status = "quality_pending".to_owned();
         store
@@ -6526,7 +6954,7 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                qdrant_collection: "nomic-embed-text-v2-moe",
+                vector_table: "mxbai-embed-large",
                 upserted_embeddings: &fast_manifest,
                 files_seen: 1,
                 completed_at: "800",
@@ -6639,11 +7067,8 @@ mod tests {
         let quality = summary.quality.expect("quality summary should exist");
         assert_eq!(summary.active_layer, SemanticLayer::Quality);
         assert_eq!(summary.quality_status, SemanticLayerStatus::QualityReady);
-        assert_eq!(quality.embedding_model, "nomic-embed-text-v2-moe");
-        assert_eq!(
-            quality.qdrant_collection,
-            "symdex_repo_nomic_embed_text_v2_moe"
-        );
+        assert_eq!(quality.embedding_model, "mxbai-embed-large");
+        assert_eq!(quality.vector_table, "symdex_repo_nomic_embed_text_v2_moe");
         assert_eq!(quality.current_chunks, 1);
         assert!(quality.is_complete);
     }
@@ -6718,7 +7143,7 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                qdrant_collection: "symdex_repo_nomic_embed_text",
+                vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &fast_manifest,
                 files_seen: 1,
                 completed_at: "200",
@@ -6755,7 +7180,7 @@ mod tests {
                 && embedding.embedding_dimension == 768
                 && embedding.content_hash == "content-hash"
                 && embedding.status == "current"
-                && !embedding.qdrant_point_id.is_empty()
+                && !embedding.vector_point_id.is_empty()
         }));
     }
 
@@ -6785,7 +7210,7 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                qdrant_collection: "symdex_repo_nomic_embed_text",
+                vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &first_manifest,
                 files_seen: 1,
                 completed_at: "200",
@@ -6796,7 +7221,7 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                qdrant_collection: "symdex_repo_nomic_embed_text",
+                vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &first_manifest,
                 files_seen: 1,
                 completed_at: "201",
@@ -6825,7 +7250,7 @@ mod tests {
                 repository_id: "repo",
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
-                qdrant_collection: "symdex_repo_nomic_embed_text",
+                vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &changed_manifest,
                 files_seen: 1,
                 completed_at: "202",
@@ -7004,8 +7429,8 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_collects_layered_qdrant_point_ids_before_replacement_and_deletion() {
-        let db = TestDb::new("qdrant-point-cleanup");
+    fn sqlite_collects_layered_vector_point_ids_before_replacement_and_deletion() {
+        let db = TestDb::new("vector-point-cleanup");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
         store.migrate().expect("migration should run");
         store
@@ -7020,7 +7445,7 @@ mod tests {
         other_file.path = "src/other.rs".to_owned();
         let mut other_chunk = sample_chunk("other-chunk");
         other_chunk.file_id = "other-file".to_owned();
-        other_chunk.qdrant_point_id = Some("11111111-1111-1111-1111-111111111111".to_owned());
+        other_chunk.vector_point_id = Some("11111111-1111-1111-1111-111111111111".to_owned());
 
         store
             .replace_file_facts(&sample_file("hash-1"), &[], &[sample_chunk("chunk-1")], &[])
@@ -7041,13 +7466,13 @@ mod tests {
                 chunk_id: "other-chunk".to_owned(),
                 content_hash: "hash-other".to_owned(),
                 text_hash: "text-other-chunk".to_owned(),
-                qdrant_point_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+                vector_point_id: "11111111-1111-1111-1111-111111111111".to_owned(),
                 ..sample_chunk_embedding()
             })
             .expect("other embedding should persist");
 
         let replaced = store
-            .qdrant_point_ids_for_latest_generation_layer_paths(
+            .vector_point_ids_for_latest_generation_layer_paths(
                 "repo",
                 SemanticLayer::Fast,
                 &["src/lib.rs".to_owned()],
@@ -7056,7 +7481,7 @@ mod tests {
         assert_eq!(replaced, vec!["01234567-89ab-cdef-fedc-ba9876543210"]);
 
         let missing = store
-            .qdrant_point_ids_for_latest_generation_layer_missing_files(
+            .vector_point_ids_for_latest_generation_layer_missing_files(
                 "repo",
                 SemanticLayer::Fast,
                 &["src/lib.rs".to_owned()],
@@ -7066,8 +7491,8 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_builds_layered_qdrant_expected_point_manifest() {
-        let db = TestDb::new("layered-qdrant-expected-points");
+    fn sqlite_builds_layered_expected_vector_point_manifest() {
+        let db = TestDb::new("layered-vector-expected-points");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
         store.migrate().expect("migration should run");
         store
@@ -7095,14 +7520,14 @@ mod tests {
             .expect("quality embedding should persist");
 
         let fast = store
-            .qdrant_expected_points_for_generation_layer(
+            .expected_vector_points_for_generation_layer(
                 "repo",
                 "generation-1",
                 SemanticLayer::Fast,
             )
             .expect("fast manifest should load");
         let quality = store
-            .qdrant_expected_points_for_generation_layer(
+            .expected_vector_points_for_generation_layer(
                 "repo",
                 "generation-1",
                 SemanticLayer::Quality,
@@ -7114,17 +7539,17 @@ mod tests {
         assert_eq!(quality.len(), 1);
         assert_eq!(
             quality[0].embedding_model.as_deref(),
-            Some("nomic-embed-text-v2-moe")
+            Some("mxbai-embed-large")
         );
         assert_eq!(
-            quality[0].qdrant_point_id,
+            quality[0].vector_point_id,
             "01234567-89ab-cdef-fedc-ba9876543211"
         );
     }
 
     #[test]
-    fn sqlite_layered_qdrant_manifest_uses_current_embeddings_only() {
-        let db = TestDb::new("layered-qdrant-current-only");
+    fn sqlite_layered_vector_manifest_uses_current_embeddings_only() {
+        let db = TestDb::new("layered-vector-current-only");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
         store.migrate().expect("migration should run");
         store
@@ -7149,7 +7574,7 @@ mod tests {
             .expect("stale quality embedding should persist");
 
         let quality = store
-            .qdrant_expected_points_for_generation_layer(
+            .expected_vector_points_for_generation_layer(
                 "repo",
                 "generation-1",
                 SemanticLayer::Quality,
@@ -7647,9 +8072,9 @@ mod tests {
             .expect("repository should persist");
 
         let mut missing_vector = sample_chunk("chunk-missing-vector");
-        missing_vector.qdrant_point_id = None;
+        missing_vector.vector_point_id = None;
         let mut excluded = sample_chunk("chunk-excluded");
-        excluded.qdrant_point_id = None;
+        excluded.vector_point_id = None;
         excluded.excluded_reason = Some("secret_detected".to_owned());
         store
             .replace_file_facts(
@@ -7673,13 +8098,13 @@ mod tests {
         assert_eq!(summary.sqlite.chunks, 3);
         assert_eq!(summary.sqlite.symbols, 1);
         assert_eq!(summary.sqlite.index_runs, 1);
-        assert_eq!(summary.qdrant.embedding_model, "nomic-embed-text");
-        assert_eq!(summary.qdrant.embedding_dimension, Some(768));
-        assert_eq!(summary.qdrant.embeddable_chunks, 2);
-        assert_eq!(summary.qdrant.vector_backed_chunks, 1);
-        assert_eq!(summary.qdrant.excluded_chunks, 1);
-        assert_eq!(summary.qdrant.missing_vector_chunks, 1);
-        assert!(summary.qdrant.collection_name.starts_with("symdex_repo_"));
+        assert_eq!(summary.vector.embedding_model, "nomic-embed-text");
+        assert_eq!(summary.vector.embedding_dimension, Some(768));
+        assert_eq!(summary.vector.embeddable_chunks, 2);
+        assert_eq!(summary.vector.vector_backed_chunks, 1);
+        assert_eq!(summary.vector.excluded_chunks, 1);
+        assert_eq!(summary.vector.missing_vector_chunks, 1);
+        assert!(summary.vector.collection_name.starts_with("symdex_repo_"));
         assert!(summary.warnings.iter().any(
             |row| row.status == StorageHealthStatus::Warning && row.label == "missing_vectors"
         ));
@@ -7780,7 +8205,7 @@ mod tests {
                 files_seen: 5,
                 files_indexed: 2,
                 chunks_embedded: 1,
-                error_summary: Some("qdrant unavailable"),
+                error_summary: Some("vector store unavailable"),
                 run_kind: "watch",
             },
         );
@@ -7799,7 +8224,7 @@ mod tests {
         assert_eq!(summary.runs[0].run_kind, "watch");
         assert_eq!(
             summary.runs[0].error_summary.as_deref(),
-            Some("qdrant unavailable")
+            Some("vector store unavailable")
         );
         assert_eq!(summary.runs[1].id, "run-old");
         assert_eq!(summary.runs[1].run_kind, "semantic");
@@ -7844,7 +8269,7 @@ mod tests {
         run.status = "partial".to_owned();
         run.files_seen = 4;
         run.files_indexed = 3;
-        run.error_summary = Some("qdrant unavailable".to_owned());
+        run.error_summary = Some("vector store unavailable".to_owned());
         store
             .finish_index_run(&run)
             .expect("finished run should persist");
@@ -7871,7 +8296,99 @@ mod tests {
         assert!(finished.1.is_some());
         assert_eq!(finished.2, 4);
         assert_eq!(finished.3, 3);
-        assert_eq!(finished.4.as_deref(), Some("qdrant unavailable"));
+        assert_eq!(finished.4.as_deref(), Some("vector store unavailable"));
+    }
+
+    #[test]
+    fn sqlite_persists_watcher_status() {
+        let db = TestDb::new("watcher-status");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .upsert_watcher_status(&WatcherStatusRecord {
+                repository_id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+                mode: "semantic".to_owned(),
+                owner_kind: "daemon".to_owned(),
+                owner_pid: Some(123),
+                socket_path: Some("/tmp/repo/.symdex/watch.sock".to_owned()),
+                state: "running".to_owned(),
+                started_at: Some("1".to_owned()),
+                updated_at: Some("1".to_owned()),
+                heartbeat_at: Some("1".to_owned()),
+                files_seen: 3,
+                queued_events: 2,
+                last_indexed_path: Some("src/lib.rs".to_owned()),
+                last_error: None,
+                active_layer: Some("fast".to_owned()),
+                quality_status: Some("quality_pending".to_owned()),
+                quality_pending_jobs: 1,
+                quality_running_jobs: 0,
+                quality_failed_jobs: 0,
+                quality_stale_jobs: 0,
+            })
+            .expect("watcher should persist");
+
+        let status = store
+            .watcher_status("repo")
+            .expect("watcher status should load")
+            .expect("watcher should exist");
+
+        assert_eq!(status.state, "running");
+        assert_eq!(status.files_seen, 3);
+        assert_eq!(status.queued_events, 2);
+        assert_eq!(status.last_indexed_path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn sqlite_persists_and_prunes_watcher_clients() {
+        let db = TestDb::new("watcher-clients");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .upsert_watcher_client(&WatcherClientRecord {
+                repository_id: "repo".to_owned(),
+                client_id: "mcp-1".to_owned(),
+                client_kind: "mcp".to_owned(),
+                pid: Some(123),
+                started_at: Some("1".to_owned()),
+                heartbeat_at: Some("1".to_owned()),
+                last_seen_at: None,
+            })
+            .expect("client should persist");
+
+        let clients = store.watcher_clients("repo").expect("clients should load");
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].client_kind, "mcp");
+
+        store
+            .heartbeat_watcher_client("repo", "mcp-1")
+            .expect("heartbeat should update");
+        let clients = store.watcher_clients("repo").expect("clients should load");
+        assert_ne!(clients[0].heartbeat_at.as_deref(), Some("1"));
+
+        let removed = store
+            .prune_stale_watcher_clients("repo", "999999999999")
+            .expect("stale clients should prune");
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .watcher_clients("repo")
+                .expect("clients should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8282,13 +8799,15 @@ mod tests {
     }
 
     #[test]
-    fn live_qdrant_health_is_opt_in() {
-        if std::env::var("SYMDEX_TEST_QDRANT").ok().as_deref() != Some("1") {
+    fn sqlite_vec_health_is_available() {
+        if std::env::var("SYMDEX_TEST_SQLITE_VEC").ok().as_deref() != Some("1") {
             return;
         }
 
-        let client = QdrantClient::new(&StoreConfig::from_env()).expect("client should build");
-        client.health_check().expect("qdrant should be reachable");
+        let client = SqliteVectorStore::new(&StoreConfig::from_env()).expect("client should build");
+        client
+            .health_check()
+            .expect("sqlite-vec should be available");
     }
 
     fn sample_payload() -> PointPayload {
@@ -8336,7 +8855,7 @@ mod tests {
             end_line: 3,
             start_byte: 0,
             end_byte: 32,
-            qdrant_point_id: Some("01234567-89ab-cdef-fedc-ba9876543210".to_owned()),
+            vector_point_id: Some("01234567-89ab-cdef-fedc-ba9876543210".to_owned()),
             excluded_reason: None,
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
@@ -8348,7 +8867,7 @@ mod tests {
 
     fn missing_vector_chunk(id: &str) -> ChunkRecord {
         let mut chunk = sample_chunk(id);
-        chunk.qdrant_point_id = None;
+        chunk.vector_point_id = None;
         chunk
     }
 
@@ -8363,7 +8882,7 @@ mod tests {
             end_line: 3,
             start_byte: 0,
             end_byte: 32,
-            qdrant_point_id: None,
+            vector_point_id: None,
             excluded_reason: Some("secret_detected".to_owned()),
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
@@ -8491,7 +9010,7 @@ mod tests {
             fast_model: "nomic-embed-text".to_owned(),
             fast_dimension: 768,
             fast_completed_at: "100".to_owned(),
-            quality_model: Some("nomic-embed-text-v2-moe".to_owned()),
+            quality_model: Some("mxbai-embed-large".to_owned()),
             quality_dimension: Some(768),
             quality_status: "quality_pending".to_owned(),
             quality_started_at: None,
@@ -8529,8 +9048,8 @@ mod tests {
             embedding_dimension: 768,
             content_hash: "content-hash".to_owned(),
             text_hash: "text-chunk-1".to_owned(),
-            qdrant_collection: "symdex_repo_nomic_embed_text".to_owned(),
-            qdrant_point_id: "01234567-89ab-cdef-fedc-ba9876543210".to_owned(),
+            vector_table: "symdex_repo_nomic_embed_text".to_owned(),
+            vector_point_id: "01234567-89ab-cdef-fedc-ba9876543210".to_owned(),
             generation_id: "generation-1".to_owned(),
             embedded_at: "101".to_owned(),
             status: "current".to_owned(),
@@ -8548,7 +9067,7 @@ mod tests {
                 chunk_id: (*chunk_id).to_owned(),
                 content_hash: content_hash.to_owned(),
                 text_hash: format!("text-{chunk_id}"),
-                qdrant_point_id: format!("point-{chunk_id}"),
+                vector_point_id: format!("point-{chunk_id}"),
             })
             .collect()
     }
@@ -8577,9 +9096,9 @@ mod tests {
         ChunkEmbeddingRecord {
             id: format!("quality-embedding-{status}"),
             semantic_layer: "quality".to_owned(),
-            embedding_model: "nomic-embed-text-v2-moe".to_owned(),
-            qdrant_collection: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
-            qdrant_point_id: "01234567-89ab-cdef-fedc-ba9876543211".to_owned(),
+            embedding_model: "mxbai-embed-large".to_owned(),
+            vector_table: "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
+            vector_point_id: "01234567-89ab-cdef-fedc-ba9876543211".to_owned(),
             status: status.to_owned(),
             ..sample_chunk_embedding()
         }
@@ -8714,7 +9233,6 @@ mod tests {
         fn config(&self) -> StoreConfig {
             StoreConfig {
                 sqlite_path: self.dir.join("symdex.sqlite"),
-                qdrant_url: "http://localhost:6333".to_owned(),
             }
         }
     }
