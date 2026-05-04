@@ -31,14 +31,17 @@ Before discovery, indexing resolves local repository-ref metadata without
 executing repository code. Attached local branches are recorded by branch name,
 detached HEADs by object ID, unusual refs as `other`, and non-Git repositories
 as a stable `non_git` working-tree ref. This first slice stores the ref metadata
-and attaches it to index-run provenance. Indexing also records a `ref_files`
-path manifest for the active ref and removes paths missing from that ref's
-latest discovery result. Repo-wide file facts are removed only when no remaining
-ref manifest points at them. Structural symbol, call graph, impact, and
-context-pack queries use the live worktree ref when `ref_files` manifests exist.
-Semantic search filters sqlite-vec candidates through the same active ref
-manifest; semantic generation state remains repo-wide until a later
-generation-routing slice.
+and attaches it to index-run provenance. File IDs are content-addressed from the
+repository ID, repo-relative path, and content hash. Indexing records a
+`ref_files` path manifest for the active ref, pointing each active path at its
+current file snapshot, and removes paths missing from that ref's latest
+discovery result. File snapshots are removed only when no remaining ref manifest
+points at them, so same-path/different-content local branches can coexist.
+Unchanged files skipped by hash are still linked into the active ref manifest.
+Structural symbol, call graph, impact, and context-pack queries use the live
+worktree ref when `ref_files` manifests exist. Semantic search filters
+sqlite-vec candidates through the same active ref manifest; semantic generation
+state remains repo-wide until a later generation-routing slice.
 
 Respect:
 

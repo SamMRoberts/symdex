@@ -72,15 +72,14 @@ CREATE TABLE ref_files (
 
 `ref_files` records the current file manifest for each local repository ref.
 Indexing upserts a path mapping for each active file it persists and removes
-paths missing from that ref's latest discovery result. Branch-aware cleanup only
-removes repo-wide file facts that are missing from the active discovery result
-and no longer referenced by any remaining ref manifest. This slice still keeps
-repo-wide `files` rows as the structural fact storage, but structural symbol,
-call graph, impact, and context-pack query paths use the live worktree ref when
-`ref_files` manifests exist. Semantic search also filters sqlite-vec candidates
-through the active ref manifest when manifests exist. Later work will make file
-snapshots content-addressed so same-path/different-content facts can coexist
-without relying on repo-wide file replacement.
+paths missing from that ref's latest discovery result. `file_id` points at the
+content-addressed `files` snapshot for that path, so two local refs can retain
+different indexed facts for the same repo-relative path when their content
+hashes differ. Branch-aware cleanup removes file snapshots only after no
+remaining ref manifest points at them. Structural symbol, call graph, impact,
+and context-pack query paths use the live worktree ref when `ref_files`
+manifests exist. Semantic search also filters sqlite-vec candidates through the
+active ref manifest when manifests exist.
 
 ### `index_runs`
 
@@ -108,9 +107,9 @@ Indexing records a row when a run starts and finalizes it when the run finishes.
 New index runs record `repository_ref_id` when the active local ref is known.
 The current branch-awareness slices record active ref metadata, populate
 `ref_files`, and route structural and semantic evidence queries through the
-active ref manifest when available. File fact storage and semantic generation
-state still use the repo-wide view until the snapshot and generation-routing
-migrations land.
+active ref manifest when available. File facts are content-addressed snapshots,
+while semantic generation state still uses the repo-wide view until the
+generation-routing migration lands.
 Run status values are `running`, `success`, `skipped`, `partial`, and `failed`.
 Successful semantic runs include the embedding model, vector dimension, and
 embedded chunk count. Semantic runs with no changed embeddable chunks finish as
@@ -137,10 +136,17 @@ CREATE TABLE files (
   content_hash TEXT NOT NULL,
   indexed_at TEXT NOT NULL,
   index_run_id TEXT,
-  parser_version TEXT,
-  UNIQUE(repository_id, path)
+  parser_version TEXT
 );
 ```
+
+`id` is derived from repository identity, repo-relative path, and content hash.
+This lets branch-specific manifests preserve same-path/different-content file
+snapshots without reindexing or overwriting another local ref's structural
+facts. A unique index on `(repository_id, path, content_hash)` prevents duplicate
+snapshots for identical content, while ordinary path indexes keep current-path
+lookups fast. Older local databases with the legacy `(repository_id, path)`
+unique constraint are migrated to the snapshot shape during `migrate`.
 
 `language` stores a stable language slug such as `rust`, `csharp`,
 `javascript`, or `typescript`. The schema is intentionally language-neutral; no

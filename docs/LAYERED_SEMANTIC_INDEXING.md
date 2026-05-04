@@ -155,8 +155,12 @@ evidence rather than quality-backed evidence.
 When branch-aware `ref_files` manifests exist, semantic search resolves the live
 local worktree ref and constrains sqlite-vec candidates through that manifest.
 Older indexes without manifests fall back to the legacy repo-wide vector query.
-The active semantic generation is still repository-wide until a later generation
-routing slice makes fast/quality generation state ref-aware.
+The manifest points at content-addressed file snapshots, so candidate filtering
+can distinguish local refs that share a path but have different content. Stale
+vector cleanup protects sqlite-vec points whose file snapshots are still
+referenced by any ref manifest. The active semantic generation is still
+repository-wide until a later generation-routing slice makes fast/quality
+generation state ref-aware.
 
 ## Activation rule
 

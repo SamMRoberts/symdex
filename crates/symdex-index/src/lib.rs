@@ -1016,6 +1016,7 @@ fn collect_index_reports(
             && sqlite
                 .file_unchanged(
                     root.id(),
+                    &file.facts.id,
                     &file.facts.relative_path,
                     &file.facts.content_hash,
                     file.facts.language.parser_version(),
@@ -1023,6 +1024,16 @@ fn collect_index_reports(
                 .map_err(|error| error.to_string())?
         {
             files_skipped_unchanged += 1;
+            reports.push(IndexReport {
+                file: file.facts.clone(),
+                chunks: Vec::new(),
+                symbols: Vec::new(),
+                calls: Vec::new(),
+                tests: Vec::new(),
+                parse_diagnostics: Vec::new(),
+                source: String::new(),
+                skipped_unchanged: true,
+            });
             on_progress(IndexProgress::new(
                 "parse",
                 index + 1,
@@ -1045,6 +1056,7 @@ fn collect_index_reports(
             tests: file_index.tests,
             parse_diagnostics: file_index.parse_diagnostics,
             source,
+            skipped_unchanged: false,
         });
         let message = if parse_diagnostic_count == 0 {
             format!("Parsed {}", file.facts.relative_path)
@@ -1074,6 +1086,7 @@ fn collect_index_reports(
 fn file_summaries(reports: &[IndexReport]) -> Vec<FileIndexSummary> {
     reports
         .iter()
+        .filter(|report| !report.skipped_unchanged)
         .map(|report| FileIndexSummary {
             path: report.file.relative_path.clone(),
             language: report.file.language.as_str().to_owned(),
@@ -1595,6 +1608,20 @@ fn persist_structural_index(
                 )
             })
             .collect::<Vec<_>>();
+        if report.skipped_unchanged {
+            if let Some(repository_ref_id) = repository_ref_id {
+                sqlite
+                    .link_file_to_ref(repository_ref_id, &file)
+                    .map_err(|error| error.to_string())?;
+            }
+            on_progress(IndexProgress::new(
+                "sqlite",
+                index + 1,
+                collection.reports.len(),
+                format!("Linked unchanged {}", report.file.relative_path),
+            ));
+            continue;
+        }
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
         calls_indexed += calls.len();
@@ -1814,12 +1841,17 @@ fn finalize_semantic_index(
 ) -> Result<EmbeddingSummary, String> {
     let prepared = match prepared {
         PreparedSemanticIndex::SkippedNoChunks => {
+            let vector_table =
+                vector_table_name(root.id(), &layered_embed_config.fast_embed_config().model);
+            let protected_point_ids = sqlite
+                .vector_point_ids_referenced_by_ref_files(root.id(), &vector_table)
+                .map_err(|error| error.to_string())?;
             delete_stale_vector_points(
                 root,
                 store_config,
                 &layered_embed_config.fast_embed_config().model,
                 stale_vector_point_ids,
-                &BTreeSet::new(),
+                &protected_point_ids,
                 on_progress,
             )?;
             return Ok(EmbeddingSummary::SkippedNoChunks);
@@ -1846,12 +1878,18 @@ fn finalize_semantic_index(
         &generation,
         on_progress,
     )?;
+    let mut protected_point_ids = prepared.point_ids();
+    protected_point_ids.extend(
+        sqlite
+            .vector_point_ids_referenced_by_ref_files(root.id(), &prepared.vector_table)
+            .map_err(|error| error.to_string())?,
+    );
     delete_stale_vector_points(
         root,
         store_config,
         &prepared.model,
         stale_vector_point_ids,
-        &prepared.point_ids(),
+        &protected_point_ids,
         on_progress,
     )?;
     Ok(EmbeddingSummary::Completed {
@@ -2708,6 +2746,7 @@ struct IndexReport {
     tests: Vec<DiscoveredTest>,
     parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
+    skipped_unchanged: bool,
 }
 
 struct ChunkText<'a> {
@@ -2766,6 +2805,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
+            skipped_unchanged: false,
         };
 
         let reports = [report];
@@ -2895,6 +2935,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
+            skipped_unchanged: false,
         }];
 
         let excluded = apply_embedding_size_limits(&mut reports, 64);
@@ -3071,7 +3112,11 @@ mod tests {
         store
             .replace_file_facts(
                 &FileRecord {
-                    id: stable_id(&[root.id(), "src/lib.rs"]),
+                    id: stable_id(&[
+                        root.id(),
+                        "src/lib.rs",
+                        &content_hash(lib_source.as_bytes()),
+                    ]),
                     repository_id: root.id().to_owned(),
                     path: "src/lib.rs".to_owned(),
                     language: "rust".to_owned(),
@@ -3091,9 +3136,15 @@ mod tests {
 
         assert_eq!(collection.files_seen, 2);
         assert_eq!(collection.files_skipped_unchanged, 1);
-        assert_eq!(collection.reports.len(), 1);
+        assert_eq!(collection.reports.len(), 2);
         assert_eq!(
-            collection.reports[0].file.relative_path,
+            collection
+                .reports
+                .iter()
+                .find(|report| !report.skipped_unchanged)
+                .expect("changed report should be present")
+                .file
+                .relative_path,
             "src/keep.generated.rs"
         );
     }
@@ -3169,6 +3220,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let persisted_helper = sample_symbol_record("worker::helper", "file-worker");
 
@@ -3207,6 +3259,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let outer_helper = sample_symbol_record("outer::helper", "file-outer-helper");
         let root_helper = sample_symbol_record("helper", "file-root-helper");
@@ -3248,6 +3301,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let outer_run = sample_symbol_record("outer::Worker::run", "file-outer-worker");
         let root_run = sample_symbol_record("Worker::run", "file-root-worker");
@@ -3285,6 +3339,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let mut helper = sample_symbol_record("Worker::helper", "file-worker-methods");
         helper.kind = SymbolKind::Method.as_str().to_owned();
@@ -3332,6 +3387,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let parent_helper = sample_symbol_record("outer::worker::helper", "file-parent-worker");
         let root_helper = sample_symbol_record("worker::helper", "file-root-worker");
@@ -3363,6 +3419,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }]);
         let stale_symbol = sample_symbol_record("worker::helper", &collection_file_id);
 
@@ -3484,6 +3541,7 @@ mod tests {
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
+            skipped_unchanged: false,
         }
     }
 

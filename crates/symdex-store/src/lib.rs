@@ -69,7 +69,79 @@ impl SqliteStore {
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;
         self.ensure_compatibility_columns()?;
+        self.ensure_content_addressed_files()?;
         Ok(())
+    }
+
+    fn ensure_content_addressed_files(&self) -> Result<()> {
+        if self.files_has_unique_repository_path_constraint()? {
+            self.connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     BEGIN;
+                     CREATE TABLE files_new (
+                       id TEXT PRIMARY KEY,
+                       repository_id TEXT NOT NULL,
+                       path TEXT NOT NULL,
+                       language TEXT NOT NULL,
+                       content_hash TEXT NOT NULL,
+                       indexed_at TEXT NOT NULL,
+                       index_run_id TEXT,
+                       parser_version TEXT,
+                       FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+                     );
+                     INSERT OR IGNORE INTO files_new (
+                       id, repository_id, path, language, content_hash, indexed_at,
+                       index_run_id, parser_version
+                     )
+                     SELECT id, repository_id, path, language, content_hash, indexed_at,
+                            index_run_id, parser_version
+                       FROM files;
+                     DROP TABLE files;
+                     ALTER TABLE files_new RENAME TO files;
+                     COMMIT;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        self.connection
+            .execute_batch(FILES_CONTENT_ADDRESSING_INDEXES)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn files_has_unique_repository_path_constraint(&self) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA index_list(files)")
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
+            .map_err(StoreError::Sqlite)?;
+        for row in rows {
+            let (index_name, unique) = row.map_err(StoreError::Sqlite)?;
+            if unique == 0 {
+                continue;
+            }
+            if self.index_columns(&index_name)? == ["repository_id", "path"] {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn index_columns(&self, index_name: &str) -> Result<Vec<String>> {
+        let escaped = index_name.replace('"', "\"\"");
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA index_info(\"{escaped}\")"))
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
     }
 
     fn ensure_compatibility_columns(&self) -> Result<()> {
@@ -226,25 +298,54 @@ impl SqliteStore {
     pub fn file_unchanged(
         &self,
         repository_id: &str,
+        file_id: &str,
         path: &str,
         content_hash: &str,
         parser_version: &str,
     ) -> Result<bool> {
-        let stored: Option<(String, Option<String>)> = self
+        let unchanged: i64 = self
             .connection
             .query_row(
-                "SELECT content_hash, parser_version FROM files WHERE repository_id = ?1 AND path = ?2",
-                params![repository_id, path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT EXISTS(
+                   SELECT 1
+                     FROM files
+                    WHERE repository_id = ?1
+                      AND id = ?2
+                      AND path = ?3
+                      AND content_hash = ?4
+                      AND parser_version = ?5
+                 )",
+                params![repository_id, file_id, path, content_hash, parser_version],
+                |row| row.get(0),
             )
-            .optional()
             .map_err(StoreError::Sqlite)?;
-        Ok(stored
-            .as_ref()
-            .is_some_and(|(stored_hash, stored_parser_version)| {
-                stored_hash == content_hash
-                    && stored_parser_version.as_deref() == Some(parser_version)
-            }))
+        Ok(unchanged != 0)
+    }
+
+    pub fn link_file_to_ref(&mut self, repository_ref_id: &str, file: &FileRecord) -> Result<()> {
+        let indexed_at = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO ref_files (
+                   repository_ref_id, repository_id, path, file_id, indexed_at, index_run_id
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(repository_ref_id, path) DO UPDATE SET
+                   repository_id = excluded.repository_id,
+                   file_id = excluded.file_id,
+                   indexed_at = excluded.indexed_at,
+                   index_run_id = excluded.index_run_id",
+                params![
+                    repository_ref_id,
+                    file.repository_id,
+                    file.path,
+                    file.id,
+                    indexed_at,
+                    file.index_run_id,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
     }
 
     pub fn replace_file_facts(
@@ -298,8 +399,9 @@ impl SqliteStore {
                    index_run_id, parser_version
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                  ON CONFLICT(repository_id, path) DO UPDATE SET
-                    id = excluded.id,
+                                    ON CONFLICT(id) DO UPDATE SET
+                                        repository_id = excluded.repository_id,
+                                        path = excluded.path,
                     language = excluded.language,
                     content_hash = excluded.content_hash,
                     indexed_at = excluded.indexed_at,
@@ -340,6 +442,24 @@ impl SqliteStore {
                 )
                 .map_err(StoreError::Sqlite)?;
         }
+        let stale_same_path_file_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id
+                       FROM files
+                      WHERE repository_id = ?1
+                        AND path = ?2
+                        AND id <> ?3
+                      ORDER BY indexed_at, id",
+                )
+                .map_err(StoreError::Sqlite)?;
+            let rows = statement
+                .query_map(params![file.repository_id, file.path, file.id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(StoreError::Sqlite)?;
+            collect_rows(rows)?
+        };
         transaction
             .execute(
                 "DELETE FROM calls
@@ -356,6 +476,51 @@ impl SqliteStore {
         transaction
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file.id])
             .map_err(StoreError::Sqlite)?;
+
+        for stale_file_id in stale_same_path_file_ids {
+            let ref_count: i64 = if repository_ref_id.is_some() {
+                transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM ref_files WHERE file_id = ?1",
+                        params![&stale_file_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(StoreError::Sqlite)?
+            } else {
+                0
+            };
+            if ref_count > 0 {
+                continue;
+            }
+            transaction
+                .execute(
+                    "DELETE FROM calls
+                     WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM tests WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM chunks WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM symbols WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute("DELETE FROM files WHERE id = ?1", params![&stale_file_id])
+                .map_err(StoreError::Sqlite)?;
+        }
 
         {
             let mut statement = transaction
@@ -563,43 +728,46 @@ impl SqliteStore {
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         let mut removed = 0usize;
         for path in &missing {
-            let file_id: Option<String> = transaction
-                .query_row(
-                    "SELECT id FROM files WHERE repository_id = ?1 AND path = ?2",
-                    params![repository_id, path],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(StoreError::Sqlite)?;
-            let Some(file_id) = file_id else {
-                continue;
+            let file_ids = {
+                let mut statement = transaction
+                    .prepare("SELECT id FROM files WHERE repository_id = ?1 AND path = ?2")
+                    .map_err(StoreError::Sqlite)?;
+                let rows = statement
+                    .query_map(params![repository_id, path], |row| row.get::<_, String>(0))
+                    .map_err(StoreError::Sqlite)?;
+                collect_rows(rows)?
             };
-            let ref_count: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM ref_files WHERE file_id = ?1",
-                    params![file_id],
-                    |row| row.get(0),
-                )
-                .map_err(StoreError::Sqlite)?;
-            if ref_count > 0 {
-                continue;
-            }
-            transaction
-                .execute(
-                    "DELETE FROM calls
+            for file_id in file_ids {
+                let ref_count: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM ref_files WHERE file_id = ?1",
+                        params![&file_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                if ref_count > 0 {
+                    continue;
+                }
+                transaction
+                    .execute(
+                        "DELETE FROM calls
                      WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
-                    params![file_id],
-                )
-                .map_err(StoreError::Sqlite)?;
-            transaction
-                .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
-                .map_err(StoreError::Sqlite)?;
-            removed += transaction
-                .execute(
-                    "DELETE FROM files WHERE repository_id = ?1 AND path = ?2",
-                    params![repository_id, path],
-                )
-                .map_err(StoreError::Sqlite)?;
+                        params![&file_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM tests WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM chunks WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM symbols WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                removed += transaction
+                    .execute("DELETE FROM files WHERE id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+            }
         }
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(removed)
@@ -622,32 +790,36 @@ impl SqliteStore {
 
         let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
         for path in &missing {
-            let file_id: Option<String> = transaction
-                .query_row(
-                    "SELECT id FROM files WHERE repository_id = ?1 AND path = ?2",
-                    params![repository_id, path],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(StoreError::Sqlite)?;
-            if let Some(file_id) = file_id {
+            let file_ids = {
+                let mut statement = transaction
+                    .prepare("SELECT id FROM files WHERE repository_id = ?1 AND path = ?2")
+                    .map_err(StoreError::Sqlite)?;
+                let rows = statement
+                    .query_map(params![repository_id, path], |row| row.get::<_, String>(0))
+                    .map_err(StoreError::Sqlite)?;
+                collect_rows(rows)?
+            };
+            for file_id in file_ids {
                 transaction
                     .execute(
                         "DELETE FROM calls
                          WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
-                        params![file_id],
+                        params![&file_id],
                     )
                     .map_err(StoreError::Sqlite)?;
                 transaction
-                    .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
+                    .execute("DELETE FROM tests WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM chunks WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM symbols WHERE file_id = ?1", params![&file_id])
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute("DELETE FROM files WHERE id = ?1", params![&file_id])
                     .map_err(StoreError::Sqlite)?;
             }
-            transaction
-                .execute(
-                    "DELETE FROM files WHERE repository_id = ?1 AND path = ?2",
-                    params![repository_id, path],
-                )
-                .map_err(StoreError::Sqlite)?;
         }
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(missing.len())
@@ -714,6 +886,28 @@ impl SqliteStore {
             semantic_layer,
             &missing,
         )
+    }
+
+    pub fn vector_point_ids_referenced_by_ref_files(
+        &self,
+        repository_id: &str,
+        vector_table: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT vector_points.vector_point_id
+                   FROM vector_points
+                   JOIN ref_files ON ref_files.file_id = vector_points.file_id
+                  WHERE vector_points.vector_store = 'sqlite_vec'
+                    AND vector_points.repository_id = ?1
+                    AND vector_points.vector_table = ?2",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, vector_table], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows).map(|rows: Vec<String>| rows.into_iter().collect())
     }
 
     pub fn expected_vector_points_for_generation_layer(
@@ -3970,7 +4164,7 @@ impl SqliteStore {
     fn file_paths(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
-            .prepare("SELECT path FROM files WHERE repository_id = ?1")
+            .prepare("SELECT DISTINCT path FROM files WHERE repository_id = ?1")
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id], |row| row.get(0))
@@ -6427,6 +6621,12 @@ const COMPATIBILITY_COLUMNS: &[ProvenanceColumn] = &[
     },
 ];
 
+const FILES_CONTENT_ADDRESSING_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_repository_path_hash
+    ON files(repository_id, path, content_hash);
+"#;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repositories (
   id TEXT PRIMARY KEY,
@@ -6543,7 +6743,6 @@ CREATE TABLE IF NOT EXISTS files (
   indexed_at TEXT NOT NULL,
   index_run_id TEXT,
   parser_version TEXT,
-  UNIQUE(repository_id, path),
   FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
 
@@ -6725,6 +6924,8 @@ CREATE TABLE IF NOT EXISTS quality_embedding_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_repository_path ON files(repository_id, path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_repository_path_hash
+    ON files(repository_id, path, content_hash);
 CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -7115,6 +7316,142 @@ mod tests {
     }
 
     #[test]
+    fn ref_scoped_queries_preserve_same_path_different_content_snapshots() {
+        let db = TestDb::new("ref-same-path-snapshots");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+
+        store
+            .sync_repository_ref(&main)
+            .expect("main ref should sync");
+        let main_symbols = vec![
+            sample_symbol_in_file("main-caller", "main-file-hash", "caller", "main::caller"),
+            sample_symbol_in_file("main-helper", "main-file-hash", "helper", "main::helper"),
+        ];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &main.id,
+                &sample_file_at("main-file-hash", "src/lib.rs", "hash-main"),
+                &main_symbols,
+                &[],
+                &[sample_call(
+                    "main-call",
+                    "main-caller",
+                    "helper",
+                    Some("main-helper"),
+                    3,
+                )],
+                &[],
+            )
+            .expect("main snapshot should persist");
+
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature ref should sync");
+        let feature_symbols = vec![
+            sample_symbol_in_file(
+                "feature-caller",
+                "feature-file-hash",
+                "caller",
+                "feature::caller",
+            ),
+            sample_symbol_in_file(
+                "feature-helper",
+                "feature-file-hash",
+                "helper",
+                "feature::helper",
+            ),
+        ];
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &feature.id,
+                &sample_file_at("feature-file-hash", "src/lib.rs", "hash-feature"),
+                &feature_symbols,
+                &[],
+                &[sample_call(
+                    "feature-call",
+                    "feature-caller",
+                    "helper",
+                    Some("feature-helper"),
+                    7,
+                )],
+                &[],
+            )
+            .expect("feature snapshot should persist");
+
+        let status = store.repository_status("repo").expect("status should load");
+        assert_eq!(status.files_indexed, 2);
+
+        let main_symbols = store
+            .find_symbols_for_ref("repo", &main.id, "helper")
+            .expect("main symbols should load");
+        assert_eq!(main_symbols.len(), 1);
+        assert_eq!(main_symbols[0].qualified_name, "main::helper");
+        assert_eq!(
+            main_symbols[0].provenance.content_hash,
+            Some("hash-main".to_owned())
+        );
+
+        let feature_symbols = store
+            .find_symbols_for_ref("repo", &feature.id, "helper")
+            .expect("feature symbols should load");
+        assert_eq!(feature_symbols.len(), 1);
+        assert_eq!(feature_symbols[0].qualified_name, "feature::helper");
+        assert_eq!(
+            feature_symbols[0].provenance.content_hash,
+            Some("hash-feature".to_owned())
+        );
+
+        assert!(
+            store
+                .callers_for_ref("repo", &main.id, "feature::helper")
+                .expect("main should not see feature callers")
+                .is_empty()
+        );
+
+        store
+            .remove_missing_ref_files(&main.id, &[])
+            .expect("main manifest should clear");
+        let removed = store
+            .remove_unreferenced_missing_files("repo", &[])
+            .expect("unreferenced main snapshot should be removed");
+        assert_eq!(removed, 1);
+        let status = store
+            .repository_status("repo")
+            .expect("status should reload");
+        assert_eq!(status.files_indexed, 1);
+        assert_eq!(
+            store
+                .find_symbols_for_ref("repo", &feature.id, "helper")
+                .expect("feature snapshot should remain")[0]
+                .qualified_name,
+            "feature::helper"
+        );
+    }
+
+    #[test]
     fn sqlite_vec_upserts_queries_scrolls_and_deletes_points() {
         let db = TestDb::new("sqlite-vec-roundtrip");
         let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
@@ -7316,12 +7653,12 @@ mod tests {
 
         assert!(
             store
-                .file_unchanged("repo", "src/lib.rs", "hash-1", "parser")
+                .file_unchanged("repo", "file", "src/lib.rs", "hash-1", "parser")
                 .expect("unchanged check should run")
         );
         assert!(
             !store
-                .file_unchanged("repo", "src/lib.rs", "hash-1", "next-parser")
+                .file_unchanged("repo", "file", "src/lib.rs", "hash-1", "next-parser")
                 .expect("parser-version check should run")
         );
         let status = store.repository_status("repo").expect("status should load");
@@ -7340,6 +7677,7 @@ mod tests {
 
         for expected in [
             "idx_files_repository_path",
+            "idx_files_repository_path_hash",
             "idx_chunks_file_id",
             "idx_symbols_file_id",
             "idx_symbols_name",
@@ -7363,6 +7701,65 @@ mod tests {
                 "missing SQLite index {expected}; found {indexes:?}"
             );
         }
+    }
+
+    #[test]
+    fn sqlite_migration_removes_legacy_file_path_uniqueness() {
+        let db = TestDb::new("content-addressed-files-migration");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE repositories (
+                   id TEXT PRIMARY KEY,
+                   root_path TEXT NOT NULL UNIQUE,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE files (
+                   id TEXT PRIMARY KEY,
+                   repository_id TEXT NOT NULL,
+                   path TEXT NOT NULL,
+                   language TEXT NOT NULL,
+                   content_hash TEXT NOT NULL,
+                   indexed_at TEXT NOT NULL,
+                   index_run_id TEXT,
+                   parser_version TEXT,
+                   UNIQUE(repository_id, path),
+                   FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO repositories (id, root_path, created_at, updated_at)
+                 VALUES ('repo', '/tmp/repo', '1', '1');
+                 INSERT INTO files (
+                   id, repository_id, path, language, content_hash, indexed_at,
+                   index_run_id, parser_version
+                 )
+                 VALUES ('old-file', 'repo', 'src/lib.rs', 'rust', 'hash-old', '1', 'run', 'parser');",
+            )
+            .expect("legacy schema should be installed");
+
+        store.migrate().expect("migration should run");
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO files (
+                   id, repository_id, path, language, content_hash, indexed_at,
+                   index_run_id, parser_version
+                 )
+                 VALUES ('new-file', 'repo', 'src/lib.rs', 'rust', 'hash-new', '2', 'run', 'parser')",
+                [],
+            )
+            .expect("same path with different content should insert");
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE repository_id = 'repo' AND path = 'src/lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("file count should load");
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -8603,7 +9000,7 @@ mod tests {
         assert_eq!(status.chunks_indexed, 2);
         assert!(
             !store
-                .file_unchanged("repo", "src/lib.rs", "hash-1", "parser")
+                .file_unchanged("repo", "file", "src/lib.rs", "hash-1", "parser")
                 .expect("unchanged check should run")
         );
 
