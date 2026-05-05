@@ -186,7 +186,9 @@ Current implementation status:
 - `symdex serve-mcp --watch <repo>` starts or attaches the single background
   watcher before serving MCP and holds a client lease until the MCP process
   exits. Live TUI/MCP/CLI clients heartbeat their lease and reinsert it if a
-  transient stale-client prune removed the row. MCP stdout remains
+  transient stale-client prune removed the row. Read-only watcher status treats
+  live client leases as evidence that the watcher is still active, even if the
+  daemon's event heartbeat lags during local work. MCP stdout remains
   protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.

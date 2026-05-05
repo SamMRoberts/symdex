@@ -88,7 +88,7 @@ impl WatcherStatus {
     }
 
     pub fn from_record(record: WatcherStatusRecord) -> Self {
-        let mut status = Self {
+        Self {
             repository_id: record.repository_id,
             root_path: record.root_path,
             mode: record.mode,
@@ -113,11 +113,7 @@ impl WatcherStatus {
             client_kinds: Vec::new(),
             clients: Vec::new(),
             shutdown_after_seconds: None,
-        };
-        if status.is_active() && heartbeat_is_stale(status.heartbeat_at.as_deref()) {
-            status.state = "stale".to_owned();
         }
-        status
     }
 
     fn inactive(root: &RepoRoot) -> Self {
@@ -566,7 +562,17 @@ fn status_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
         Err(error) => return Err(error.to_string()),
     };
     attach_clients(&store, root.id(), &mut status)?;
+    apply_status_staleness(&mut status);
     Ok(status)
+}
+
+fn apply_status_staleness(status: &mut WatcherStatus) {
+    if status.is_active()
+        && status.attached_clients == 0
+        && heartbeat_is_stale(status.heartbeat_at.as_deref())
+    {
+        status.state = "stale".to_owned();
+    }
 }
 
 fn attach_clients(
@@ -1000,20 +1006,33 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        HEARTBEAT_STALE_SECONDS, NO_CLIENT_GRACE, WatcherStatus,
+        HEARTBEAT_STALE_SECONDS, NO_CLIENT_GRACE, WatcherStatus, apply_status_staleness,
         clients_allow_continuing_with_count, heartbeat_is_stale, timestamp_minus,
         watcher_client_is_live, watcher_endpoint_name,
     };
     use symdex_store::WatcherClientRecord;
 
     #[test]
-    fn stale_heartbeat_marks_active_status_stale() {
+    fn stale_heartbeat_without_clients_marks_active_status_stale() {
         let mut record = sample_status("running");
         record.heartbeat_at = Some("1".to_owned());
 
-        let status = WatcherStatus::from_record(record);
+        let mut status = WatcherStatus::from_record(record);
+        apply_status_staleness(&mut status);
 
         assert_eq!(status.state, "stale");
+    }
+
+    #[test]
+    fn live_clients_keep_stale_watcher_heartbeat_running() {
+        let mut record = sample_status("running");
+        record.heartbeat_at = Some("1".to_owned());
+
+        let mut status = WatcherStatus::from_record(record);
+        status.attached_clients = 1;
+        apply_status_staleness(&mut status);
+
+        assert_eq!(status.state, "running");
     }
 
     #[test]
