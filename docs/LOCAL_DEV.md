@@ -37,10 +37,11 @@ SYMDEX_DEBUG_DB_LOCKS=1
 `SYMDEX_DB_PATH` remains the structural SQLite path. Additional database roles
 derive sibling SQLite files from that path: `.symdex/symdex-fast.sqlite` for the
 fast sqlite-vec projection, `.symdex/symdex-quality.sqlite` for the quality
-sqlite-vec projection, and `.symdex/symdex-watch.sqlite` for watcher status and
-client leases. Existing legacy vector collections in the structural database
-remain readable as a compatibility fallback until the split storage migration is
-complete.
+sqlite-vec projection, `.symdex/symdex-watch.sqlite` for watcher status and
+client leases, and `.symdex/symdex-events.sqlite` for index-run summaries and
+per-file index events. Existing legacy vector collections in the structural
+database remain readable as a compatibility fallback until the split storage
+migration is complete.
 
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
 default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command

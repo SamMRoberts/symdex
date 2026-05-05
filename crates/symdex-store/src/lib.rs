@@ -511,6 +511,7 @@ impl SqliteStore {
         );
         match self.role {
             DatabaseRole::Watch => self.migrate_watch_schema()?,
+            DatabaseRole::Events => self.migrate_events_schema()?,
             _ => {
                 self.connection
                     .execute_batch(SCHEMA)
@@ -534,6 +535,13 @@ impl SqliteStore {
     fn migrate_watch_schema(&self) -> Result<()> {
         self.connection
             .execute_batch(WATCH_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn migrate_events_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(EVENTS_SCHEMA)
             .map_err(StoreError::Sqlite)?;
         Ok(())
     }
@@ -5243,6 +5251,21 @@ impl SqliteStore {
         &self,
         repository_id: &str,
     ) -> Result<IndexRunsTimelineSummary> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.index_runs_timeline_summary_local(repository_id) {
+                Ok(summary) if !summary.runs.is_empty() => return Ok(summary),
+                Ok(_) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.index_runs_timeline_summary_local(repository_id)
+    }
+
+    fn index_runs_timeline_summary_local(
+        &self,
+        repository_id: &str,
+    ) -> Result<IndexRunsTimelineSummary> {
         let mut statement = self
             .connection
             .prepare(
@@ -5591,6 +5614,18 @@ impl SqliteStore {
     }
 
     fn count_index_runs(&self, repository_id: &str) -> Result<usize> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.count_index_runs_local(repository_id) {
+                Ok(count) if count > 0 => return Ok(count),
+                Ok(_) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.count_index_runs_local(repository_id)
+    }
+
+    fn count_index_runs_local(&self, repository_id: &str) -> Result<usize> {
         self.count_scalar(
             "SELECT COUNT(*) FROM index_runs WHERE repository_id = ?1",
             repository_id,
@@ -5785,6 +5820,22 @@ impl SqliteStore {
         repository_id: &str,
         embedding_model: &str,
     ) -> Result<Vec<usize>> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.successful_embedding_dimensions_local(repository_id, embedding_model) {
+                Ok(dimensions) if !dimensions.is_empty() => return Ok(dimensions),
+                Ok(_) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.successful_embedding_dimensions_local(repository_id, embedding_model)
+    }
+
+    fn successful_embedding_dimensions_local(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+    ) -> Result<Vec<usize>> {
         let mut statement = self
             .connection
             .prepare(
@@ -5806,6 +5857,21 @@ impl SqliteStore {
     }
 
     fn latest_embedding_run(&self, repository_id: &str) -> Result<Option<EmbeddingIndexMetadata>> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.latest_embedding_run_local(repository_id) {
+                Ok(Some(metadata)) => return Ok(Some(metadata)),
+                Ok(None) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.latest_embedding_run_local(repository_id)
+    }
+
+    fn latest_embedding_run_local(
+        &self,
+        repository_id: &str,
+    ) -> Result<Option<EmbeddingIndexMetadata>> {
         self.connection
             .query_row(
                 "SELECT embedding_model, embedding_dimension, chunks_embedded
@@ -5827,6 +5893,22 @@ impl SqliteStore {
         repository_id: &str,
         embedding_model: &str,
     ) -> Result<Option<EmbeddingIndexMetadata>> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.latest_embedding_run_for_model_local(repository_id, embedding_model) {
+                Ok(Some(metadata)) => return Ok(Some(metadata)),
+                Ok(None) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.latest_embedding_run_for_model_local(repository_id, embedding_model)
+    }
+
+    fn latest_embedding_run_for_model_local(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+    ) -> Result<Option<EmbeddingIndexMetadata>> {
         self.connection
             .query_row(
                 "SELECT embedding_model, embedding_dimension, chunks_embedded
@@ -5842,6 +5924,19 @@ impl SqliteStore {
             )
             .optional()
             .map_err(StoreError::Sqlite)
+    }
+
+    fn sibling_role_store_read_only(&self, role: DatabaseRole) -> Option<Self> {
+        if self.role != DatabaseRole::Structural {
+            return None;
+        }
+        let config = StoreConfig {
+            sqlite_path: self.database_path.clone(),
+        };
+        if !config.database_path(role).exists() {
+            return None;
+        }
+        Self::open_read_only_for_role(&config, role).ok()
     }
 }
 
@@ -6992,6 +7087,10 @@ fn collect_rows<T>(
         values.push(row.map_err(StoreError::Sqlite)?);
     }
     Ok(values)
+}
+
+fn is_missing_table_error(error: &StoreError) -> bool {
+    matches!(error, StoreError::Sqlite(sqlite_error) if sqlite_error.to_string().contains("no such table"))
 }
 
 fn insert_inferred_test_targets(
@@ -9160,6 +9259,50 @@ CREATE TABLE IF NOT EXISTS watcher_clients (
 
 CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heartbeat_at);
 CREATE INDEX IF NOT EXISTS idx_watcher_clients_repository_heartbeat ON watcher_clients(repository_id, heartbeat_at);
+"#;
+
+const EVENTS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS index_runs (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    repository_ref_id TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dimension INTEGER,
+    files_seen INTEGER DEFAULT 0,
+    files_indexed INTEGER DEFAULT 0,
+    chunks_embedded INTEGER DEFAULT 0,
+    error_summary TEXT,
+    parser_version TEXT,
+    indexer_version TEXT,
+    run_kind TEXT NOT NULL DEFAULT 'manual'
+);
+
+CREATE TABLE IF NOT EXISTS file_index_events (
+    id TEXT PRIMARY KEY,
+    index_run_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    repository_ref_id TEXT,
+    path TEXT NOT NULL,
+    old_content_hash TEXT,
+    new_content_hash TEXT,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_summary TEXT,
+    occurred_at TEXT NOT NULL,
+    CHECK(action IN ('created', 'updated', 'deleted', 'skipped', 'failed')),
+    CHECK(status IN ('success', 'failed', 'skipped')),
+    FOREIGN KEY(index_run_id) REFERENCES index_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_run_path ON file_index_events(index_run_id, path);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_path_time ON file_index_events(repository_id, path, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_action_status ON file_index_events(repository_id, action, status, occurred_at);
 "#;
 
 pub fn current_timestamp() -> String {
@@ -13418,6 +13561,79 @@ mod tests {
         assert!(tables.contains(&"watchers".to_owned()));
         assert!(tables.contains(&"watcher_clients".to_owned()));
         assert!(!tables.contains(&"files".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_events_role_uses_events_database() {
+        let db = TestDb::new("events-role-database");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::Events)
+            .expect("events store should open");
+        store.migrate().expect("events schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::Events).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        let run = sample_index_run("nomic-embed-text", 768);
+        store.start_index_run(&run).expect("run should start");
+        store
+            .record_file_index_events(&[FileIndexEventRecord {
+                id: "event-1".to_owned(),
+                index_run_id: run.id.clone(),
+                repository_id: "repo".to_owned(),
+                repository_ref_id: None,
+                path: "src/lib.rs".to_owned(),
+                old_content_hash: None,
+                new_content_hash: Some("hash".to_owned()),
+                action: "created".to_owned(),
+                reason: "new_file".to_owned(),
+                status: "success".to_owned(),
+                error_summary: None,
+            }])
+            .expect("file event should persist");
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"index_runs".to_owned()));
+        assert!(tables.contains(&"file_index_events".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_structural_reads_prefer_events_role_index_runs() {
+        let db = TestDb::new("events-role-read-fan-in");
+        let config = db.config();
+        let structural = SqliteStore::open(&config).expect("structural store should open");
+        structural
+            .migrate()
+            .expect("structural schema should migrate");
+        structural
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        structural
+            .finish_index_run(&sample_index_run("legacy-model", 384))
+            .expect("legacy run should persist");
+
+        let events = SqliteStore::open_for_role(&config, DatabaseRole::Events)
+            .expect("events store should open");
+        events.migrate().expect("events schema should migrate");
+        events
+            .finish_index_run(&sample_index_run("event-model", 768))
+            .expect("event run should persist");
+
+        let status = structural
+            .repository_status("repo")
+            .expect("status should load");
+        assert_eq!(status.embedding_model.as_deref(), Some("event-model"));
+        assert_eq!(status.embedding_dimension, Some(768));
+
+        let timeline = structural
+            .index_runs_timeline_summary("repo")
+            .expect("timeline should load");
+        assert_eq!(timeline.runs.len(), 1);
+        assert_eq!(timeline.runs[0].embedding_model, "event-model");
     }
 
     #[test]

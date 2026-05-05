@@ -194,8 +194,9 @@ Current implementation status:
   missing current-fast quality jobs before claiming work. Continuous quality
   catch-up also treats current stale quality jobs as work because the worker
   requeues those terminal rows before claiming the next batch.
-- Watch-driven batches are recorded with `run_kind = watch` in local index-run
-  metadata so storage views can distinguish watch updates from manual runs.
+- Watch-driven batches are recorded with `run_kind = watch` in events-role
+  index-run metadata so storage views can distinguish watch updates from manual
+  runs without writing those telemetry rows into structural SQLite.
 - In semantic watch mode, when `SYMDEX_QUALITY_INDEX` is enabled, watch mode
   automatically runs cooperative quality catch-up after fast batches and during
   idle ticks. Each catch-up tick uses the same hash-verifying quality worker
@@ -214,11 +215,11 @@ Current implementation status:
 - Log summaries only: event counts, paths, index counts, status labels, and
   errors.
 - Do not log source text.
-- Record index run summaries for continuous indexing batches so storage views
-  can show when watch-driven updates occurred.
+- Record index run summaries in the events database role for continuous indexing
+  batches so storage views can show when watch-driven updates occurred.
 - Record per-file `file_index_events` for watch batches so created, modified,
   deleted, skipped unchanged, and paths removed from discovery by ignore or
-  support rules can be debugged from local metadata.
+  support rules can be debugged from local events-role metadata.
 - Record watcher status and client leases in the watch database role so frequent
   control-plane updates do not compete with structural indexing writes.
 - Surface watch health in diagnostics when available, including watcher active

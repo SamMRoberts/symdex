@@ -9,7 +9,7 @@ Current implementation runs idempotent SQLite migrations at `symdex init`,
 while the current indexing write path persists repositories, files, chunks,
 symbols, calls, symbol references, external dependency facts, dependency usage
 links, tests, conservative test targets, short-lived runtime observations,
-fast semantic generations, and fast/quality
+index-run telemetry, fast semantic generations, and fast/quality
 `chunk_embeddings` manifests. The older chunk-level vector columns remain
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
@@ -17,14 +17,15 @@ semantic projection.
 `SYMDEX_DB_PATH` names the structural database. Role-specific sibling databases
 derive from that path as the storage split progresses. The fast and quality
 sqlite-vec projections live in `fast_semantic` and `quality_semantic` database
-roles, and watcher control-plane state lives in the `watch` database role. With
-the default path this means `.symdex/symdex.sqlite`,
-`.symdex/symdex-fast.sqlite`, `.symdex/symdex-quality.sqlite`, and
-`.symdex/symdex-watch.sqlite`.
+roles, watcher control-plane state lives in the `watch` database role, and
+index-run telemetry lives in the `events` database role. With the default path
+this means `.symdex/symdex.sqlite`, `.symdex/symdex-fast.sqlite`,
+`.symdex/symdex-quality.sqlite`, `.symdex/symdex-watch.sqlite`, and
+`.symdex/symdex-events.sqlite`.
 
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
-caller/callee traversal, and index-run metadata checks.
+caller/callee traversal, and events-role index-run metadata checks.
 Symbol-reference indexes cover source-symbol, target-symbol, kind, and
 resolution-status scans for broader structural evidence beyond calls.
 Dependency indexes cover package-name lookup, manifest cleanup, usage-by-file,
@@ -117,7 +118,8 @@ CREATE TABLE index_runs (
 );
 ```
 
-Indexing records a row when a run starts and finalizes it when the run finishes.
+`index_runs` is stored in the `events` database role. Indexing records a row
+when a run starts and finalizes it when the run finishes.
 New index runs record `repository_ref_id` when the active local ref is known.
 The current branch-awareness slices record active ref metadata, populate
 `ref_files`, and route structural and semantic evidence queries through the
@@ -134,11 +136,11 @@ metadata-only `error_summary`; earlier recorded failures finish as `failed`.
 model and dimension when present.
 
 Continuous indexing records compact batch summaries in `index_runs` through the
-same indexing path, so watch-driven updates are visible in storage views. The UI
-can distinguish manual/offline and semantic batches through `run_kind`, status,
-timestamps, files seen/indexed, chunks embedded, model, dimension, and any
-metadata-only error summary. Watch-driven batches are currently recorded with
-`run_kind = watch`.
+same indexing path, so watch-driven updates are visible in storage views without
+writing structural SQLite telemetry rows. The UI can distinguish manual/offline
+and semantic batches through `run_kind`, status, timestamps, files
+seen/indexed, chunks embedded, model, dimension, and any metadata-only error
+summary. Watch-driven batches are currently recorded with `run_kind = watch`.
 
 ### `file_index_events`
 
@@ -159,11 +161,13 @@ CREATE TABLE file_index_events (
 );
 ```
 
-`file_index_events` records the per-file decisions that make up an index run.
-The table is append-only telemetry keyed by `index_run_id`, repo-relative path,
-and action. It complements `index_runs`: the run row answers whether a batch
-finished, while file events answer why each path was created, updated, deleted,
-or skipped.
+`file_index_events` is stored in the `events` database role and records the
+per-file decisions that make up an index run. The table is append-only telemetry
+keyed by `index_run_id`, repo-relative path, and action. It complements
+`index_runs`: the run row answers whether a batch finished, while file events
+answer why each path was created, updated, deleted, or skipped. References to
+structural repository/ref/file facts are stable IDs; cross-database foreign keys
+are intentionally not used.
 
 Current indexing writes events for:
 
@@ -779,15 +783,15 @@ than by a separate write path so SQLite remains the structural source of truth.
 ## TUI visualization mapping
 
 The TUI should visualize storage metadata without showing source text by
-default. Treat SQLite as the structural source of truth and sqlite-vec as the
-semantic projection of embeddable chunks.
+default. Treat role-scoped SQLite databases as the source of truth for local
+metadata and sqlite-vec as the semantic projection of embeddable chunks.
 
 ### Storage explorer
 
-Use SQLite tables to show repository structure:
+Use SQLite tables to show repository structure and telemetry:
 
 - `repositories`: selected repository identity and root metadata.
-- `index_runs`: latest and historical indexing status.
+- `events.index_runs`: latest and historical indexing status.
 - `files`: indexed paths, languages, content hashes, and indexed timestamps.
 - `symbols`: symbol names, qualified names, kinds, nesting, and line ranges.
 - `chunks`: chunk kinds, line ranges, text hashes, compatibility vector fields,
@@ -858,7 +862,8 @@ Compare SQLite chunk metadata with sqlite-vec collection metadata:
 - current fast `chunk_embeddings` rows should have matching sqlite-vec points
 - chunks without a current fast `chunk_embeddings` row and without
   `excluded_reason` are missing vectors
-- latest successful `index_runs.embedding_model` and `embedding_dimension`
+- latest successful events-role `index_runs.embedding_model` and
+  `embedding_dimension`
   should match the selected sqlite-vec collection metadata
 
 Surface missing vector tables, missing points, model drift, and dimension drift
@@ -887,8 +892,9 @@ Use `index_runs.started_at`, `finished_at`, `status`, `files_seen`,
 `files_indexed`, `chunks_embedded`, `embedding_model`, `embedding_dimension`,
 and `error_summary` for a compact run timeline.
 
-The first TUI implementation reads `index_runs` directly from SQLite and shows
-the latest 50 runs as metadata-only rows ordered by start time. Selecting a row
+The first TUI implementation reads `index_runs` through store APIs that prefer
+the events database role and fall back to legacy structural rows. It shows the
+latest 50 runs as metadata-only rows ordered by start time. Selecting a row
 shows timestamps, status, file/chunk counts, embedding model and dimension, and
 the stored error summary when present.
 

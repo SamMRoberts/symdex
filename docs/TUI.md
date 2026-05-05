@@ -248,9 +248,9 @@ Phase 10.5 implementation status:
 The TUI should add a storage-focused view for inspecting how SQLite and sqlite-vec
 represent the indexed repository.
 
-- Treat SQLite as the structural source of truth:
+- Treat role-scoped SQLite databases as the local metadata source of truth:
   - `repositories`
-  - `index_runs`
+  - events-role `index_runs`
   - `files`
   - `symbols`
   - `chunks`
@@ -361,7 +361,7 @@ represent the indexed repository.
 
 ### Index Runs Timeline
 
-- Render `index_runs` as a compact table:
+- Render events-role `index_runs` as a compact table:
   - started/finished time
   - status
   - files seen/indexed

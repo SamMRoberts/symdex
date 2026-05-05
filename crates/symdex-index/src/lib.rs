@@ -16,13 +16,13 @@ use symdex_core::{
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
-    CallRecord, ChunkEmbeddingRecord, ChunkRecord, DependencyRecord, DependencyUsageRecord,
-    FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileIndexEventRecord, FileRecord,
-    IndexRunRecord, PointPayload, QualityActivationSummary, QualityGenerationProgress,
-    QualityJobCompletion, QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore,
-    SqliteVectorStore, StoreConfig, SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint,
-    WriterLease, WriterLeaseKind, WriterLeaseRequest, current_timestamp, vector_point_id,
-    vector_table_name,
+    CallRecord, ChunkEmbeddingRecord, ChunkRecord, DatabaseRole, DependencyRecord,
+    DependencyUsageRecord, FastEmbeddingManifestRecord, FastSemanticGenerationInput,
+    FileIndexEventRecord, FileRecord, IndexRunRecord, PointPayload, QualityActivationSummary,
+    QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow, QualityQueueSummary,
+    RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig, SymbolRecord,
+    SymbolReferenceRecord, TestRecord, VectorPoint, WriterLease, WriterLeaseKind,
+    WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
 };
 
 const EMBEDDING_SEGMENT_OVERLAP_DIVISOR: usize = 5;
@@ -888,6 +888,9 @@ fn run_index_internal(
     };
     let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
+    let mut events = SqliteStore::open_for_role(&store_config, DatabaseRole::Events)
+        .map_err(|error| error.to_string())?;
+    events.migrate().map_err(|error| error.to_string())?;
     sqlite
         .upsert_repository(&RepositoryRecord {
             id: root.id().to_owned(),
@@ -921,7 +924,7 @@ fn run_index_internal(
         embedding_model: &embedding_model,
         run_kind,
     };
-    sqlite
+    events
         .start_index_run(&index_run_record(
             &run_scope,
             "running",
@@ -936,9 +939,9 @@ fn run_index_internal(
         match collect_index_reports(&root, Some(&sqlite), skip_unchanged, &mut on_progress) {
             Ok(collection) => collection,
             Err(error) => {
-                record_collect_failure_file_event(&mut sqlite, &run_scope, &error)?;
+                record_collect_failure_file_event(&mut events, &run_scope, &error)?;
                 finish_failed_index_run(
-                    &sqlite,
+                    &events,
                     &run_scope,
                     "unknown",
                     RunCounts::default(),
@@ -953,7 +956,7 @@ fn run_index_internal(
         Err(error) => {
             let error = error.to_string();
             finish_failed_index_run(
-                &sqlite,
+                &events,
                 &run_scope,
                 &parser_version_summary(&collection),
                 RunCounts {
@@ -989,7 +992,7 @@ fn run_index_internal(
             Ok(point_ids) => point_ids,
             Err(error) => {
                 finish_failed_index_run(
-                    &sqlite,
+                    &events,
                     &run_scope,
                     &parser_version_summary(&collection),
                     RunCounts {
@@ -1019,7 +1022,7 @@ fn run_index_internal(
             Ok(prepared) => Some(prepared),
             Err(error) => {
                 finish_failed_index_run(
-                    &sqlite,
+                    &events,
                     &run_scope,
                     &parser_version_summary(&collection),
                     RunCounts {
@@ -1038,6 +1041,7 @@ fn run_index_internal(
         &mut sqlite,
         &root,
         &collection,
+        &mut events,
         &index_run_id,
         run_scope.repository_ref_id,
         &mut on_progress,
@@ -1045,7 +1049,7 @@ fn run_index_internal(
         Ok(persistence) => persistence,
         Err(error) => {
             finish_failed_index_run(
-                &sqlite,
+                &events,
                 &run_scope,
                 &parser_version_summary(&collection),
                 RunCounts {
@@ -1067,7 +1071,7 @@ fn run_index_internal(
             1,
             "Embedding skipped for offline indexing",
         ));
-        sqlite
+        events
             .finish_index_run(&index_run_record(
                 &run_scope,
                 "success",
@@ -1105,7 +1109,7 @@ fn run_index_internal(
                     EmbeddingSummary::SkippedNoChunks => ("skipped", None, 0),
                     EmbeddingSummary::SkippedOffline => ("success", None, 0),
                 };
-                sqlite
+                events
                     .finish_index_run(&index_run_record(
                         &run_scope,
                         status,
@@ -1123,7 +1127,7 @@ fn run_index_internal(
             }
             Err(error) => {
                 finish_failed_index_run(
-                    &sqlite,
+                    &events,
                     &run_scope,
                     &parser_version_summary(&collection),
                     RunCounts {
@@ -1779,6 +1783,7 @@ fn persist_structural_index(
     sqlite: &mut SqliteStore,
     root: &RepoRoot,
     collection: &IndexCollection,
+    events: &mut SqliteStore,
     index_run_id: &str,
     repository_ref_id: Option<&str>,
     on_progress: &mut impl FnMut(IndexProgress),
@@ -1977,7 +1982,7 @@ fn persist_structural_index(
             error_summary: None,
         }));
     }
-    sqlite
+    events
         .record_file_index_events(&file_index_events)
         .map_err(|error| error.to_string())?;
 

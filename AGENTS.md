@@ -25,16 +25,17 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Support a local continuous indexing mode that can be toggled on or off.
 - In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
-- SQLite stores repositories, files, symbols, chunks, calls, tests,
-  conservative test targets, short-lived runtime observations, and index
-  metadata.
-- Only ONE process may write to the configured local SQLite/sqlite-vec database
-  at a time. The guard is database-file scoped, not repository scoped. TUI, MCP,
-  diagnostics, query, and status paths must be read-only unless they are
-  starting or attaching the single writer. Manual indexing, continuous indexing,
-  quality catch-up, repair, and future write tools must coordinate through that
-  writer, queue/coalesce work, or refuse while another writer is active to
-  prevent SQLite database lock errors.
+- Role-scoped local SQLite databases store repositories, files, symbols,
+  chunks, calls, tests, conservative test targets, short-lived runtime
+  observations, watcher state, and index metadata.
+- Only ONE process may write to each configured local SQLite/sqlite-vec database
+  file at a time. The guard is database-file scoped, not repository scoped. TUI,
+  MCP, diagnostics, query, and status paths must be read-only unless they are
+  starting or attaching an explicit writer lane. Manual indexing, continuous
+  indexing, quality catch-up, repair, and future write tools must coordinate
+  through the appropriate database-role writer, queue/coalesce work, or refuse
+  while another writer for the same database file is active to prevent SQLite
+  database lock errors.
 - SQLite stores local Git/ref metadata for repository indexes. Branch-aware
   work must preserve local branch/ref identity, detached HEAD support, and
   non-Git repository behavior.

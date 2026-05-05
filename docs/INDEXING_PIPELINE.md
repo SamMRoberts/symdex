@@ -189,23 +189,23 @@ Store:
 
 If model name or vector dimension changes, require full reindex or collection migration.
 
-Current implementation records started and finished index runs in SQLite. Runs
-finish as `success`, `skipped`, `partial`, or `failed`. Offline indexing records
-successful structural runs, semantic indexing records skipped runs when there
-are no chunks to embed, and semantic embedding or sqlite-vec upsert failures before
-SQLite replacement are recorded as failed runs so the previous semantic
-generation remains intact. Failures after SQLite replacement, such as generation
-finalization or stale-vector cleanup failures, are recorded as partial runs with
-metadata-only error summaries. Before upserting vectors, semantic indexing
-rejects a same-repository, same-model dimension change so an existing sqlite-vec
-collection is not reused with incompatible vector sizes. Different model names
-map to different sqlite-vec collection names.
-Indexing also records per-file decisions in `file_index_events`. Each event
-links back to the run and active repository ref when known, and stores the path,
-old content hash, new content hash, action, reason, status, and metadata-only
-error summary. This makes created, updated, deleted, skipped unchanged,
-ignored or unsupported-by-discovery, and parser-diagnostic paths debuggable
-without reading source text.
+Current implementation records started and finished index runs in the events
+database role. Runs finish as `success`, `skipped`, `partial`, or `failed`.
+Offline indexing records successful structural runs, semantic indexing records
+skipped runs when there are no chunks to embed, and semantic embedding or
+sqlite-vec upsert failures before SQLite replacement are recorded as failed runs
+so the previous semantic generation remains intact. Failures after SQLite
+replacement, such as generation finalization or stale-vector cleanup failures,
+are recorded as partial runs with metadata-only error summaries. Before
+upserting vectors, semantic indexing rejects a same-repository, same-model
+dimension change so an existing sqlite-vec collection is not reused with
+incompatible vector sizes. Different model names map to different sqlite-vec
+collection names. Indexing also records per-file decisions in events-role
+`file_index_events`. Each event links back to the run and active repository ref
+when known, and stores the path, old content hash, new content hash, action,
+reason, status, and metadata-only error summary. This makes created, updated,
+deleted, skipped unchanged, ignored or unsupported-by-discovery, and
+parser-diagnostic paths debuggable without reading source text.
 Continuous watch batches use the same incremental indexing path and are recorded
 with `run_kind = watch` in index-run metadata.
 
@@ -439,25 +439,26 @@ process. Clients do not acquire the lock directly.
 The first multi-database split moved sqlite-vec projections out of the
 structural database: fast vectors use a derived `fast_semantic` SQLite file, and
 quality vectors use a derived `quality_semantic` SQLite file. The next split
-moves watcher control-plane state into the derived `watch` SQLite file. Watcher
+moved watcher control-plane state into the derived `watch` SQLite file. Watcher
 client heartbeat and detach jobs use the watch-role writer endpoint so they do
-not wait for structural indexing jobs. Structural SQLite continues to own the
-authoritative manifests, quality jobs, generation state, index runs, and
-per-file index events until later slices move those tables into their own role
-databases.
+not wait for structural indexing jobs. Index-run summaries and per-file index
+events now write to the derived `events` SQLite file. Structural SQLite
+continues to own the authoritative repository/ref manifests, file facts,
+symbols, calls, quality jobs, and generation state until later slices move the
+remaining semantic tables into their own role databases.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
 tool. These paths submit jobs to the writer service and wait for the result
 instead of opening a second structural writer. Continuous indexing runs as
 writer-managed watcher work and uses the same in-process structural write gate
-as queued manual jobs for repository facts, index runs, generation metadata, and
-quality jobs. A manual index, repair, migration, or quality job still pauses
+as queued manual jobs for repository facts, generation metadata, and quality
+jobs. A manual index, repair, migration, or quality job still pauses
 watch-driven structural writes: the watcher can continue polling and coalescing
 filesystem changes, but incremental batches and idle quality catch-up wait for
-the structural writer gate before touching structural SQLite. Watcher
-status/client rows write to the watch database role and do not wait for the
-structural gate.
+the structural writer gate before touching structural SQLite. Index-run and
+per-file event rows write to the events database role, while watcher
+status/client rows write to the watch database role.
 Read paths such as TUI refreshes, MCP evidence tools,
 diagnostics, semantic status, staleness checks, and query tools must not run
 migrations, stale-client pruning, repair, or quality catch-up as a side effect
