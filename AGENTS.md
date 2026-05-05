@@ -142,9 +142,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Continuous indexing uses one background watcher per repository. TUI, MCP, and
   CLI clients hold visible watcher leases; when no clients remain, the watcher
   exits after a short grace period.
-- The watcher is the continuous-indexing database writer. Other processes must
-  not run concurrent SQLite/sqlite-vec writes while it is active; they must
-  attach, read shared state, queue/coalesce, or fail closed with a clear message.
+- The database-file-scoped writer service is the only SQLite/sqlite-vec writer.
+  Watchers, manual index jobs, quality jobs, repair, migrations, and future
+  write-capable tools must submit write jobs to that service. Read paths use
+  read-only SQLite connections and do not depend on the writer service.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 - Branch-aware indexing must read only local Git metadata. Do not execute hooks,
   fetch remotes, contact hosted services, or treat branch names as trusted input.

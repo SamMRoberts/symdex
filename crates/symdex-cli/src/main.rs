@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::json;
 use symdex_core::RepoRoot;
@@ -10,8 +11,7 @@ use symdex_diagnostics::{
 use symdex_index::{
     ContinuousIndexEvent, EmbeddingSummary, IndexOptions, IndexScope, IndexSummary,
     QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
-    run_index, run_index_with_existing_writer, run_quality_index_with_existing_writer,
-    run_quality_index_with_progress,
+    run_index_with_existing_writer, run_quality_index_with_existing_writer,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
@@ -22,10 +22,13 @@ use symdex_query::{
     run_vector_verify_with_options,
 };
 use symdex_store::{
-    EvidenceFreshness, SqliteStore, SqliteVectorStore, StoreConfig, WriterLease, WriterLeaseKind,
-    WriterLeaseRequest, sqlite_parent,
+    EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
+    WatcherClientRecord, WatcherStatusRecord, current_timestamp, sqlite_parent,
 };
 use symdex_watch::{WatcherClientKind, WatcherStatus};
+use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse};
+
+static WRITER_WRITE_GATE: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -64,8 +67,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "watch-daemon" => {
             require_text_output(command, output)?;
-            let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            symdex_watch::run_daemon(repo)
+            symdex_writer::run_daemon(execute_writer_job)
+        }
+        "writer-daemon" => {
+            require_text_output(command, output)?;
+            symdex_writer::run_daemon(execute_writer_job)
         }
         "index-quality" => {
             require_text_output(command, output)?;
@@ -237,56 +243,374 @@ fn require_text_output(command: &str, output: OutputMode) -> Result<(), String> 
     Ok(())
 }
 
+fn execute_writer_job(job: WriterJob) -> WriterJobResponse {
+    match job {
+        WriterJob::Ping => WriterJobResponse::ok("writer daemon ready"),
+        WriterJob::Init => match with_writer_gate(init_with_existing_writer) {
+            Ok(message) => WriterJobResponse::ok(message),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::Index {
+            repo,
+            offline,
+            scope,
+        } => match with_writer_gate(|| {
+            run_index_with_existing_writer(&IndexOptions {
+                repo,
+                offline,
+                scope: index_scope(scope),
+            })
+        }) {
+            Ok(summary) => WriterJobResponse::ok_with_data(
+                "index completed",
+                json!({
+                    "kind": "index",
+                    "repository_id": summary.repository_id,
+                    "repository_root": summary.repository_root,
+                    "files_seen": summary.files_seen,
+                    "files_skipped_unchanged": summary.files_skipped_unchanged,
+                    "chunks_seen": summary.chunks_seen,
+                    "chunks_excluded_from_embedding": summary.chunks_excluded_from_embedding,
+                    "sqlite_files_indexed": summary.sqlite_files_indexed,
+                    "sqlite_chunks_indexed": summary.sqlite_chunks_indexed,
+                    "sqlite_symbols_indexed": summary.sqlite_symbols_indexed,
+                    "sqlite_calls_indexed": summary.sqlite_calls_indexed,
+                    "sqlite_files_removed": summary.sqlite_files_removed,
+                }),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::IndexQuality { repo } => {
+            match with_writer_gate(|| {
+                run_quality_index_with_existing_writer(&QualityIndexOptions { repo })
+            }) {
+                Ok(summary) => WriterJobResponse::ok_with_data(
+                    "quality index completed",
+                    json!({
+                        "kind": "index-quality",
+                        "repository_id": summary.repository_id,
+                        "generation_id": summary.generation_id,
+                        "quality_model": summary.quality_model,
+                        "quality_dimension": summary.quality_dimension,
+                        "quality_status": summary.quality_status,
+                        "active_layer": summary.active_layer,
+                        "activation_reason": summary.activation_reason,
+                        "vector_table": summary.vector_table,
+                        "claimed_jobs": summary.claimed_jobs,
+                        "succeeded_jobs": summary.succeeded_jobs,
+                        "failed_jobs": summary.failed_jobs,
+                        "skipped_stale_jobs": summary.skipped_stale_jobs,
+                        "skipped_excluded_jobs": summary.skipped_excluded_jobs,
+                        "remaining_pending_jobs": summary.remaining_pending_jobs,
+                    }),
+                ),
+                Err(error) => WriterJobResponse::error(error),
+            }
+        }
+        WriterJob::VectorRepair {
+            repo,
+            semantic_layer,
+        } => match VectorVerifySemanticLayer::parse(&semantic_layer).and_then(|semantic_layer| {
+            with_writer_gate(|| {
+                vector_repair_with_existing_writer(&VectorMaintenanceArgs {
+                    repo,
+                    semantic_layer,
+                })
+            })
+        }) {
+            Ok(message) => WriterJobResponse::ok(message),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::StartWatcher {
+            repo,
+            client_kind,
+            client_id,
+            pid,
+        } => match writer_start_watcher(&repo, &client_kind, &client_id, pid) {
+            Ok(status) => WriterJobResponse::ok_with_data(
+                "watcher started",
+                serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::StopWatcher { repo } => match writer_stop_watcher(&repo) {
+            Ok(status) => WriterJobResponse::ok_with_data(
+                "watcher stopped",
+                serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::AttachWatcherClient {
+            repo,
+            client_kind,
+            client_id,
+            pid,
+        } => match writer_attach_watcher_client(&repo, &client_kind, &client_id, pid) {
+            Ok(status) => WriterJobResponse::ok_with_data(
+                "watcher client attached",
+                serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::HeartbeatWatcherClient { repo, client_id } => {
+            match writer_heartbeat_watcher_client(&repo, &client_id) {
+                Ok(status) => WriterJobResponse::ok_with_data(
+                    "watcher client heartbeat",
+                    serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+                ),
+                Err(error) => WriterJobResponse::error(error),
+            }
+        }
+        WriterJob::DetachWatcherClient { repo, client_id } => {
+            match writer_detach_watcher_client(&repo, &client_id) {
+                Ok(status) => WriterJobResponse::ok_with_data(
+                    "watcher client detached",
+                    serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+                ),
+                Err(error) => WriterJobResponse::error(error),
+            }
+        }
+    }
+}
+
+fn writer_start_watcher(
+    repo: &str,
+    client_kind: &str,
+    client_id: &str,
+    pid: i32,
+) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let was_active = symdex_watch::status(repo)
+        .map(|status| status.is_active())
+        .unwrap_or(false);
+    let store_config = StoreConfig::from_env();
+    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    store
+        .upsert_repository(&RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    let now = current_timestamp();
+    store
+        .upsert_watcher_status(&WatcherStatusRecord {
+            repository_id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+            mode: "semantic".to_owned(),
+            owner_kind: "writer-daemon".to_owned(),
+            owner_pid: Some(std::process::id() as i32),
+            socket_path: None,
+            state: "running".to_owned(),
+            started_at: Some(now.clone()),
+            updated_at: Some(now.clone()),
+            heartbeat_at: Some(now),
+            files_seen: 0,
+            queued_events: 0,
+            last_indexed_path: None,
+            last_error: None,
+            active_layer: None,
+            quality_status: None,
+            quality_pending_jobs: 0,
+            quality_running_jobs: 0,
+            quality_failed_jobs: 0,
+            quality_stale_jobs: 0,
+        })
+        .map_err(|error| error.to_string())?;
+    let status = writer_attach_watcher_client(repo, client_kind, client_id, pid)?;
+    if !was_active {
+        symdex_watch::spawn_writer_managed_daemon(
+            root.path().display().to_string(),
+            writer_write_gate(),
+        );
+    }
+    Ok(status)
+}
+
+fn writer_stop_watcher(repo: &str) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    store
+        .mark_watcher_stopped(root.id())
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_attach_watcher_client(
+    repo: &str,
+    client_kind: &str,
+    client_id: &str,
+    pid: i32,
+) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let now = current_timestamp();
+    store
+        .upsert_watcher_client(&WatcherClientRecord {
+            repository_id: root.id().to_owned(),
+            client_id: client_id.to_owned(),
+            client_kind: client_kind.to_owned(),
+            pid: Some(pid),
+            started_at: Some(now.clone()),
+            heartbeat_at: Some(now),
+            last_seen_at: None,
+        })
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_heartbeat_watcher_client(repo: &str, client_id: &str) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    store
+        .heartbeat_watcher_client(root.id(), client_id)
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_detach_watcher_client(repo: &str, client_id: &str) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    store
+        .remove_watcher_client(root.id(), client_id)
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_scope(scope: IndexScope) -> WriterIndexScope {
+    match scope {
+        IndexScope::Full => WriterIndexScope::Full,
+        IndexScope::Incremental => WriterIndexScope::Incremental,
+    }
+}
+
+fn index_scope(scope: WriterIndexScope) -> IndexScope {
+    match scope {
+        WriterIndexScope::Full => IndexScope::Full,
+        WriterIndexScope::Incremental => IndexScope::Incremental,
+    }
+}
+
+fn writer_write_gate() -> Arc<Mutex<()>> {
+    WRITER_WRITE_GATE
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn with_writer_gate<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let gate = writer_write_gate();
+    let _guard = gate
+        .lock()
+        .map_err(|_| "writer gate lock poisoned".to_owned())?;
+    job()
+}
+
+fn print_writer_response(response: &WriterJobResponse) -> Result<(), String> {
+    for progress in &response.progress {
+        println!(
+            "progress phase={} completed={} total={} message={}",
+            progress.phase, progress.completed, progress.total, progress.message
+        );
+    }
+    if !response.ok {
+        return Err(response.message.clone());
+    }
+    match response
+        .data
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("index") => print_writer_index_summary(&response.data),
+        Some("index-quality") => print_writer_quality_summary(&response.data),
+        _ => println!("{}", response.message),
+    }
+    Ok(())
+}
+
+fn print_writer_index_summary(data: &serde_json::Value) {
+    for key in [
+        "repository_id",
+        "repository_root",
+        "files_seen",
+        "files_skipped_unchanged",
+        "chunks_seen",
+        "chunks_excluded_from_embedding",
+        "sqlite_files_indexed",
+        "sqlite_chunks_indexed",
+        "sqlite_symbols_indexed",
+        "sqlite_calls_indexed",
+        "sqlite_files_removed",
+    ] {
+        println!(
+            "{key}: {}",
+            data.get(key).unwrap_or(&serde_json::Value::Null)
+        );
+    }
+}
+
+fn print_writer_quality_summary(data: &serde_json::Value) {
+    for key in [
+        "repository_id",
+        "generation_id",
+        "quality_model",
+        "quality_dimension",
+        "quality_status",
+        "active_layer",
+        "activation_reason",
+        "vector_table",
+        "claimed_jobs",
+        "succeeded_jobs",
+        "failed_jobs",
+        "skipped_stale_jobs",
+        "skipped_excluded_jobs",
+        "remaining_pending_jobs",
+    ] {
+        println!(
+            "{key}: {}",
+            data.get(key).unwrap_or(&serde_json::Value::Null)
+        );
+    }
+}
+
 fn doctor(repo: Option<&str>) -> Result<(), String> {
     print_diagnostic_report(&run_diagnostics_for_repo(repo)?);
     Ok(())
 }
 
 fn init() -> Result<(), String> {
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::Init)?;
+    print_writer_response(&response)?;
+    Ok(())
+}
+
+fn init_with_existing_writer() -> Result<String, String> {
     let store = StoreConfig::from_env();
-    let _writer = WriterLease::acquire(
-        &store,
-        WriterLeaseRequest::new(WriterLeaseKind::Init, "init"),
-    )
-    .map_err(|error| error.to_string())?;
     if let Some(parent) = sqlite_parent(&store) {
         fs::create_dir_all(&parent)
             .map_err(|error| format!("create sqlite directory {}: {error}", parent.display()))?;
-        println!("created {}", parent.display());
     }
     let sqlite = SqliteStore::open(&store).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
-    println!("initialized symdex local state");
-    Ok(())
+    Ok("initialized symdex local state".to_owned())
 }
 
 fn index(args: &IndexArgs) -> Result<(), String> {
     if args.watch {
         return continuous_index(args);
     }
-    let summary = run_index(&IndexOptions {
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::Index {
         repo: args.repo.clone(),
         offline: args.offline,
-        scope: args.scope,
+        scope: writer_scope(args.scope),
     })?;
-    print_index_summary(&summary);
-    Ok(())
+    print_writer_response(&response)
 }
 
 fn index_quality(repo: &str) -> Result<(), String> {
-    let summary = run_quality_index_with_progress(
-        &QualityIndexOptions {
-            repo: repo.to_owned(),
-        },
-        |progress| {
-            println!(
-                "quality_progress phase={} completed={} total={} message={}",
-                progress.phase, progress.completed, progress.total, progress.message
-            );
-        },
-    )?;
-    print_quality_index_summary(&summary);
-    Ok(())
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::IndexQuality {
+        repo: repo.to_owned(),
+    })?;
+    print_writer_response(&response)
 }
 
 fn continuous_index(args: &IndexArgs) -> Result<(), String> {
@@ -510,14 +834,14 @@ fn vector_verify(args: &VectorMaintenanceArgs) -> Result<(), String> {
 }
 
 fn vector_repair(args: &VectorMaintenanceArgs) -> Result<(), String> {
-    let root = RepoRoot::open(&args.repo).map_err(|error| error.to_string())?;
-    let store_config = StoreConfig::from_env();
-    let _writer = WriterLease::acquire(
-        &store_config,
-        WriterLeaseRequest::new(WriterLeaseKind::VectorRepair, "vector-repair")
-            .for_repo(root.id(), root.path().display().to_string()),
-    )
-    .map_err(|error| error.to_string())?;
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::VectorRepair {
+        repo: args.repo.clone(),
+        semantic_layer: args.semantic_layer.as_str().to_owned(),
+    })?;
+    print_writer_response(&response)
+}
+
+fn vector_repair_with_existing_writer(args: &VectorMaintenanceArgs) -> Result<String, String> {
     let options = VectorVerifyOptions {
         semantic_layer: args.semantic_layer,
     };
@@ -533,7 +857,7 @@ fn vector_repair(args: &VectorMaintenanceArgs) -> Result<(), String> {
     let after = run_vector_verify_with_options(&args.repo, options)?;
     println!("post_repair_verify:");
     print_vector_verify_summary(&after);
-    Ok(())
+    Ok("vector repair completed".to_owned())
 }
 
 fn repair_vector_summary(repo: &str, summary: &VectorVerifySummary) -> Result<(), String> {

@@ -159,13 +159,13 @@ uses the verifier's captured point IDs for orphan deletion and the existing
 semantic index path for vector rebuilds, so focused tests cover the repair plan
 classification while live end-to-end repair remains service-dependent.
 
-Single-writer tests should stay split between deterministic store/unit coverage
-and higher-level watcher/CLI behavior. Store tests cover same-database
-exclusion, independent database paths, release/reacquire, and stale metadata
-replacement. Watcher and CLI tests should prove the daemon holds the writer
-lease while active, attach/heartbeat/detach route through daemon IPC, manual
-writers fail with owner metadata, and read-only status/evidence commands keep
-working while the writer is active.
+Single-writer tests should stay split between deterministic store/unit coverage,
+writer-service protocol coverage, and higher-level watcher/CLI behavior. Store
+tests cover the daemon-internal advisory lock. Writer tests cover stable
+database-path endpoints, job serialization, and one daemon per DB path. Watcher
+and CLI tests should prove attach/heartbeat/detach route through writer jobs,
+manual writers queue through the service, and read-only status/evidence commands
+keep working while writer-managed work is active.
 
 Service-dependent checks:
 

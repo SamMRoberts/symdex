@@ -1,10 +1,9 @@
 //! Shared continuous-indexing watcher control plane.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -12,18 +11,17 @@ use serde::Serialize;
 use symdex_core::RepoRoot;
 use symdex_index::{
     ContinuousIndexEvent, ContinuousIndexOptions, QualityIndexSummary, WatchChangeSet,
-    run_continuous_index_until,
+    run_continuous_index_until_with_write_gate,
 };
 use symdex_store::{
     RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord, WatcherStatusRecord,
-    WriterLease, WriterLeaseKind, WriterLeaseRequest, current_timestamp,
+    current_timestamp,
 };
+use symdex_writer::{WriterClient, WriterJob};
 
 const HEARTBEAT_STALE_SECONDS: u64 = 10;
 const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const NO_CLIENT_GRACE: Duration = Duration::from_secs(10);
-const START_WAIT: Duration = Duration::from_secs(3);
-
 static CLIENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +178,7 @@ impl WatcherStatus {
 pub struct WatcherAttachment {
     repository_id: String,
     client_id: String,
+    root_path: String,
     endpoint: Option<String>,
     stop_heartbeat: Option<Sender<()>>,
     heartbeat_thread: Option<JoinHandle<()>>,
@@ -216,8 +215,11 @@ impl Drop for WatcherAttachment {
         if let Some(endpoint) = &self.endpoint {
             let _ =
                 control_ipc::send_control_command(endpoint, &format!("detach {}", self.client_id));
-        } else if let Ok(store) = open_store() {
-            let _ = store.remove_watcher_client(&self.repository_id, &self.client_id);
+        } else {
+            let _ = WriterClient::from_env().submit_and_wait(&WriterJob::DetachWatcherClient {
+                repo: self.root_path.clone(),
+                client_id: self.client_id.clone(),
+            });
         }
     }
 }
@@ -227,122 +229,42 @@ pub fn start_or_attach(
     client_kind: WatcherClientKind,
 ) -> Result<WatcherAttachment, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    start_daemon_for_root(&root)?;
-    attach_to_daemon(&root, client_kind)
+    let client_id = format!(
+        "{}-{}-{}",
+        client_kind.as_str(),
+        std::process::id(),
+        CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    WriterClient::from_env().submit_and_wait(&WriterJob::StartWatcher {
+        repo: root.path().display().to_string(),
+        client_kind: client_kind.as_str().to_owned(),
+        client_id: client_id.clone(),
+        pid: std::process::id() as i32,
+    })?;
+    heartbeat_attachment(&root, client_kind, client_id)
 }
 
 pub fn start_daemon(repo: &str) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    start_daemon_for_root(&root)
-}
-
-fn start_daemon_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
-    let status = status_for_root(root)?;
-    if status.is_active() {
-        return Ok(status);
-    }
-    if let Some(endpoint) = status.socket_path.as_deref() {
-        control_ipc::cleanup_control_endpoint(endpoint);
-    }
-    {
-        let store_config = StoreConfig::from_env();
-        let _writer = acquire_writer_for_root(
-            &store_config,
-            root,
-            WriterLeaseKind::WatcherLauncher,
-            "watch start",
-        )?;
-        let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-        store.migrate().map_err(|error| error.to_string())?;
-        store
-            .upsert_repository(&RepositoryRecord {
-                id: root.id().to_owned(),
-                root_path: root.path().display().to_string(),
-            })
-            .map_err(|error| error.to_string())?;
-        let starting = WatcherStatus {
-            repository_id: root.id().to_owned(),
-            root_path: root.path().display().to_string(),
-            mode: "semantic".to_owned(),
-            owner_kind: "launcher".to_owned(),
-            owner_pid: Some(std::process::id() as i32),
-            socket_path: None,
-            state: "starting".to_owned(),
-            started_at: Some(current_timestamp()),
-            updated_at: None,
-            heartbeat_at: None,
-            files_seen: 0,
-            queued_events: 0,
-            last_indexed_path: None,
-            last_error: None,
-            active_layer: None,
-            quality_status: None,
-            quality_pending_jobs: 0,
-            quality_running_jobs: 0,
-            quality_failed_jobs: 0,
-            quality_stale_jobs: 0,
-            attached_clients: 0,
-            client_kinds: Vec::new(),
-            clients: Vec::new(),
-            shutdown_after_seconds: None,
-        };
-        store
-            .upsert_watcher_status(&starting.record())
-            .map_err(|error| error.to_string())?;
-    }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    if let Err(error) = Command::new(executable)
-        .arg("watch-daemon")
-        .arg(root.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        let store_config = StoreConfig::from_env();
-        if let Ok(_writer) = acquire_writer_for_root(
-            &store_config,
-            root,
-            WriterLeaseKind::WatcherLauncher,
-            "watch start failed",
-        ) && let Ok(store) = SqliteStore::open(&store_config)
-        {
-            let _ = store.mark_watcher_failed(root.id(), &error.to_string());
-        }
-        return Err(format!("start watcher daemon: {error}"));
-    }
-
-    let started = Instant::now();
-    while started.elapsed() < START_WAIT {
-        let current = status_for_root(root)?;
-        if current.is_active() {
-            return Ok(current);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    status_for_root(root)
+    let client_id = format!(
+        "cli-{}-{}",
+        std::process::id(),
+        CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    WriterClient::from_env().submit_and_wait(&WriterJob::StartWatcher {
+        repo: root.path().display().to_string(),
+        client_kind: WatcherClientKind::Cli.as_str().to_owned(),
+        client_id,
+        pid: std::process::id() as i32,
+    })?;
+    status_for_root(&root)
 }
 
 pub fn stop_daemon(repo: &str) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let status = status_for_root(&root)?;
-    if let Some(endpoint) = status.socket_path.as_deref()
-        && control_ipc::send_control_command(endpoint, "stop")
-    {
-        wait_for_stopped(&root)?;
-        return status_for_root(&root);
-    }
-    let store_config = StoreConfig::from_env();
-    let _writer = acquire_writer_for_root(
-        &store_config,
-        &root,
-        WriterLeaseKind::WatcherLauncher,
-        "watch stop",
-    )?;
-    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    store
-        .mark_watcher_stopped(root.id())
-        .map_err(|error| error.to_string())?;
+    WriterClient::from_env().submit_and_wait(&WriterJob::StopWatcher {
+        repo: root.path().display().to_string(),
+    })?;
     status_for_root(&root)
 }
 
@@ -351,15 +273,15 @@ pub fn status(repo: &str) -> Result<WatcherStatus, String> {
     status_for_root(&root)
 }
 
-pub fn run_daemon(repo: &str) -> Result<(), String> {
+pub fn spawn_writer_managed_daemon(repo: String, write_gate: Arc<Mutex<()>>) {
+    thread::spawn(move || {
+        let _ = run_writer_managed_daemon(&repo, write_gate);
+    });
+}
+
+pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Result<(), String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
-    let _writer = acquire_writer_for_root(
-        &store_config,
-        &root,
-        WriterLeaseKind::WatcherDaemon,
-        "watch daemon",
-    )?;
     let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     store.migrate().map_err(|error| error.to_string())?;
     store
@@ -368,23 +290,15 @@ pub fn run_daemon(repo: &str) -> Result<(), String> {
             root_path: root.path().display().to_string(),
         })
         .map_err(|error| error.to_string())?;
-    let endpoint = control_ipc::control_endpoint_for_repo(root.id())?;
-    let listener = control_ipc::bind_control_listener(&endpoint)?;
-    let should_continue = Arc::new(AtomicBool::new(true));
-    control_ipc::start_control_listener(
-        listener,
-        Arc::clone(&should_continue),
-        root.id().to_owned(),
-    );
 
     let initial = WatcherStatus {
         repository_id: root.id().to_owned(),
         root_path: root.path().display().to_string(),
         mode: "semantic".to_owned(),
-        owner_kind: "daemon".to_owned(),
+        owner_kind: "writer-daemon".to_owned(),
         owner_pid: Some(std::process::id() as i32),
-        socket_path: Some(endpoint.clone()),
-        state: "starting".to_owned(),
+        socket_path: None,
+        state: "running".to_owned(),
         started_at: Some(current_timestamp()),
         updated_at: None,
         heartbeat_at: None,
@@ -409,18 +323,20 @@ pub fn run_daemon(repo: &str) -> Result<(), String> {
 
     let mut current = initial;
     let mut no_clients_since: Option<Instant> = None;
-    let result = run_continuous_index_until(
+    let result = run_continuous_index_until_with_write_gate(
         &ContinuousIndexOptions::new(root.path().display().to_string(), false),
         |event| {
             apply_event(&mut current, &event);
             let _ = store.upsert_watcher_status(&current.record());
         },
-        || {
-            should_continue.load(Ordering::SeqCst)
-                && clients_allow_continuing(root.id(), &mut no_clients_since)
+        || clients_allow_continuing(root.id(), &mut no_clients_since),
+        |job| {
+            let _guard = write_gate
+                .lock()
+                .map_err(|_| "writer gate lock poisoned".to_owned())?;
+            job()
         },
     );
-    control_ipc::cleanup_control_endpoint(&endpoint);
     match result {
         Ok(()) => store
             .mark_watcher_stopped(root.id())
@@ -437,100 +353,37 @@ pub fn run_foreground(
     offline: bool,
     mut on_event: impl FnMut(ContinuousIndexEvent),
 ) -> Result<(), String> {
-    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let store_config = StoreConfig::from_env();
-    let _writer = acquire_writer_for_root(
-        &store_config,
-        &root,
-        WriterLeaseKind::WatcherForeground,
-        "watch foreground",
-    )?;
-    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    store.migrate().map_err(|error| error.to_string())?;
-    store
-        .upsert_repository(&RepositoryRecord {
-            id: root.id().to_owned(),
-            root_path: root.path().display().to_string(),
-        })
-        .map_err(|error| error.to_string())?;
-    let status = status_for_root(&root)?;
-    if status.is_active() {
-        return Err(format!(
-            "continuous watcher already active for `{}`; use `symdex watch status {}`",
-            root.path().display(),
-            root.path().display()
-        ));
+    let attachment = start_or_attach(repo, WatcherClientKind::Cli)?;
+    let status = attachment.status()?;
+    on_event(ContinuousIndexEvent::Started {
+        repository_id: status.repository_id,
+        files_seen: status.files_seen,
+    });
+    if offline {
+        on_event(ContinuousIndexEvent::BatchFailed {
+            changes: WatchChangeSet::default(),
+            error: "offline foreground watch is now managed by the writer service semantic watcher"
+                .to_owned(),
+        });
     }
-    let _attachment = register_client(&root, WatcherClientKind::Cli)?;
-    let mut current = WatcherStatus {
-        repository_id: root.id().to_owned(),
-        root_path: root.path().display().to_string(),
-        mode: if offline { "offline" } else { "semantic" }.to_owned(),
-        owner_kind: "foreground-cli".to_owned(),
-        owner_pid: Some(std::process::id() as i32),
-        socket_path: None,
-        state: "starting".to_owned(),
-        started_at: Some(current_timestamp()),
-        updated_at: None,
-        heartbeat_at: None,
-        files_seen: 0,
-        queued_events: 0,
-        last_indexed_path: None,
-        last_error: None,
-        active_layer: None,
-        quality_status: None,
-        quality_pending_jobs: 0,
-        quality_running_jobs: 0,
-        quality_failed_jobs: 0,
-        quality_stale_jobs: 0,
-        attached_clients: 0,
-        client_kinds: Vec::new(),
-        clients: Vec::new(),
-        shutdown_after_seconds: None,
-    };
-    store
-        .upsert_watcher_status(&current.record())
-        .map_err(|error| error.to_string())?;
-    run_continuous_index_until(
-        &ContinuousIndexOptions::new(root.path().display().to_string(), offline),
-        |event| {
-            apply_event(&mut current, &event);
-            let _ = store.upsert_watcher_status(&current.record());
-            on_event(event);
-        },
-        || true,
-    )?;
-    store
-        .mark_watcher_stopped(root.id())
-        .map_err(|error| error.to_string())
+    loop {
+        thread::sleep(CLIENT_HEARTBEAT_INTERVAL);
+        if let Ok(status) = attachment.status()
+            && !status.is_active()
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
-fn register_client(
+fn heartbeat_attachment(
     root: &RepoRoot,
-    client_kind: WatcherClientKind,
+    _client_kind: WatcherClientKind,
+    client_id: String,
 ) -> Result<WatcherAttachment, String> {
-    let client_id = format!(
-        "{}-{}-{}",
-        client_kind.as_str(),
-        std::process::id(),
-        CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
-    );
-    let record = WatcherClientRecord {
-        repository_id: root.id().to_owned(),
-        client_id: client_id.clone(),
-        client_kind: client_kind.as_str().to_owned(),
-        pid: Some(std::process::id() as i32),
-        started_at: Some(current_timestamp()),
-        heartbeat_at: Some(current_timestamp()),
-        last_seen_at: None,
-    };
-    let store = open_store()?;
-    store
-        .upsert_watcher_client(&record)
-        .map_err(|error| error.to_string())?;
-
-    let heartbeat_record = record.clone();
-    let repository_id = root.id().to_owned();
+    let repo = root.path().display().to_string();
+    let heartbeat_repo = repo.clone();
     let heartbeat_client_id = client_id.clone();
     let (stop_heartbeat, heartbeat_stop) = mpsc::channel();
     let heartbeat_thread = thread::spawn(move || {
@@ -538,97 +391,21 @@ fn register_client(
             .recv_timeout(CLIENT_HEARTBEAT_INTERVAL)
             .is_err()
         {
-            if let Ok(store) = open_store() {
-                match store.heartbeat_watcher_client(&repository_id, &heartbeat_client_id) {
-                    Ok(0) => {
-                        let now = current_timestamp();
-                        let mut revived = heartbeat_record.clone();
-                        revived.heartbeat_at = Some(now);
-                        revived.last_seen_at = None;
-                        let _ = store.upsert_watcher_client(&revived);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {}
-                }
-            }
+            let _ = WriterClient::from_env().submit_and_wait(&WriterJob::HeartbeatWatcherClient {
+                repo: heartbeat_repo.clone(),
+                client_id: heartbeat_client_id.clone(),
+            });
         }
     });
 
     Ok(WatcherAttachment {
         repository_id: root.id().to_owned(),
         client_id,
+        root_path: repo,
         endpoint: None,
         stop_heartbeat: Some(stop_heartbeat),
         heartbeat_thread: Some(heartbeat_thread),
     })
-}
-
-fn attach_to_daemon(
-    root: &RepoRoot,
-    client_kind: WatcherClientKind,
-) -> Result<WatcherAttachment, String> {
-    let client_id = format!(
-        "{}-{}-{}",
-        client_kind.as_str(),
-        std::process::id(),
-        CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
-    );
-    let command = format!(
-        "attach {} {} {}",
-        client_kind.as_str(),
-        std::process::id(),
-        client_id
-    );
-    let started = Instant::now();
-    let endpoint = loop {
-        let status = status_for_root(root)?;
-        if let Some(endpoint) = status.socket_path {
-            if control_ipc::send_control_command(&endpoint, &command) {
-                break endpoint;
-            }
-        }
-        if started.elapsed() >= START_WAIT {
-            return Err("watcher daemon did not accept client attachment".to_owned());
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-
-    let heartbeat_endpoint = endpoint.clone();
-    let heartbeat_client_id = client_id.clone();
-    let (stop_heartbeat, heartbeat_stop) = mpsc::channel();
-    let heartbeat_thread = thread::spawn(move || {
-        while heartbeat_stop
-            .recv_timeout(CLIENT_HEARTBEAT_INTERVAL)
-            .is_err()
-        {
-            let _ = control_ipc::send_control_command(
-                &heartbeat_endpoint,
-                &format!("heartbeat {heartbeat_client_id}"),
-            );
-        }
-    });
-
-    Ok(WatcherAttachment {
-        repository_id: root.id().to_owned(),
-        client_id,
-        endpoint: Some(endpoint),
-        stop_heartbeat: Some(stop_heartbeat),
-        heartbeat_thread: Some(heartbeat_thread),
-    })
-}
-
-fn acquire_writer_for_root(
-    config: &StoreConfig,
-    root: &RepoRoot,
-    kind: WriterLeaseKind,
-    operation: &str,
-) -> Result<WriterLease, String> {
-    WriterLease::acquire(
-        config,
-        WriterLeaseRequest::new(kind, operation)
-            .for_repo(root.id(), root.path().display().to_string()),
-    )
-    .map_err(|error| error.to_string())
 }
 
 fn open_store() -> Result<SqliteStore, String> {
@@ -710,18 +487,6 @@ fn watcher_client_is_live(client: &WatcherClientRecord, stale_before: u64) -> bo
         .and_then(|value| value.parse::<u64>().ok())
         .map(|heartbeat| heartbeat >= stale_before)
         .unwrap_or(true)
-}
-
-fn wait_for_stopped(root: &RepoRoot) -> Result<(), String> {
-    let started = Instant::now();
-    while started.elapsed() < START_WAIT {
-        let status = status_for_root(root)?;
-        if !status.is_active() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Ok(())
 }
 
 fn clients_allow_continuing(repository_id: &str, no_clients_since: &mut Option<Instant>) -> bool {
@@ -850,6 +615,7 @@ fn latest_changed_path(changes: &WatchChangeSet) -> Option<String> {
         .cloned()
 }
 
+#[allow(dead_code)]
 fn handle_control_stream(
     mut stream: impl Read + Write,
     should_continue: &AtomicBool,
@@ -872,6 +638,7 @@ fn handle_control_stream(
     false
 }
 
+#[allow(dead_code)]
 fn handle_control_command(command: &str, repository_id: &str) -> String {
     let mut parts = command.split_whitespace();
     match parts.next() {
@@ -949,6 +716,7 @@ fn watcher_endpoint_name(repository_id: &str) -> String {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 mod control_ipc {
     use std::fs;
     use std::os::unix::net::{UnixListener, UnixStream};

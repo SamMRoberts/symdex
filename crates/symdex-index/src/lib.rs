@@ -572,6 +572,20 @@ pub fn run_continuous_index_until(
     mut on_event: impl FnMut(ContinuousIndexEvent),
     mut should_continue: impl FnMut() -> bool,
 ) -> Result<(), String> {
+    run_continuous_index_until_with_write_gate(
+        options,
+        &mut on_event,
+        &mut should_continue,
+        |job| job(),
+    )
+}
+
+pub fn run_continuous_index_until_with_write_gate(
+    options: &ContinuousIndexOptions,
+    mut on_event: impl FnMut(ContinuousIndexEvent),
+    mut should_continue: impl FnMut() -> bool,
+    mut with_writer: impl FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+) -> Result<(), String> {
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let mut snapshot = watch_snapshot(&root)?;
     on_event(ContinuousIndexEvent::Started {
@@ -611,18 +625,27 @@ pub fn run_continuous_index_until(
             changes: changes.clone(),
         });
 
-        match run_watch_incremental_index(&IndexOptions {
-            repo: options.repo.clone(),
-            offline: options.offline,
-            scope: IndexScope::Incremental,
-        }) {
-            Ok(summary) => {
-                snapshot = watch_snapshot(&root).unwrap_or(debounced_snapshot);
+        let batch_job = || {
+            run_watch_incremental_index(&IndexOptions {
+                repo: options.repo.clone(),
+                offline: options.offline,
+                scope: IndexScope::Incremental,
+            })
+        };
+        match with_writer(&mut || {
+            batch_job().map(|summary| {
+                snapshot = watch_snapshot(&root).unwrap_or(debounced_snapshot.clone());
                 on_event(ContinuousIndexEvent::BatchCompleted {
-                    changes,
+                    changes: changes.clone(),
                     summary: Box::new(summary),
                 });
-                run_continuous_quality_catch_up(options, &mut on_event, true);
+            })
+        }) {
+            Ok(()) => {
+                let _ = with_writer(&mut || {
+                    run_continuous_quality_catch_up(options, &mut on_event, true);
+                    Ok(())
+                });
             }
             Err(error) => {
                 snapshot = debounced_snapshot;

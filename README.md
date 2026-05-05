@@ -118,11 +118,11 @@ symdex enforces one watcher per repository. The watcher polls eligible files,
 debounces changes, respects ignore/path-boundary rules, and runs incremental
 indexing for changed content.
 
-symdex also enforces a single database writer per configured SQLite database.
-The active watcher daemon, manual index command, quality catch-up, repair, or
-cleanup job owns SQLite/sqlite-vec writes through a sidecar writer lock file;
-other clients read shared state, attach through watcher IPC, queue work, or
-refuse with owner metadata rather than starting a competing writer.
+symdex also enforces a single writer service per configured SQLite database.
+Manual indexing, quality catch-up, repair, migrations, watcher state updates,
+and continuous indexing batches submit jobs to that service. The service owns
+SQLite/sqlite-vec writes and keeps the sidecar OS lock only as its internal
+duplicate-daemon guard. Read paths use read-only SQLite connections directly.
 
 Watcher lifetime is client-scoped:
 
@@ -161,7 +161,7 @@ Core keys:
 - `q` / `Esc`: quit or back out of the current interaction.
 
 The Index tab auto-refreshes shared watcher and semantic readiness state because
-continuous indexing is owned by the background watcher daemon, not the TUI
+continuous indexing is owned by the background writer service, not the TUI
 process itself.
 
 ## MCP

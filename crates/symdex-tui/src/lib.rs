@@ -27,8 +27,8 @@ use symdex_diagnostics::{
 };
 use symdex_embed::EmbedConfig;
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousQualityState, EmbeddingSummary, IndexOptions, IndexProgress,
-    IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary, run_index_with_progress,
+    ContinuousIndexEvent, ContinuousQualityState, EmbeddingSummary, IndexProgress, IndexScope,
+    IndexSummary, RustAnalyzerEnrichmentSummary,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
@@ -49,6 +49,7 @@ use symdex_store::{
     VectorStorageProjection, vector_table_name,
 };
 use symdex_watch::{WatcherAttachment, WatcherClientKind, WatcherStatus};
+use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse};
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
 
@@ -1119,18 +1120,21 @@ impl App {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let progress_sender = sender.clone();
-            let result = run_index_with_progress(
-                &IndexOptions {
+            let _ = sender.send(IndexJobMessage::Progress(IndexProgress {
+                phase: "queue",
+                completed: 0,
+                total: 1,
+                message: "Submitting index job to writer service".to_owned(),
+            }));
+            let result = WriterClient::from_env()
+                .submit_and_wait(&WriterJob::Index {
                     repo,
                     offline: matches!(request.mode, IndexMode::Offline),
-                    scope: request.scope,
-                },
-                move |progress| {
-                    let _ = progress_sender.send(IndexJobMessage::Progress(progress));
-                },
-            );
-            let _ = sender.send(IndexJobMessage::Finished(result.map(Box::new)));
+                    scope: writer_scope(request.scope),
+                })
+                .and_then(index_summary_from_writer_response)
+                .map(Box::new);
+            let _ = sender.send(IndexJobMessage::Finished(result));
         });
         self.index_receiver = Some(receiver);
         self.last_index_summary = None;
@@ -1167,17 +1171,26 @@ impl App {
     }
 
     fn stop_continuous_index(&mut self) {
-        self.watcher_attachment = None;
+        let had_attachment = self.watcher_attachment.take().is_some();
         match symdex_watch::stop_daemon(&self.repo_input) {
             Ok(status) => {
                 self.apply_watcher_status(&status);
+                self.continuous.enabled = false;
+                self.continuous.status = ContinuousIndexStatus::Off;
                 self.last_watcher_status_refresh = Some(Instant::now());
                 self.message = "Continuous indexing stopped.".to_owned();
             }
             Err(error) => {
-                self.continuous.status = ContinuousIndexStatus::Failed;
-                self.continuous.latest_error = Some(error);
-                self.message = "Continuous indexing stop failed.".to_owned();
+                if had_attachment {
+                    self.continuous.status = ContinuousIndexStatus::Failed;
+                    self.continuous.latest_error = Some(error);
+                    self.message = "Continuous indexing stop failed.".to_owned();
+                } else {
+                    self.continuous.enabled = false;
+                    self.continuous.status = ContinuousIndexStatus::Off;
+                    self.continuous.queued_events = 0;
+                    self.message = "Continuous indexing stopped.".to_owned();
+                }
             }
         }
         self.continuous_receiver = None;
@@ -6082,6 +6095,52 @@ fn progress_label(progress: Option<&IndexProgress>) -> String {
         ),
         None => "starting 0/1".to_owned(),
     }
+}
+
+fn writer_scope(scope: IndexScope) -> WriterIndexScope {
+    match scope {
+        IndexScope::Full => WriterIndexScope::Full,
+        IndexScope::Incremental => WriterIndexScope::Incremental,
+    }
+}
+
+fn index_summary_from_writer_response(response: WriterJobResponse) -> Result<IndexSummary, String> {
+    if !response.ok {
+        return Err(response.message);
+    }
+    let data = response.data;
+    Ok(IndexSummary {
+        repository_id: string_field(&data, "repository_id"),
+        repository_root: string_field(&data, "repository_root"),
+        files_seen: usize_field(&data, "files_seen"),
+        files_skipped_unchanged: usize_field(&data, "files_skipped_unchanged"),
+        files: Vec::new(),
+        chunks_seen: usize_field(&data, "chunks_seen"),
+        chunks_excluded_from_embedding: usize_field(&data, "chunks_excluded_from_embedding"),
+        sqlite_files_indexed: usize_field(&data, "sqlite_files_indexed"),
+        sqlite_chunks_indexed: usize_field(&data, "sqlite_chunks_indexed"),
+        sqlite_symbols_indexed: usize_field(&data, "sqlite_symbols_indexed"),
+        sqlite_calls_indexed: usize_field(&data, "sqlite_calls_indexed"),
+        sqlite_files_removed: usize_field(&data, "sqlite_files_removed"),
+        rust_analyzer: RustAnalyzerEnrichmentSummary::Disabled {
+            enable_env: "SYMDEX_RUST_ANALYZER".to_owned(),
+        },
+        embedding: EmbeddingSummary::SkippedNoChunks,
+    })
+}
+
+fn string_field(data: &serde_json::Value, key: &str) -> String {
+    data.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn usize_field(data: &serde_json::Value, key: &str) -> usize {
+    data.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 fn layer_readiness_percent(layer: &SemanticStatusLayerSummary) -> u16 {

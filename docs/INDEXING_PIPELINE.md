@@ -412,20 +412,17 @@ a time. This is a product invariant, not just an implementation detail:
 competing write loops cause SQLite lock errors and make index provenance hard to
 reason about.
 
-The guard is database-file scoped, not repository scoped. `symdex-store` derives
-a sidecar writer lock file from `StoreConfig.sqlite_path`, acquires an advisory
-exclusive lock before mutations, and records JSON owner metadata with owner
-kind, process id, operation, repository id, repository path, and start time when
-available. If another process holds the lock, write paths fail closed with a
-`database writer busy` message that includes the owner metadata when readable.
-Crashes are handled by the operating system lock release; stale metadata is
-overwritten by the next successful owner.
+The writer is database-file scoped, not repository scoped. `symdex-writer`
+starts or attaches to one local writer daemon keyed by `StoreConfig.sqlite_path`.
+The daemon owns the advisory sidecar lock internally as a duplicate-start guard,
+then serializes write jobs in process. Clients do not acquire the lock directly.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
-tool. These paths must coordinate through the repository's active writer, queue
-or coalesce work, or fail closed with a clear owner/status message instead of
-opening a second writer. Read paths such as TUI refreshes, MCP evidence tools,
+tool. These paths submit jobs to the writer service and wait for the result
+instead of opening a second writer. Continuous indexing runs as writer-managed
+watcher work and uses the same in-process write gate as queued manual jobs.
+Read paths such as TUI refreshes, MCP evidence tools,
 diagnostics, semantic status, staleness checks, and query tools must not run
 migrations, stale-client pruning, repair, or quality catch-up as a side effect
 while a writer is active. Structural read helpers open SQLite in read-only mode;

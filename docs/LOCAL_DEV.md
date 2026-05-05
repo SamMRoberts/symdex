@@ -120,8 +120,7 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 `context-pack`, and `debug-context`. `semantic-status` supports top-level
 `--json` as plain local command JSON for semantic layer readiness metadata.
 
-- `init`: creates the local state directory for the configured SQLite path and
-  acquires the database-file-scoped writer lease before running migrations.
+- `init`: submits a migration job to the database-file-scoped writer service.
 - `doctor [repo]`: prints local configuration, filesystem diagnostics, local
   service checks, auto-detected or explicitly overridden rust-analyzer
   enrichment readiness, the active MCP evidence contract version, and repo-specific index
@@ -205,8 +204,8 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   indexing when missing or stale fast vector metadata requires rebuilding
   points. With `--semantic-layer quality`, repair runs the quality worker path
   instead so hash verification, quality job state, and activation refresh remain
-  centralized. Repair acquires the same writer lease as indexing before any
-  sqlite-vec or SQLite mutation.
+  centralized. Repair runs through the same writer service as indexing before
+  any sqlite-vec or SQLite mutation.
 - `symbol <repo> <query>`: searches local SQLite symbols by name or qualified
   name and returns path, line ranges, and provenance metadata.
 - `callers <repo> <symbol>` / `callees <repo> <symbol>`: returns direct

@@ -157,6 +157,7 @@ impl WriterLease {
         let lock_path = writer_lock_path(config);
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -164,7 +165,10 @@ impl WriterLease {
         match file.try_lock_exclusive() {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                let owner = read_writer_lease_info(&lock_path).ok().flatten();
+                let owner = read_writer_lease_info(&lock_path)
+                    .ok()
+                    .flatten()
+                    .map(Box::new);
                 return Err(StoreError::WriterBusy { owner });
             }
             Err(error) => return Err(StoreError::Io(error)),
@@ -686,6 +690,7 @@ impl SqliteStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn replace_file_facts_for_ref_with_references_and_tests(
         &mut self,
         repository_ref_id: &str,
@@ -707,6 +712,7 @@ impl SqliteStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace_file_facts_inner(
         &mut self,
         repository_ref_id: Option<&str>,
@@ -6070,7 +6076,7 @@ pub enum StoreError {
         current_dimension: usize,
     },
     WriterBusy {
-        owner: Option<WriterLeaseInfo>,
+        owner: Option<Box<WriterLeaseInfo>>,
     },
     UnexpectedResponse(String),
 }
@@ -6101,7 +6107,7 @@ impl Display for StoreError {
                 "embedding dimension changed for repository `{repository_id}` and model `{embedding_model}`: previous={previous_dimension} current={current_dimension}; reset the collection or use a new model name before reindexing"
             ),
             Self::WriterBusy { owner } => {
-                write!(f, "{}", writer_busy_message(owner.as_ref()))
+                write!(f, "{}", writer_busy_message(owner.as_deref()))
             }
             Self::UnexpectedResponse(message) => {
                 write!(f, "unexpected vector store response: {message}")
@@ -11291,14 +11297,15 @@ mod tests {
             ])
             .expect("file events should persist");
 
-        let rows: Vec<(
+        type FileIndexEventRow = (
             String,
             Option<String>,
             Option<String>,
             String,
             String,
             String,
-        )> = store
+        );
+        let rows: Vec<FileIndexEventRow> = store
             .connection
             .prepare(
                 "SELECT path, old_content_hash, new_content_hash, action, reason, status

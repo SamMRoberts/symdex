@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 crossterm = "0.28.1"
 ratatui = "0.29.0"
+serde_json = "1.0.149"
 symdex-core = { path = "../symdex-core" }
 symdex-diagnostics = { path = "../symdex-diagnostics" }
 symdex-embed = { path = "../symdex-embed" }
@@ -18,3 +19,4 @@ symdex-index = { path = "../symdex-index" }
 symdex-query = { path = "../symdex-query" }
 symdex-store = { path = "../symdex-store" }
 symdex-watch = { path = "../symdex-watch" }
+symdex-writer = { path = "../symdex-writer" }
