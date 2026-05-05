@@ -23,6 +23,10 @@ use symdex_store::{
     WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
 };
 
+const EMBEDDING_SEGMENT_OVERLAP_DIVISOR: usize = 5;
+const MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES: usize = 256;
+const MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOptions {
     pub repo: String,
@@ -2942,7 +2946,9 @@ fn embedding_overlap_bytes(max_chunk_bytes: usize) -> usize {
     if max_chunk_bytes < 32 {
         0
     } else {
-        (max_chunk_bytes / 5).min(256).min(max_chunk_bytes - 1)
+        (max_chunk_bytes / EMBEDDING_SEGMENT_OVERLAP_DIVISOR)
+            .min(MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES)
+            .min(max_chunk_bytes - 1)
     }
 }
 
@@ -2955,7 +2961,7 @@ fn preferred_embedding_segment_end(
     if hard_end >= text.len() {
         return text.len();
     }
-    let min_end = start + (max_chunk_bytes / 2).max(1);
+    let min_end = start + (max_chunk_bytes / MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR).max(1);
     if let Some(relative_newline) = text[start..hard_end].rfind('\n') {
         let newline_end = start + relative_newline + 1;
         if newline_end >= min_end {
@@ -2974,9 +2980,9 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
 
 fn next_char_boundary(text: &str, start: usize) -> usize {
     text[start..]
-        .char_indices()
-        .nth(1)
-        .map(|(offset, _)| start + offset)
+        .chars()
+        .next()
+        .map(|character| start + character.len_utf8())
         .unwrap_or(text.len())
 }
 
