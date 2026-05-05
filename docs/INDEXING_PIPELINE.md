@@ -75,6 +75,9 @@ and YAML configuration files are indexed as fallback-only configuration
 evidence with no symbols, calls, tests, or tree-sitter parse diagnostics. JSON
 configuration files are disabled by default and are indexed only when
 `SYMDEX_INDEX_JSON_PATHS` contains a matching repo-relative folder scope.
+Root `Cargo.toml` and `package.json` manifests also produce metadata-only
+dependency facts, and code-file import references are conservatively linked to
+those facts when the import path matches the declared package/crate name.
 Future languages must be added through the same discovery, parsing, chunking,
 symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec, manual
 indexing, and continuous indexing contracts.
@@ -186,28 +189,39 @@ Store:
 
 If model name or vector dimension changes, require full reindex or collection migration.
 
-Current implementation records started and finished index runs in SQLite. Runs
-finish as `success`, `skipped`, `partial`, or `failed`. Offline indexing records
-successful structural runs, semantic indexing records skipped runs when there
-are no chunks to embed, and semantic embedding or sqlite-vec upsert failures before
-SQLite replacement are recorded as failed runs so the previous semantic
-generation remains intact. Failures after SQLite replacement, such as generation
-finalization or stale-vector cleanup failures, are recorded as partial runs with
-metadata-only error summaries. Before upserting vectors, semantic indexing
-rejects a same-repository, same-model dimension change so an existing sqlite-vec
-collection is not reused with incompatible vector sizes. Different model names
-map to different sqlite-vec collection names.
-Indexing also records per-file decisions in `file_index_events`. Each event
-links back to the run and active repository ref when known, and stores the path,
-old content hash, new content hash, action, reason, status, and metadata-only
-error summary. This makes created, updated, deleted, skipped unchanged,
-ignored or unsupported-by-discovery, and parser-diagnostic paths debuggable
-without reading source text.
+Current implementation records started and finished index runs in the events
+database role. Runs finish as `success`, `skipped`, `partial`, or `failed`.
+Offline indexing records successful structural runs, semantic indexing records
+skipped runs when there are no chunks to embed, and semantic embedding or
+sqlite-vec upsert failures before SQLite replacement are recorded as failed runs
+so the previous semantic generation remains intact. Failures after SQLite
+replacement, such as generation finalization or stale-vector cleanup failures,
+are recorded as partial runs with metadata-only error summaries. Before
+upserting vectors, semantic indexing rejects a same-repository, same-model
+dimension change so an existing sqlite-vec collection is not reused with
+incompatible vector sizes. Different model names map to different sqlite-vec
+collection names. Indexing also records per-file decisions in events-role
+`file_index_events`. Each event links back to the run and active repository ref
+when known, and stores the path, old content hash, new content hash, action,
+reason, status, and metadata-only error summary. This makes created, updated,
+deleted, skipped unchanged, ignored or unsupported-by-discovery, and
+parser-diagnostic paths debuggable without reading source text.
 Continuous watch batches use the same incremental indexing path and are recorded
 with `run_kind = watch` in index-run metadata.
 
 The SQLite schema also includes additive layered semantic tables for
 `semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
+Staged semantic metadata schemas are now initialized in the `fast_semantic` and
+`quality_semantic` role databases so fast manifest and quality job routing can
+move off structural SQLite without later schema bootstraps. During the
+transition, completed fast semantic generations and their current fast
+`chunk_embeddings` manifest are mirrored into the `fast_semantic` role after
+structural finalization, and quality queued/blocked metadata is mirrored into
+the `quality_semantic` role from structural job selection with the current fast
+manifest. Manual quality catch-up is routed to the `quality_semantic` writer
+lane and claims/completes quality jobs in that role. Semantic status and search
+routing use structural SQLite for live-ref fast generation selection, then merge
+same-generation quality readiness and progress from `quality_semantic`.
 After a successful fast sqlite-vec upsert, semantic indexing records a deterministic
 fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
 The older chunk-level vector columns remain nullable compatibility schema, but
@@ -356,6 +370,10 @@ base-list or class-heritage inheritance, attributes/decorators, and type-like
 syntax where available. Resolution is local and conservative: a single local
 symbol suffix/name match becomes `resolved_local_candidate`, multiple matches
 are `ambiguous`, and otherwise the reference is preserved as `unresolved`.
+Dependency usage extraction reuses only import-kind symbol references and known
+manifest facts. It records package manager, package name, version requirement,
+import path, source symbol when available, confidence, and reason tags without
+returning source text or claiming package-manager resolution.
 
 After per-file parsing, the indexer performs a conservative Rust cross-file
 resolution pass before persisting SQLite facts. Qualified module calls such as
@@ -424,19 +442,46 @@ competing write loops cause SQLite lock errors and make index provenance hard to
 reason about.
 
 The writer is database-file scoped, not repository scoped. `symdex-writer`
-starts or attaches to one local writer daemon keyed by `StoreConfig.sqlite_path`.
-The daemon owns the advisory sidecar lock internally as a duplicate-start guard,
-then serializes write jobs in process. Clients do not acquire the lock directly.
+starts or attaches to local writer daemons keyed by database role and derived
+database path. Each daemon owns that role's advisory sidecar lock internally as
+a duplicate-start guard, then serializes write jobs for that database file in
+process. Clients do not acquire the lock directly.
+
+The first multi-database split moved sqlite-vec projections out of the
+structural database: fast vectors use a derived `fast_semantic` SQLite file, and
+quality vectors use a derived `quality_semantic` SQLite file. Fast indexing also
+mirrors completed fast generation metadata into `fast_semantic` after structural
+finalization, and quality queue/block metadata plus the current fast manifest is
+mirrored into `quality_semantic` after structural job selection. The next split
+moved watcher control-plane state into the derived `watch` SQLite file. Watcher client
+heartbeat and detach jobs use the watch-role writer endpoint so they do not wait
+for structural indexing jobs. Index-run summaries and per-file index events now
+write to the derived `events` SQLite file. Structural SQLite continues to own the
+authoritative repository/ref manifests, file facts, symbols, calls, and live-ref
+fast generation selection. Semantic status and search routing merge
+same-generation quality readiness from `quality_semantic`, and ignore stale
+quality-role generations. Manual quality catch-up now uses the `quality_semantic`
+writer endpoint and uses structural SQLite only for read-only source validation
+and compatibility checks; quality job claims, completions, quality embeddings,
+and activation progress write to `quality_semantic`.
+Vector verification also reads expected fast/quality manifest rows from the
+matching semantic role database when that role contains the same generation, then
+uses structural SQLite for file paths and chunk line ranges needed to compare
+sqlite-vec payload metadata.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
 tool. These paths submit jobs to the writer service and wait for the result
-instead of opening a second writer. Continuous indexing runs as writer-managed
-watcher work and uses the same in-process write gate as queued manual jobs. A
-manual index, repair, migration, or quality job pauses watcher database writes:
-the watcher can continue polling and coalescing filesystem changes, but watcher
-status writes, incremental batches, idle quality catch-up, and terminal
-stop/failure state writes wait for the writer gate before touching SQLite.
+instead of opening a second structural writer. Continuous indexing runs as
+writer-managed watcher work and uses the same in-process structural write gate
+as queued manual jobs for repository facts and fast generation metadata. A
+manual index, repair, or migration still pauses watch-driven structural writes:
+the watcher continues polling and coalescing filesystem changes, but incremental
+batches yield when the structural writer gate is busy and retry on the next poll.
+Idle and post-batch quality catch-up use the `quality_semantic` writer lane, so
+they do not wait on the structural gate. Index-run and per-file event rows write
+to the events database role, while watcher status/client rows write to the watch
+database role.
 Read paths such as TUI refreshes, MCP evidence tools,
 diagnostics, semantic status, staleness checks, and query tools must not run
 migrations, stale-client pruning, repair, or quality catch-up as a side effect

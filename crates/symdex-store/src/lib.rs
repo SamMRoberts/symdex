@@ -40,6 +40,68 @@ pub struct StoreConfig {
     pub sqlite_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DatabaseRole {
+    Structural,
+    FastSemantic,
+    QualitySemantic,
+    Watch,
+    Events,
+    Runtime,
+}
+
+pub const DATABASE_ROLES: [DatabaseRole; 6] = [
+    DatabaseRole::Structural,
+    DatabaseRole::FastSemantic,
+    DatabaseRole::QualitySemantic,
+    DatabaseRole::Watch,
+    DatabaseRole::Events,
+    DatabaseRole::Runtime,
+];
+
+impl DatabaseRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Structural => "structural",
+            Self::FastSemantic => "fast_semantic",
+            Self::QualitySemantic => "quality_semantic",
+            Self::Watch => "watch",
+            Self::Events => "events",
+            Self::Runtime => "runtime",
+        }
+    }
+
+    pub fn for_semantic_layer(layer: SemanticLayer) -> Self {
+        match layer {
+            SemanticLayer::Fast => Self::FastSemantic,
+            SemanticLayer::Quality => Self::QualitySemantic,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "structural" => Some(Self::Structural),
+            "fast_semantic" => Some(Self::FastSemantic),
+            "quality_semantic" => Some(Self::QualitySemantic),
+            "watch" => Some(Self::Watch),
+            "events" => Some(Self::Events),
+            "runtime" => Some(Self::Runtime),
+            _ => None,
+        }
+    }
+
+    fn file_suffix(self) -> Option<&'static str> {
+        match self {
+            Self::Structural => None,
+            Self::FastSemantic => Some("fast"),
+            Self::QualitySemantic => Some("quality"),
+            Self::Watch => Some("watch"),
+            Self::Events => Some("events"),
+            Self::Runtime => Some("runtime"),
+        }
+    }
+}
+
 impl StoreConfig {
     pub fn from_env() -> Self {
         Self {
@@ -47,6 +109,36 @@ impl StoreConfig {
                 .unwrap_or_else(|| PathBuf::from(".symdex/symdex.sqlite")),
         }
     }
+
+    pub fn database_path(&self, role: DatabaseRole) -> PathBuf {
+        match role.file_suffix() {
+            None => self.sqlite_path.clone(),
+            Some(suffix) => sibling_role_path(&self.sqlite_path, suffix),
+        }
+    }
+
+    pub fn structural_path(&self) -> &Path {
+        &self.sqlite_path
+    }
+}
+
+fn sibling_role_path(base_path: &Path, suffix: &str) -> PathBuf {
+    let stem = base_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("symdex");
+    let file_name = match base_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension) if !extension.is_empty() => format!("{stem}-{suffix}.{extension}"),
+        _ => format!("{stem}-{suffix}"),
+    };
+    base_path
+        .parent()
+        .map(|parent| parent.join(&file_name))
+        .unwrap_or_else(|| PathBuf::from(file_name))
 }
 
 pub fn debug_db_locks_enabled() -> bool {
@@ -68,18 +160,25 @@ pub fn debug_db_lock_log(scope: &str, message: std::fmt::Arguments<'_>) {
 }
 
 pub fn sqlite_parent(config: &StoreConfig) -> Option<PathBuf> {
-    config.sqlite_path.parent().map(PathBuf::from)
+    database_parent(config, DatabaseRole::Structural)
+}
+
+pub fn database_parent(config: &StoreConfig, role: DatabaseRole) -> Option<PathBuf> {
+    config.database_path(role).parent().map(PathBuf::from)
 }
 
 pub fn writer_lock_path(config: &StoreConfig) -> PathBuf {
-    let lock_name = config
-        .sqlite_path
+    writer_lock_path_for_role(config, DatabaseRole::Structural)
+}
+
+pub fn writer_lock_path_for_role(config: &StoreConfig, role: DatabaseRole) -> PathBuf {
+    let database_path = config.database_path(role);
+    let lock_name = database_path
         .file_name()
         .and_then(|name| name.to_str())
         .map(|name| format!("{name}.writer.lock"))
         .unwrap_or_else(|| "symdex.sqlite.writer.lock".to_owned());
-    config
-        .sqlite_path
+    database_path
         .parent()
         .map(|parent| parent.join(&lock_name))
         .unwrap_or_else(|| PathBuf::from(lock_name))
@@ -160,7 +259,11 @@ impl WriterLeaseInfo {
     }
 
     pub fn read_for(config: &StoreConfig) -> Result<Option<Self>> {
-        read_writer_lease_info(&writer_lock_path(config))
+        Self::read_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn read_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Option<Self>> {
+        read_writer_lease_info(&writer_lock_path_for_role(config, role))
     }
 }
 
@@ -173,15 +276,25 @@ pub struct WriterLease {
 
 impl WriterLease {
     pub fn acquire(config: &StoreConfig, request: WriterLeaseRequest) -> Result<Self> {
-        if let Some(parent) = sqlite_parent(config) {
+        Self::acquire_for_role(config, DatabaseRole::Structural, request)
+    }
+
+    pub fn acquire_for_role(
+        config: &StoreConfig,
+        role: DatabaseRole,
+        request: WriterLeaseRequest,
+    ) -> Result<Self> {
+        let database_path = config.database_path(role);
+        if let Some(parent) = database_parent(config, role) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
-        let lock_path = writer_lock_path(config);
+        let lock_path = writer_lock_path_for_role(config, role);
         debug_db_lock_log(
             "writer-lease",
             format_args!(
-                "acquire_attempt db={} lock={} owner_kind={} operation={} repo={}",
-                config.sqlite_path.display(),
+                "acquire_attempt role={} db={} lock={} owner_kind={} operation={} repo={}",
+                role.as_str(),
+                database_path.display(),
                 lock_path.display(),
                 request.kind.as_str(),
                 request.operation,
@@ -205,8 +318,9 @@ impl WriterLease {
                 debug_db_lock_log(
                     "writer-lease",
                     format_args!(
-                        "acquire_busy db={} lock={} owner={:?}",
-                        config.sqlite_path.display(),
+                        "acquire_busy role={} db={} lock={} owner={:?}",
+                        role.as_str(),
+                        database_path.display(),
                         lock_path.display(),
                         owner
                     ),
@@ -217,8 +331,9 @@ impl WriterLease {
                 debug_db_lock_log(
                     "writer-lease",
                     format_args!(
-                        "acquire_error db={} lock={} error={}",
-                        config.sqlite_path.display(),
+                        "acquire_error role={} db={} lock={} error={}",
+                        role.as_str(),
+                        database_path.display(),
                         lock_path.display(),
                         error
                     ),
@@ -237,8 +352,9 @@ impl WriterLease {
         debug_db_lock_log(
             "writer-lease",
             format_args!(
-                "acquire_success db={} lock={} owner_kind={} operation={} repo={}",
-                config.sqlite_path.display(),
+                "acquire_success role={} db={} lock={} owner_kind={} operation={} repo={}",
+                role.as_str(),
+                database_path.display(),
                 lock_path.display(),
                 info.owner_kind,
                 info.operation,
@@ -292,20 +408,31 @@ fn read_writer_lease_info(lock_path: &PathBuf) -> Result<Option<WriterLeaseInfo>
 #[derive(Debug)]
 pub struct SqliteStore {
     connection: Connection,
+    role: DatabaseRole,
+    database_path: PathBuf,
 }
 
 impl SqliteStore {
     pub fn open(config: &StoreConfig) -> Result<Self> {
+        Self::open_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn open_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Self> {
+        let database_path = config.database_path(role);
         debug_db_lock_log(
             "sqlite",
-            format_args!("open_read_write_start db={}", config.sqlite_path.display()),
+            format_args!(
+                "open_read_write_start role={} db={}",
+                role.as_str(),
+                database_path.display()
+            ),
         );
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
-        if let Some(parent) = sqlite_parent(config) {
+        if let Some(parent) = database_parent(config, role) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
-        let initialize_wal = !config.sqlite_path.exists();
-        let connection = Connection::open(&config.sqlite_path).map_err(StoreError::Sqlite)?;
+        let initialize_wal = !database_path.exists();
+        let connection = Connection::open(&database_path).map_err(StoreError::Sqlite)?;
         connection
             .busy_timeout(Duration::from_secs(30))
             .map_err(StoreError::Sqlite)?;
@@ -320,22 +447,36 @@ impl SqliteStore {
         debug_db_lock_log(
             "sqlite",
             format_args!(
-                "open_read_write_success db={} initialized_wal={} busy_timeout_ms=30000",
-                config.sqlite_path.display(),
+                "open_read_write_success role={} db={} initialized_wal={} busy_timeout_ms=30000",
+                role.as_str(),
+                database_path.display(),
                 initialize_wal
             ),
         );
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            role,
+            database_path,
+        })
     }
 
     pub fn open_read_only(config: &StoreConfig) -> Result<Self> {
+        Self::open_read_only_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn open_read_only_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Self> {
+        let database_path = config.database_path(role);
         debug_db_lock_log(
             "sqlite",
-            format_args!("open_read_only_start db={}", config.sqlite_path.display()),
+            format_args!(
+                "open_read_only_start role={} db={}",
+                role.as_str(),
+                database_path.display()
+            ),
         );
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         let connection =
-            Connection::open_with_flags(&config.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(StoreError::Sqlite)?;
         connection
             .busy_timeout(Duration::from_secs(30))
@@ -346,28 +487,86 @@ impl SqliteStore {
         debug_db_lock_log(
             "sqlite",
             format_args!(
-                "open_read_only_success db={} busy_timeout_ms=30000",
-                config.sqlite_path.display()
+                "open_read_only_success role={} db={} busy_timeout_ms=30000",
+                role.as_str(),
+                database_path.display()
             ),
         );
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            role,
+            database_path,
+        })
     }
 
     pub fn migrate(&self) -> Result<()> {
         let started = std::time::Instant::now();
-        debug_db_lock_log("sqlite", format_args!("migrate_start"));
-        self.connection
-            .execute_batch(SCHEMA)
-            .map_err(StoreError::Sqlite)?;
-        self.ensure_compatibility_columns()?;
-        self.ensure_content_addressed_files()?;
         debug_db_lock_log(
             "sqlite",
             format_args!(
-                "migrate_success elapsed_ms={}",
+                "migrate_start role={} db={}",
+                self.role.as_str(),
+                self.database_path.display()
+            ),
+        );
+        match self.role {
+            DatabaseRole::FastSemantic => self.migrate_fast_semantic_schema()?,
+            DatabaseRole::QualitySemantic => self.migrate_quality_semantic_schema()?,
+            DatabaseRole::Watch => self.migrate_watch_schema()?,
+            DatabaseRole::Events => self.migrate_events_schema()?,
+            DatabaseRole::Runtime => self.migrate_runtime_schema()?,
+            _ => {
+                self.connection
+                    .execute_batch(SCHEMA)
+                    .map_err(StoreError::Sqlite)?;
+                self.ensure_compatibility_columns()?;
+                self.ensure_content_addressed_files()?;
+            }
+        }
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "migrate_success role={} db={} elapsed_ms={}",
+                self.role.as_str(),
+                self.database_path.display(),
                 started.elapsed().as_millis()
             ),
         );
+        Ok(())
+    }
+
+    fn migrate_watch_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(WATCH_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn migrate_events_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(EVENTS_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn migrate_fast_semantic_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(FAST_SEMANTIC_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn migrate_quality_semantic_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(QUALITY_SEMANTIC_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn migrate_runtime_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(RUNTIME_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
         Ok(())
     }
 
@@ -681,6 +880,27 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn ref_file_ids(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT file_id
+                   FROM ref_files
+                  WHERE repository_id = ?1
+                    AND repository_ref_id = ?2
+                  ORDER BY path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn record_file_index_events(&mut self, events: &[FileIndexEventRecord]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -761,7 +981,7 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(None, file, symbols, chunks, calls, &[], tests)
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, &[], &[], &[], tests)
     }
 
     pub fn replace_file_facts_with_references_and_tests(
@@ -773,7 +993,42 @@ impl SqliteStore {
         symbol_references: &[SymbolReferenceRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(None, file, symbols, chunks, calls, symbol_references, tests)
+        self.replace_file_facts_inner(
+            None,
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            &[],
+            &[],
+            tests,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_facts_with_references_dependencies_and_tests(
+        &mut self,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        dependencies: &[DependencyRecord],
+        dependency_usages: &[DependencyUsageRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(
+            None,
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            dependencies,
+            dependency_usages,
+            tests,
+        )
     }
 
     pub fn replace_file_facts_for_ref_with_tests(
@@ -792,6 +1047,8 @@ impl SqliteStore {
             chunks,
             calls,
             &[],
+            &[],
+            &[],
             tests,
         )
     }
@@ -807,6 +1064,32 @@ impl SqliteStore {
         symbol_references: &[SymbolReferenceRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
+        self.replace_file_facts_for_ref_with_references_dependencies_and_tests(
+            repository_ref_id,
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            &[],
+            &[],
+            tests,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_facts_for_ref_with_references_dependencies_and_tests(
+        &mut self,
+        repository_ref_id: &str,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        dependencies: &[DependencyRecord],
+        dependency_usages: &[DependencyUsageRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
         self.replace_file_facts_inner(
             Some(repository_ref_id),
             file,
@@ -814,6 +1097,8 @@ impl SqliteStore {
             chunks,
             calls,
             symbol_references,
+            dependencies,
+            dependency_usages,
             tests,
         )
     }
@@ -827,6 +1112,8 @@ impl SqliteStore {
         chunks: &[ChunkRecord],
         calls: &[CallRecord],
         symbol_references: &[SymbolReferenceRecord],
+        dependencies: &[DependencyRecord],
+        dependency_usages: &[DependencyUsageRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
         let indexed_at = timestamp();
@@ -915,6 +1202,20 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         transaction
             .execute(
+                "DELETE FROM dependency_usages
+                 WHERE file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM dependencies
+                 WHERE file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
                 "DELETE FROM test_targets
                  WHERE test_id IN (SELECT id FROM tests WHERE file_id = ?1)
                     OR target_file_id = ?1",
@@ -956,6 +1257,20 @@ impl SqliteStore {
             transaction
                 .execute(
                     "DELETE FROM symbol_references
+                     WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM dependency_usages
+                     WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM dependencies
                      WHERE file_id = ?1",
                     params![&stale_file_id],
                 )
@@ -1017,6 +1332,96 @@ impl SqliteStore {
                         symbol.end_byte as i64,
                         symbol.index_run_id,
                         symbol.parser_version,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO dependencies (
+                        id, repository_id, file_id, manifest_path, package_manager,
+                        dependency_name, package_name, version_req, dependency_kind,
+                        index_run_id, parser_version, indexed_at
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                      ON CONFLICT(id) DO UPDATE SET
+                        repository_id = excluded.repository_id,
+                        file_id = excluded.file_id,
+                        manifest_path = excluded.manifest_path,
+                        package_manager = excluded.package_manager,
+                        dependency_name = excluded.dependency_name,
+                        package_name = excluded.package_name,
+                        version_req = excluded.version_req,
+                        dependency_kind = excluded.dependency_kind,
+                        index_run_id = excluded.index_run_id,
+                        parser_version = excluded.parser_version,
+                        indexed_at = excluded.indexed_at",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for dependency in dependencies {
+                statement
+                    .execute(params![
+                        dependency.id,
+                        dependency.repository_id,
+                        dependency.file_id,
+                        dependency.manifest_path,
+                        dependency.package_manager,
+                        dependency.dependency_name,
+                        dependency.package_name,
+                        dependency.version_req,
+                        dependency.dependency_kind,
+                        dependency.index_run_id,
+                        dependency.parser_version,
+                        indexed_at,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO dependency_usages (
+                        id, repository_id, dependency_id, file_id, source_symbol_id,
+                        usage_kind, import_path, referenced_symbol, line, confidence,
+                        reason, index_run_id, parser_version, indexed_at
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                      ON CONFLICT(id) DO UPDATE SET
+                        repository_id = excluded.repository_id,
+                        dependency_id = excluded.dependency_id,
+                        file_id = excluded.file_id,
+                        source_symbol_id = excluded.source_symbol_id,
+                        usage_kind = excluded.usage_kind,
+                        import_path = excluded.import_path,
+                        referenced_symbol = excluded.referenced_symbol,
+                        line = excluded.line,
+                        confidence = excluded.confidence,
+                        reason = excluded.reason,
+                        index_run_id = excluded.index_run_id,
+                        parser_version = excluded.parser_version,
+                        indexed_at = excluded.indexed_at",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for usage in dependency_usages {
+                statement
+                    .execute(params![
+                        usage.id,
+                        usage.repository_id,
+                        usage.dependency_id,
+                        usage.file_id,
+                        usage.source_symbol_id,
+                        usage.usage_kind,
+                        usage.import_path,
+                        usage.referenced_symbol,
+                        usage.line as i64,
+                        usage.confidence as f64,
+                        usage.reason,
+                        usage.index_run_id,
+                        usage.parser_version,
+                        indexed_at,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -1210,6 +1615,51 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id, symbol_query], test_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn dependency_usages_for_symbol(
+        &self,
+        repository_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<DependencyUsageSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT dependencies.id, dependencies.package_manager,
+                        dependencies.dependency_name, dependencies.package_name,
+                        dependencies.version_req, dependencies.dependency_kind,
+                        dependencies.manifest_path, dependency_usages.usage_kind,
+                        dependency_usages.import_path, dependency_usages.referenced_symbol,
+                        files.path, dependency_usages.line, dependency_usages.confidence,
+                        dependency_usages.reason, files.content_hash,
+                        dependency_usages.index_run_id, dependency_usages.parser_version,
+                        dependency_usages.indexed_at
+                   FROM dependency_usages
+                   JOIN dependencies ON dependency_usages.dependency_id = dependencies.id
+                   JOIN files ON dependency_usages.file_id = files.id
+                   LEFT JOIN symbols source_symbol
+                     ON dependency_usages.source_symbol_id = source_symbol.id
+                  WHERE dependency_usages.repository_id = ?1
+                    AND (
+                      source_symbol.id = ?2
+                      OR source_symbol.name = ?2
+                      OR source_symbol.qualified_name = ?2
+                      OR files.path = ?2
+                    )
+                  ORDER BY dependency_usages.confidence DESC,
+                           dependencies.package_name,
+                           files.path,
+                           dependency_usages.line
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, symbol_query],
+                dependency_usage_search_row,
+            )
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }
@@ -1460,12 +1910,11 @@ impl SqliteStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT DISTINCT vector_points.vector_point_id
-                   FROM vector_points
-                   JOIN ref_files ON ref_files.file_id = vector_points.file_id
-                  WHERE vector_points.vector_store = 'sqlite_vec'
-                    AND vector_points.repository_id = ?1
-                    AND vector_points.vector_table = ?2",
+                "SELECT DISTINCT chunk_embeddings.vector_point_id
+                                     FROM chunk_embeddings
+                                     JOIN ref_files ON ref_files.file_id = chunk_embeddings.file_id
+                                    WHERE chunk_embeddings.repository_id = ?1
+                                        AND chunk_embeddings.vector_table = ?2",
             )
             .map_err(StoreError::Sqlite)?;
         let rows = statement
@@ -1517,6 +1966,62 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
+    }
+
+    pub fn expected_vector_points_for_chunk_embeddings(
+        &self,
+        embeddings: &[ChunkEmbeddingRecord],
+    ) -> Result<Vec<ExpectedVectorPoint>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT files.path, chunks.start_line, chunks.end_line
+                 FROM chunks
+                 JOIN files ON files.id = chunks.file_id
+                 WHERE files.repository_id = ?1
+                   AND files.id = ?2
+                   AND chunks.id = ?3
+                   AND chunks.file_id = ?2",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let mut expected = Vec::new();
+        for embedding in embeddings
+            .iter()
+            .filter(|embedding| embedding.status == "current")
+        {
+            let point = statement
+                .query_row(
+                    params![
+                        embedding.repository_id,
+                        embedding.file_id,
+                        embedding.chunk_id,
+                    ],
+                    |row| {
+                        Ok(ExpectedVectorPoint {
+                            vector_point_id: embedding.vector_point_id.clone(),
+                            chunk_id: embedding.chunk_id.clone(),
+                            path: row.get(0)?,
+                            start_line: row.get::<_, i64>(1)? as usize,
+                            end_line: row.get::<_, i64>(2)? as usize,
+                            text_hash: embedding.text_hash.clone(),
+                            embedding_model: Some(embedding.embedding_model.clone()),
+                            embedding_dimension: Some(embedding.embedding_dimension),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?;
+            if let Some(point) = point {
+                expected.push(point);
+            }
+        }
+        expected.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.chunk_id.cmp(&right.chunk_id))
+        });
+        Ok(expected)
     }
 
     pub fn repository_status(&self, repository_id: &str) -> Result<RepositoryStatus> {
@@ -2093,6 +2598,52 @@ impl SqliteStore {
                 ],
             )
             .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn record_semantic_generation_manifest(
+        &mut self,
+        generation: &SemanticGenerationRecord,
+        embeddings: &[ChunkEmbeddingRecord],
+        repository_ref_id: Option<&str>,
+        linked_at: &str,
+    ) -> Result<()> {
+        for embedding in embeddings {
+            if embedding.repository_id != generation.repository_id
+                || embedding.generation_id != generation.id
+            {
+                return Err(StoreError::UnexpectedResponse(
+                    "semantic embedding does not belong to generation".to_owned(),
+                ));
+            }
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        upsert_semantic_generation_in_transaction(&transaction, generation)?;
+        for embedding in embeddings {
+            upsert_chunk_embedding_in_transaction(&transaction, embedding)?;
+        }
+        if let Some(repository_ref_id) = repository_ref_id {
+            transaction
+                .execute(
+                    "INSERT INTO semantic_generation_refs (
+                       repository_ref_id, repository_id, generation_id, linked_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(repository_ref_id) DO UPDATE SET
+                       repository_id = excluded.repository_id,
+                       generation_id = excluded.generation_id,
+                       linked_at = excluded.linked_at",
+                    params![
+                        repository_ref_id,
+                        generation.repository_id,
+                        generation.id,
+                        linked_at
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(())
     }
 
@@ -2683,6 +3234,66 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn missing_quality_embedding_jobs_from_candidates(
+        &self,
+        candidates: &[QualityEmbeddingJobRecord],
+        quality_model: &str,
+    ) -> Result<Vec<QualityEmbeddingJobRecord>> {
+        let mut missing = Vec::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT 1
+                 WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM chunk_embeddings AS quality
+                   WHERE quality.repository_id = ?1
+                     AND quality.generation_id = ?2
+                     AND quality.chunk_id = ?3
+                     AND quality.semantic_layer = 'quality'
+                     AND quality.embedding_model = ?7
+                     AND quality.content_hash = ?5
+                     AND quality.text_hash = ?6
+                     AND quality.status = 'current'
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM quality_embedding_jobs AS existing
+                   WHERE existing.repository_id = ?1
+                     AND existing.generation_id = ?2
+                     AND existing.file_id = ?4
+                     AND existing.chunk_id = ?3
+                     AND existing.content_hash = ?5
+                     AND existing.text_hash = ?6
+                 )",
+            )
+            .map_err(StoreError::Sqlite)?;
+
+        for candidate in candidates {
+            let should_queue = statement
+                .query_row(
+                    params![
+                        candidate.repository_id,
+                        candidate.generation_id,
+                        candidate.chunk_id,
+                        candidate.file_id,
+                        candidate.content_hash,
+                        candidate.text_hash,
+                        quality_model,
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?
+                .is_some();
+            if should_queue {
+                missing.push(candidate.clone());
+            }
+        }
+
+        Ok(missing)
+    }
+
     pub fn mark_quality_generation_blocked(
         &mut self,
         generation: &SemanticGenerationRecord,
@@ -2891,6 +3502,63 @@ impl SqliteStore {
             {
                 rows.push(row);
             }
+        }
+
+        Ok(rows)
+    }
+
+    pub fn quality_job_source_rows_for_jobs(
+        &self,
+        jobs: &[QualityEmbeddingJobRecord],
+    ) -> Result<Vec<QualityJobSourceRow>> {
+        let mut rows = Vec::with_capacity(jobs.len());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT files.id, files.content_hash, files.language,
+                        chunks.kind, chunks.text_hash, chunks.start_line, chunks.end_line,
+                        chunks.start_byte, chunks.end_byte, chunks.excluded_reason,
+                        chunks.symbol_id, symbols.name, chunks.index_run_id,
+                        chunks.parser_version
+                 FROM (SELECT 1) AS source
+                 LEFT JOIN files
+                   ON files.id = ?1
+                  AND files.repository_id = ?2
+                  AND files.path = ?3
+                 LEFT JOIN chunks
+                   ON chunks.id = ?4
+                  AND chunks.file_id = files.id
+                 LEFT JOIN symbols
+                   ON symbols.id = chunks.symbol_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+
+        for job in jobs {
+            let row = statement
+                .query_row(
+                    params![job.file_id, job.repository_id, job.path, job.chunk_id],
+                    |row| {
+                        Ok(QualityJobSourceRow {
+                            job: job.clone(),
+                            current_file_id: row.get(0)?,
+                            current_content_hash: row.get(1)?,
+                            language: row.get(2)?,
+                            chunk_kind: row.get(3)?,
+                            current_text_hash: row.get(4)?,
+                            start_line: row.get::<_, Option<i64>>(5)?.map(|line| line as usize),
+                            end_line: row.get::<_, Option<i64>>(6)?.map(|line| line as usize),
+                            start_byte: row.get::<_, Option<i64>>(7)?.map(|byte| byte as usize),
+                            end_byte: row.get::<_, Option<i64>>(8)?.map(|byte| byte as usize),
+                            excluded_reason: row.get(9)?,
+                            symbol_id: row.get(10)?,
+                            symbol_name: row.get(11)?,
+                            index_run_id: row.get(12)?,
+                            parser_version: row.get(13)?,
+                        })
+                    },
+                )
+                .map_err(StoreError::Sqlite)?;
+            rows.push(row);
         }
 
         Ok(rows)
@@ -4826,6 +5494,21 @@ impl SqliteStore {
         &self,
         repository_id: &str,
     ) -> Result<IndexRunsTimelineSummary> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.index_runs_timeline_summary_local(repository_id) {
+                Ok(summary) if !summary.runs.is_empty() => return Ok(summary),
+                Ok(_) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.index_runs_timeline_summary_local(repository_id)
+    }
+
+    fn index_runs_timeline_summary_local(
+        &self,
+        repository_id: &str,
+    ) -> Result<IndexRunsTimelineSummary> {
         let mut statement = self
             .connection
             .prepare(
@@ -5174,6 +5857,18 @@ impl SqliteStore {
     }
 
     fn count_index_runs(&self, repository_id: &str) -> Result<usize> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.count_index_runs_local(repository_id) {
+                Ok(count) if count > 0 => return Ok(count),
+                Ok(_) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.count_index_runs_local(repository_id)
+    }
+
+    fn count_index_runs_local(&self, repository_id: &str) -> Result<usize> {
         self.count_scalar(
             "SELECT COUNT(*) FROM index_runs WHERE repository_id = ?1",
             repository_id,
@@ -5368,6 +6063,22 @@ impl SqliteStore {
         repository_id: &str,
         embedding_model: &str,
     ) -> Result<Vec<usize>> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.successful_embedding_dimensions_local(repository_id, embedding_model) {
+                Ok(dimensions) if !dimensions.is_empty() => return Ok(dimensions),
+                Ok(_) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.successful_embedding_dimensions_local(repository_id, embedding_model)
+    }
+
+    fn successful_embedding_dimensions_local(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+    ) -> Result<Vec<usize>> {
         let mut statement = self
             .connection
             .prepare(
@@ -5389,6 +6100,21 @@ impl SqliteStore {
     }
 
     fn latest_embedding_run(&self, repository_id: &str) -> Result<Option<EmbeddingIndexMetadata>> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.latest_embedding_run_local(repository_id) {
+                Ok(Some(metadata)) => return Ok(Some(metadata)),
+                Ok(None) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.latest_embedding_run_local(repository_id)
+    }
+
+    fn latest_embedding_run_local(
+        &self,
+        repository_id: &str,
+    ) -> Result<Option<EmbeddingIndexMetadata>> {
         self.connection
             .query_row(
                 "SELECT embedding_model, embedding_dimension, chunks_embedded
@@ -5410,6 +6136,22 @@ impl SqliteStore {
         repository_id: &str,
         embedding_model: &str,
     ) -> Result<Option<EmbeddingIndexMetadata>> {
+        if let Some(events) = self.sibling_role_store_read_only(DatabaseRole::Events) {
+            match events.latest_embedding_run_for_model_local(repository_id, embedding_model) {
+                Ok(Some(metadata)) => return Ok(Some(metadata)),
+                Ok(None) => {}
+                Err(error) if is_missing_table_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.latest_embedding_run_for_model_local(repository_id, embedding_model)
+    }
+
+    fn latest_embedding_run_for_model_local(
+        &self,
+        repository_id: &str,
+        embedding_model: &str,
+    ) -> Result<Option<EmbeddingIndexMetadata>> {
         self.connection
             .query_row(
                 "SELECT embedding_model, embedding_dimension, chunks_embedded
@@ -5425,6 +6167,19 @@ impl SqliteStore {
             )
             .optional()
             .map_err(StoreError::Sqlite)
+    }
+
+    fn sibling_role_store_read_only(&self, role: DatabaseRole) -> Option<Self> {
+        if self.role != DatabaseRole::Structural {
+            return None;
+        }
+        let config = StoreConfig {
+            sqlite_path: self.database_path.clone(),
+        };
+        if !config.database_path(role).exists() {
+            return None;
+        }
+        Self::open_read_only_for_role(&config, role).ok()
     }
 }
 
@@ -5598,6 +6353,57 @@ pub struct SymbolReferenceRecord {
     pub resolution_status: String,
     pub index_run_id: String,
     pub parser_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DependencyRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub file_id: String,
+    pub manifest_path: String,
+    pub package_manager: String,
+    pub dependency_name: String,
+    pub package_name: String,
+    pub version_req: Option<String>,
+    pub dependency_kind: String,
+    pub index_run_id: String,
+    pub parser_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DependencyUsageRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub dependency_id: String,
+    pub file_id: String,
+    pub source_symbol_id: Option<String>,
+    pub usage_kind: String,
+    pub import_path: String,
+    pub referenced_symbol: Option<String>,
+    pub line: usize,
+    pub confidence: f32,
+    pub reason: String,
+    pub index_run_id: String,
+    pub parser_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DependencyUsageSearchRow {
+    pub dependency_id: String,
+    pub package_manager: String,
+    pub dependency_name: String,
+    pub package_name: String,
+    pub version_req: Option<String>,
+    pub dependency_kind: String,
+    pub manifest_path: String,
+    pub usage_kind: String,
+    pub import_path: String,
+    pub referenced_symbol: Option<String>,
+    pub path: String,
+    pub line: usize,
+    pub confidence: f32,
+    pub reason: String,
+    pub provenance: EvidenceProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6524,6 +7330,10 @@ fn collect_rows<T>(
         values.push(row.map_err(StoreError::Sqlite)?);
     }
     Ok(values)
+}
+
+fn is_missing_table_error(error: &StoreError) -> bool {
+    matches!(error, StoreError::Sqlite(sqlite_error) if sqlite_error.to_string().contains("no such table"))
 }
 
 fn insert_inferred_test_targets(
@@ -7528,6 +8338,36 @@ fn test_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestSearchRow> {
     })
 }
 
+fn dependency_usage_search_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DependencyUsageSearchRow> {
+    Ok(DependencyUsageSearchRow {
+        dependency_id: row.get(0)?,
+        package_manager: row.get(1)?,
+        dependency_name: row.get(2)?,
+        package_name: row.get(3)?,
+        version_req: row.get(4)?,
+        dependency_kind: row.get(5)?,
+        manifest_path: row.get(6)?,
+        usage_kind: row.get(7)?,
+        import_path: row.get(8)?,
+        referenced_symbol: row.get(9)?,
+        path: row.get(10)?,
+        line: row.get::<_, i64>(11)? as usize,
+        confidence: row.get::<_, f64>(12)? as f32,
+        reason: row.get(13)?,
+        provenance: EvidenceProvenance {
+            content_hash: row.get(14)?,
+            index_run_id: row.get(15)?,
+            parser_version: row.get(16)?,
+            indexed_at: row.get(17)?,
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        },
+    })
+}
+
 fn symbol_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolSearchRow> {
     Ok(SymbolSearchRow {
         id: row.get(0)?,
@@ -8345,6 +9185,44 @@ CREATE TABLE IF NOT EXISTS symbol_references (
     FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS dependencies (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    manifest_path TEXT NOT NULL,
+    package_manager TEXT NOT NULL,
+    dependency_name TEXT NOT NULL,
+    package_name TEXT NOT NULL,
+    version_req TEXT,
+    dependency_kind TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    indexed_at TEXT NOT NULL,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS dependency_usages (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    dependency_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    source_symbol_id TEXT,
+    usage_kind TEXT NOT NULL,
+    import_path TEXT NOT NULL,
+    referenced_symbol TEXT,
+    line INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    indexed_at TEXT NOT NULL,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(dependency_id) REFERENCES dependencies(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS tests (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -8545,6 +9423,11 @@ CREATE INDEX IF NOT EXISTS idx_symbol_references_file_kind ON symbol_references(
 CREATE INDEX IF NOT EXISTS idx_symbol_references_source_kind ON symbol_references(source_symbol_id, reference_kind);
 CREATE INDEX IF NOT EXISTS idx_symbol_references_target_kind ON symbol_references(target_symbol_id, reference_kind);
 CREATE INDEX IF NOT EXISTS idx_symbol_references_kind_status ON symbol_references(reference_kind, resolution_status);
+CREATE INDEX IF NOT EXISTS idx_dependencies_repository_name ON dependencies(repository_id, package_name);
+CREATE INDEX IF NOT EXISTS idx_dependencies_file ON dependencies(file_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_usages_dependency ON dependency_usages(dependency_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_usages_file ON dependency_usages(file_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_usages_symbol ON dependency_usages(source_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_name ON tests(repository_id, name);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_qualified_name ON tests(repository_id, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_tests_file_id ON tests(file_id);
@@ -8571,6 +9454,329 @@ CREATE INDEX IF NOT EXISTS idx_vector_points_chunk ON vector_points(chunk_id);
 CREATE INDEX IF NOT EXISTS idx_quality_embedding_jobs_repository_generation_status ON quality_embedding_jobs(repository_id, generation_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heartbeat_at);
 CREATE INDEX IF NOT EXISTS idx_watcher_clients_repository_heartbeat ON watcher_clients(repository_id, heartbeat_at);
+"#;
+
+const WATCH_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS repositories (
+    id TEXT PRIMARY KEY,
+    root_path TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watchers (
+    repository_id TEXT PRIMARY KEY,
+    root_path TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    owner_kind TEXT NOT NULL,
+    owner_pid INTEGER,
+    socket_path TEXT,
+    state TEXT NOT NULL,
+    started_at TEXT,
+    updated_at TEXT,
+    heartbeat_at TEXT,
+    files_seen INTEGER NOT NULL DEFAULT 0,
+    queued_events INTEGER NOT NULL DEFAULT 0,
+    last_indexed_path TEXT,
+    last_error TEXT,
+    active_layer TEXT,
+    quality_status TEXT,
+    quality_pending_jobs INTEGER NOT NULL DEFAULT 0,
+    quality_running_jobs INTEGER NOT NULL DEFAULT 0,
+    quality_failed_jobs INTEGER NOT NULL DEFAULT 0,
+    quality_stale_jobs INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS watcher_clients (
+    repository_id TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    client_kind TEXT NOT NULL,
+    pid INTEGER,
+    started_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(repository_id, client_id),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_watcher_clients_repository_heartbeat ON watcher_clients(repository_id, heartbeat_at);
+"#;
+
+const EVENTS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS index_runs (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    repository_ref_id TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dimension INTEGER,
+    files_seen INTEGER DEFAULT 0,
+    files_indexed INTEGER DEFAULT 0,
+    chunks_embedded INTEGER DEFAULT 0,
+    error_summary TEXT,
+    parser_version TEXT,
+    indexer_version TEXT,
+    run_kind TEXT NOT NULL DEFAULT 'manual'
+);
+
+CREATE TABLE IF NOT EXISTS file_index_events (
+    id TEXT PRIMARY KEY,
+    index_run_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    repository_ref_id TEXT,
+    path TEXT NOT NULL,
+    old_content_hash TEXT,
+    new_content_hash TEXT,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_summary TEXT,
+    occurred_at TEXT NOT NULL,
+    CHECK(action IN ('created', 'updated', 'deleted', 'skipped', 'failed')),
+    CHECK(status IN ('success', 'failed', 'skipped')),
+    FOREIGN KEY(index_run_id) REFERENCES index_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_run_path ON file_index_events(index_run_id, path);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_path_time ON file_index_events(repository_id, path, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_action_status ON file_index_events(repository_id, action, status, occurred_at);
+"#;
+
+const FAST_SEMANTIC_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS semantic_generations (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    fast_model TEXT NOT NULL,
+    fast_dimension INTEGER NOT NULL,
+    fast_completed_at TEXT NOT NULL,
+    quality_model TEXT,
+    quality_dimension INTEGER,
+    quality_status TEXT NOT NULL,
+    quality_started_at TEXT,
+    quality_completed_at TEXT,
+    active_layer TEXT NOT NULL,
+    files_seen INTEGER NOT NULL,
+    embeddable_chunks INTEGER NOT NULL,
+    fast_embedded_chunks INTEGER NOT NULL,
+    quality_embedded_chunks INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(quality_status IN (
+        'missing',
+        'fast_ready',
+        'quality_pending',
+        'quality_ready',
+        'quality_stale',
+        'quality_blocked',
+        'quality_failed'
+    )),
+    CHECK(active_layer IN ('fast', 'quality'))
+);
+
+CREATE TABLE IF NOT EXISTS semantic_generation_refs (
+    repository_ref_id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    linked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    semantic_layer TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dimension INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    vector_table TEXT NOT NULL,
+    vector_point_id TEXT NOT NULL,
+    vector_store TEXT NOT NULL DEFAULT 'sqlite_vec',
+    vector_rowid INTEGER,
+    generation_id TEXT NOT NULL,
+    embedded_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'current',
+    UNIQUE(chunk_id, semantic_layer, embedding_model, embedding_dimension),
+    CHECK(semantic_layer IN ('fast', 'quality')),
+    CHECK(status IN ('current', 'stale', 'blocked', 'failed'))
+);
+
+CREATE TABLE IF NOT EXISTS vector_points (
+  vector_store TEXT NOT NULL,
+  vector_table TEXT NOT NULL,
+  vector_rowid INTEGER NOT NULL,
+  vector_point_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  symbol_id TEXT,
+  symbol_name TEXT,
+  path TEXT NOT NULL,
+  language TEXT NOT NULL,
+  chunk_kind TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  text_hash TEXT NOT NULL,
+  parser_version TEXT,
+  content_hash TEXT,
+  index_run_id TEXT,
+  embedding_model TEXT,
+  embedding_dimension INTEGER,
+  indexed_at TEXT,
+  PRIMARY KEY(vector_store, vector_table, vector_point_id),
+  UNIQUE(vector_store, vector_table, vector_rowid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON semantic_generations(repository_id, fast_completed_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_semantic_generation_refs_generation ON semantic_generation_refs(repository_id, generation_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_generation_chunk ON chunk_embeddings(generation_id, chunk_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_generation_layer_status ON chunk_embeddings(repository_id, generation_id, semantic_layer, status);
+CREATE INDEX IF NOT EXISTS idx_vector_points_repository_table ON vector_points(repository_id, vector_store, vector_table);
+CREATE INDEX IF NOT EXISTS idx_vector_points_chunk ON vector_points(chunk_id);
+"#;
+
+const QUALITY_SEMANTIC_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS semantic_generations (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    fast_model TEXT NOT NULL,
+    fast_dimension INTEGER NOT NULL,
+    fast_completed_at TEXT NOT NULL,
+    quality_model TEXT,
+    quality_dimension INTEGER,
+    quality_status TEXT NOT NULL,
+    quality_started_at TEXT,
+    quality_completed_at TEXT,
+    active_layer TEXT NOT NULL,
+    files_seen INTEGER NOT NULL,
+    embeddable_chunks INTEGER NOT NULL,
+    fast_embedded_chunks INTEGER NOT NULL,
+    quality_embedded_chunks INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(quality_status IN (
+        'missing',
+        'fast_ready',
+        'quality_pending',
+        'quality_ready',
+        'quality_stale',
+        'quality_blocked',
+        'quality_failed'
+    )),
+    CHECK(active_layer IN ('fast', 'quality'))
+);
+
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    semantic_layer TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dimension INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    vector_table TEXT NOT NULL,
+    vector_point_id TEXT NOT NULL,
+    vector_store TEXT NOT NULL DEFAULT 'sqlite_vec',
+    vector_rowid INTEGER,
+    generation_id TEXT NOT NULL,
+    embedded_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'current',
+    UNIQUE(chunk_id, semantic_layer, embedding_model, embedding_dimension),
+    CHECK(semantic_layer IN ('fast', 'quality')),
+    CHECK(status IN ('current', 'stale', 'blocked', 'failed'))
+);
+
+CREATE TABLE IF NOT EXISTS vector_points (
+  vector_store TEXT NOT NULL,
+  vector_table TEXT NOT NULL,
+  vector_rowid INTEGER NOT NULL,
+  vector_point_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  symbol_id TEXT,
+  symbol_name TEXT,
+  path TEXT NOT NULL,
+  language TEXT NOT NULL,
+  chunk_kind TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  text_hash TEXT NOT NULL,
+  parser_version TEXT,
+  content_hash TEXT,
+  index_run_id TEXT,
+  embedding_model TEXT,
+  embedding_dimension INTEGER,
+  indexed_at TEXT,
+  PRIMARY KEY(vector_store, vector_table, vector_point_id),
+  UNIQUE(vector_store, vector_table, vector_rowid)
+);
+
+CREATE TABLE IF NOT EXISTS quality_embedding_jobs (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error_summary TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(repository_id, generation_id, chunk_id),
+    CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'skipped_stale', 'skipped_excluded')),
+    CHECK(attempts >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON semantic_generations(repository_id, fast_completed_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_generation_chunk ON chunk_embeddings(generation_id, chunk_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_generation_layer_status ON chunk_embeddings(repository_id, generation_id, semantic_layer, status);
+CREATE INDEX IF NOT EXISTS idx_vector_points_repository_table ON vector_points(repository_id, vector_store, vector_table);
+CREATE INDEX IF NOT EXISTS idx_vector_points_chunk ON vector_points(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_quality_embedding_jobs_repository_generation_status ON quality_embedding_jobs(repository_id, generation_id, status, updated_at);
+"#;
+
+const RUNTIME_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS runtime_observations (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    observation_kind TEXT NOT NULL,
+    ordinal INTEGER,
+    runtime_symbol TEXT,
+    runtime_path TEXT,
+    normalized_path TEXT,
+    line INTEGER,
+    column INTEGER,
+    failing_test_name TEXT,
+    mapped_test_name TEXT,
+    matched INTEGER NOT NULL,
+    match_kind TEXT NOT NULL,
+    match_summary TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    CHECK(observation_kind IN ('frame', 'failing_test')),
+    CHECK(matched IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_repository_hash ON runtime_observations(repository_id, input_hash, observed_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_observation ON runtime_observations(observation_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_expires ON runtime_observations(expires_at);
 "#;
 
 pub fn current_timestamp() -> String {
@@ -8614,14 +9820,15 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
-        FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus,
-        FileIndexEventRecord, FileRecord, PointPayload, QualityActivationReason,
-        QualityEmbeddingJobRecord, QualityJobCompletion, RepositoryRecord,
-        RuntimeObservationRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
-        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, SymbolReferenceRecord,
-        TestRecord, VectorPoint, WatcherClientRecord, WatcherStatusRecord, WriterLease,
-        WriterLeaseInfo, WriterLeaseKind, WriterLeaseRequest, validate_vector_table_name,
-        vector_point_id, vector_rowid, vector_table_name,
+        DatabaseRole, DependencyRecord, DependencyUsageRecord, FastEmbeddingManifestRecord,
+        FastSemanticGenerationInput, FileCoverageStatus, FileIndexEventRecord, FileRecord,
+        PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
+        RepositoryRecord, RuntimeObservationRecord, SemanticGenerationRecord, SqliteStore,
+        SqliteVectorStore, StorageHealthStatus, StoreConfig, StoreError, SymbolRecord,
+        SymbolReferenceRecord, TestRecord, VectorPoint, WatcherClientRecord, WatcherStatusRecord,
+        WriterLease, WriterLeaseInfo, WriterLeaseKind, WriterLeaseRequest,
+        validate_vector_table_name, vector_point_id, vector_rowid, vector_table_name,
+        writer_lock_path_for_role,
     };
 
     #[test]
@@ -8637,6 +9844,87 @@ mod tests {
         assert!(validate_vector_table_name("symdex_repo_model").is_ok());
         assert!(validate_vector_table_name("").is_err());
         assert!(validate_vector_table_name("../bad").is_err());
+    }
+
+    #[test]
+    fn database_role_paths_are_derived_from_structural_path() {
+        let config = StoreConfig {
+            sqlite_path: PathBuf::from(".symdex/symdex.sqlite"),
+        };
+
+        assert_eq!(
+            config.database_path(DatabaseRole::Structural),
+            PathBuf::from(".symdex/symdex.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::FastSemantic),
+            PathBuf::from(".symdex/symdex-fast.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::QualitySemantic),
+            PathBuf::from(".symdex/symdex-quality.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::Watch),
+            PathBuf::from(".symdex/symdex-watch.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::Events),
+            PathBuf::from(".symdex/symdex-events.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::Runtime),
+            PathBuf::from(".symdex/symdex-runtime.sqlite")
+        );
+        assert_eq!(
+            DatabaseRole::for_semantic_layer(SemanticLayer::Fast),
+            DatabaseRole::FastSemantic
+        );
+        assert_eq!(
+            DatabaseRole::for_semantic_layer(SemanticLayer::Quality),
+            DatabaseRole::QualitySemantic
+        );
+    }
+
+    #[test]
+    fn writer_lock_paths_are_database_role_scoped() {
+        let config = StoreConfig {
+            sqlite_path: PathBuf::from(".symdex/symdex.sqlite"),
+        };
+
+        assert_eq!(
+            writer_lock_path_for_role(&config, DatabaseRole::Structural),
+            PathBuf::from(".symdex/symdex.sqlite.writer.lock")
+        );
+        assert_eq!(
+            writer_lock_path_for_role(&config, DatabaseRole::QualitySemantic),
+            PathBuf::from(".symdex/symdex-quality.sqlite.writer.lock")
+        );
+        assert_ne!(
+            writer_lock_path_for_role(&config, DatabaseRole::FastSemantic),
+            writer_lock_path_for_role(&config, DatabaseRole::QualitySemantic)
+        );
+    }
+
+    #[test]
+    fn vector_store_uses_database_role_path() {
+        let config = StoreConfig {
+            sqlite_path: PathBuf::from(".symdex/symdex.sqlite"),
+        };
+
+        let fast = SqliteVectorStore::new_for_role(&config, DatabaseRole::FastSemantic)
+            .expect("fast vector store should build");
+        let quality = SqliteVectorStore::new_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality vector store should build");
+
+        assert_eq!(
+            fast.database_path(),
+            Path::new(".symdex/symdex-fast.sqlite")
+        );
+        assert_eq!(
+            quality.database_path(),
+            Path::new(".symdex/symdex-quality.sqlite")
+        );
     }
 
     #[test]
@@ -9399,6 +10687,18 @@ mod tests {
                 &[],
             )
             .expect("feature file should persist");
+        assert_eq!(
+            store
+                .ref_file_ids("repo", &main.id)
+                .expect("main file ids should load"),
+            vec!["main-file".to_owned()]
+        );
+        assert_eq!(
+            store
+                .ref_file_ids("repo", &feature.id)
+                .expect("feature file ids should load"),
+            vec!["feature-file".to_owned()]
+        );
         drop(store);
 
         let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
@@ -9441,6 +10741,13 @@ mod tests {
         assert_eq!(main_results.len(), 1);
         assert_eq!(main_results[0].id, main_point);
         assert_eq!(main_results[0].payload.path, "src/main.rs");
+
+        let file_id_results = vector_store
+            .query_points_for_file_ids(&table, "repo", &["main-file".to_owned()], vec![0.0, 1.0], 5)
+            .expect("file-id scoped query should run");
+        assert_eq!(file_id_results.len(), 1);
+        assert_eq!(file_id_results[0].id, main_point);
+        assert_eq!(file_id_results[0].payload.path, "src/main.rs");
 
         let feature_results = vector_store
             .query_points_for_ref(&table, "repo", &feature.id, vec![1.0, 0.0], 5)
@@ -9527,6 +10834,11 @@ mod tests {
             "idx_symbol_references_source_kind",
             "idx_symbol_references_target_kind",
             "idx_symbol_references_kind_status",
+            "idx_dependencies_repository_name",
+            "idx_dependencies_file",
+            "idx_dependency_usages_dependency",
+            "idx_dependency_usages_file",
+            "idx_dependency_usages_symbol",
             "idx_tests_repository_name",
             "idx_tests_repository_qualified_name",
             "idx_tests_file_id",
@@ -10039,6 +11351,54 @@ mod tests {
                 .expect("pending jobs should load")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn quality_worker_loads_sources_from_external_job_records() {
+        let db = TestDb::new("quality-worker-external-job-sources");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+
+        let job = QualityEmbeddingJobRecord {
+            status: "running".to_owned(),
+            attempts: 1,
+            updated_at: "500".to_owned(),
+            ..sample_quality_embedding_job()
+        };
+        let source_rows = store
+            .quality_job_source_rows_for_jobs(std::slice::from_ref(&job))
+            .expect("source row should load from job record");
+
+        assert_eq!(source_rows.len(), 1);
+        assert_eq!(source_rows[0].job, job);
+        assert_eq!(source_rows[0].current_file_id.as_deref(), Some("file"));
+        assert_eq!(
+            source_rows[0].current_text_hash.as_deref(),
+            Some("text-chunk-1")
+        );
+        assert_eq!(source_rows[0].start_byte, Some(0));
+        assert_eq!(source_rows[0].end_byte, Some(32));
+        assert_eq!(source_rows[0].symbol_name.as_deref(), Some("hello"));
+        assert!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "running")
+                .expect("running jobs should load")
+                .is_empty()
         );
     }
 
@@ -11161,6 +12521,19 @@ mod tests {
             ("test_targets", "relationship_kind"),
             ("test_targets", "confidence"),
             ("test_targets", "reason"),
+            ("dependencies", "repository_id"),
+            ("dependencies", "manifest_path"),
+            ("dependencies", "package_manager"),
+            ("dependencies", "dependency_name"),
+            ("dependencies", "package_name"),
+            ("dependencies", "version_req"),
+            ("dependencies", "dependency_kind"),
+            ("dependency_usages", "dependency_id"),
+            ("dependency_usages", "source_symbol_id"),
+            ("dependency_usages", "usage_kind"),
+            ("dependency_usages", "import_path"),
+            ("dependency_usages", "referenced_symbol"),
+            ("dependency_usages", "reason"),
             ("runtime_observations", "observation_id"),
             ("runtime_observations", "input_hash"),
             ("runtime_observations", "observation_kind"),
@@ -11500,6 +12873,290 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_runtime_role_uses_runtime_database() {
+        let db = TestDb::new("runtime-role-database");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::Runtime)
+            .expect("runtime store should open");
+        store.migrate().expect("runtime schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::Runtime).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        store
+            .record_runtime_observations(
+                "repo",
+                "thread 'tests::fails' panicked at src/lib.rs:42:5",
+                &[RuntimeObservationRecord {
+                    observation_kind: "frame".to_owned(),
+                    ordinal: Some(0),
+                    runtime_symbol: Some("crate::fails".to_owned()),
+                    runtime_path: Some("src/lib.rs".to_owned()),
+                    normalized_path: Some("src/lib.rs".to_owned()),
+                    line: Some(42),
+                    column: Some(5),
+                    failing_test_name: None,
+                    mapped_test_name: None,
+                    matched: true,
+                    match_kind: "symbols_at_runtime_location".to_owned(),
+                    match_summary: "{\"metadata_only\":true}".to_owned(),
+                }],
+            )
+            .expect("runtime observations should persist");
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"runtime_observations".to_owned()));
+        assert!(!tables.contains(&"repositories".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_quality_semantic_role_uses_quality_database() {
+        let db = TestDb::new("quality-semantic-role-database");
+        let config = db.config();
+        let store = SqliteStore::open_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality semantic store should open");
+        store
+            .migrate()
+            .expect("quality semantic schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::QualitySemantic).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"semantic_generations".to_owned()));
+        assert!(tables.contains(&"chunk_embeddings".to_owned()));
+        assert!(tables.contains(&"quality_embedding_jobs".to_owned()));
+        assert!(tables.contains(&"vector_points".to_owned()));
+        assert!(!tables.contains(&"repositories".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
+        assert!(!tables.contains(&"chunks".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_quality_semantic_role_records_queue_metadata() {
+        let db = TestDb::new("quality-semantic-role-queue-metadata");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality semantic store should open");
+        store
+            .migrate()
+            .expect("quality semantic schema should migrate");
+
+        let generation = sample_semantic_generation();
+        let job = sample_quality_embedding_job();
+        let fast_embedding = sample_chunk_embedding();
+        store
+            .record_semantic_generation_manifest(
+                &generation,
+                std::slice::from_ref(&fast_embedding),
+                None,
+                "102",
+            )
+            .expect("fast manifest should persist");
+        let summary = store
+            .queue_quality_embedding_jobs(
+                &generation,
+                "mxbai-embed-large",
+                std::slice::from_ref(&job),
+                "103",
+            )
+            .expect("quality queue metadata should persist");
+
+        assert_eq!(summary.queued_jobs, 1);
+        assert_eq!(summary.skipped_stale_jobs, 0);
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should read")
+                .map(|generation| generation.quality_status),
+            Some("quality_pending".to_owned())
+        );
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "pending")
+                .expect("pending quality jobs should read"),
+            vec![job]
+        );
+        let progress = store
+            .quality_generation_progress("repo", "generation-1")
+            .expect("quality progress should read");
+        assert_eq!(progress.pending_jobs, 1);
+        assert_eq!(progress.quality_eligible_chunks, 1);
+    }
+
+    #[test]
+    fn sqlite_quality_semantic_role_filters_existing_quality_candidates() {
+        let db = TestDb::new("quality-semantic-role-candidate-filter");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality semantic store should open");
+        store
+            .migrate()
+            .expect("quality semantic schema should migrate");
+
+        let generation = sample_semantic_generation();
+        let job = sample_quality_embedding_job();
+        assert_eq!(
+            store
+                .missing_quality_embedding_jobs_from_candidates(
+                    std::slice::from_ref(&job),
+                    "mxbai-embed-large",
+                )
+                .expect("missing candidates should read"),
+            vec![job.clone()]
+        );
+
+        store
+            .queue_quality_embedding_jobs(
+                &generation,
+                "mxbai-embed-large",
+                std::slice::from_ref(&job),
+                "103",
+            )
+            .expect("quality queue metadata should persist");
+        assert!(
+            store
+                .missing_quality_embedding_jobs_from_candidates(
+                    std::slice::from_ref(&job),
+                    "mxbai-embed-large",
+                )
+                .expect("missing candidates should read")
+                .is_empty()
+        );
+
+        let embedded_job = sample_quality_embedding_job_for("generation-1", "chunk-2", "pending");
+        let quality_embedding = ChunkEmbeddingRecord {
+            chunk_id: "chunk-2".to_owned(),
+            text_hash: "text-chunk-2".to_owned(),
+            ..sample_quality_chunk_embedding("current")
+        };
+        store
+            .upsert_chunk_embedding(&quality_embedding)
+            .expect("quality embedding should persist");
+        assert!(
+            store
+                .missing_quality_embedding_jobs_from_candidates(
+                    std::slice::from_ref(&embedded_job),
+                    "mxbai-embed-large",
+                )
+                .expect("missing candidates should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_quality_semantic_role_records_generation_manifest() {
+        let db = TestDb::new("quality-semantic-role-generation-manifest");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality semantic store should open");
+        store
+            .migrate()
+            .expect("quality semantic schema should migrate");
+
+        let generation = SemanticGenerationRecord {
+            quality_status: "quality_ready".to_owned(),
+            active_layer: "quality".to_owned(),
+            quality_embedded_chunks: 1,
+            updated_at: "104".to_owned(),
+            ..sample_semantic_generation()
+        };
+        let fast_embedding = sample_chunk_embedding();
+        let quality_embedding = sample_quality_chunk_embedding("current");
+        store
+            .record_semantic_generation_manifest(
+                &generation,
+                &[fast_embedding, quality_embedding.clone()],
+                None,
+                "104",
+            )
+            .expect("quality generation manifest should persist");
+
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should read"),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            store
+                .chunk_embeddings_for_generation("repo", "generation-1", "quality")
+                .expect("quality embeddings should read"),
+            vec![quality_embedding]
+        );
+        let progress = store
+            .quality_generation_progress("repo", "generation-1")
+            .expect("quality progress should read");
+        assert_eq!(progress.quality_embedded_chunks, 1);
+    }
+
+    #[test]
+    fn sqlite_fast_semantic_role_uses_fast_database() {
+        let db = TestDb::new("fast-semantic-role-database");
+        let config = db.config();
+        let store = SqliteStore::open_for_role(&config, DatabaseRole::FastSemantic)
+            .expect("fast semantic store should open");
+        store
+            .migrate()
+            .expect("fast semantic schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::FastSemantic).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"semantic_generations".to_owned()));
+        assert!(tables.contains(&"semantic_generation_refs".to_owned()));
+        assert!(tables.contains(&"chunk_embeddings".to_owned()));
+        assert!(tables.contains(&"vector_points".to_owned()));
+        assert!(!tables.contains(&"repositories".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
+        assert!(!tables.contains(&"chunks".to_owned()));
+        assert!(!tables.contains(&"quality_embedding_jobs".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_fast_semantic_role_records_generation_manifest() {
+        let db = TestDb::new("fast-semantic-role-generation-manifest");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::FastSemantic)
+            .expect("fast semantic store should open");
+        store
+            .migrate()
+            .expect("fast semantic schema should migrate");
+
+        let generation = sample_semantic_generation();
+        let embedding = sample_chunk_embedding();
+        store
+            .record_semantic_generation_manifest(
+                &generation,
+                std::slice::from_ref(&embedding),
+                Some("ref-main"),
+                "102",
+            )
+            .expect("generation manifest should persist");
+
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should read"),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            store
+                .latest_semantic_generation_for_ref("repo", "ref-main")
+                .expect("ref generation should read"),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            store
+                .chunk_embeddings_for_generation("repo", "generation-1", "fast")
+                .expect("embeddings should read"),
+            vec![embedding]
+        );
+    }
+
+    #[test]
     fn sqlite_collects_layered_vector_point_ids_before_replacement_and_deletion() {
         let db = TestDb::new("vector-point-cleanup");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -11653,6 +13310,51 @@ mod tests {
             .expect("quality manifest should load");
 
         assert!(quality.is_empty());
+    }
+
+    #[test]
+    fn sqlite_expected_vector_points_can_use_external_embedding_manifest() {
+        let db = TestDb::new("external-vector-manifest");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("facts should persist");
+
+        let mut stale = sample_quality_chunk_embedding("stale");
+        stale.vector_point_id = "01234567-89ab-cdef-fedc-ba9876543212".to_owned();
+        let missing_chunk = ChunkEmbeddingRecord {
+            chunk_id: "missing-chunk".to_owned(),
+            vector_point_id: "01234567-89ab-cdef-fedc-ba9876543213".to_owned(),
+            ..sample_quality_chunk_embedding("current")
+        };
+        let expected = store
+            .expected_vector_points_for_chunk_embeddings(&[
+                sample_quality_chunk_embedding("current"),
+                stale,
+                missing_chunk,
+            ])
+            .expect("expected points should load from structural facts");
+
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].chunk_id, "chunk-1");
+        assert_eq!(expected[0].path, "src/lib.rs");
+        assert_eq!(
+            expected[0].embedding_model.as_deref(),
+            Some("mxbai-embed-large")
+        );
+        assert_eq!(expected[0].embedding_dimension, Some(768));
     }
 
     #[test]
@@ -11883,6 +13585,126 @@ mod tests {
         assert_eq!(row.1, "import");
         assert_eq!(row.2, 2);
         assert_eq!(row.4, "unresolved");
+    }
+
+    #[test]
+    fn sqlite_persists_dependency_facts_and_usages() {
+        let db = TestDb::new("dependency-facts");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let dependency = DependencyRecord {
+            id: "dep-sqlx".to_owned(),
+            repository_id: "repo".to_owned(),
+            file_id: "manifest-file".to_owned(),
+            manifest_path: "Cargo.toml".to_owned(),
+            package_manager: "cargo".to_owned(),
+            dependency_name: "sqlx".to_owned(),
+            package_name: "sqlx".to_owned(),
+            version_req: Some("0.7".to_owned()),
+            dependency_kind: "runtime".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        };
+        let usage = DependencyUsageRecord {
+            id: "usage-sqlx".to_owned(),
+            repository_id: "repo".to_owned(),
+            dependency_id: "dep-sqlx".to_owned(),
+            file_id: "code-file".to_owned(),
+            source_symbol_id: Some("source-symbol".to_owned()),
+            usage_kind: "import".to_owned(),
+            import_path: "sqlx::SqlitePool".to_owned(),
+            referenced_symbol: Some("SqlitePool".to_owned()),
+            line: 3,
+            confidence: 0.75,
+            reason: "import_matches_manifest_dependency".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        };
+
+        store
+            .replace_file_facts_with_references_dependencies_and_tests(
+                &sample_file_at("manifest-file", "Cargo.toml", "hash-1"),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[dependency],
+                &[],
+                &[],
+            )
+            .expect("dependency facts should persist");
+        store
+            .replace_file_facts_with_references_dependencies_and_tests(
+                &sample_file_at("code-file", "src/lib.rs", "hash-2"),
+                &[sample_symbol_in_file(
+                    "source-symbol",
+                    "code-file",
+                    "run",
+                    "crate::run",
+                )],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[usage],
+                &[],
+            )
+            .expect("dependency usages should persist");
+
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = store
+            .connection
+            .query_row(
+                "SELECT dependencies.package_manager, dependencies.dependency_name,
+                        dependencies.package_name, dependencies.dependency_kind,
+                        dependencies.version_req, dependency_usages.import_path,
+                        dependency_usages.reason
+                   FROM dependencies
+                   JOIN dependency_usages ON dependency_usages.dependency_id = dependencies.id
+                  WHERE dependencies.id = 'dep-sqlx'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("dependency facts should load");
+        assert_eq!(row.0, "cargo");
+        assert_eq!(row.1, "sqlx");
+        assert_eq!(row.2, "sqlx");
+        assert_eq!(row.3, "runtime");
+        assert_eq!(row.4.as_deref(), Some("0.7"));
+        assert_eq!(row.5, "sqlx::SqlitePool");
+        assert_eq!(row.6, "import_matches_manifest_dependency");
+
+        let rows = store
+            .dependency_usages_for_symbol("repo", "crate::run")
+            .expect("dependency usages should query by symbol");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].package_name, "sqlx");
+        assert_eq!(rows[0].path, "src/lib.rs");
+        assert_eq!(rows[0].provenance.content_hash.as_deref(), Some("hash-2"));
     }
 
     #[test]
@@ -12572,6 +14394,97 @@ mod tests {
         assert_eq!(status.files_seen, 3);
         assert_eq!(status.queued_events, 2);
         assert_eq!(status.last_indexed_path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn sqlite_watch_role_uses_watch_database() {
+        let db = TestDb::new("watch-role-database");
+        let config = db.config();
+        let store = SqliteStore::open_for_role(&config, DatabaseRole::Watch)
+            .expect("watch store should open");
+        store.migrate().expect("watch schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::Watch).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"repositories".to_owned()));
+        assert!(tables.contains(&"watchers".to_owned()));
+        assert!(tables.contains(&"watcher_clients".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_events_role_uses_events_database() {
+        let db = TestDb::new("events-role-database");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::Events)
+            .expect("events store should open");
+        store.migrate().expect("events schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::Events).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        let run = sample_index_run("nomic-embed-text", 768);
+        store.start_index_run(&run).expect("run should start");
+        store
+            .record_file_index_events(&[FileIndexEventRecord {
+                id: "event-1".to_owned(),
+                index_run_id: run.id.clone(),
+                repository_id: "repo".to_owned(),
+                repository_ref_id: None,
+                path: "src/lib.rs".to_owned(),
+                old_content_hash: None,
+                new_content_hash: Some("hash".to_owned()),
+                action: "created".to_owned(),
+                reason: "new_file".to_owned(),
+                status: "success".to_owned(),
+                error_summary: None,
+            }])
+            .expect("file event should persist");
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"index_runs".to_owned()));
+        assert!(tables.contains(&"file_index_events".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_structural_reads_prefer_events_role_index_runs() {
+        let db = TestDb::new("events-role-read-fan-in");
+        let config = db.config();
+        let structural = SqliteStore::open(&config).expect("structural store should open");
+        structural
+            .migrate()
+            .expect("structural schema should migrate");
+        structural
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        structural
+            .finish_index_run(&sample_index_run("legacy-model", 384))
+            .expect("legacy run should persist");
+
+        let events = SqliteStore::open_for_role(&config, DatabaseRole::Events)
+            .expect("events store should open");
+        events.migrate().expect("events schema should migrate");
+        events
+            .finish_index_run(&sample_index_run("event-model", 768))
+            .expect("event run should persist");
+
+        let status = structural
+            .repository_status("repo")
+            .expect("status should load");
+        assert_eq!(status.embedding_model.as_deref(), Some("event-model"));
+        assert_eq!(status.embedding_dimension, Some(768));
+
+        let timeline = structural
+            .index_runs_timeline_summary("repo")
+            .expect("timeline should load");
+        assert_eq!(timeline.runs.len(), 1);
+        assert_eq!(timeline.runs[0].embedding_model, "event-model");
     }
 
     #[test]

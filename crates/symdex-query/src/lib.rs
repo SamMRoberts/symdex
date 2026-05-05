@@ -12,12 +12,12 @@ use symdex_core::{
 use symdex_embed::{EmbedConfig, LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
-    EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, ExpectedVectorPoint,
-    FileFreshnessSnapshot, IndexCoverageSummary, IndexRunsTimelineSummary,
-    QualityGenerationProgress, RetrievedPoint, RuntimeObservationCacheSummary,
-    RuntimeObservationRecord, ScoredPoint, SemanticLayerManifestSummary,
-    SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore, SqliteVectorStore,
-    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    DatabaseRole, DependencyUsageSearchRow, EmbeddingCoverageSummary, EvidenceFreshness,
+    EvidenceProvenance, ExpectedVectorPoint, FileFreshnessSnapshot, IndexCoverageSummary,
+    IndexRunsTimelineSummary, QualityGenerationProgress, RetrievedPoint,
+    RuntimeObservationCacheSummary, RuntimeObservationRecord, ScoredPoint,
+    SemanticLayerManifestSummary, SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore,
+    SqliteVectorStore, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
     SymbolOutlineSummary, SymbolSearchRow, TestSearchRow, clamp_call_path_depth,
     freshness_for_hash, vector_table_name,
 };
@@ -384,6 +384,7 @@ pub struct ImpactSummary {
     pub transitive_callers: Vec<ImpactPathEvidence>,
     pub transitive_callees: Vec<ImpactPathEvidence>,
     pub related_files: Vec<ImpactRelatedFile>,
+    pub external_dependencies: Vec<ImpactDependencyEvidence>,
     pub tests_likely: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -407,6 +408,7 @@ pub struct ExplainChangeSummary {
     pub transitive_callers: Vec<ImpactPathEvidence>,
     pub transitive_callees: Vec<ImpactPathEvidence>,
     pub related_files: Vec<ImpactRelatedFile>,
+    pub external_dependencies: Vec<ImpactDependencyEvidence>,
     pub likely_tests: Vec<String>,
     pub limits: ExplainChangeLimits,
     pub notes: Vec<String>,
@@ -527,6 +529,14 @@ pub struct ImpactRelatedFile {
     pub relationship_count: usize,
     pub freshness: EvidenceFreshness,
     pub provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImpactDependencyEvidence {
+    pub row: DependencyUsageSearchRow,
+    pub freshness: EvidenceFreshness,
     pub trust: EvidenceTrust,
     pub reasons: Vec<String>,
 }
@@ -768,6 +778,7 @@ fn build_explain_change_summary(
     let mut transitive_callers: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
     let mut transitive_callees: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
     let mut related_files: BTreeMap<String, ImpactRelatedFile> = BTreeMap::new();
+    let mut external_dependencies: BTreeMap<String, ImpactDependencyEvidence> = BTreeMap::new();
     let mut likely_tests = BTreeSet::new();
     let mut notes = vec![
         "metadata_only_no_source_text".to_owned(),
@@ -892,6 +903,11 @@ fn build_explain_change_summary(
             for file in impact.related_files {
                 merge_related_file(&mut related_files, file);
             }
+            for dependency in impact.external_dependencies {
+                external_dependencies
+                    .entry(impact_dependency_key(&dependency))
+                    .or_insert(dependency);
+            }
             likely_tests.extend(impact.tests_likely);
         }
     }
@@ -912,6 +928,7 @@ fn build_explain_change_summary(
         transitive_callers: transitive_callers.into_values().collect(),
         transitive_callees: transitive_callees.into_values().collect(),
         related_files: related_files.into_values().collect(),
+        external_dependencies: external_dependencies.into_values().collect(),
         likely_tests: likely_tests.into_iter().collect(),
         limits: ExplainChangeLimits {
             max_targets,
@@ -965,6 +982,10 @@ fn build_impact_summary(
         &transitive_callees,
         &current_hashes,
     );
+    let external_dependencies = sqlite
+        .dependency_usages_for_symbol(root.id(), query)
+        .map(|rows| impact_dependency_evidence(rows, &current_hashes))
+        .map_err(|error| error.to_string())?;
     let tests_likely = sqlite
         .likely_tests_for_symbol(root.id(), query)
         .map(test_names)
@@ -985,6 +1006,7 @@ fn build_impact_summary(
         transitive_callers,
         transitive_callees,
         related_files,
+        external_dependencies,
         tests_likely,
         notes,
     })
@@ -1058,6 +1080,48 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
         }
         if let Some(test) = parse_failing_test(trimmed, in_failures) {
             failing_tests.insert(test);
+        }
+        if let Some((symbol, path, line_number, column)) = parse_csharp_stack_frame(trimmed) {
+            if let Some((_, raw, pending)) = pending_symbol.take() {
+                frames.push(RuntimeFrame {
+                    ordinal: frames.len(),
+                    raw,
+                    symbol: Some(pending),
+                    path: None,
+                    line: None,
+                    column: None,
+                });
+            }
+            frames.push(RuntimeFrame {
+                ordinal: frames.len(),
+                raw: trimmed.to_owned(),
+                symbol: Some(symbol),
+                path: Some(path),
+                line: Some(line_number),
+                column,
+            });
+            continue;
+        }
+        if let Some((symbol, path, line_number, column)) = parse_node_v8_stack_frame(trimmed) {
+            if let Some((_, raw, pending)) = pending_symbol.take() {
+                frames.push(RuntimeFrame {
+                    ordinal: frames.len(),
+                    raw,
+                    symbol: Some(pending),
+                    path: None,
+                    line: None,
+                    column: None,
+                });
+            }
+            frames.push(RuntimeFrame {
+                ordinal: frames.len(),
+                raw: trimmed.to_owned(),
+                symbol: Some(symbol),
+                path: Some(path),
+                line: Some(line_number),
+                column,
+            });
+            continue;
         }
         if let Some((symbol, path, line_number, column)) = parse_inline_symbol_location(trimmed) {
             if let Some((_, raw, pending)) = pending_symbol.take() {
@@ -1139,11 +1203,12 @@ pub fn run_debug_context_pack(
         return Err("debug-context requires runtime failure input".to_owned());
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let mut sqlite = sqlite_for_write()?;
+    let sqlite = sqlite_for_read()?;
+    let mut runtime = sqlite_for_runtime_write()?;
     let current_hashes = current_hashes(&root)?;
     let mut pack = build_debug_context_pack(&root, &sqlite, runtime_input, limit, &current_hashes)?;
     let observations = runtime_observation_records(&sqlite, root.id(), runtime_input, &pack)?;
-    let cache_summary = sqlite
+    let cache_summary = runtime
         .record_runtime_observations(root.id(), runtime_input, &observations)
         .map_err(|error| error.to_string())?;
     pack.runtime_observation = Some(Box::new(cache_summary));
@@ -1345,12 +1410,24 @@ pub fn run_vector_verify_with_options(
     options: VectorVerifyOptions,
 ) -> Result<VectorVerifySummary, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
-    let targets = vector_verify_targets(&root, &sqlite, options.semantic_layer)?;
     let store_config = StoreConfig::from_env();
-    let vector = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let fast_store = semantic_role_store_for_read(&store_config, DatabaseRole::FastSemantic)?;
+    let quality_store = semantic_role_store_for_read(&store_config, DatabaseRole::QualitySemantic)?;
+    let targets = vector_verify_targets(
+        &root,
+        &sqlite,
+        fast_store.as_ref(),
+        quality_store.as_ref(),
+        options.semantic_layer,
+    )?;
     let mut summaries = Vec::new();
     for target in targets {
+        let vector = vector_store_for_semantic_layer(
+            &store_config,
+            target.semantic_layer,
+            &target.collection_name,
+        )?;
         let table_exists = vector
             .table_exists(&target.collection_name)
             .map_err(|error| error.to_string())?;
@@ -1393,33 +1470,47 @@ struct VectorVerifyTarget {
 fn vector_verify_targets(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    fast_store: Option<&SqliteStore>,
+    quality_store: Option<&SqliteStore>,
     selection: VectorVerifySemanticLayer,
 ) -> Result<Vec<VectorVerifyTarget>, String> {
-    let routing = sqlite
-        .semantic_routing_summary(root.id())
-        .map_err(|error| error.to_string())?;
+    let routing = semantic_routing_summary_for_scope(sqlite, root.id(), None, quality_store)?;
     selection
         .layers()
         .into_iter()
-        .map(|layer| vector_verify_target(root, sqlite, routing.as_ref(), layer))
+        .map(|layer| {
+            vector_verify_target(
+                root,
+                sqlite,
+                fast_store,
+                quality_store,
+                routing.as_ref(),
+                layer,
+            )
+        })
         .collect()
 }
 
 fn vector_verify_target(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    fast_store: Option<&SqliteStore>,
+    quality_store: Option<&SqliteStore>,
     routing: Option<&SemanticRoutingSummary>,
     semantic_layer: SemanticLayer,
 ) -> Result<VectorVerifyTarget, String> {
     match semantic_layer {
-        SemanticLayer::Fast => vector_verify_fast_target(root, sqlite, routing),
-        SemanticLayer::Quality => vector_verify_quality_target(root, sqlite, routing),
+        SemanticLayer::Fast => vector_verify_fast_target(root, sqlite, fast_store, routing),
+        SemanticLayer::Quality => {
+            vector_verify_quality_target(root, sqlite, quality_store, routing)
+        }
     }
 }
 
 fn vector_verify_fast_target(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    fast_store: Option<&SqliteStore>,
     routing: Option<&SemanticRoutingSummary>,
 ) -> Result<VectorVerifyTarget, String> {
     let Some(routing) = routing else {
@@ -1428,13 +1519,16 @@ fn vector_verify_fast_target(
             root.id()
         ));
     };
-    let expected = sqlite
-        .expected_vector_points_for_generation_layer(
-            root.id(),
-            &routing.generation_id,
-            SemanticLayer::Fast,
-        )
-        .map_err(|error| error.to_string())?;
+    let metadata_store =
+        semantic_layer_store_for_generation(fast_store, root.id(), &routing.generation_id)?
+            .unwrap_or(sqlite);
+    let expected = expected_vector_points_from_layer_metadata(
+        sqlite,
+        metadata_store,
+        root.id(),
+        &routing.generation_id,
+        SemanticLayer::Fast,
+    )?;
     if !routing.fast.is_complete {
         return Err(format!(
             "layered fast semantic metadata is incomplete for {}; run `symdex index <repo>` to refresh chunk_embeddings before vector-verify",
@@ -1447,16 +1541,20 @@ fn vector_verify_fast_target(
 fn vector_verify_quality_target(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    quality_store: Option<&SqliteStore>,
     routing: Option<&SemanticRoutingSummary>,
 ) -> Result<VectorVerifyTarget, String> {
     if let Some(routing) = routing {
-        let expected = sqlite
-            .expected_vector_points_for_generation_layer(
-                root.id(),
-                &routing.generation_id,
-                SemanticLayer::Quality,
-            )
-            .map_err(|error| error.to_string())?;
+        let metadata_store =
+            semantic_layer_store_for_generation(quality_store, root.id(), &routing.generation_id)?
+                .unwrap_or(sqlite);
+        let expected = expected_vector_points_from_layer_metadata(
+            sqlite,
+            metadata_store,
+            root.id(),
+            &routing.generation_id,
+            SemanticLayer::Quality,
+        )?;
         if let Some(manifest) = &routing.quality {
             return Ok(vector_target_from_manifest(manifest, expected));
         }
@@ -1469,6 +1567,36 @@ fn vector_verify_quality_target(
         embedding_model: quality_config.model,
         expected: Vec::new(),
     })
+}
+
+fn semantic_layer_store_for_generation<'a>(
+    store: Option<&'a SqliteStore>,
+    repository_id: &str,
+    generation_id: &str,
+) -> Result<Option<&'a SqliteStore>, String> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let is_current_generation = store
+        .latest_semantic_generation(repository_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|generation| generation.id == generation_id);
+    Ok(is_current_generation.then_some(store))
+}
+
+fn expected_vector_points_from_layer_metadata(
+    structural_store: &SqliteStore,
+    metadata_store: &SqliteStore,
+    repository_id: &str,
+    generation_id: &str,
+    semantic_layer: SemanticLayer,
+) -> Result<Vec<ExpectedVectorPoint>, String> {
+    let embeddings = metadata_store
+        .chunk_embeddings_for_generation(repository_id, generation_id, semantic_layer.as_str())
+        .map_err(|error| error.to_string())?;
+    structural_store
+        .expected_vector_points_for_chunk_embeddings(&embeddings)
+        .map_err(|error| error.to_string())
 }
 
 fn vector_target_from_manifest(
@@ -1755,21 +1883,42 @@ pub fn run_semantic_status(repo: &str) -> Result<SemanticStatusSummary, String> 
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let quality_store = semantic_role_store_for_read(&store_config, DatabaseRole::QualitySemantic)?;
     let repository_ref_id = active_ref_scope(&root, &sqlite)?;
-    let routing =
-        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
+    let routing = semantic_routing_summary_for_scope(
+        &sqlite,
+        root.id(),
+        repository_ref_id.as_deref(),
+        quality_store.as_ref(),
+    )?;
     let quality_progress = match routing.as_ref() {
-        Some(summary) => Some(
-            sqlite
-                .quality_generation_progress(root.id(), &summary.generation_id)
-                .map_err(|error| error.to_string())?,
-        ),
+        Some(summary) => {
+            let read_store = semantic_quality_store_for_generation(
+                quality_store.as_ref(),
+                root.id(),
+                &summary.generation_id,
+            )?
+            .unwrap_or(&sqlite);
+            Some(
+                read_store
+                    .quality_generation_progress(root.id(), &summary.generation_id)
+                    .map_err(|error| error.to_string())?,
+            )
+        }
         None => None,
     };
     let latest_quality_error = match routing.as_ref() {
-        Some(summary) => sqlite
-            .latest_quality_generation_error(root.id(), &summary.generation_id)
-            .map_err(|error| error.to_string())?,
+        Some(summary) => {
+            let read_store = semantic_quality_store_for_generation(
+                quality_store.as_ref(),
+                root.id(),
+                &summary.generation_id,
+            )?
+            .unwrap_or(&sqlite);
+            read_store
+                .latest_quality_generation_error(root.id(), &summary.generation_id)
+                .map_err(|error| error.to_string())?
+        }
         None => None,
     };
     Ok(semantic_status_from_routing(
@@ -1918,9 +2067,14 @@ fn semantic_search_for_root(
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let quality_store = semantic_role_store_for_read(&store_config, DatabaseRole::QualitySemantic)?;
     let repository_ref_id = active_ref_scope(root, &sqlite)?;
-    let routing =
-        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
+    let routing = semantic_routing_summary_for_scope(
+        &sqlite,
+        root.id(),
+        repository_ref_id.as_deref(),
+        quality_store.as_ref(),
+    )?;
     let target =
         resolve_semantic_search_target(root.id(), options, routing.as_ref(), &layered_config)?;
     let embed_config = embed_config_for_semantic_target(&layered_config, &target);
@@ -1933,12 +2087,19 @@ fn semantic_search_for_root(
         return Err("embedding query returned no vector".to_owned());
     };
 
-    let vector_store = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
+    let vector_store = vector_store_for_semantic_layer(
+        &store_config,
+        target.semantic_layer,
+        &target.vector_table,
+    )?;
     let points = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
-        vector_store.query_points_for_ref(
+        let file_ids = sqlite
+            .ref_file_ids(root.id(), repository_ref_id)
+            .map_err(|error| error.to_string())?;
+        vector_store.query_points_for_file_ids(
             &target.vector_table,
             root.id(),
-            repository_ref_id,
+            &file_ids,
             query_vector,
             limit,
         )
@@ -1962,22 +2123,114 @@ fn semantic_search_for_root(
     })
 }
 
+fn vector_store_for_semantic_layer(
+    store_config: &StoreConfig,
+    semantic_layer: SemanticLayer,
+    vector_table: &str,
+) -> Result<SqliteVectorStore, String> {
+    let layer_store = SqliteVectorStore::new_for_semantic_layer(store_config, semantic_layer)
+        .map_err(|error| error.to_string())?;
+    if layer_store
+        .table_exists(vector_table)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(layer_store);
+    }
+
+    let legacy_store = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    if legacy_store.database_path() != layer_store.database_path()
+        && legacy_store
+            .table_exists(vector_table)
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(legacy_store);
+    }
+
+    Ok(layer_store)
+}
+
 fn semantic_routing_summary_for_scope(
     sqlite: &SqliteStore,
     repository_id: &str,
     repository_ref_id: Option<&str>,
+    quality_store: Option<&SqliteStore>,
 ) -> Result<Option<SemanticRoutingSummary>, String> {
-    if let Some(repository_ref_id) = repository_ref_id {
+    let structural_routing = if let Some(repository_ref_id) = repository_ref_id {
         let routing = sqlite
             .semantic_routing_summary_for_ref(repository_id, repository_ref_id)
             .map_err(|error| error.to_string())?;
         if routing.is_some() {
-            return Ok(routing);
+            routing
+        } else {
+            sqlite
+                .semantic_routing_summary(repository_id)
+                .map_err(|error| error.to_string())?
         }
+    } else {
+        sqlite
+            .semantic_routing_summary(repository_id)
+            .map_err(|error| error.to_string())?
+    };
+
+    let Some(structural_routing) = structural_routing else {
+        return Ok(None);
+    };
+
+    let quality_routing = match quality_store {
+        Some(store) => store
+            .semantic_routing_summary(repository_id)
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    Ok(Some(merge_quality_semantic_routing(
+        structural_routing,
+        quality_routing,
+    )))
+}
+
+fn semantic_role_store_for_read(
+    store_config: &StoreConfig,
+    role: DatabaseRole,
+) -> Result<Option<SqliteStore>, String> {
+    if !store_config.database_path(role).exists() {
+        return Ok(None);
     }
-    sqlite
-        .semantic_routing_summary(repository_id)
+    SqliteStore::open_read_only_for_role(store_config, role)
+        .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn semantic_quality_store_for_generation<'a>(
+    quality_store: Option<&'a SqliteStore>,
+    repository_id: &str,
+    generation_id: &str,
+) -> Result<Option<&'a SqliteStore>, String> {
+    let Some(store) = quality_store else {
+        return Ok(None);
+    };
+    let is_current_generation = store
+        .latest_semantic_generation(repository_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|generation| generation.id == generation_id);
+    Ok(is_current_generation.then_some(store))
+}
+
+fn merge_quality_semantic_routing(
+    mut structural: SemanticRoutingSummary,
+    quality: Option<SemanticRoutingSummary>,
+) -> SemanticRoutingSummary {
+    let Some(quality) = quality else {
+        return structural;
+    };
+    if quality.generation_id != structural.generation_id {
+        return structural;
+    }
+
+    structural.active_layer = quality.active_layer;
+    structural.quality_status = quality.quality_status;
+    structural.quality_embedded_chunks = quality.quality_embedded_chunks;
+    structural.quality = quality.quality;
+    structural
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3088,6 +3341,50 @@ fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
     Some((path, line_number, column))
 }
 
+fn parse_csharp_stack_frame(line: &str) -> Option<(String, String, usize, Option<usize>)> {
+    let prefix_stripped = line.strip_prefix("at ")?;
+    let (raw_symbol, location) = prefix_stripped.rsplit_once(" in ")?;
+    let trimmed_symbol = raw_symbol
+        .split_once('(')
+        .map_or(raw_symbol, |(symbol, _)| symbol);
+    let normalized_symbol = normalize_stack_symbol(trimmed_symbol)?;
+    let (path, line_number, column) = parse_csharp_line_location(location)?;
+    Some((normalized_symbol, path, line_number, column))
+}
+
+fn parse_csharp_line_location(location: &str) -> Option<(String, usize, Option<usize>)> {
+    let (path, line_suffix) = location.rsplit_once(":line ")?;
+    if !path.ends_with(".cs") {
+        return None;
+    }
+    let line_suffix = line_suffix.trim_start();
+    let (line_number, column_suffix) = parse_usize_prefix(line_suffix)?;
+    let column = column_suffix
+        .strip_prefix(':')
+        .and_then(|rest| parse_usize_prefix(rest).map(|(column, _)| column));
+    Some((path.trim().to_owned(), line_number, column))
+}
+
+fn parse_node_v8_stack_frame(line: &str) -> Option<(String, String, usize, Option<usize>)> {
+    let rest = line.strip_prefix("at ")?;
+    let open_paren_pos = rest.rfind('(')?;
+    let close_paren_pos = rest.rfind(')')?;
+    if close_paren_pos <= open_paren_pos {
+        return None;
+    }
+    let symbol = rest[..open_paren_pos]
+        .trim()
+        .trim_start_matches("async ")
+        .trim();
+    if symbol.is_empty() {
+        return None;
+    }
+    let symbol = normalize_stack_symbol(symbol)?;
+    let location = rest[open_paren_pos + 1..close_paren_pos].trim();
+    let (path, line_number, column) = parse_file_location(location)?;
+    Some((symbol, path, line_number, column))
+}
+
 fn runtime_path_start(line: &str, marker_start: usize) -> usize {
     line[..marker_start]
         .rfind(|character: char| {
@@ -3293,9 +3590,10 @@ fn sqlite_for_read_with_config(store_config: &StoreConfig) -> Result<SqliteStore
     SqliteStore::open_read_only(store_config).map_err(|error| error.to_string())
 }
 
-fn sqlite_for_write() -> Result<SqliteStore, String> {
+fn sqlite_for_runtime_write() -> Result<SqliteStore, String> {
     let store_config = StoreConfig::from_env();
-    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    let store = SqliteStore::open_for_role(&store_config, DatabaseRole::Runtime)
+        .map_err(|error| error.to_string())?;
     store.migrate().map_err(|error| error.to_string())?;
     Ok(store)
 }
@@ -3595,6 +3893,35 @@ fn impact_path_evidence(
         .collect()
 }
 
+fn impact_dependency_evidence(
+    rows: Vec<DependencyUsageSearchRow>,
+    current_hashes: &BTreeMap<String, String>,
+) -> Vec<ImpactDependencyEvidence> {
+    rows.into_iter()
+        .map(|row| {
+            let freshness =
+                freshness_for_provenance(Some(&row.path), &row.provenance, current_hashes);
+            let trust = evidence_trust(
+                freshness,
+                Some(&row.provenance),
+                Some(row.confidence as f64),
+            );
+            let reasons = vec![
+                "relationship:external_dependency_import".to_owned(),
+                format!("dependency:{}", row.package_name),
+                format!("usage_kind:{}", row.usage_kind),
+                row.reason.clone(),
+            ];
+            ImpactDependencyEvidence {
+                row,
+                freshness,
+                trust,
+                reasons,
+            }
+        })
+        .collect()
+}
+
 fn aggregate_trust(trust: &[EvidenceTrust]) -> EvidenceTrust {
     if trust.is_empty() {
         return evidence_trust(EvidenceFreshness::Unknown, None, None);
@@ -3663,6 +3990,13 @@ fn impact_call_key(evidence: &ImpactCallEvidence) -> String {
         evidence.row.symbol_id.as_deref().unwrap_or("<unresolved>"),
         evidence.row.callee_text,
         evidence.row.call_line
+    )
+}
+
+fn impact_dependency_key(evidence: &ImpactDependencyEvidence) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        evidence.row.dependency_id, evidence.row.path, evidence.row.line, evidence.row.import_path
     )
 }
 
@@ -3824,11 +4158,11 @@ mod tests {
         QueryMode, SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
         VectorVerifySemanticLayer, build_debug_context_pack, build_explain_change_summary,
         build_freshness_report, build_impact_summary, build_unified_context_pack, evidence_trust,
-        freshness_rows, parse_runtime_input, resolve_semantic_search_target, run_call_graph,
-        run_call_path, run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
-        run_symbol_search, runtime_observation_records, semantic_reasons,
-        semantic_result_from_point, semantic_status_from_routing, vector_verify_all_summary,
-        vector_verify_summary,
+        freshness_rows, merge_quality_semantic_routing, parse_runtime_input,
+        resolve_semantic_search_target, run_call_graph, run_call_path, run_context_pack,
+        run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
+        runtime_observation_records, semantic_reasons, semantic_result_from_point,
+        semantic_status_from_routing, vector_verify_all_summary, vector_verify_summary,
     };
     use symdex_store::QualityGenerationProgress;
 
@@ -3899,6 +4233,46 @@ mod tests {
         assert_eq!(target.vector_table, "symdex_repo_quality_model");
         assert_eq!(target.quality_status, SemanticLayerStatus::QualityReady);
         assert_eq!(target.fallback_reason, None);
+    }
+
+    #[test]
+    fn semantic_routing_merges_same_generation_quality_role_state() {
+        let structural =
+            sample_routing_summary(SemanticLayer::Fast, SemanticLayerStatus::FastReady, None);
+        let quality = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+
+        let merged = merge_quality_semantic_routing(structural, Some(quality));
+
+        assert_eq!(merged.active_layer, SemanticLayer::Quality);
+        assert_eq!(merged.quality_status, SemanticLayerStatus::QualityReady);
+        assert!(
+            merged
+                .quality
+                .as_ref()
+                .is_some_and(|manifest| manifest.is_complete)
+        );
+    }
+
+    #[test]
+    fn semantic_routing_ignores_stale_quality_role_generation() {
+        let structural =
+            sample_routing_summary(SemanticLayer::Fast, SemanticLayerStatus::FastReady, None);
+        let mut quality = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+        quality.generation_id = "generation-old".to_owned();
+
+        let merged = merge_quality_semantic_routing(structural, Some(quality));
+
+        assert_eq!(merged.active_layer, SemanticLayer::Fast);
+        assert_eq!(merged.quality_status, SemanticLayerStatus::FastReady);
+        assert_eq!(merged.quality, None);
     }
 
     #[test]
@@ -4586,6 +4960,60 @@ mod tests {
     }
 
     #[test]
+    fn runtime_parser_extracts_csharp_and_node_v8_frames() {
+        let parsed = parse_runtime_input(
+            "System.ApplicationException: failed\n\
+             at Example.Service.Run(System.String value) in src/Program.cs:line 42\n\
+             at Example.Service.Helper() in C:\\repo\\src\\Service.cs:line 7\n\
+             at handleRequest (/repo/web/app.js:12:3)\n\
+             at async Object.load (/repo/web/app.ts:22:9)\n\
+             at Module._compile (node:internal/modules/cjs/loader:1254:14)\n\
+             at broken (web/app.js:nope)\n",
+        );
+
+        assert_eq!(parsed.frames.len(), 4);
+        assert_eq!(
+            parsed
+                .frames
+                .iter()
+                .map(|frame| (
+                    frame.symbol.as_deref(),
+                    frame.path.as_deref(),
+                    frame.line,
+                    frame.column,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some("Example.Service.Run"),
+                    Some("src/Program.cs"),
+                    Some(42),
+                    None,
+                ),
+                (
+                    Some("Example.Service.Helper"),
+                    Some("C:\\repo\\src\\Service.cs"),
+                    Some(7),
+                    None,
+                ),
+                (
+                    Some("handleRequest"),
+                    Some("/repo/web/app.js"),
+                    Some(12),
+                    Some(3),
+                ),
+                (
+                    Some("Object.load"),
+                    Some("/repo/web/app.ts"),
+                    Some(22),
+                    Some(9),
+                ),
+            ]
+        );
+        assert_eq!(parsed.malformed_lines, vec!["at broken (web/app.js:nope)"]);
+    }
+
+    #[test]
     fn debug_context_maps_fresh_stale_deleted_and_unmapped_frames() {
         let fixture = DebugFixture::new();
         let current_hashes = BTreeMap::from([
@@ -4644,6 +5072,91 @@ mod tests {
                 .iter()
                 .any(|note| note == "malformed_runtime_lines_ignored")
         );
+    }
+
+    #[test]
+    fn debug_context_maps_csharp_and_node_frames_through_existing_pipeline() {
+        let mut fixture = DebugFixture::new();
+        fs::write(
+            fixture._root_path.join("src/Program.cs"),
+            "class Program {}\n",
+        )
+        .expect("csharp file should be written");
+        fs::create_dir_all(fixture._root_path.join("web")).expect("web dir should be created");
+        fs::write(
+            fixture._root_path.join("web/app.ts"),
+            "export function handler() {}\n",
+        )
+        .expect("typescript file should be written");
+        let repository_id = fixture.root.id().to_owned();
+        persist_file(
+            &mut fixture.store,
+            &repository_id,
+            FileFixture {
+                file_id: "file-csharp-program",
+                path: "src/Program.cs",
+                content_hash: "hash-csharp-program",
+                symbol_id: "sym-csharp-run",
+                symbol_name: "Run",
+                qualified_name: "Example.Service.Run",
+            },
+        );
+        persist_file(
+            &mut fixture.store,
+            &repository_id,
+            FileFixture {
+                file_id: "file-node-app",
+                path: "web/app.ts",
+                content_hash: "hash-node-app",
+                symbol_id: "sym-node-handler",
+                symbol_name: "handler",
+                qualified_name: "handler",
+            },
+        );
+        let input = format!(
+            "at Example.Service.Run(System.String value) in {}/src/Program.cs:line 2\n\
+             at async handler (web/app.ts:2:1)\n\
+             at Missing.Frame() in outside/Other.cs:line 9\n",
+            fixture.root.path().display()
+        );
+
+        let pack = build_debug_context_pack(
+            &fixture.root,
+            &fixture.store,
+            &input,
+            8,
+            &BTreeMap::from([
+                (
+                    "src/Program.cs".to_owned(),
+                    "hash-csharp-program".to_owned(),
+                ),
+                ("web/app.ts".to_owned(), "hash-node-app".to_owned()),
+            ]),
+        )
+        .expect("debug context should build");
+
+        assert_eq!(pack.frames.len(), 3);
+        assert_eq!(
+            pack.frames
+                .iter()
+                .map(|frame| (
+                    frame.normalized_path.as_deref(),
+                    frame
+                        .matched_symbols
+                        .first()
+                        .map(|symbol| symbol.qualified_name.as_str()),
+                    frame.matched,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("src/Program.cs"), Some("Example.Service.Run"), true,),
+                (Some("web/app.ts"), Some("handler"), true),
+                (Some("outside/Other.cs"), None, false),
+            ]
+        );
+        assert!(pack.frames[2].reasons.iter().any(|reason| {
+            reason == "runtime_path_outside_or_unindexed" || reason == "unmatched_runtime_frame"
+        }));
     }
 
     #[test]

@@ -250,14 +250,14 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### A5 — C# and Node stack trace parsing
 
-- [ ] Extend debug-context runtime parsing for C# frames shaped like
+- [x] Extend debug-context runtime parsing for C# frames shaped like
   `at Namespace.Type.Method(...) in path.cs:line N`.
-- [ ] Extend runtime parsing for Node/V8 frames shaped like
+- [x] Extend runtime parsing for Node/V8 frames shaped like
   `at name (path.js:line:column)` and async TS/JS variants.
-- [ ] Preserve unmapped frames with explicit status.
-- [ ] Join parsed frames through the existing file, symbol, call, freshness,
+- [x] Preserve unmapped frames with explicit status.
+- [x] Join parsed frames through the existing file, symbol, call, freshness,
   trust, and provenance pipeline.
-- [ ] Add parser tests for mapped frames, unmapped frames, relative paths,
+- [x] Add parser tests for mapped frames, unmapped frames, relative paths,
   absolute paths inside the repo, and malformed lines.
 
 ### A6 — Write-capable reindex design

@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zerocopy::IntoBytes;
 
-use crate::{Result, StoreConfig, StoreError, collect_rows};
+use symdex_core::SemanticLayer;
+
+use crate::{DatabaseRole, Result, StoreConfig, StoreError, collect_rows};
 
 #[derive(Debug, Clone)]
 pub struct SqliteVectorStore {
@@ -11,10 +13,22 @@ pub struct SqliteVectorStore {
 
 impl SqliteVectorStore {
     pub fn new(config: &StoreConfig) -> Result<Self> {
+        Self::new_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn new_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Self> {
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         Ok(Self {
-            sqlite_path: config.sqlite_path.clone(),
+            sqlite_path: config.database_path(role),
         })
+    }
+
+    pub fn new_for_semantic_layer(config: &StoreConfig, layer: SemanticLayer) -> Result<Self> {
+        Self::new_for_role(config, DatabaseRole::for_semantic_layer(layer))
+    }
+
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.sqlite_path
     }
 
     pub fn health_check(&self) -> Result<String> {
@@ -345,6 +359,88 @@ impl SqliteVectorStore {
                     })
                 },
             )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn query_points_for_file_ids(
+        &self,
+        table_name: &str,
+        repository_id: &str,
+        file_ids: &[String],
+        vector: Vec<f32>,
+        limit: usize,
+    ) -> Result<Vec<ScoredPoint>> {
+        validate_vector_table_name(table_name)?;
+        if vector.is_empty() {
+            return Err(StoreError::InvalidVectorSize(0));
+        }
+        if limit == 0 {
+            return Err(StoreError::InvalidLimit(limit));
+        }
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let connection = self.connection()?;
+        ensure_vector_points_table(&connection)?;
+        if !self.table_exists(table_name)? {
+            return Ok(Vec::new());
+        }
+        let file_placeholders = std::iter::repeat("?")
+            .take(file_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH eligible AS (
+               SELECT vector_points.vector_rowid
+               FROM vector_points
+               WHERE vector_points.vector_store = 'sqlite_vec'
+                 AND vector_points.vector_table = ?3
+                 AND vector_points.repository_id = ?4
+                 AND vector_points.file_id IN ({file_placeholders})
+             ),
+             matches AS (
+               SELECT rowid, distance
+               FROM {table_name}
+               WHERE embedding MATCH ?1
+                 AND k = ?2
+                 AND rowid IN (SELECT vector_rowid FROM eligible)
+             )
+             SELECT vector_points.vector_point_id, matches.distance,
+                    vector_points.repository_id, vector_points.file_id,
+                    vector_points.chunk_id, vector_points.symbol_id,
+                    vector_points.symbol_name, vector_points.path,
+                    vector_points.language, vector_points.chunk_kind,
+                    vector_points.start_line, vector_points.end_line,
+                    vector_points.text_hash, vector_points.parser_version,
+                    vector_points.content_hash, vector_points.index_run_id,
+                    vector_points.embedding_model, vector_points.embedding_dimension,
+                    vector_points.indexed_at
+             FROM matches
+             JOIN vector_points
+               ON vector_points.vector_store = 'sqlite_vec'
+              AND vector_points.vector_table = ?3
+              AND vector_points.vector_rowid = matches.rowid
+             ORDER BY matches.distance ASC"
+        );
+        let mut values = vec![
+            rusqlite::types::Value::Blob(vector.as_bytes().to_vec()),
+            rusqlite::types::Value::Integer(limit as i64),
+            rusqlite::types::Value::Text(table_name.to_owned()),
+            rusqlite::types::Value::Text(repository_id.to_owned()),
+        ];
+        values.extend(file_ids.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut statement = connection.prepare(&sql).map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                let distance = row.get::<_, f64>(1)?;
+                Ok(ScoredPoint {
+                    id: row.get(0)?,
+                    score: 1.0 - distance,
+                    payload: payload_from_row(row, 2)?,
+                })
+            })
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }

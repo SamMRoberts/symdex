@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -14,8 +14,8 @@ use symdex_index::{
     run_continuous_index_until_with_write_gate,
 };
 use symdex_store::{
-    RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord, WatcherStatusRecord,
-    current_timestamp, debug_db_lock_log,
+    DatabaseRole, RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord,
+    WatcherStatusRecord, current_timestamp, debug_db_lock_log,
 };
 use symdex_writer::{WriterClient, WriterJob};
 
@@ -88,7 +88,7 @@ impl WatcherStatus {
     }
 
     pub fn from_record(record: WatcherStatusRecord) -> Self {
-        let mut status = Self {
+        Self {
             repository_id: record.repository_id,
             root_path: record.root_path,
             mode: record.mode,
@@ -113,11 +113,7 @@ impl WatcherStatus {
             client_kinds: Vec::new(),
             clients: Vec::new(),
             shutdown_after_seconds: None,
-        };
-        if status.is_active() && heartbeat_is_stale(status.heartbeat_at.as_deref()) {
-            status.state = "stale".to_owned();
         }
-        status
     }
 
     fn inactive(root: &RepoRoot) -> Self {
@@ -342,7 +338,7 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
         clients: Vec::new(),
         shutdown_after_seconds: None,
     };
-    let store = {
+    {
         let wait_started = Instant::now();
         debug_db_lock_log(
             "watcher-managed",
@@ -360,16 +356,16 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
             ),
         );
         let setup_started = Instant::now();
-        let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-        store.migrate().map_err(|error| error.to_string())?;
-        store
+        let structural_store =
+            SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+        structural_store
+            .migrate()
+            .map_err(|error| error.to_string())?;
+        structural_store
             .upsert_repository(&RepositoryRecord {
                 id: root.id().to_owned(),
                 root_path: root.path().display().to_string(),
             })
-            .map_err(|error| error.to_string())?;
-        store
-            .upsert_watcher_status(&initial.record())
             .map_err(|error| error.to_string())?;
         debug_db_lock_log(
             "watcher-managed",
@@ -379,8 +375,11 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 setup_started.elapsed().as_millis()
             ),
         );
-        store
     };
+    let store = open_store_for_root(&root)?;
+    store
+        .upsert_watcher_status(&initial.record())
+        .map_err(|error| error.to_string())?;
 
     let mut current = initial;
     let mut no_clients_since: Option<Instant> = None;
@@ -395,11 +394,25 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
             let wait_started = Instant::now();
             debug_db_lock_log(
                 "watcher-managed",
-                format_args!("write_gate_wait repo={}", root.path().display()),
+                format_args!("write_gate_try repo={}", root.path().display()),
             );
-            let _guard = write_gate
-                .lock()
-                .map_err(|_| "writer gate lock poisoned".to_owned())?;
+            let _guard = match write_gate.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    debug_db_lock_log(
+                        "watcher-managed",
+                        format_args!(
+                            "write_gate_busy repo={} wait_ms={}",
+                            root.path().display(),
+                            wait_started.elapsed().as_millis()
+                        ),
+                    );
+                    return Ok(false);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err("writer gate lock poisoned".to_owned());
+                }
+            };
             debug_db_lock_log(
                 "watcher-managed",
                 format_args!(
@@ -419,7 +432,7 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                     run_started.elapsed().as_millis()
                 ),
             );
-            result
+            result.map(|_| true)
         },
     );
     match result {
@@ -428,9 +441,6 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 "watcher-managed",
                 format_args!("stop repo={}", root.path().display()),
             );
-            let _guard = write_gate
-                .lock()
-                .map_err(|_| "writer gate lock poisoned".to_owned())?;
             store
                 .mark_watcher_stopped(root.id())
                 .map_err(|error| error.to_string())
@@ -440,9 +450,6 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 "watcher-managed",
                 format_args!("fail repo={} error={}", root.path().display(), error),
             );
-            let _guard = write_gate
-                .lock()
-                .map_err(|_| "writer gate lock poisoned".to_owned())?;
             let _ = store.mark_watcher_failed(root.id(), &error);
             Err(error)
         }
@@ -520,11 +527,26 @@ fn heartbeat_attachment(
 }
 
 fn open_store() -> Result<SqliteStore, String> {
-    SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())
+    SqliteStore::open_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())
 }
 
 fn open_store_read_only() -> Result<SqliteStore, String> {
-    SqliteStore::open_read_only(&StoreConfig::from_env()).map_err(|error| error.to_string())
+    SqliteStore::open_read_only_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())
+}
+
+fn open_store_for_root(root: &RepoRoot) -> Result<SqliteStore, String> {
+    let store = SqliteStore::open_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    store
+        .upsert_repository(&RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 fn status_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
@@ -540,7 +562,17 @@ fn status_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
         Err(error) => return Err(error.to_string()),
     };
     attach_clients(&store, root.id(), &mut status)?;
+    apply_status_staleness(&mut status);
     Ok(status)
+}
+
+fn apply_status_staleness(status: &mut WatcherStatus) {
+    if status.is_active()
+        && status.attached_clients == 0
+        && heartbeat_is_stale(status.heartbeat_at.as_deref())
+    {
+        status.state = "stale".to_owned();
+    }
 }
 
 fn attach_clients(
@@ -836,14 +868,15 @@ mod control_ipc {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    use super::{BufRead, BufReader, StoreConfig, Write, handle_control_stream};
-    use symdex_store::sqlite_parent;
+    use super::{BufRead, BufReader, DatabaseRole, StoreConfig, Write, handle_control_stream};
+    use symdex_store::database_parent;
 
     pub type ControlListener = UnixListener;
 
     pub fn control_endpoint_for_repo(repository_id: &str) -> Result<String, String> {
         let config = StoreConfig::from_env();
-        let parent = sqlite_parent(&config).unwrap_or_else(|| PathBuf::from(".symdex"));
+        let parent = database_parent(&config, DatabaseRole::Watch)
+            .unwrap_or_else(|| PathBuf::from(".symdex"));
         fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
         Ok(parent
             .join(format!("watch-{repository_id}.sock"))
@@ -973,20 +1006,33 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        HEARTBEAT_STALE_SECONDS, NO_CLIENT_GRACE, WatcherStatus,
+        HEARTBEAT_STALE_SECONDS, NO_CLIENT_GRACE, WatcherStatus, apply_status_staleness,
         clients_allow_continuing_with_count, heartbeat_is_stale, timestamp_minus,
         watcher_client_is_live, watcher_endpoint_name,
     };
     use symdex_store::WatcherClientRecord;
 
     #[test]
-    fn stale_heartbeat_marks_active_status_stale() {
+    fn stale_heartbeat_without_clients_marks_active_status_stale() {
         let mut record = sample_status("running");
         record.heartbeat_at = Some("1".to_owned());
 
-        let status = WatcherStatus::from_record(record);
+        let mut status = WatcherStatus::from_record(record);
+        apply_status_staleness(&mut status);
 
         assert_eq!(status.state, "stale");
+    }
+
+    #[test]
+    fn live_clients_keep_stale_watcher_heartbeat_running() {
+        let mut record = sample_status("running");
+        record.heartbeat_at = Some("1".to_owned());
+
+        let mut status = WatcherStatus::from_record(record);
+        status.attached_clients = 1;
+        apply_status_staleness(&mut status);
+
+        assert_eq!(status.state, "running");
     }
 
     #[test]

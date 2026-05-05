@@ -1628,6 +1628,7 @@ dependencies = [
 name = "symdex-index"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "symdex-core",
  "symdex-embed",
  "symdex-store",

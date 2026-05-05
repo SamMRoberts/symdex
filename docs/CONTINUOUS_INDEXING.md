@@ -26,17 +26,22 @@ enabled, modified or newly created eligible files are automatically reindexed.
   `mxbai-embed-large` layer as deferred work.
 - Continuous indexing must not wait for quality indexing before returning to
   watch mode.
-- Single-writer rule: only ONE process may write to the configured local
-  SQLite/sqlite-vec database at a time. A database-file-scoped writer service
-  owns all mutations. Continuous indexing, manual indexing, quality catch-up,
-  repair, migrations, and future write-capable tools submit jobs to that
-  service. TUI, MCP, diagnostics, status, and query paths read shared state
-  without migrations or cleanup writes.
-- Manual writer jobs take priority over watcher writes. The watcher may keep
-  polling and coalescing filesystem changes, but watcher status updates,
-  incremental indexing batches, idle quality catch-up, and stop/failure state
-  writes wait on the writer-service gate while a manual index, repair,
-  migration, or quality job is running.
+- Single-writer rule: only ONE process may write to each configured local
+  SQLite/sqlite-vec database file at a time. Database-role-scoped writer
+  services own mutations for their files. Structural indexing, manual indexing,
+  repair, migrations, and future structural write-capable tools use the
+  structural writer. Quality catch-up claims, completions, embeddings, and
+  activation metadata use the quality-semantic database role. Watcher status and
+  client lease rows use the watch database role, and index-run/event rows use the
+  events database role. TUI, MCP, diagnostics, status, and query paths read
+  shared state without structural migrations or cleanup writes.
+- Manual structural writer jobs take priority over structural watcher writes.
+  The watcher keeps polling and coalescing filesystem changes while a manual
+  index, repair, or migration owns the structural gate. If that gate is busy,
+  the watcher defers only the incremental structural batch and leaves the prior
+  snapshot active so the next poll folds in any additional changes. Watcher
+  status, client lease heartbeats, index events, and quality catch-up do not wait
+  on the structural SQLite writer gate.
 
 ## Event Handling
 
@@ -75,7 +80,7 @@ file changes
   -> debounce/coalesce
   -> structural SQLite update
   -> fast nomic-embed-text embedding
-  -> fast sqlite-vec upsert
+  -> fast sqlite-vec upsert in the fast semantic database role
   -> mark quality stale when needed
   -> enqueue quality jobs
   -> return to watching
@@ -88,7 +93,7 @@ quality queue
   -> background worker
   -> verify hashes
   -> embed with mxbai-embed-large
-  -> quality sqlite-vec upsert
+  -> quality sqlite-vec upsert in the quality semantic database role
   -> activate quality only after complete/current
 ```
 
@@ -160,18 +165,19 @@ Current implementation status:
 - `symdex-index` exposes shared watch snapshot, diff, and continuous polling
   APIs.
 - `symdex-writer` owns the local writer daemon, writer client, job protocol, and
-  database-path-keyed IPC endpoint. `symdex-store` still exposes the advisory
-  lock primitives, but only the writer daemon should acquire them.
+  database-role-keyed IPC endpoints. `symdex-store` still exposes the advisory
+  lock primitives, but only writer daemons should acquire them.
 - `symdex watch start <repo>` starts or attaches the background watcher and
   prints status. Watchers are client-scoped, so this command alone does not make
   a permanent daemon; without a live TUI, MCP server, or foreground watcher the
   daemon exits after about 10 seconds. `symdex watch status <repo>` reads shared
   SQLite watcher state without running migrations or pruning stale client rows,
   keeping status polling read-only while the watcher writes index updates.
-  `symdex watch stop <repo>` asks the writer service to stop the managed watcher.
-  Watcher clients attach, heartbeat, detach, and request status through writer
-  jobs, and the service writes `watchers` / `watcher_clients` rows on their
-  behalf.
+  `symdex watch stop <repo>` asks the structural writer service to stop the
+  managed watcher. Watcher status, client attach, heartbeat, and detach metadata
+  are stored in the watch database role (`.symdex/symdex-watch.sqlite` by
+  default). Client heartbeat and detach jobs are routed to the watch-role writer
+  endpoint so long-running structural indexing jobs do not block lease updates.
 - `symdex index --watch <repo>` attaches a foreground client to the same
   writer-managed watcher rather than opening a separate SQLite writer.
 - Manual `symdex index`, `symdex index-quality`, `vector-repair`, migrations,
@@ -180,7 +186,9 @@ Current implementation status:
 - `symdex serve-mcp --watch <repo>` starts or attaches the single background
   watcher before serving MCP and holds a client lease until the MCP process
   exits. Live TUI/MCP/CLI clients heartbeat their lease and reinsert it if a
-  transient stale-client prune removed the row. MCP stdout remains
+  transient stale-client prune removed the row. Read-only watcher status treats
+  live client leases as evidence that the watcher is still active, even if the
+  daemon's event heartbeat lags during local work. MCP stdout remains
   protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
@@ -190,13 +198,16 @@ Current implementation status:
   missing current-fast quality jobs before claiming work. Continuous quality
   catch-up also treats current stale quality jobs as work because the worker
   requeues those terminal rows before claiming the next batch.
-- Watch-driven batches are recorded with `run_kind = watch` in local index-run
-  metadata so storage views can distinguish watch updates from manual runs.
+- Watch-driven batches are recorded with `run_kind = watch` in events-role
+  index-run metadata so storage views can distinguish watch updates from manual
+  runs without writing those telemetry rows into structural SQLite.
 - In semantic watch mode, when `SYMDEX_QUALITY_INDEX` is enabled, watch mode
   automatically runs cooperative quality catch-up after fast batches and during
   idle ticks. Each catch-up tick uses the same hash-verifying quality worker
   path as `symdex index-quality <repo>` and is bounded by
-  `SYMDEX_QUALITY_BATCH_SIZE` before returning to watch polling.
+  `SYMDEX_QUALITY_BATCH_SIZE` before returning to watch polling. Quality
+  catch-up uses the `quality_semantic` writer lane, so it can continue while the
+  structural writer lane is occupied by manual structural work.
 - The TUI starts continuous indexing on launch and exposes a `c` toggle to stop
   or confirm restarting watch mode, with explicit `on` / `off` labels, pending
   debounce state, queued event count, last reindexed file, active semantic
@@ -210,11 +221,13 @@ Current implementation status:
 - Log summaries only: event counts, paths, index counts, status labels, and
   errors.
 - Do not log source text.
-- Record index run summaries for continuous indexing batches so storage views
-  can show when watch-driven updates occurred.
+- Record index run summaries in the events database role for continuous indexing
+  batches so storage views can show when watch-driven updates occurred.
 - Record per-file `file_index_events` for watch batches so created, modified,
   deleted, skipped unchanged, and paths removed from discovery by ignore or
-  support rules can be debugged from local metadata.
+  support rules can be debugged from local events-role metadata.
+- Record watcher status and client leases in the watch database role so frequent
+  control-plane updates do not compete with structural indexing writes.
 - Surface watch health in diagnostics when available, including watcher active
   state and the most recent error.
 - Surface quality-layer status separately from fast-layer indexing status.

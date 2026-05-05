@@ -34,6 +34,18 @@ SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 SYMDEX_DEBUG_DB_LOCKS=1
 ```
 
+`SYMDEX_DB_PATH` remains the structural SQLite path. Additional database roles
+derive sibling SQLite files from that path: `.symdex/symdex-fast.sqlite` for the
+fast sqlite-vec projection plus staged fast metadata tables,
+`.symdex/symdex-quality.sqlite` for the quality sqlite-vec projection plus staged
+quality metadata tables,
+`.symdex/symdex-watch.sqlite` for watcher status and client leases,
+`.symdex/symdex-events.sqlite` for index-run summaries and per-file index
+events, and `.symdex/symdex-runtime.sqlite` for short-lived debug-context
+runtime observation metadata. Existing legacy vector collections in the
+structural database remain readable as a compatibility fallback until the split
+storage migration is complete.
+
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
 default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command
 can be launched, `symdex doctor` checks readiness with `rust-analyzer --version`
@@ -79,12 +91,13 @@ to Ollama.
 
 `SYMDEX_DEBUG_DB_LOCKS=1` enables stderr diagnostics for SQLite lock
 troubleshooting. Logs include writer-service daemon startup and attach attempts,
-job start/finish events, writer-gate wait and hold durations, daemon-internal
-lease acquire/release events, SQLite read-write/read-only opens, migrations, and
-watcher client attach/heartbeat/detach routing. `SYMDEX_DEBUG_WRITER=1` is an
-alias. The logs include local DB and repo paths when enabled; leave it unset for
-normal CLI/TUI output. For TUI or continuous-indexing sessions, redirect stderr
-to a file so diagnostics do not interfere with terminal rendering:
+database role names, job start/finish events, writer-gate wait and hold
+durations, daemon-internal lease acquire/release events, SQLite
+read-write/read-only opens, migrations, and watcher client
+attach/heartbeat/detach routing. `SYMDEX_DEBUG_WRITER=1` is an alias. The logs
+include local DB and repo paths when enabled; leave it unset for normal CLI/TUI
+output. For TUI or continuous-indexing sessions, redirect stderr to a file so
+diagnostics do not interfere with terminal rendering:
 
 ```bash
 SYMDEX_DEBUG_DB_LOCKS=1 cargo run -p symdex-cli -- tui . 2>symdex-db-locks.log
@@ -240,7 +253,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   compact reason tags explaining why each evidence row was returned. Likely tests
   list indexed tests with moderate-confidence `test_targets` evidence for the
   queried symbol or its file, with direct-call joins retained as a compatibility
-  fallback for older indexes.
+  fallback for older indexes. When package manifests and import references
+  match, impact also prints metadata-only `external_dependencies` rows with
+  package manager, package name, import path, freshness, trust, and reason tags.
 - `explain-change <repo> <targets-json|file|->`: accepts proposed
   `{ path, start_line, end_line, description }` targets, maps the line ranges
   to intersecting indexed symbols, reuses impact analysis, and prints a
@@ -259,14 +274,17 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   such as stack traces, panic locations, failing test names, frame symbols, and
   indexed-language file paths, then prints `symdex.debug_context.v1` JSON. Rust
   parsing covers common `cargo test`, panic-hook, `anyhow`, `tracing`, full
-  backtrace, and async stack-like output shapes. The pack maps frames to indexed
-  files, symbols, calls at the failing line, freshness, and provenance when
-  available. Passing `-` reads from stdin; a single existing path reads that
+  backtrace, and async stack-like output shapes. C# parsing covers
+  `at Namespace.Type.Method(...) in path.cs:line N`, and Node/V8 parsing covers
+  `at name (path.js:line:column)` plus async JS/TS variants. The pack maps
+  frames to indexed files, symbols, calls at the failing line, freshness, and
+  provenance when available. Passing `-` reads from stdin; a single existing path reads that
   file; otherwise remaining arguments are treated as inline runtime text. Frame
   matches include trust scores and reason tags, and the pack does not include
   source text. Each run also appends short-lived metadata-only
-  `runtime_observations` rows with an input hash, normalized paths, failing test
-  names, match summaries, and expiry metadata for repeated-failure comparison.
+  `runtime_observations` rows in the runtime database role with an input hash,
+  normalized paths, failing test names, match summaries, and expiry metadata for
+  repeated-failure comparison.
 - `search <repo> <query>`: embeds the query locally through the active semantic
   routing path and returns ranked sqlite-vec matches with scores, paths, line
   ranges, symbol names, active layer metadata, fallback reason, and provenance

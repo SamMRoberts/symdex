@@ -65,6 +65,9 @@ Fixtures should be tiny and purpose-built.
 - Evidence explainability coverage for semantic result reasons, direct impact
   call reasons, related-file reasons, pre-edit change explanation reasons, MCP
   contract reason availability, and debug-context frame match reasons.
+- Dependency-fact coverage for Cargo and npm manifest parsing, conservative
+  import-to-dependency usage links, persistence without source text, and impact
+  evidence rows that expose package, import, freshness, trust, and reason tags.
 - Unified context-pack coverage for structural-only fallback, semantic-only
   chunks, overlapping structural/semantic evidence marked as `both`, stale
   freshness labels, missing-vector or unavailable-semantic notes, and continued
@@ -72,8 +75,9 @@ Fixtures should be tiny and purpose-built.
 - Debug context coverage for parsed panic/file locations, stack-frame symbols,
   failing test names, mapped frames, unmapped frames, stale frames, deleted
   files, malformed runtime input, common Rust `cargo test`, `anyhow`, `tracing`,
-  full backtrace, panic-hook, and async stack-like output, and TUI debug context
-  pack rendering. Runtime observation cache tests should assert that only
+  full backtrace, panic-hook, and async stack-like output, C# stack frames,
+  Node/V8 and async JS/TS stack frames, and TUI debug context pack rendering.
+  Runtime observation cache tests should assert that only
   metadata is stored: input hashes, normalized paths, failing test names, match
   kinds, summaries, and expiry metadata, never raw logs or source text.
 - Test discovery coverage for Rust recognized test attributes, C# NUnit/xUnit/

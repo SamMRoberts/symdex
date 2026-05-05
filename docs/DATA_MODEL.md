@@ -7,17 +7,30 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, symbol references, tests, conservative test targets, short-lived
-runtime observations, fast semantic generations, and fast/quality
+symbols, calls, symbol references, external dependency facts, dependency usage
+links, tests, conservative test targets, short-lived runtime observations,
+index-run telemetry, fast semantic generations, and fast/quality
 `chunk_embeddings` manifests. The older chunk-level vector columns remain
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
 
+`SYMDEX_DB_PATH` names the structural database. Role-specific sibling databases
+derive from that path as the storage split progresses. The fast and quality
+sqlite-vec projections live in `fast_semantic` and `quality_semantic` database
+roles, watcher control-plane state lives in the `watch` database role, and
+index-run telemetry lives in the `events` database role, and debug-context
+runtime observations live in the `runtime` database role. With the default path
+this means `.symdex/symdex.sqlite`, `.symdex/symdex-fast.sqlite`,
+`.symdex/symdex-quality.sqlite`, `.symdex/symdex-watch.sqlite`,
+`.symdex/symdex-events.sqlite`, and `.symdex/symdex-runtime.sqlite`.
+
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
-caller/callee traversal, and index-run metadata checks.
+caller/callee traversal, and events-role index-run metadata checks.
 Symbol-reference indexes cover source-symbol, target-symbol, kind, and
 resolution-status scans for broader structural evidence beyond calls.
+Dependency indexes cover package-name lookup, manifest cleanup, usage-by-file,
+usage-by-source-symbol, and dependency-to-import joins for impact evidence.
 Layered semantic indexes cover latest generation lookup, per-layer embedding
 manifests, and quality job status scans.
 
@@ -106,7 +119,8 @@ CREATE TABLE index_runs (
 );
 ```
 
-Indexing records a row when a run starts and finalizes it when the run finishes.
+`index_runs` is stored in the `events` database role. Indexing records a row
+when a run starts and finalizes it when the run finishes.
 New index runs record `repository_ref_id` when the active local ref is known.
 The current branch-awareness slices record active ref metadata, populate
 `ref_files`, and route structural and semantic evidence queries through the
@@ -123,11 +137,11 @@ metadata-only `error_summary`; earlier recorded failures finish as `failed`.
 model and dimension when present.
 
 Continuous indexing records compact batch summaries in `index_runs` through the
-same indexing path, so watch-driven updates are visible in storage views. The UI
-can distinguish manual/offline and semantic batches through `run_kind`, status,
-timestamps, files seen/indexed, chunks embedded, model, dimension, and any
-metadata-only error summary. Watch-driven batches are currently recorded with
-`run_kind = watch`.
+same indexing path, so watch-driven updates are visible in storage views without
+writing structural SQLite telemetry rows. The UI can distinguish manual/offline
+and semantic batches through `run_kind`, status, timestamps, files
+seen/indexed, chunks embedded, model, dimension, and any metadata-only error
+summary. Watch-driven batches are currently recorded with `run_kind = watch`.
 
 ### `file_index_events`
 
@@ -148,11 +162,13 @@ CREATE TABLE file_index_events (
 );
 ```
 
-`file_index_events` records the per-file decisions that make up an index run.
-The table is append-only telemetry keyed by `index_run_id`, repo-relative path,
-and action. It complements `index_runs`: the run row answers whether a batch
-finished, while file events answer why each path was created, updated, deleted,
-or skipped.
+`file_index_events` is stored in the `events` database role and records the
+per-file decisions that make up an index run. The table is append-only telemetry
+keyed by `index_run_id`, repo-relative path, and action. It complements
+`index_runs`: the run row answers whether a batch finished, while file events
+answer why each path was created, updated, deleted, or skipped. References to
+structural repository/ref/file facts are stable IDs; cross-database foreign keys
+are intentionally not used.
 
 Current indexing writes events for:
 
@@ -175,6 +191,59 @@ Events store `old_content_hash` and `new_content_hash` when available, plus
 table. Parser or read failures that abort collection record `status = failed`
 and a metadata-only `error_summary` when the failing path is known; aggregate
 failure status remains in `index_runs`.
+
+### `watchers`
+
+```sql
+CREATE TABLE watchers (
+  repository_id TEXT PRIMARY KEY,
+  root_path TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  owner_kind TEXT NOT NULL,
+  owner_pid INTEGER,
+  socket_path TEXT,
+  state TEXT NOT NULL,
+  started_at TEXT,
+  updated_at TEXT,
+  heartbeat_at TEXT,
+  files_seen INTEGER NOT NULL DEFAULT 0,
+  queued_events INTEGER NOT NULL DEFAULT 0,
+  last_indexed_path TEXT,
+  last_error TEXT,
+  active_layer TEXT,
+  quality_status TEXT,
+  quality_pending_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_running_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_failed_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_stale_jobs INTEGER NOT NULL DEFAULT 0
+);
+```
+
+`watchers` stores metadata-only state for the writer-managed continuous indexer:
+active/stale/failed state, latest heartbeat, coalesced event counts, latest
+indexed path, compact error text, and quality-layer progress counters. The table
+is stored in the `watch` database role so frequent status updates do not compete
+with structural index writes.
+
+### `watcher_clients`
+
+```sql
+CREATE TABLE watcher_clients (
+  repository_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  client_kind TEXT NOT NULL,
+  pid INTEGER,
+  started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  PRIMARY KEY(repository_id, client_id)
+);
+```
+
+`watcher_clients` stores live TUI, MCP, and CLI leases for the single local
+watcher per repository. Client heartbeat and detach jobs route through the watch
+writer endpoint and update the `watch` database role, keeping lightweight lease
+maintenance independent from long structural indexing jobs.
 
 ### `files`
 
@@ -259,13 +328,15 @@ manifests. New indexing leaves them unset and records vector provenance in
 Before semantic indexing replaces changed-file chunk rows or removes deleted
 files, it reads current fast `chunk_embeddings` point IDs for those paths from
 the latest semantic generation. New fast embeddings are staged and upserted to
-sqlite-vec before SQLite mutation; after structural facts and the new semantic
-generation are persisted, the previously collected stale point IDs are deleted
-unless the new manifest reused the same deterministic point ID. This keeps
-SQLite as the source of truth for vector lifecycle cleanup while avoiding source
-text in sqlite-vec payloads or cleanup reports, and it preserves the previous
-complete manifest if local embedding or vector upsert fails before SQLite
-replacement.
+the fast semantic sqlite-vec database before SQLite mutation; after structural
+facts and the new semantic generation are persisted, the finished fast
+generation and chunk embedding manifest are mirrored into the `fast_semantic`
+role database by stable IDs. The previously collected stale point IDs are then
+deleted from the fast semantic sqlite-vec database unless the new manifest reused
+the same deterministic point ID. This keeps structural SQLite as the current
+source of truth for vector lifecycle cleanup while avoiding source text in
+sqlite-vec payloads or cleanup reports, and it preserves the previous complete
+manifest if local embedding or vector upsert fails before SQLite replacement.
 
 When an active `ref_files` manifest is available, fast semantic generation
 recording carries forward only fast `chunk_embeddings` whose file snapshot is
@@ -323,6 +394,60 @@ attributes/decorators, and type-like syntax where tree-sitter exposes stable
 nodes. The table stores no source text beyond the compact reference expression,
 and unresolved or ambiguous references are retained with confidence and
 `resolution_status` metadata.
+
+### `dependencies`
+
+```sql
+CREATE TABLE dependencies (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  manifest_path TEXT NOT NULL,
+  package_manager TEXT NOT NULL,
+  dependency_name TEXT NOT NULL,
+  package_name TEXT NOT NULL,
+  version_req TEXT,
+  dependency_kind TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+`dependencies` stores metadata-only package manifest facts. Current indexing
+extracts conservative Cargo facts from root `Cargo.toml` dependency sections,
+including package aliases, plus npm facts from root `package.json` dependency
+maps. It stores manifest path, package manager, manifest key, package name,
+requested version, and dependency kind; it does not store lockfile resolution
+graphs or downloaded package metadata.
+
+### `dependency_usages`
+
+```sql
+CREATE TABLE dependency_usages (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  dependency_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  source_symbol_id TEXT,
+  usage_kind TEXT NOT NULL,
+  import_path TEXT NOT NULL,
+  referenced_symbol TEXT,
+  line INTEGER NOT NULL,
+  confidence REAL NOT NULL,
+  reason TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+`dependency_usages` links manifest dependencies to conservative import evidence
+from `symbol_references`. It records usage kind, import path, optional
+referenced symbol, line, confidence, and reason. Current matching is limited to
+import/use/using statements that match known Cargo or npm dependency names.
+These rows let impact and debug workflows answer questions such as "which
+symbols import sqlx/sqlite?" without storing source text.
 
 ### `tests`
 
@@ -527,14 +652,22 @@ and records one averaged vector for the original chunk. If a new fast generation
 supersedes queued work, only old `pending` and `running` jobs are marked
 `skipped_stale`; terminal history is preserved. If the quality model or service
 is unavailable, the semantic generation is marked `quality_blocked` and no
-pending quality jobs are created.
+pending quality jobs are created. New queue and blocked-generation writes are
+also mirrored into the `quality_semantic` role database from the already-built
+structural job list and current fast manifest, so clean role databases receive
+quality catch-up metadata that can be checked against the fast generation
+without requiring cross-database foreign keys or source text.
 `semantic_generations.quality_dimension` remains null until the quality worker
 records actual quality embeddings.
 
-The manual quality worker claims oldest `pending` jobs in bounded batches,
-marks them `running`, increments `attempts`, and then revalidates current file
-and chunk metadata before embedding. Successful jobs transactionally write a
-quality-layer `chunk_embeddings` row and move to `succeeded`. Service or vector
+The manual quality worker claims oldest `pending` jobs from the
+`quality_semantic` role in bounded batches, marks them `running`, increments
+`attempts`, and then revalidates current file and chunk metadata before
+embedding. Source revalidation accepts claimed job records and reads structural
+file/chunk/symbol metadata separately, so quality queue state stays in the
+`quality_semantic` role without copying source facts or adding cross-database
+foreign keys. Successful jobs transactionally write a quality-layer
+`chunk_embeddings` row and move to `succeeded` in `quality_semantic`. Service or vector
 write failures move to `failed` with a compact metadata-only error summary.
 Stale jobs move to `skipped_stale` and are not embedded. Chunks that are current
 but not eligible for the quality layer, such as chunks over the quality model's
@@ -571,6 +704,35 @@ symdex_<repository_id>_<embedding_model_slug>
 
 The current slugger lowercases ASCII alphanumerics and converts other
 characters to underscores so generated collection names are safe for REST paths.
+
+Fast and quality sqlite-vec projections are stored in separate local SQLite
+files derived from `SYMDEX_DB_PATH`: the fast layer uses the `fast_semantic`
+database role, and the quality layer uses the `quality_semantic` database role.
+For a legacy structural path such as `.symdex/symdex.sqlite`, the derived vector
+files are `.symdex/symdex-fast.sqlite` and `.symdex/symdex-quality.sqlite`.
+The `fast_semantic` role also initializes staged metadata tables for
+`semantic_generations`, `semantic_generation_refs`, `chunk_embeddings`, and
+`vector_points`; the `quality_semantic` role initializes staged metadata tables
+for `semantic_generations`, `chunk_embeddings`, `quality_embedding_jobs`, and
+`vector_points`. These role schemas intentionally avoid cross-database foreign
+keys. New fast indexing mirrors completed fast `semantic_generations`,
+`semantic_generation_refs`, and fast `chunk_embeddings` into the `fast_semantic`
+role after structural finalization. Structural SQLite still stores the active-ref
+file manifests and the fast semantic generation selected for the live ref. Query
+routing then merges same-generation quality status, quality manifests, progress,
+and latest quality errors from `quality_semantic`; stale quality-role generations
+are ignored. The manual quality worker claims, completes, and refreshes quality
+progress in `quality_semantic` while reading structural source facts read-only.
+Query-time ref filtering reads active `ref_files` file IDs from structural SQLite
+and applies those IDs to sqlite-vec payload metadata instead of requiring
+`ref_files` to live in the vector database.
+
+Vector verification reads the selected layer's `chunk_embeddings` manifest from
+that layer's semantic role database when the role database contains the same
+current generation. It then uses structural SQLite only to resolve file paths and
+chunk line ranges for expected payload comparison. If a role database is missing
+or has a different generation, verification falls back to structural metadata for
+legacy and clean-rebuild compatibility.
 
 Payload fields:
 
@@ -650,15 +812,15 @@ than by a separate write path so SQLite remains the structural source of truth.
 ## TUI visualization mapping
 
 The TUI should visualize storage metadata without showing source text by
-default. Treat SQLite as the structural source of truth and sqlite-vec as the
-semantic projection of embeddable chunks.
+default. Treat role-scoped SQLite databases as the source of truth for local
+metadata and sqlite-vec as the semantic projection of embeddable chunks.
 
 ### Storage explorer
 
-Use SQLite tables to show repository structure:
+Use SQLite tables to show repository structure and telemetry:
 
 - `repositories`: selected repository identity and root metadata.
-- `index_runs`: latest and historical indexing status.
+- `events.index_runs`: latest and historical indexing status.
 - `files`: indexed paths, languages, content hashes, and indexed timestamps.
 - `symbols`: symbol names, qualified names, kinds, nesting, and line ranges.
 - `chunks`: chunk kinds, line ranges, text hashes, compatibility vector fields,
@@ -666,6 +828,8 @@ Use SQLite tables to show repository structure:
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
 - `symbol_references`: imports, type references, implementations, inheritance,
   attributes/decorators, confidence, and resolution status.
+- `dependencies` and `dependency_usages`: manifest package facts plus
+  conservative import-to-dependency links.
 - `tests` and `test_targets`: discovered test metadata plus conservative
   test-to-code relationship kind, confidence, and reason.
 
@@ -684,6 +848,8 @@ Group by `files.path` and aggregate:
 - call count from `calls` joined through caller symbols
 - symbol-reference count from `symbol_references` joined through files and,
   when present, source symbols
+- dependency and dependency-usage counts from `dependencies` and
+  `dependency_usages`
 - embeddable chunk count from chunks where `excluded_reason IS NULL`
 - vector-backed chunk count from current fast `chunk_embeddings` rows for the
   latest semantic generation
@@ -725,7 +891,8 @@ Compare SQLite chunk metadata with sqlite-vec collection metadata:
 - current fast `chunk_embeddings` rows should have matching sqlite-vec points
 - chunks without a current fast `chunk_embeddings` row and without
   `excluded_reason` are missing vectors
-- latest successful `index_runs.embedding_model` and `embedding_dimension`
+- latest successful events-role `index_runs.embedding_model` and
+  `embedding_dimension`
   should match the selected sqlite-vec collection metadata
 
 Surface missing vector tables, missing points, model drift, and dimension drift
@@ -754,8 +921,9 @@ Use `index_runs.started_at`, `finished_at`, `status`, `files_seen`,
 `files_indexed`, `chunks_embedded`, `embedding_model`, `embedding_dimension`,
 and `error_summary` for a compact run timeline.
 
-The first TUI implementation reads `index_runs` directly from SQLite and shows
-the latest 50 runs as metadata-only rows ordered by start time. Selecting a row
+The first TUI implementation reads `index_runs` through store APIs that prefer
+the events database role and fall back to legacy structural rows. It shows the
+latest 50 runs as metadata-only rows ordered by start time. Selecting a row
 shows timestamps, status, file/chunk counts, embedding model and dimension, and
 the stored error summary when present.
 
@@ -888,14 +1056,18 @@ CREATE TABLE runtime_observations (
 );
 ```
 
-`runtime_observations` is a short-lived metadata cache for repeated debugging
-workflows. `symdex_debug_context` appends one row per parsed frame and failing
-test name after it builds the normal debug context pack. Rows store a hash of
-the full runtime input, not the pasted log. Frame rows can include the parsed
-runtime symbol, parsed path, normalized repo-relative path, line, column,
-match kind, freshness/trust summary, reason tags, matched symbol names, and
-call-at-line counts. Failing-test rows store the parsed failing test name and
-the indexed test name when mapping succeeds.
+`runtime_observations` is stored in the `runtime` database role as a
+short-lived metadata cache for repeated debugging workflows. `symdex_debug_context`
+appends one row per parsed frame and failing test name after it builds the normal
+debug context pack. Rows store a hash of the full runtime input, not the pasted
+log. Frame rows can include the parsed runtime symbol, parsed path, normalized
+repo-relative path, line, column, match kind, freshness/trust summary, reason
+tags, matched symbol names, and call-at-line counts. Failing-test rows store the
+parsed failing test name and the indexed test name when mapping succeeds.
+
+References to structural repository/file/symbol/test facts are stable IDs,
+paths, and metadata summaries; cross-database foreign keys are intentionally not
+used.
 
 The cache currently uses a 24-hour expiry window and prunes expired rows during
 new debug-context writes. It is intended for comparing repeated failures by

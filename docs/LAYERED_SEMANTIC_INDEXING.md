@@ -69,6 +69,14 @@ sqlite-vec owns:
 - metadata-only payloads
 - one collection per repository/model layer
 
+Fast and quality sqlite-vec projections use separate local SQLite files derived
+from the configured structural database path. Fast vectors are written to the
+`fast_semantic` database role, and quality vectors are written to the
+`quality_semantic` database role. SQLite structural metadata remains the source
+of truth for generation readiness and active-ref file membership; query routing
+selects the active layer, opens that layer's vector database, and filters ref-
+scoped candidates using file IDs read from the structural `ref_files` manifest.
+
 sqlite-vec payloads must continue to exclude source text.
 
 ## Collection naming

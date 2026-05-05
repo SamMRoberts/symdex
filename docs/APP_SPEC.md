@@ -70,15 +70,18 @@ symdex serve-mcp --watch <repo>
   run only while TUI, MCP, or CLI clients hold leases, can be toggled on and
   off, and reindex modified or newly created eligible files without source
   execution.
-- Only one local process writes to a repository's SQLite/sqlite-vec database at
-  a time. Write-capable indexing, quality, repair, cleanup, and future mutating
-  MCP operations coordinate through that writer or refuse instead of racing a
-  second writer. The debug-context runtime observation cache is a narrow
-  metadata-only append exception and must never store pasted logs or source text.
+- Only one local process writes to each role-scoped SQLite/sqlite-vec database
+  file at a time. Write-capable indexing, quality, repair, cleanup, and future
+  mutating MCP operations coordinate through the matching writer lane or refuse
+  instead of racing a second writer for the same role. The debug-context runtime
+  observation cache is a narrow metadata-only append to the runtime database role
+  and must never store pasted logs or source text.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.
 - MCP tools return compact JSON evidence that a coding agent can use immediately.
+- Impact evidence includes external dependency usage when local package
+  manifests and import references conservatively connect a symbol to a package.
 - Pre-edit explanation maps proposed line-range changes to indexed symbols,
   impact evidence, likely tests, freshness, trust, and reason tags without
   storing source text or mutating the index.
@@ -98,8 +101,6 @@ feature contracts.
 - Unified context packs that merge structural and semantic evidence in one
   agent-facing response.
 - Multi-language test discovery for C#, JavaScript, and TypeScript.
-- Runtime-to-source mapping for C# and Node/V8 stack traces in addition to the
-  existing Rust-focused debug context behavior.
 - Future write-capable reindex requests only after an explicit design doc and
   trust/confirmation model.
 - Future languages beyond Rust, C#, JavaScript, and TypeScript, added only

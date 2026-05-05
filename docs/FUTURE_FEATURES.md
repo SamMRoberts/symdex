@@ -32,19 +32,17 @@ Requirements:
 
 ### Runtime-To-Source Mapping Follow-Ups
 
-Future runtime work should expand parser precision for non-Rust stacks.
+Runtime parsing now covers C# and Node/V8 stack frames. Future runtime work
+should deepen precision for those shapes and any later active language targets.
 
 Requirements:
 
-- Parse C# frames shaped like `at Namespace.Type.Method(...) in path.cs:line N`.
-- Parse Node/V8 frames shaped like `at name (path.js:line:column)` and common
-  async TypeScript/JavaScript variants.
-- Preserve unmapped C# and Node/V8 frames with explicit status instead of
+- Continue preserving unmapped runtime frames with explicit status instead of
   dropping them.
-- Join parsed C# and Node/V8 frames through the existing file, symbol, call,
+- Continue joining runtime frames through the existing file, symbol, call,
   likely-test, freshness, trust, and provenance pipeline.
-- Add parser tests for mapped frames, unmapped frames, relative paths, absolute
-  paths inside the repo, and malformed lines.
+- Add fixture-backed parser coverage before expanding to any additional runtime
+  stack shapes.
 
 ### Scoped Reindex Requests
 

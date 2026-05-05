@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use serde_json::json;
-use symdex_core::RepoRoot;
+use symdex_core::{RepoRoot, SemanticLayer};
 use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
@@ -24,7 +24,7 @@ use symdex_query::{
     run_unified_context_pack, run_vector_verify_with_options,
 };
 use symdex_store::{
-    EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
+    DatabaseRole, EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
     WatcherClientRecord, WatcherStatusRecord, current_timestamp, debug_db_lock_log, sqlite_parent,
 };
 use symdex_watch::{WatcherClientKind, WatcherStatus};
@@ -69,13 +69,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "watch-daemon" => {
             require_text_output(command, output)?;
-            symdex_writer::run_daemon(|job, on_progress| {
+            let role = parse_writer_daemon_role(&args[1..])?;
+            symdex_writer::run_daemon_for_role(role, |job, on_progress| {
                 execute_writer_job_with_progress(job, on_progress)
             })
         }
         "writer-daemon" => {
             require_text_output(command, output)?;
-            symdex_writer::run_daemon(|job, on_progress| {
+            let role = parse_writer_daemon_role(&args[1..])?;
+            symdex_writer::run_daemon_for_role(role, |job, on_progress| {
                 execute_writer_job_with_progress(job, on_progress)
             })
         }
@@ -237,6 +239,17 @@ fn parse_cli_invocation(args: Vec<String>) -> Result<CliInvocation, String> {
     })
 }
 
+fn parse_writer_daemon_role(args: &[String]) -> Result<DatabaseRole, String> {
+    if args.is_empty() {
+        return Ok(DatabaseRole::Structural);
+    }
+    if args.len() == 2 && args[0] == "--role" {
+        return DatabaseRole::parse(&args[1])
+            .ok_or_else(|| format!("unsupported writer role `{}`", args[1]));
+    }
+    Err("writer-daemon accepts only optional `--role <role>`".to_owned())
+}
+
 fn parse_output_value(value: &str) -> Result<OutputMode, String> {
     match value {
         "text" => Ok(OutputMode::Text),
@@ -305,12 +318,10 @@ fn execute_writer_job_with_progress(
             Err(error) => WriterJobResponse::error(error),
         },
         WriterJob::IndexQuality { repo } => {
-            match with_writer_gate(|| {
-                run_quality_index_with_existing_writer_and_progress(
-                    &QualityIndexOptions { repo },
-                    |progress| on_progress(writer_progress(progress)),
-                )
-            }) {
+            match run_quality_index_with_existing_writer_and_progress(
+                &QualityIndexOptions { repo },
+                |progress| on_progress(writer_progress(progress)),
+            ) {
                 Ok(summary) => WriterJobResponse::ok_with_data(
                     "quality index completed",
                     json!({
@@ -441,14 +452,17 @@ fn writer_start_watcher(
         .map(|status| status.is_active())
         .unwrap_or(false);
     let store_config = StoreConfig::from_env();
-    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    store.migrate().map_err(|error| error.to_string())?;
-    store
+    let structural_store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    structural_store
+        .migrate()
+        .map_err(|error| error.to_string())?;
+    structural_store
         .upsert_repository(&RepositoryRecord {
             id: root.id().to_owned(),
             root_path: root.path().display().to_string(),
         })
         .map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     let now = current_timestamp();
     store
         .upsert_watcher_status(&WatcherStatusRecord {
@@ -499,7 +513,7 @@ fn writer_stop_watcher(repo: &str) -> Result<WatcherStatus, String> {
         "watcher-writer",
         format_args!("stop_watcher repo={}", root.path().display()),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     store
         .mark_watcher_stopped(root.id())
         .map_err(|error| error.to_string())?;
@@ -523,7 +537,7 @@ fn writer_attach_watcher_client(
             pid
         ),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     let now = current_timestamp();
     store
         .upsert_watcher_client(&WatcherClientRecord {
@@ -549,7 +563,7 @@ fn writer_heartbeat_watcher_client(repo: &str, client_id: &str) -> Result<Watche
             client_id
         ),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     store
         .heartbeat_watcher_client(root.id(), client_id)
         .map_err(|error| error.to_string())?;
@@ -566,11 +580,24 @@ fn writer_detach_watcher_client(repo: &str, client_id: &str) -> Result<WatcherSt
             client_id
         ),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     store
         .remove_watcher_client(root.id(), client_id)
         .map_err(|error| error.to_string())?;
     symdex_watch::status(repo)
+}
+
+fn open_watcher_store_for_root(root: &RepoRoot) -> Result<SqliteStore, String> {
+    let store = SqliteStore::open_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    store
+        .upsert_repository(&RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 fn writer_scope(scope: IndexScope) -> WriterIndexScope {
@@ -703,6 +730,17 @@ fn init_with_existing_writer() -> Result<String, String> {
     }
     let sqlite = SqliteStore::open(&store).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
+    for role in [
+        DatabaseRole::FastSemantic,
+        DatabaseRole::QualitySemantic,
+        DatabaseRole::Events,
+        DatabaseRole::Runtime,
+        DatabaseRole::Watch,
+    ] {
+        let role_store =
+            SqliteStore::open_for_role(&store, role).map_err(|error| error.to_string())?;
+        role_store.migrate().map_err(|error| error.to_string())?;
+    }
     Ok("initialized symdex local state".to_owned())
 }
 
@@ -1024,11 +1062,50 @@ fn delete_orphaned_vector_points(summary: &VectorVerifySummary) -> Result<usize,
         return Ok(0);
     }
     let store_config = StoreConfig::from_env();
-    let vector = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
+    let semantic_layer = semantic_layer_for_vector_summary(summary)?;
+    let vector = vector_store_for_repair(&store_config, semantic_layer, &summary.collection_name)?;
     vector
         .delete_points(&summary.collection_name, &summary.orphaned_point_ids)
         .map_err(|error| error.to_string())?;
     Ok(summary.orphaned_point_ids.len())
+}
+
+fn semantic_layer_for_vector_summary(
+    summary: &VectorVerifySummary,
+) -> Result<SemanticLayer, String> {
+    match summary.semantic_layer.as_str() {
+        "fast" => Ok(SemanticLayer::Fast),
+        "quality" => Ok(SemanticLayer::Quality),
+        other => Err(format!(
+            "cannot repair vector summary for semantic layer `{other}`"
+        )),
+    }
+}
+
+fn vector_store_for_repair(
+    store_config: &StoreConfig,
+    semantic_layer: SemanticLayer,
+    vector_table: &str,
+) -> Result<SqliteVectorStore, String> {
+    let layer_store = SqliteVectorStore::new_for_semantic_layer(store_config, semantic_layer)
+        .map_err(|error| error.to_string())?;
+    if layer_store
+        .table_exists(vector_table)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(layer_store);
+    }
+
+    let legacy_store = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    if legacy_store.database_path() != layer_store.database_path()
+        && legacy_store
+            .table_exists(vector_table)
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(legacy_store);
+    }
+
+    Ok(layer_store)
 }
 
 fn symbol(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
@@ -1253,6 +1330,7 @@ fn print_impact_summary(summary: &ImpactSummary) {
                 .unwrap_or("<none>")
         );
     }
+    print_impact_dependency_evidence(&summary.external_dependencies);
     println!("tests_likely: {}", summary.tests_likely.len());
     for test in &summary.tests_likely {
         println!("test: {test}");
@@ -1325,12 +1403,30 @@ fn print_explain_change_summary(summary: &ExplainChangeSummary) {
             reason_list(&file.reasons)
         );
     }
+    print_impact_dependency_evidence(&summary.external_dependencies);
     println!("likely_tests: {}", summary.likely_tests.len());
     for test in &summary.likely_tests {
         println!("test: {test}");
     }
     for note in &summary.notes {
         println!("note: {note}");
+    }
+}
+
+fn print_impact_dependency_evidence(dependencies: &[symdex_query::ImpactDependencyEvidence]) {
+    println!("external_dependencies: {}", dependencies.len());
+    for dependency in dependencies {
+        println!(
+            "{} import={} {}:{} freshness={} trust={:.2}/{} reasons={}",
+            dependency.row.package_name,
+            dependency.row.import_path,
+            dependency.row.path,
+            dependency.row.line,
+            dependency.freshness.label(),
+            dependency.trust.score,
+            dependency.trust.level,
+            reason_list(&dependency.reasons)
+        );
     }
 }
 

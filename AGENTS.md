@@ -9,6 +9,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 ## First Reads
 - Read this file before changing code, docs, tests, or configuration.
 - Read `docs/README.md` next; it maps tasks to the right deeper docs.
+- For using symdex MCP tools during development, read
+  `.github/instructions/symdex-mcp-tools.instructions.md`.
 - For semantic indexing changes, read `docs/LAYERED_SEMANTIC_INDEXING.md`,
   `docs/INDEXING_PIPELINE.md`, `docs/DATA_MODEL.md`, and
   `docs/CONTINUOUS_INDEXING.md` before implementation.
@@ -25,16 +27,17 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Support a local continuous indexing mode that can be toggled on or off.
 - In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
-- SQLite stores repositories, files, symbols, chunks, calls, tests,
-  conservative test targets, short-lived runtime observations, and index
-  metadata.
-- Only ONE process may write to the configured local SQLite/sqlite-vec database
-  at a time. The guard is database-file scoped, not repository scoped. TUI, MCP,
-  diagnostics, query, and status paths must be read-only unless they are
-  starting or attaching the single writer. Manual indexing, continuous indexing,
-  quality catch-up, repair, and future write tools must coordinate through that
-  writer, queue/coalesce work, or refuse while another writer is active to
-  prevent SQLite database lock errors.
+- Role-scoped local SQLite databases store repositories, files, symbols,
+  chunks, calls, tests, conservative test targets, short-lived runtime
+  observations, watcher state, and index metadata.
+- Only ONE process may write to each configured local SQLite/sqlite-vec database
+  file at a time. The guard is database-file scoped, not repository scoped. TUI,
+  MCP, diagnostics, query, and status paths must be read-only unless they are
+  starting or attaching an explicit writer lane. Manual indexing, continuous
+  indexing, quality catch-up, repair, and future write tools must coordinate
+  through the appropriate database-role writer, queue/coalesce work, or refuse
+  while another writer for the same database file is active to prevent SQLite
+  database lock errors.
 - SQLite stores local Git/ref metadata for repository indexes. Branch-aware
   work must preserve local branch/ref identity, detached HEAD support, and
   non-Git repository behavior.
@@ -129,6 +132,13 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   evidence supports direct calls, naming conventions, fixture paths, or
   same-module file relationships. Store relationship kind, confidence, and
   reason; do not turn weak hints into exact coverage claims.
+- Persist external dependency facts from local package manifests in
+  `dependencies`, and import-to-dependency links in `dependency_usages` when
+  conservative import evidence matches a declared package or crate. Store
+  package manager, manifest path, package/crate name, version requirement,
+  import path, source symbol when available, confidence, and reason; do not
+  execute package managers, read lockfile resolution graphs as authority, or
+  claim dependency usage without manifest evidence.
 - Record embedding model name and vector dimension with every semantic layer.
 - A model or dimension change requires collection migration or full reindex for
   the affected layer.
@@ -155,7 +165,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Runtime/debug evidence caching is a narrow metadata-write exception for
   `symdex_debug_context`: store only parsed stack-frame metadata, failing test
   names, normalized paths, match summaries, hashes, and expiry timestamps in
-  `runtime_observations`; never store pasted logs or source text.
+  runtime-role `runtime_observations`; never store pasted logs or source text.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 - Branch-aware indexing must read only local Git metadata. Do not execute hooks,
   fetch remotes, contact hosted services, or treat branch names as trusted input.
@@ -167,7 +177,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - MCP evidence tools are read-only by default. `symdex_watch_start` is the
   explicit local-only exception for starting or attaching the scoped background
   watcher, and `symdex_debug_context` may append metadata-only
-  `runtime_observations` rows for short-lived repeated-failure comparison.
+  runtime-role `runtime_observations` rows for short-lived repeated-failure
+  comparison.
 - Write-capable tools require a future design doc before implementation.
 - Tool names must be stable, descriptive, and versionable.
 - Tool outputs must fit agent context windows.
@@ -227,4 +238,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Leave the repo easier to understand than you found it.
 
 ## Troubleshooting
-- Utilize the symdex mcp tools to assist with debugging.
+- Utilize the symdex MCP tools to assist with debugging. Follow
+  `.github/instructions/symdex-mcp-tools.instructions.md` for when to start the
+  watcher, check freshness, gather context packs, inspect call paths, and map
+  runtime failures without exposing source text.

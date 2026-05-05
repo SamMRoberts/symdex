@@ -279,13 +279,18 @@ Output separates:
 - transitive callers
 - transitive callees
 - related files
+- external dependency usage evidence
 - same-file symbols
 - tests likely to cover the symbol
 - unresolved candidates
 
 Direct and transitive evidence rows include provenance, freshness labels, and
 trust scores. Related-file rows include path, relationship count, freshness,
-trust, and provenance.
+trust, and provenance. `external_dependencies` contains metadata-only
+import-to-dependency evidence when indexed manifest facts and import references
+support it, including package manager, package name, version requirement,
+manifest path, import path, referenced symbol, freshness, trust, and reason
+tags.
 `tests_likely` contains indexed test qualified names when a discovered test
 has a moderate-confidence `test_targets` relationship to the queried symbol or
 its file. Direct call evidence is still supported as a compatibility fallback
@@ -542,20 +547,17 @@ Output:
 ```
 
 The tool parses panic/file locations, stack-frame symbols, indexed-language file
-paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
+paths, Rust backtraces, C# `at Namespace.Type.Method(...) in path.cs:line N`
+frames, Node/V8 `at name (path.js:line:column)` frames, async JS/TS variants,
+and failing test names. It maps frames to indexed SQLite file/symbol/call
 evidence, maps failing test names to indexed tests when available, keeps
 unmatched runtime test names as fallbacks, adds freshness, trust, and
 provenance, and returns source-free metadata only. It also appends short-lived
-metadata rows to `runtime_observations` so repeated failures can be compared by
-input hash, normalized paths, failing test names, and match results without
-storing logs or source text. Because of that cache write, this MCP tool is
-local-only, non-destructive, and not read-only or idempotent. C# and Node/V8 stack-frame
-parsing remains planned separately; this mapping only uses test names that the
-runtime parser already extracts.
-
-Planned parser expansion: keep the Rust parser behavior and add conservative C#
-and Node/V8 stack frame patterns. Unmapped frames must remain visible with an
-explicit status instead of being dropped.
+metadata rows to runtime-role `runtime_observations` so repeated failures can be
+compared by input hash, normalized paths, failing test names, and match results
+without storing logs or source text. Because of that cache write, this MCP tool
+is local-only, non-destructive, and not read-only or idempotent. Unmapped frames
+remain visible with explicit status instead of being dropped.
 
 ### `symdex_staleness_check`
 
