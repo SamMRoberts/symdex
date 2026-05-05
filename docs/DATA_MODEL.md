@@ -652,7 +652,10 @@ and records one averaged vector for the original chunk. If a new fast generation
 supersedes queued work, only old `pending` and `running` jobs are marked
 `skipped_stale`; terminal history is preserved. If the quality model or service
 is unavailable, the semantic generation is marked `quality_blocked` and no
-pending quality jobs are created.
+pending quality jobs are created. New queue and blocked-generation writes are
+also mirrored into the `quality_semantic` role database from the already-built
+structural job list, so clean role databases receive quality catch-up metadata
+without requiring cross-database foreign keys or source text.
 `semantic_generations.quality_dimension` remains null until the quality worker
 records actual quality embeddings.
 
@@ -710,9 +713,10 @@ for `semantic_generations`, `chunk_embeddings`, `quality_embedding_jobs`, and
 keys. New fast indexing mirrors completed fast `semantic_generations`,
 `semantic_generation_refs`, and fast `chunk_embeddings` into the `fast_semantic`
 role after structural finalization. Structural SQLite still stores the
-authoritative semantic manifests, quality job metadata, and active-ref file
+authoritative semantic manifests, quality job read path, and active-ref file
 manifests until query and quality-worker callers are routed to the semantic
-roles. Query-time ref
+roles; the `quality_semantic` role receives mirrored queued and blocked quality
+metadata for fresh databases. Query-time ref
 filtering reads active `ref_files` file IDs from structural SQLite and applies
 those IDs to sqlite-vec payload metadata instead of requiring `ref_files` to live
 in the vector database.

@@ -12713,6 +12713,85 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_quality_semantic_role_records_queue_metadata() {
+        let db = TestDb::new("quality-semantic-role-queue-metadata");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality semantic store should open");
+        store
+            .migrate()
+            .expect("quality semantic schema should migrate");
+
+        let generation = sample_semantic_generation();
+        let job = sample_quality_embedding_job();
+        let summary = store
+            .queue_quality_embedding_jobs(
+                &generation,
+                "mxbai-embed-large",
+                std::slice::from_ref(&job),
+                "103",
+            )
+            .expect("quality queue metadata should persist");
+
+        assert_eq!(summary.queued_jobs, 1);
+        assert_eq!(summary.skipped_stale_jobs, 0);
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should read")
+                .map(|generation| generation.quality_status),
+            Some("quality_pending".to_owned())
+        );
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "pending")
+                .expect("pending quality jobs should read"),
+            vec![job]
+        );
+    }
+
+    #[test]
+    fn sqlite_quality_semantic_role_records_generation_manifest() {
+        let db = TestDb::new("quality-semantic-role-generation-manifest");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality semantic store should open");
+        store
+            .migrate()
+            .expect("quality semantic schema should migrate");
+
+        let generation = SemanticGenerationRecord {
+            quality_status: "quality_ready".to_owned(),
+            active_layer: "quality".to_owned(),
+            quality_embedded_chunks: 1,
+            updated_at: "104".to_owned(),
+            ..sample_semantic_generation()
+        };
+        let embedding = sample_quality_chunk_embedding("current");
+        store
+            .record_semantic_generation_manifest(
+                &generation,
+                std::slice::from_ref(&embedding),
+                None,
+                "104",
+            )
+            .expect("quality generation manifest should persist");
+
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should read"),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            store
+                .chunk_embeddings_for_generation("repo", "generation-1", "quality")
+                .expect("quality embeddings should read"),
+            vec![embedding]
+        );
+    }
+
+    #[test]
     fn sqlite_fast_semantic_role_uses_fast_database() {
         let db = TestDb::new("fast-semantic-role-database");
         let config = db.config();

@@ -19,10 +19,10 @@ use symdex_store::{
     CallRecord, ChunkEmbeddingRecord, ChunkRecord, DatabaseRole, DependencyRecord,
     DependencyUsageRecord, FastEmbeddingManifestRecord, FastSemanticGenerationInput,
     FileIndexEventRecord, FileRecord, IndexRunRecord, PointPayload, QualityActivationSummary,
-    QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow, QualityQueueSummary,
-    RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig, SymbolRecord,
-    SymbolReferenceRecord, TestRecord, VectorPoint, WriterLease, WriterLeaseKind,
-    WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
+    QualityEmbeddingJobRecord, QualityGenerationProgress, QualityJobCompletion,
+    QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore, SqliteVectorStore,
+    StoreConfig, SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint, WriterLease,
+    WriterLeaseKind, WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
 };
 
 const EMBEDDING_SEGMENT_OVERLAP_DIVISOR: usize = 5;
@@ -434,6 +434,7 @@ fn run_quality_index_limited_with_progress(
     {
         let now = current_timestamp();
         let _ = sqlite.mark_quality_generation_blocked(&generation, &quality_model, &now);
+        let _ = mirror_quality_generation_blocked(&store_config, &generation, &quality_model, &now);
         return Err(format!(
             "quality embedding model `{quality_model}` is not available"
         ));
@@ -461,6 +462,13 @@ fn run_quality_index_limited_with_progress(
         sqlite
             .queue_quality_embedding_jobs(&generation, &quality_model, &queued_jobs, &requeued_at)
             .map_err(|error| error.to_string())?;
+        mirror_quality_embedding_jobs(
+            &store_config,
+            &generation,
+            &quality_model,
+            &queued_jobs,
+            &requeued_at,
+        )?;
     }
     if requeued_stale_jobs > 0 {
         on_progress(IndexProgress::new(
@@ -2296,6 +2304,7 @@ fn finalize_semantic_index(
     )?;
     queue_quality_jobs_after_fast_indexing(
         sqlite,
+        context.store_config,
         root.id(),
         context.layered_embed_config,
         &generation,
@@ -2340,6 +2349,7 @@ fn mirror_fast_semantic_generation_manifest(
 
 fn queue_quality_jobs_after_fast_indexing(
     sqlite: &mut SqliteStore,
+    store_config: &StoreConfig,
     repository_id: &str,
     layered_embed_config: &LayeredEmbedConfig,
     generation: &symdex_store::SemanticGenerationRecord,
@@ -2363,6 +2373,12 @@ fn queue_quality_jobs_after_fast_indexing(
             let summary = sqlite
                 .mark_quality_generation_blocked(generation, &quality_config.model, &queued_at)
                 .map_err(|error| error.to_string())?;
+            mirror_quality_generation_blocked(
+                store_config,
+                generation,
+                &quality_config.model,
+                &queued_at,
+            )?;
             on_progress(blocked_quality_queue_progress(&summary, &error.to_string()));
             return Ok(());
         }
@@ -2403,6 +2419,23 @@ fn queue_quality_jobs_after_fast_indexing(
                             &queued_at,
                         )
                         .map_err(|error| error.to_string())?;
+                    let updated_generation = sqlite
+                        .latest_semantic_generation(repository_id)
+                        .map_err(|error| error.to_string())?
+                        .filter(|record| record.id == generation.id)
+                        .ok_or_else(|| "refreshed semantic generation not found".to_owned())?;
+                    let quality_embeddings = sqlite
+                        .chunk_embeddings_for_generation(
+                            repository_id,
+                            &generation.id,
+                            SemanticLayer::Quality.as_str(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    mirror_quality_semantic_generation_manifest(
+                        store_config,
+                        &updated_generation,
+                        &quality_embeddings,
+                    )?;
                     on_progress(IndexProgress::new(
                         "quality_queue",
                         1,
@@ -2430,6 +2463,13 @@ fn queue_quality_jobs_after_fast_indexing(
             let summary = sqlite
                 .queue_quality_embedding_jobs(generation, &quality_config.model, &jobs, &queued_at)
                 .map_err(|error| error.to_string())?;
+            mirror_quality_embedding_jobs(
+                store_config,
+                generation,
+                &quality_config.model,
+                &jobs,
+                &queued_at,
+            )?;
             on_progress(IndexProgress::new(
                 "quality_queue",
                 1,
@@ -2448,6 +2488,12 @@ fn queue_quality_jobs_after_fast_indexing(
             let summary = sqlite
                 .mark_quality_generation_blocked(generation, &quality_config.model, &queued_at)
                 .map_err(|error| error.to_string())?;
+            mirror_quality_generation_blocked(
+                store_config,
+                generation,
+                &quality_config.model,
+                &queued_at,
+            )?;
             on_progress(blocked_quality_queue_progress(
                 &summary,
                 "quality model is not available",
@@ -2458,10 +2504,60 @@ fn queue_quality_jobs_after_fast_indexing(
             let summary = sqlite
                 .mark_quality_generation_blocked(generation, &quality_config.model, &queued_at)
                 .map_err(|error| error.to_string())?;
+            mirror_quality_generation_blocked(
+                store_config,
+                generation,
+                &quality_config.model,
+                &queued_at,
+            )?;
             on_progress(blocked_quality_queue_progress(&summary, &error.to_string()));
             Ok(())
         }
     }
+}
+
+fn mirror_quality_generation_blocked(
+    store_config: &StoreConfig,
+    generation: &symdex_store::SemanticGenerationRecord,
+    quality_model: &str,
+    blocked_at: &str,
+) -> Result<(), String> {
+    let mut quality_store = SqliteStore::open_for_role(store_config, DatabaseRole::QualitySemantic)
+        .map_err(|error| error.to_string())?;
+    quality_store.migrate().map_err(|error| error.to_string())?;
+    quality_store
+        .mark_quality_generation_blocked(generation, quality_model, blocked_at)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn mirror_quality_embedding_jobs(
+    store_config: &StoreConfig,
+    generation: &symdex_store::SemanticGenerationRecord,
+    quality_model: &str,
+    jobs: &[QualityEmbeddingJobRecord],
+    queued_at: &str,
+) -> Result<(), String> {
+    let mut quality_store = SqliteStore::open_for_role(store_config, DatabaseRole::QualitySemantic)
+        .map_err(|error| error.to_string())?;
+    quality_store.migrate().map_err(|error| error.to_string())?;
+    quality_store
+        .queue_quality_embedding_jobs(generation, quality_model, jobs, queued_at)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn mirror_quality_semantic_generation_manifest(
+    store_config: &StoreConfig,
+    generation: &symdex_store::SemanticGenerationRecord,
+    embeddings: &[ChunkEmbeddingRecord],
+) -> Result<(), String> {
+    let mut quality_store = SqliteStore::open_for_role(store_config, DatabaseRole::QualitySemantic)
+        .map_err(|error| error.to_string())?;
+    quality_store.migrate().map_err(|error| error.to_string())?;
+    quality_store
+        .record_semantic_generation_manifest(generation, embeddings, None, &generation.updated_at)
+        .map_err(|error| error.to_string())
 }
 
 fn blocked_quality_queue_progress(summary: &QualityQueueSummary, reason: &str) -> IndexProgress {

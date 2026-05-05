@@ -216,8 +216,10 @@ Staged semantic metadata schemas are now initialized in the `fast_semantic` and
 move off structural SQLite without later schema bootstraps. During the
 transition, completed fast semantic generations and their current fast
 `chunk_embeddings` manifest are mirrored into the `fast_semantic` role after
-structural finalization, while structural rows remain the authoritative read
-path and quality job queue until callers are routed to the semantic roles.
+structural finalization, and quality queued/blocked metadata is mirrored into
+the `quality_semantic` role from structural job selection. Structural rows remain
+the authoritative read path and quality job queue until callers are routed to the
+semantic roles.
 After a successful fast sqlite-vec upsert, semantic indexing records a deterministic
 fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
 The older chunk-level vector columns remain nullable compatibility schema, but
@@ -447,14 +449,15 @@ The first multi-database split moved sqlite-vec projections out of the
 structural database: fast vectors use a derived `fast_semantic` SQLite file, and
 quality vectors use a derived `quality_semantic` SQLite file. Fast indexing also
 mirrors completed fast generation metadata into `fast_semantic` after structural
-finalization. The next split moved watcher control-plane state into the derived
-`watch` SQLite file. Watcher client heartbeat and detach jobs use the watch-role
-writer endpoint so they do not wait for structural indexing jobs. Index-run
-summaries and per-file index events now write to the derived `events` SQLite
-file. Structural SQLite continues to own the authoritative repository/ref
-manifests, file facts, symbols, calls, quality jobs, and generation read path
-until later slices move the remaining semantic callers into their own role
-databases.
+finalization, and quality queue/block metadata is mirrored into
+`quality_semantic` after structural job selection. The next split moved watcher
+control-plane state into the derived `watch` SQLite file. Watcher client
+heartbeat and detach jobs use the watch-role writer endpoint so they do not wait
+for structural indexing jobs. Index-run summaries and per-file index events now
+write to the derived `events` SQLite file. Structural SQLite continues to own the
+authoritative repository/ref manifests, file facts, symbols, calls, quality job
+read path, and generation read path until later slices move the remaining
+semantic callers into their own role databases.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
