@@ -7,7 +7,8 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, tests, fast semantic generations, and fast/quality
+symbols, calls, symbol references, tests, conservative test targets, short-lived
+runtime observations, fast semantic generations, and fast/quality
 `chunk_embeddings` manifests. The older chunk-level vector columns remain
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
@@ -15,6 +16,8 @@ semantic projection.
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
 caller/callee traversal, and index-run metadata checks.
+Symbol-reference indexes cover source-symbol, target-symbol, kind, and
+resolution-status scans for broader structural evidence beyond calls.
 Layered semantic indexes cover latest generation lookup, per-layer embedding
 manifests, and quality job status scans.
 
@@ -126,6 +129,53 @@ timestamps, files seen/indexed, chunks embedded, model, dimension, and any
 metadata-only error summary. Watch-driven batches are currently recorded with
 `run_kind = watch`.
 
+### `file_index_events`
+
+```sql
+CREATE TABLE file_index_events (
+  id TEXT PRIMARY KEY,
+  index_run_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  repository_ref_id TEXT,
+  path TEXT NOT NULL,
+  old_content_hash TEXT,
+  new_content_hash TEXT,
+  action TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL,
+  error_summary TEXT,
+  occurred_at TEXT NOT NULL
+);
+```
+
+`file_index_events` records the per-file decisions that make up an index run.
+The table is append-only telemetry keyed by `index_run_id`, repo-relative path,
+and action. It complements `index_runs`: the run row answers whether a batch
+finished, while file events answer why each path was created, updated, deleted,
+or skipped.
+
+Current indexing writes events for:
+
+- `created` with reason `new_file` when a discovered path has no prior indexed
+  hash.
+- `updated` with reason `content_changed` when a discovered path replaces a
+  prior indexed hash.
+- `updated` with reason `parsed_with_diagnostics` when syntax-aware parsing
+  produced usable facts with parser diagnostics.
+- `skipped` with reason `unchanged_content_hash` when incremental indexing
+  links the existing file snapshot into the active ref manifest.
+- `deleted` with reason `missing_from_discovery` when a previously indexed path
+  is absent from the current discovery result because it was removed, ignored,
+  unsupported, or no longer inside the configured indexing scope.
+- `failed` with reason `read_failed` or `parse_failed` when collection aborts
+  on a path-specific file read or parser error.
+
+Events store `old_content_hash` and `new_content_hash` when available, plus
+`repository_ref_id` for branch-aware runs. Source text is never stored in this
+table. Parser or read failures that abort collection record `status = failed`
+and a metadata-only `error_summary` when the failing path is known; aggregate
+failure status remains in `index_runs`.
+
 ### `files`
 
 ```sql
@@ -150,9 +200,11 @@ lookups fast. Older local databases with the legacy `(repository_id, path)`
 unique constraint are migrated to the snapshot shape during `migrate`.
 
 `language` stores a stable language slug such as `rust`, `csharp`,
-`javascript`, or `typescript`. The schema is intentionally language-neutral; no
-table change is required when adding C#, JavaScript, TypeScript, or future
-languages that follow the same evidence contracts.
+`javascript`, `typescript`, `toml`, `yaml`, or `json`. The schema is
+intentionally language-neutral; no table change is required when adding C#,
+JavaScript, TypeScript, fallback-only configuration formats, or future languages
+that follow the same evidence contracts. Configuration chunks use nullable
+`symbol_id` fields because they do not emit code symbols.
 
 ### `symbols`
 
@@ -215,6 +267,12 @@ text in sqlite-vec payloads or cleanup reports, and it preserves the previous
 complete manifest if local embedding or vector upsert fails before SQLite
 replacement.
 
+When an active `ref_files` manifest is available, fast semantic generation
+recording carries forward only fast `chunk_embeddings` whose file snapshot is
+linked by that active ref manifest. Historical same-path snapshots can remain in
+`files`, chunks, and older embedding rows, but they must not become members of
+the latest ref-linked fast generation or drive quality job readiness.
+
 ### `calls`
 
 ```sql
@@ -230,6 +288,41 @@ CREATE TABLE calls (
   parser_version TEXT
 );
 ```
+
+### `symbol_references`
+
+```sql
+CREATE TABLE symbol_references (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  source_symbol_id TEXT,
+  target_symbol_id TEXT,
+  reference_text TEXT NOT NULL,
+  reference_kind TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  confidence REAL NOT NULL,
+  resolution_status TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT
+);
+```
+
+`symbol_references` stores conservative structural references that are useful
+to coding agents but are not caller/callee execution edges. Reference kinds are
+`import`, `type_reference`, `implementation`, `attribute`, `inheritance`,
+`decorator`, and `config_link`. `file_id` anchors lifecycle cleanup for
+file-level references. `source_symbol_id` is nullable because imports,
+file-level attributes, and future configuration links can originate outside a
+function or method symbol. `target_symbol_id` is nullable and should only be
+set when local evidence resolves the reference conservatively.
+
+Current Rust extraction records `use` declarations, type-like syntax nodes,
+`impl` relationships, and attributes. C#, JavaScript, and TypeScript have
+conservative parser hooks for imports/usings, inheritance or base lists,
+attributes/decorators, and type-like syntax where tree-sitter exposes stable
+nodes. The table stores no source text beyond the compact reference expression,
+and unresolved or ambiguous references are retained with confidence and
+`resolution_status` metadata.
 
 ### `tests`
 
@@ -263,6 +356,40 @@ TypeScript named callbacks. It is absent for metadata-only callback-style tests,
 such as inline Jest, Vitest, or Mocha callbacks. The `tests` table supports
 exact/suffix failing-test name lookup for debug context packs and direct
 test-to-symbol call lookup for impact summaries.
+
+### `test_targets`
+
+```sql
+CREATE TABLE test_targets (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  test_id TEXT NOT NULL,
+  target_symbol_id TEXT,
+  target_file_id TEXT NOT NULL,
+  relationship_kind TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  reason TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+`test_targets` records conservative relationships between indexed tests and
+the symbols or files they likely cover. It exists so impact analysis does not
+depend only on direct call-edge joins at query time. Current relationship kinds
+are `direct_call`, `same_module`, `naming_convention`, and `fixture_path`.
+Rows include a numeric confidence and compact reason string so downstream
+surfaces can explain why a test was considered relevant without reading source
+text.
+
+Direct-call rows require a resolved call from a symbol-linked test to a target
+symbol. Naming rows require an exact normalized test-name-to-symbol-name match
+in the same file, such as `test_target` for `target`. Fixture-path rows link
+test files such as `tests/calculator_tests.rs` to indexed source files with a
+matching stem such as `src/calculator.rs`. Same-module rows are low-confidence
+file-level evidence for colocated source-file tests and are not strong enough
+by themselves to drive `tests_likely`.
 
 ### `semantic_generations`
 
@@ -393,11 +520,14 @@ embedding, but never include source text. Current status values are `pending`,
 `running`, `succeeded`, `failed`, `skipped_stale`, and `skipped_excluded`.
 Fast semantic indexing creates `pending` jobs only for current embeddable chunks
 when quality indexing is enabled and the configured quality model is available.
-Chunks with `excluded_reason`, including secret-blocked and too-large chunks,
-do not get quality jobs. If a new fast generation supersedes queued work, only
-old `pending` and `running` jobs are marked `skipped_stale`; terminal history is
-preserved. If the quality model or service is unavailable, the semantic
-generation is marked `quality_blocked` and no pending quality jobs are created.
+Chunks with `excluded_reason`, including secret-blocked chunks, do not get
+quality jobs. Oversized chunks that are otherwise embeddable keep their quality
+jobs; the worker splits their source text into overlapping model-sized segments
+and records one averaged vector for the original chunk. If a new fast generation
+supersedes queued work, only old `pending` and `running` jobs are marked
+`skipped_stale`; terminal history is preserved. If the quality model or service
+is unavailable, the semantic generation is marked `quality_blocked` and no
+pending quality jobs are created.
 `semantic_generations.quality_dimension` remains null until the quality worker
 records actual quality embeddings.
 
@@ -409,7 +539,10 @@ write failures move to `failed` with a compact metadata-only error summary.
 Stale jobs move to `skipped_stale` and are not embedded. Chunks that are current
 but not eligible for the quality layer, such as chunks over the quality model's
 size limit or chunks that now have an `excluded_reason`, move to
-`skipped_excluded`.
+`skipped_excluded`. Queue repair treats current terminal jobs, including
+`skipped_excluded`, as accounted-for work rather than re-queueing them as
+missing quality coverage. User-facing latest quality errors are reported from
+`failed` jobs only, so intentional exclusions do not appear as worker failures.
 
 After worker progress, `semantic_generations.quality_embedded_chunks` is
 refreshed from current quality manifest rows. The first successful quality
@@ -465,7 +598,10 @@ Returned evidence rows now include compact provenance metadata where available:
 content hash, index run ID, parser version, indexed timestamp, embedding model,
 embedding dimension, and embedding timestamp. Freshness checks compare persisted
 content hashes with the current eligible file hashes and label rows as `fresh`,
-`stale`, `deleted`, `missing`, or `unknown`.
+`stale`, `deleted`, `missing`, or `unknown`. When `ref_files` manifests exist,
+repository-level freshness reports compare only the active local ref manifest so
+retained snapshots from other refs or earlier same-path content do not appear as
+repairable stale rows.
 
 Returned impact and debug-context evidence also includes an `EvidenceTrust`
 score where the query layer has enough metadata to evaluate it. The score is a
@@ -528,6 +664,10 @@ Use SQLite tables to show repository structure:
 - `chunks`: chunk kinds, line ranges, text hashes, compatibility vector fields,
   and exclusion reasons.
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
+- `symbol_references`: imports, type references, implementations, inheritance,
+  attributes/decorators, confidence, and resolution status.
+- `tests` and `test_targets`: discovered test metadata plus conservative
+  test-to-code relationship kind, confidence, and reason.
 
 Use sqlite-vec metadata to show semantic storage:
 
@@ -542,6 +682,8 @@ Group by `files.path` and aggregate:
 - chunk count from `chunks`
 - symbol count from `symbols`
 - call count from `calls` joined through caller symbols
+- symbol-reference count from `symbol_references` joined through files and,
+  when present, source symbols
 - embeddable chunk count from chunks where `excluded_reason IS NULL`
 - vector-backed chunk count from current fast `chunk_embeddings` rows for the
   latest semantic generation
@@ -557,6 +699,8 @@ For the selected file, show metadata rows from:
 - `chunks`: kind, line range, text hash, layered vector status, exclusion reason
 - `symbols`: kind, qualified name, parent symbol, line range
 - `calls`: call line, callee text, resolved callee symbol, confidence, status
+- `symbol_references`: reference line, kind, text, resolved target symbol,
+  confidence, status
 
 Do not show source previews unless a future source-preview design explicitly
 allows it.
@@ -644,6 +788,7 @@ file_id   = hash(repository_id + normalized_relative_path)
 symbol_id = hash(file_id + kind + qualified_name + start_byte + signature_hash)
 chunk_id  = hash(file_id + kind + start_byte + end_byte + text_hash)
 call_id   = hash(caller_symbol_id + callee_text + call_line)
+symbol_reference_id = hash(file_id + source_symbol_id + reference_text + reference_kind + line)
 ```
 
 ## Call path traversal
@@ -682,19 +827,22 @@ freshness label, trust score, and the first available provenance record for that
 file. Direct call rows, transitive paths, path edges, and related-file rows also
 carry reason tags that distinguish direct caller/callee evidence, bounded
 transitive paths, and file relationships derived from call evidence. The impact
-report also includes indexed tests that directly call the queried symbol through
-resolved call edges. Metadata-only tests without symbol linkage remain
-searchable as test facts but do not appear in `tests_likely`. When no direct
-indexed test evidence is available, `tests_likely` remains empty and the output
-includes an explanatory note instead of guessing.
+report also includes indexed tests that target the queried symbol or its file
+through persisted `test_targets` rows with at least moderate confidence.
+Existing direct-call joins remain a compatibility fallback for databases that
+were indexed before `test_targets` existed. Metadata-only tests can contribute
+when fixture-path evidence links them to a target file, but weak same-module
+hints stay below the likely-test threshold. When no indexed test-target
+evidence is available, `tests_likely` remains empty and the output includes an
+explanatory note instead of guessing.
 
 ## Debug context packs
 
-Debug context packs are query-time metadata bundles and do not add new tables.
-Runtime input is parsed into frames containing optional frame symbols, file
-paths, line numbers, and columns. Relative paths are normalized with repository
-path rules; absolute paths are accepted only when they are under the selected
-repository root.
+Debug context packs are metadata bundles built from runtime input. Runtime
+input is parsed into frames containing optional frame symbols, file paths, line
+numbers, and columns. Relative paths are normalized with repository path rules;
+absolute paths are accepted only when they are under the selected repository
+root.
 
 The Rust-oriented parser recognizes common `cargo test` output, panic-hook
 locations, `RUST_BACKTRACE=1` and `RUST_BACKTRACE=full` frame lines, `anyhow`
@@ -713,5 +861,43 @@ agents can distinguish fresh, fully provenanced runtime evidence from stale,
 deleted, or weakly provenanced matches. They also include reason tags that
 identify path normalization, file provenance matches, symbol-at-location
 matches, symbol-name fallback matches, calls at the runtime line, and unmatched
-frames. Debug context packs do not include source text and do not mutate index
-state.
+frames. Debug context packs do not include source text.
+
+### `runtime_observations`
+
+```sql
+CREATE TABLE runtime_observations (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  observation_id TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  observation_kind TEXT NOT NULL,
+  ordinal INTEGER,
+  runtime_symbol TEXT,
+  runtime_path TEXT,
+  normalized_path TEXT,
+  line INTEGER,
+  column INTEGER,
+  failing_test_name TEXT,
+  mapped_test_name TEXT,
+  matched INTEGER NOT NULL,
+  match_kind TEXT NOT NULL,
+  match_summary TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+```
+
+`runtime_observations` is a short-lived metadata cache for repeated debugging
+workflows. `symdex_debug_context` appends one row per parsed frame and failing
+test name after it builds the normal debug context pack. Rows store a hash of
+the full runtime input, not the pasted log. Frame rows can include the parsed
+runtime symbol, parsed path, normalized repo-relative path, line, column,
+match kind, freshness/trust summary, reason tags, matched symbol names, and
+call-at-line counts. Failing-test rows store the parsed failing test name and
+the indexed test name when mapping succeeds.
+
+The cache currently uses a 24-hour expiry window and prunes expired rows during
+new debug-context writes. It is intended for comparing repeated failures by
+metadata shape and `input_hash`; it is not an audit log. Do not store raw
+runtime output, source snippets, stack logs, or full files in this table.

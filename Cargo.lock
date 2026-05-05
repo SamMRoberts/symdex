@@ -311,6 +311,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1579,6 +1589,7 @@ dependencies = [
  "symdex-store",
  "symdex-tui",
  "symdex-watch",
+ "symdex-writer",
 ]
 
 [[package]]
@@ -1657,6 +1668,7 @@ dependencies = [
 name = "symdex-store"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1671,6 +1683,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "serde_json",
  "symdex-core",
  "symdex-diagnostics",
  "symdex-embed",
@@ -1678,6 +1691,7 @@ dependencies = [
  "symdex-query",
  "symdex-store",
  "symdex-watch",
+ "symdex-writer",
 ]
 
 [[package]]
@@ -1689,6 +1703,18 @@ dependencies = [
  "serde_json",
  "symdex-core",
  "symdex-index",
+ "symdex-store",
+ "symdex-writer",
+]
+
+[[package]]
+name = "symdex-writer"
+version = "0.1.0"
+dependencies = [
+ "interprocess",
+ "serde",
+ "serde_json",
+ "symdex-core",
  "symdex-store",
 ]
 

@@ -6,6 +6,9 @@ index without each agent rebuilding or inventing its own evidence model.
 ## Contract
 
 - The shared index is local SQLite plus local sqlite-vec.
+- Only ONE local process may write to that shared database for a repository at
+  a time. Other local agents and clients must use read-only evidence paths or
+  attach to the single writer instead of starting their own write loop.
 - The supported agent-facing protocol is MCP over stdio. Evidence tools are
   read-only; `symdex_watch_start` is the explicit local-only watcher-start
   exception.
@@ -37,15 +40,21 @@ index without each agent rebuilding or inventing its own evidence model.
 
 ## Read-Only Access Pattern
 
-1. One user process indexes a repository or starts the shared watcher with the
-   TUI, an MCP server, foreground watch, or `symdex_watch_start`.
+1. One user process owns database writes for the repository. In continuous mode
+   this is the shared watcher started or attached by the TUI, an MCP server,
+   foreground watch, or `symdex_watch_start`; in manual mode it is the single
+   manual indexing, quality, repair, or cleanup command currently running.
 2. One or more local agents connect to `symdex serve-mcp`.
 3. Agents call evidence tools with an explicit `repo` root, and may call
    `symdex_watch_status` or `symdex_watch_start` to manage watcher readiness.
    Watcher leases are held by live TUI/MCP/CLI clients; when none remain the
    watcher exits after about 10 seconds.
-4. Tool responses include compact evidence under `data` plus contract metadata.
-5. Agents inspect `freshness` and `provenance` before trusting evidence.
+4. If a write-capable operation is requested while another writer is active, it
+   must attach to the active writer, queue or coalesce work, or fail closed with
+   a clear owner/status message. It must not open a second SQLite/sqlite-vec
+   writer.
+5. Tool responses include compact evidence under `data` plus contract metadata.
+6. Agents inspect `freshness` and `provenance` before trusting evidence.
 
 The MCP server may read SQLite and sqlite-vec, embed semantic search queries through
 local Ollama, and compute freshness from current file hashes. It must not
@@ -59,6 +68,8 @@ execute indexed repository code or expose source text by default.
 - sqlite-vec extension health.
 - Ollama endpoint, model, and vector dimension health.
 - Index freshness and provenance consistency.
+- Semantic quality-layer progress and fallback state, separate from file
+  freshness.
 - Whether an agent is receiving stale, missing, deleted, unknown, or fresh
   evidence.
 - The active MCP evidence contract schema/version and local-only/read-only

@@ -5,13 +5,19 @@ mod vector;
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use fs2::FileExt;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use symdex_core::{
-    RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
+    RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, content_hash,
+    stable_id,
 };
 
 pub use vector::{
@@ -23,6 +29,7 @@ pub use vector::{
 pub(crate) use vector::validate_vector_table_name;
 
 pub const MAX_CALL_PATH_DEPTH: usize = 8;
+pub const RUNTIME_OBSERVATION_TTL_SECONDS: u64 = 60 * 60 * 24;
 
 pub fn clamp_call_path_depth(depth: usize) -> usize {
     depth.clamp(1, MAX_CALL_PATH_DEPTH)
@@ -42,8 +49,244 @@ impl StoreConfig {
     }
 }
 
+pub fn debug_db_locks_enabled() -> bool {
+    env_flag("SYMDEX_DEBUG_DB_LOCKS") || env_flag("SYMDEX_DEBUG_WRITER")
+}
+
+pub fn debug_db_lock_log(scope: &str, message: std::fmt::Arguments<'_>) {
+    if !debug_db_locks_enabled() {
+        return;
+    }
+    eprintln!(
+        "symdex-db-debug ts={} pid={} thread={:?} scope={} {}",
+        current_timestamp(),
+        process::id(),
+        thread::current().id(),
+        scope,
+        message
+    );
+}
+
 pub fn sqlite_parent(config: &StoreConfig) -> Option<PathBuf> {
     config.sqlite_path.parent().map(PathBuf::from)
+}
+
+pub fn writer_lock_path(config: &StoreConfig) -> PathBuf {
+    let lock_name = config
+        .sqlite_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.writer.lock"))
+        .unwrap_or_else(|| "symdex.sqlite.writer.lock".to_owned());
+    config
+        .sqlite_path
+        .parent()
+        .map(|parent| parent.join(&lock_name))
+        .unwrap_or_else(|| PathBuf::from(lock_name))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriterLeaseKind {
+    Init,
+    ManualIndex,
+    WatcherDaemon,
+    WatcherForeground,
+    WatcherLauncher,
+    QualityIndex,
+    VectorRepair,
+    Maintenance,
+}
+
+impl WriterLeaseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::ManualIndex => "manual_index",
+            Self::WatcherDaemon => "watcher_daemon",
+            Self::WatcherForeground => "watcher_foreground",
+            Self::WatcherLauncher => "watcher_launcher",
+            Self::QualityIndex => "quality_index",
+            Self::VectorRepair => "vector_repair",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterLeaseRequest {
+    pub kind: WriterLeaseKind,
+    pub operation: String,
+    pub repository_id: Option<String>,
+    pub repo_root: Option<String>,
+}
+
+impl WriterLeaseRequest {
+    pub fn new(kind: WriterLeaseKind, operation: impl Into<String>) -> Self {
+        Self {
+            kind,
+            operation: operation.into(),
+            repository_id: None,
+            repo_root: None,
+        }
+    }
+
+    pub fn for_repo(mut self, repository_id: &str, repo_root: impl Into<String>) -> Self {
+        self.repository_id = Some(repository_id.to_owned());
+        self.repo_root = Some(repo_root.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriterLeaseInfo {
+    pub owner_kind: String,
+    pub pid: u32,
+    pub operation: String,
+    pub repository_id: Option<String>,
+    pub repo_root: Option<String>,
+    pub started_at: String,
+}
+
+impl WriterLeaseInfo {
+    pub fn from_request(request: &WriterLeaseRequest) -> Self {
+        Self {
+            owner_kind: request.kind.as_str().to_owned(),
+            pid: std::process::id(),
+            operation: request.operation.clone(),
+            repository_id: request.repository_id.clone(),
+            repo_root: request.repo_root.clone(),
+            started_at: current_timestamp(),
+        }
+    }
+
+    pub fn read_for(config: &StoreConfig) -> Result<Option<Self>> {
+        read_writer_lease_info(&writer_lock_path(config))
+    }
+}
+
+#[derive(Debug)]
+pub struct WriterLease {
+    file: File,
+    lock_path: PathBuf,
+    pub info: WriterLeaseInfo,
+}
+
+impl WriterLease {
+    pub fn acquire(config: &StoreConfig, request: WriterLeaseRequest) -> Result<Self> {
+        if let Some(parent) = sqlite_parent(config) {
+            std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
+        }
+        let lock_path = writer_lock_path(config);
+        debug_db_lock_log(
+            "writer-lease",
+            format_args!(
+                "acquire_attempt db={} lock={} owner_kind={} operation={} repo={}",
+                config.sqlite_path.display(),
+                lock_path.display(),
+                request.kind.as_str(),
+                request.operation,
+                request.repo_root.as_deref().unwrap_or("<none>")
+            ),
+        );
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(StoreError::Io)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let owner = read_writer_lease_info(&lock_path)
+                    .ok()
+                    .flatten()
+                    .map(Box::new);
+                debug_db_lock_log(
+                    "writer-lease",
+                    format_args!(
+                        "acquire_busy db={} lock={} owner={:?}",
+                        config.sqlite_path.display(),
+                        lock_path.display(),
+                        owner
+                    ),
+                );
+                return Err(StoreError::WriterBusy { owner });
+            }
+            Err(error) => {
+                debug_db_lock_log(
+                    "writer-lease",
+                    format_args!(
+                        "acquire_error db={} lock={} error={}",
+                        config.sqlite_path.display(),
+                        lock_path.display(),
+                        error
+                    ),
+                );
+                return Err(StoreError::Io(error));
+            }
+        }
+
+        let info = WriterLeaseInfo::from_request(&request);
+        file.set_len(0).map_err(StoreError::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(StoreError::Io)?;
+        let metadata = serde_json::to_vec(&info).map_err(StoreError::Json)?;
+        file.write_all(&metadata).map_err(StoreError::Io)?;
+        file.write_all(b"\n").map_err(StoreError::Io)?;
+        file.sync_data().map_err(StoreError::Io)?;
+        debug_db_lock_log(
+            "writer-lease",
+            format_args!(
+                "acquire_success db={} lock={} owner_kind={} operation={} repo={}",
+                config.sqlite_path.display(),
+                lock_path.display(),
+                info.owner_kind,
+                info.operation,
+                info.repo_root.as_deref().unwrap_or("<none>")
+            ),
+        );
+        Ok(Self {
+            file,
+            lock_path,
+            info,
+        })
+    }
+
+    pub fn lock_path(&self) -> &PathBuf {
+        &self.lock_path
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        debug_db_lock_log(
+            "writer-lease",
+            format_args!(
+                "release db_lock={} owner_kind={} operation={} repo={}",
+                self.lock_path.display(),
+                self.info.owner_kind,
+                self.info.operation,
+                self.info.repo_root.as_deref().unwrap_or("<none>")
+            ),
+        );
+        let _ = self.file.unlock();
+    }
+}
+
+fn read_writer_lease_info(lock_path: &PathBuf) -> Result<Option<WriterLeaseInfo>> {
+    let mut file = match File::open(lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::Io(error)),
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(StoreError::Io)?;
+    if contents.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(contents.trim())
+        .map(Some)
+        .map_err(StoreError::Json)
 }
 
 #[derive(Debug)]
@@ -53,23 +296,78 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(config: &StoreConfig) -> Result<Self> {
+        debug_db_lock_log(
+            "sqlite",
+            format_args!("open_read_write_start db={}", config.sqlite_path.display()),
+        );
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         if let Some(parent) = sqlite_parent(config) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
+        let initialize_wal = !config.sqlite_path.exists();
         let connection = Connection::open(&config.sqlite_path).map_err(StoreError::Sqlite)?;
+        connection
+            .busy_timeout(Duration::from_secs(30))
+            .map_err(StoreError::Sqlite)?;
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(StoreError::Sqlite)?;
+        if initialize_wal {
+            connection
+                .execute_batch("PRAGMA journal_mode = WAL;")
+                .map_err(StoreError::Sqlite)?;
+        }
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "open_read_write_success db={} initialized_wal={} busy_timeout_ms=30000",
+                config.sqlite_path.display(),
+                initialize_wal
+            ),
+        );
+        Ok(Self { connection })
+    }
+
+    pub fn open_read_only(config: &StoreConfig) -> Result<Self> {
+        debug_db_lock_log(
+            "sqlite",
+            format_args!("open_read_only_start db={}", config.sqlite_path.display()),
+        );
+        symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
+        let connection =
+            Connection::open_with_flags(&config.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(StoreError::Sqlite)?;
+        connection
+            .busy_timeout(Duration::from_secs(30))
+            .map_err(StoreError::Sqlite)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(StoreError::Sqlite)?;
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "open_read_only_success db={} busy_timeout_ms=30000",
+                config.sqlite_path.display()
+            ),
+        );
         Ok(Self { connection })
     }
 
     pub fn migrate(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        debug_db_lock_log("sqlite", format_args!("migrate_start"));
         self.connection
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;
         self.ensure_compatibility_columns()?;
         self.ensure_content_addressed_files()?;
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "migrate_success elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        );
         Ok(())
     }
 
@@ -295,6 +593,26 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)
     }
 
+    pub fn latest_file_state_for_path(
+        &self,
+        repository_id: &str,
+        path: &str,
+    ) -> Result<Option<FileStateRecord>> {
+        self.connection
+            .query_row(
+                "SELECT path, content_hash
+                   FROM files
+                  WHERE repository_id = ?1
+                    AND path = ?2
+                  ORDER BY indexed_at DESC, index_run_id DESC, id DESC
+                  LIMIT 1",
+                params![repository_id, path],
+                file_state_record,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
     pub fn file_unchanged(
         &self,
         repository_id: &str,
@@ -320,6 +638,83 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         Ok(unchanged != 0)
+    }
+
+    pub fn file_index_states(&self, repository_id: &str) -> Result<Vec<FileStateRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path, content_hash
+                   FROM files
+                  WHERE repository_id = ?1
+                  ORDER BY path, indexed_at DESC, index_run_id DESC, id DESC",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id], file_state_record)
+            .map_err(StoreError::Sqlite)?;
+        let mut latest = Vec::new();
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let state = row.map_err(StoreError::Sqlite)?;
+            if seen.insert(state.path.clone()) {
+                latest.push(state);
+            }
+        }
+        Ok(latest)
+    }
+
+    pub fn ref_file_index_states(&self, repository_ref_id: &str) -> Result<Vec<FileStateRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ref_files.path, files.content_hash
+                   FROM ref_files
+                   JOIN files ON files.id = ref_files.file_id
+                  WHERE ref_files.repository_ref_id = ?1
+                  ORDER BY ref_files.path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_ref_id], file_state_record)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn record_file_index_events(&mut self, events: &[FileIndexEventRecord]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let occurred_at = timestamp();
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        for event in events {
+            transaction
+                .execute(
+                    "INSERT INTO file_index_events (
+                       id, index_run_id, repository_id, repository_ref_id, path,
+                       old_content_hash, new_content_hash, action, reason, status,
+                       error_summary, occurred_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        event.id,
+                        event.index_run_id,
+                        event.repository_id,
+                        event.repository_ref_id,
+                        event.path,
+                        event.old_content_hash,
+                        event.new_content_hash,
+                        event.action,
+                        event.reason,
+                        event.status,
+                        event.error_summary,
+                        occurred_at,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(())
     }
 
     pub fn link_file_to_ref(&mut self, repository_ref_id: &str, file: &FileRecord) -> Result<()> {
@@ -366,7 +761,19 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(None, file, symbols, chunks, calls, tests)
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, &[], tests)
+    }
+
+    pub fn replace_file_facts_with_references_and_tests(
+        &mut self,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, symbol_references, tests)
     }
 
     pub fn replace_file_facts_for_ref_with_tests(
@@ -378,9 +785,40 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(Some(repository_ref_id), file, symbols, chunks, calls, tests)
+        self.replace_file_facts_inner(
+            Some(repository_ref_id),
+            file,
+            symbols,
+            chunks,
+            calls,
+            &[],
+            tests,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_facts_for_ref_with_references_and_tests(
+        &mut self,
+        repository_ref_id: &str,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(
+            Some(repository_ref_id),
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            tests,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn replace_file_facts_inner(
         &mut self,
         repository_ref_id: Option<&str>,
@@ -388,6 +826,7 @@ impl SqliteStore {
         symbols: &[SymbolRecord],
         chunks: &[ChunkRecord],
         calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
         let indexed_at = timestamp();
@@ -468,6 +907,21 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         transaction
+            .execute(
+                "DELETE FROM symbol_references
+                 WHERE file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM test_targets
+                 WHERE test_id IN (SELECT id FROM tests WHERE file_id = ?1)
+                    OR target_file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
             .execute("DELETE FROM tests WHERE file_id = ?1", params![file.id])
             .map_err(StoreError::Sqlite)?;
         transaction
@@ -496,6 +950,21 @@ impl SqliteStore {
                 .execute(
                     "DELETE FROM calls
                      WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM symbol_references
+                     WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM test_targets
+                     WHERE test_id IN (SELECT id FROM tests WHERE file_id = ?1)
+                        OR target_file_id = ?1",
                     params![&stale_file_id],
                 )
                 .map_err(StoreError::Sqlite)?;
@@ -548,6 +1017,46 @@ impl SqliteStore {
                         symbol.end_byte as i64,
                         symbol.index_run_id,
                         symbol.parser_version,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO symbol_references (
+                        id, file_id, source_symbol_id, target_symbol_id, reference_text, reference_kind,
+                        line, confidence, resolution_status, index_run_id, parser_version
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                      ON CONFLICT(id) DO UPDATE SET
+                        file_id = excluded.file_id,
+                        source_symbol_id = excluded.source_symbol_id,
+                        target_symbol_id = excluded.target_symbol_id,
+                        reference_text = excluded.reference_text,
+                        reference_kind = excluded.reference_kind,
+                        line = excluded.line,
+                        confidence = excluded.confidence,
+                        resolution_status = excluded.resolution_status,
+                        index_run_id = excluded.index_run_id,
+                        parser_version = excluded.parser_version",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for reference in symbol_references {
+                statement
+                    .execute(params![
+                        reference.id,
+                        reference.file_id,
+                        reference.source_symbol_id,
+                        reference.target_symbol_id,
+                        reference.reference_text,
+                        reference.reference_kind,
+                        reference.line as i64,
+                        reference.confidence as f64,
+                        reference.resolution_status,
+                        reference.index_run_id,
+                        reference.parser_version,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -660,8 +1169,49 @@ impl SqliteStore {
             }
         }
 
+        insert_inferred_test_targets(&transaction, file, tests, &indexed_at)?;
+
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(())
+    }
+
+    pub fn test_targets_for_symbol(
+        &self,
+        repository_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<TestSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT tests.id, tests.name, tests.qualified_name, tests.framework,
+                        tests.language, tests.path, tests.start_line, tests.end_line,
+                        files.content_hash, tests.index_run_id, tests.parser_version, tests.indexed_at
+                   FROM tests
+                   JOIN files ON tests.file_id = files.id
+                   JOIN test_targets ON test_targets.test_id = tests.id
+                   LEFT JOIN symbols target_symbol ON test_targets.target_symbol_id = target_symbol.id
+                   JOIN files target_file ON test_targets.target_file_id = target_file.id
+                   LEFT JOIN symbols file_symbol ON file_symbol.file_id = target_file.id
+                  WHERE tests.repository_id = ?1
+                    AND test_targets.confidence >= 0.5
+                    AND (
+                      target_symbol.id = ?2
+                      OR target_symbol.name = ?2
+                      OR target_symbol.qualified_name = ?2
+                      OR target_file.path = ?2
+                      OR file_symbol.id = ?2
+                      OR file_symbol.name = ?2
+                      OR file_symbol.qualified_name = ?2
+                    )
+                  GROUP BY tests.id
+                  ORDER BY MAX(test_targets.confidence) DESC, tests.path, tests.start_line, tests.qualified_name
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, symbol_query], test_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
     }
 
     pub fn ref_file_paths(&self, repository_ref_id: &str) -> Result<Vec<String>> {
@@ -756,6 +1306,13 @@ impl SqliteStore {
                     )
                     .map_err(StoreError::Sqlite)?;
                 transaction
+                    .execute(
+                        "DELETE FROM symbol_references
+                         WHERE file_id = ?1",
+                        params![&file_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                transaction
                     .execute("DELETE FROM tests WHERE file_id = ?1", params![&file_id])
                     .map_err(StoreError::Sqlite)?;
                 transaction
@@ -804,6 +1361,13 @@ impl SqliteStore {
                     .execute(
                         "DELETE FROM calls
                          WHERE caller_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                        params![&file_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                transaction
+                    .execute(
+                        "DELETE FROM symbol_references
+                         WHERE file_id = ?1",
                         params![&file_id],
                     )
                     .map_err(StoreError::Sqlite)?;
@@ -1150,9 +1714,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn heartbeat_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
+    pub fn heartbeat_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<usize> {
         let now = timestamp();
-        self.connection
+        let updated = self
+            .connection
             .execute(
                 "UPDATE watcher_clients
                     SET heartbeat_at = ?3,
@@ -1161,7 +1726,7 @@ impl SqliteStore {
                 params![repository_id, client_id, now],
             )
             .map_err(StoreError::Sqlite)?;
-        Ok(())
+        Ok(updated)
     }
 
     pub fn remove_watcher_client(&self, repository_id: &str, client_id: &str) -> Result<()> {
@@ -1333,6 +1898,7 @@ impl SqliteStore {
         let manifest = current_fast_embedding_manifest(
             &transaction,
             input.repository_id,
+            input.repository_ref_id,
             input.fast_model,
             input.fast_dimension,
             input.upserted_embeddings,
@@ -2075,11 +2641,19 @@ impl SqliteStore {
                   AND quality.content_hash = embeddings.content_hash
                   AND quality.text_hash = embeddings.text_hash
                   AND quality.status = 'current'
+                 LEFT JOIN quality_embedding_jobs AS existing
+                   ON existing.repository_id = embeddings.repository_id
+                  AND existing.generation_id = embeddings.generation_id
+                  AND existing.file_id = embeddings.file_id
+                  AND existing.chunk_id = embeddings.chunk_id
+                  AND existing.content_hash = embeddings.content_hash
+                  AND existing.text_hash = embeddings.text_hash
                  WHERE embeddings.repository_id = ?1
                    AND embeddings.generation_id = ?2
                    AND embeddings.semantic_layer = 'fast'
                    AND embeddings.status = 'current'
                    AND quality.chunk_id IS NULL
+                   AND existing.chunk_id IS NULL
                  ORDER BY files.path, embeddings.chunk_id",
             )
             .map_err(StoreError::Sqlite)?;
@@ -2230,6 +2804,57 @@ impl SqliteStore {
         Ok(claimed)
     }
 
+    pub fn requeue_current_terminal_quality_embedding_jobs(
+        &self,
+        repository_id: &str,
+        generation_id: &str,
+        requeued_at: &str,
+    ) -> Result<usize> {
+        let requeued = self
+            .connection
+            .execute(
+                "UPDATE quality_embedding_jobs
+                    SET status = 'pending',
+                        error_summary = NULL,
+                        updated_at = ?3
+                  WHERE repository_id = ?1
+                    AND generation_id = ?2
+                    AND (
+                        status = 'skipped_stale'
+                        OR (
+                            status = 'failed'
+                            AND error_summary LIKE 'SQLite error: database is locked%'
+                        )
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                          FROM chunk_embeddings AS fast
+                         WHERE fast.repository_id = quality_embedding_jobs.repository_id
+                           AND fast.generation_id = quality_embedding_jobs.generation_id
+                           AND fast.file_id = quality_embedding_jobs.file_id
+                           AND fast.chunk_id = quality_embedding_jobs.chunk_id
+                           AND fast.semantic_layer = 'fast'
+                           AND fast.status = 'current'
+                           AND fast.content_hash = quality_embedding_jobs.content_hash
+                           AND fast.text_hash = quality_embedding_jobs.text_hash
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM chunk_embeddings AS quality
+                         WHERE quality.repository_id = quality_embedding_jobs.repository_id
+                           AND quality.generation_id = quality_embedding_jobs.generation_id
+                           AND quality.chunk_id = quality_embedding_jobs.chunk_id
+                           AND quality.semantic_layer = 'quality'
+                           AND quality.content_hash = quality_embedding_jobs.content_hash
+                           AND quality.text_hash = quality_embedding_jobs.text_hash
+                           AND quality.status = 'current'
+                    )",
+                params![repository_id, generation_id, requeued_at],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(requeued)
+    }
+
     pub fn quality_job_source_rows(&self, job_ids: &[String]) -> Result<Vec<QualityJobSourceRow>> {
         let mut rows = Vec::with_capacity(job_ids.len());
         let mut statement = self
@@ -2345,11 +2970,23 @@ impl SqliteStore {
             .connection
             .query_row(
                 "SELECT COUNT(*)
-                 FROM chunk_embeddings
-                 WHERE repository_id = ?1
-                   AND generation_id = ?2
-                   AND semantic_layer = 'quality'
-                   AND status = 'current'",
+                                     FROM chunk_embeddings AS quality
+                                    WHERE quality.repository_id = ?1
+                                        AND quality.generation_id = ?2
+                                        AND quality.semantic_layer = 'quality'
+                                        AND quality.status = 'current'
+                                        AND EXISTS (
+                                                SELECT 1
+                                                    FROM chunk_embeddings AS fast
+                                                 WHERE fast.repository_id = quality.repository_id
+                                                     AND fast.generation_id = quality.generation_id
+                                                     AND fast.file_id = quality.file_id
+                                                     AND fast.chunk_id = quality.chunk_id
+                                                     AND fast.semantic_layer = 'fast'
+                                                     AND fast.status = 'current'
+                                                     AND fast.content_hash = quality.content_hash
+                                                     AND fast.text_hash = quality.text_hash
+                                        )",
                 params![repository_id, generation_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -2375,11 +3012,23 @@ impl SqliteStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT status, COUNT(*)
-                 FROM quality_embedding_jobs
-                 WHERE repository_id = ?1
-                   AND generation_id = ?2
-                 GROUP BY status",
+                "SELECT jobs.status, COUNT(*)
+                                     FROM quality_embedding_jobs AS jobs
+                                    WHERE jobs.repository_id = ?1
+                                        AND jobs.generation_id = ?2
+                                        AND EXISTS (
+                                                SELECT 1
+                                                    FROM chunk_embeddings AS fast
+                                                 WHERE fast.repository_id = jobs.repository_id
+                                                     AND fast.generation_id = jobs.generation_id
+                                                     AND fast.file_id = jobs.file_id
+                                                     AND fast.chunk_id = jobs.chunk_id
+                                                     AND fast.semantic_layer = 'fast'
+                                                     AND fast.status = 'current'
+                                                     AND fast.content_hash = jobs.content_hash
+                                                     AND fast.text_hash = jobs.text_hash
+                                        )
+                                    GROUP BY jobs.status",
             )
             .map_err(StoreError::Sqlite)?;
         let rows = statement
@@ -2418,6 +3067,7 @@ impl SqliteStore {
                  FROM quality_embedding_jobs
                  WHERE repository_id = ?1
                    AND generation_id = ?2
+                   AND status = 'failed'
                    AND error_summary IS NOT NULL
                  ORDER BY updated_at DESC, id DESC
                  LIMIT 1",
@@ -2439,11 +3089,23 @@ impl SqliteStore {
         let current_embeddings = transaction
             .query_row(
                 "SELECT COUNT(*)
-                 FROM chunk_embeddings
-                 WHERE repository_id = ?1
-                   AND generation_id = ?2
-                   AND semantic_layer = 'quality'
-                   AND status = 'current'",
+                                     FROM chunk_embeddings AS quality
+                                    WHERE quality.repository_id = ?1
+                                        AND quality.generation_id = ?2
+                                        AND quality.semantic_layer = 'quality'
+                                        AND quality.status = 'current'
+                                        AND EXISTS (
+                                                SELECT 1
+                                                    FROM chunk_embeddings AS fast
+                                                 WHERE fast.repository_id = quality.repository_id
+                                                     AND fast.generation_id = quality.generation_id
+                                                     AND fast.file_id = quality.file_id
+                                                     AND fast.chunk_id = quality.chunk_id
+                                                     AND fast.semantic_layer = 'fast'
+                                                     AND fast.status = 'current'
+                                                     AND fast.content_hash = quality.content_hash
+                                                     AND fast.text_hash = quality.text_hash
+                                        )",
                 params![repository_id, generation_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -2599,11 +3261,23 @@ impl SqliteStore {
         let current_embeddings = transaction
             .query_row(
                 "SELECT COUNT(*)
-                 FROM chunk_embeddings
-                 WHERE repository_id = ?1
-                   AND generation_id = ?2
-                   AND semantic_layer = 'quality'
-                   AND status = 'current'",
+                                     FROM chunk_embeddings AS quality
+                                    WHERE quality.repository_id = ?1
+                                        AND quality.generation_id = ?2
+                                        AND quality.semantic_layer = 'quality'
+                                        AND quality.status = 'current'
+                                        AND EXISTS (
+                                                SELECT 1
+                                                    FROM chunk_embeddings AS fast
+                                                 WHERE fast.repository_id = quality.repository_id
+                                                     AND fast.generation_id = quality.generation_id
+                                                     AND fast.file_id = quality.file_id
+                                                     AND fast.chunk_id = quality.chunk_id
+                                                     AND fast.semantic_layer = 'fast'
+                                                     AND fast.status = 'current'
+                                                     AND fast.content_hash = quality.content_hash
+                                                     AND fast.text_hash = quality.text_hash
+                                        )",
                 params![repository_id, generation_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -2960,6 +3634,81 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn symbols_intersecting_range(
+        &self,
+        repository_id: &str,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<Vec<SymbolSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
+                   FROM symbols
+                   JOIN files ON symbols.file_id = files.id
+                  WHERE files.repository_id = ?1
+                    AND files.path = ?2
+                    AND symbols.start_line <= ?4
+                    AND symbols.end_line >= ?3
+                  ORDER BY symbols.start_line, (symbols.end_line - symbols.start_line), symbols.qualified_name
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, path, start_line as i64, end_line as i64],
+                symbol_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn symbols_intersecting_range_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<Vec<SymbolSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
+                   FROM symbols
+                   JOIN files ON symbols.file_id = files.id
+                   JOIN ref_files ON ref_files.file_id = files.id
+                  WHERE files.repository_id = ?1
+                    AND ref_files.repository_ref_id = ?2
+                    AND files.path = ?3
+                    AND symbols.start_line <= ?5
+                    AND symbols.end_line >= ?4
+                  ORDER BY symbols.start_line, (symbols.end_line - symbols.start_line), symbols.qualified_name
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![
+                    repository_id,
+                    repository_ref_id,
+                    path,
+                    start_line as i64,
+                    end_line as i64
+                ],
+                symbol_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn calls_at_location(
         &self,
         repository_id: &str,
@@ -3096,6 +3845,11 @@ impl SqliteStore {
         repository_id: &str,
         symbol_query: &str,
     ) -> Result<Vec<TestSearchRow>> {
+        let inferred = self.test_targets_for_symbol(repository_id, symbol_query)?;
+        if !inferred.is_empty() {
+            return Ok(inferred);
+        }
+
         let mut statement = self
             .connection
             .prepare(
@@ -3119,6 +3873,98 @@ impl SqliteStore {
             .query_map(params![repository_id, symbol_query], test_search_row)
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
+    }
+
+    pub fn record_runtime_observations(
+        &mut self,
+        repository_id: &str,
+        runtime_input: &str,
+        rows: &[RuntimeObservationRecord],
+    ) -> Result<RuntimeObservationCacheSummary> {
+        let input_hash = content_hash(runtime_input.as_bytes());
+        let observed_at = timestamp();
+        let expires_at = timestamp_after_secs(RUNTIME_OBSERVATION_TTL_SECONDS);
+        let observation_id = stable_id(&[
+            "runtime-observation",
+            repository_id,
+            &input_hash,
+            &timestamp_nanos().to_string(),
+        ]);
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let pruned_expired = transaction
+            .execute(
+                "DELETE FROM runtime_observations
+                  WHERE CAST(expires_at AS INTEGER) <= CAST(?1 AS INTEGER)",
+                params![observed_at],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let previous_observations = transaction
+            .query_row(
+                "SELECT COUNT(DISTINCT observation_id)
+                   FROM runtime_observations
+                  WHERE repository_id = ?1
+                    AND input_hash = ?2",
+                params![repository_id, input_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::Sqlite)? as usize;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO runtime_observations (
+                        id, repository_id, observation_id, input_hash, observation_kind,
+                        ordinal, runtime_symbol, runtime_path, normalized_path, line, column,
+                        failing_test_name, mapped_test_name, matched, match_kind, match_summary,
+                        observed_at, expires_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for (index, row) in rows.iter().enumerate() {
+                let id = stable_id(&[
+                    "runtime-observation-row",
+                    &observation_id,
+                    &index.to_string(),
+                    &row.observation_kind,
+                    row.ordinal
+                        .map(|ordinal| ordinal.to_string())
+                        .as_deref()
+                        .unwrap_or("none"),
+                ]);
+                statement
+                    .execute(params![
+                        id,
+                        repository_id,
+                        observation_id,
+                        input_hash,
+                        row.observation_kind,
+                        row.ordinal.map(|ordinal| ordinal as i64),
+                        row.runtime_symbol,
+                        row.runtime_path,
+                        row.normalized_path,
+                        row.line.map(|line| line as i64),
+                        row.column.map(|column| column as i64),
+                        row.failing_test_name,
+                        row.mapped_test_name,
+                        row.matched,
+                        row.match_kind,
+                        row.match_summary,
+                        observed_at,
+                        expires_at,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(RuntimeObservationCacheSummary {
+            observation_id,
+            input_hash,
+            stored_rows: rows.len(),
+            previous_observations,
+            pruned_expired,
+            observed_at,
+            expires_at,
+        })
     }
 
     pub fn callees(&self, repository_id: &str, symbol_query: &str) -> Result<Vec<CallSearchRow>> {
@@ -4201,6 +5047,38 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn indexed_file_freshness_snapshots_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<FileFreshnessSnapshot>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ref_files.path, files.content_hash, files.indexed_at,
+                        files.index_run_id, files.parser_version
+                   FROM ref_files
+                   JOIN files ON files.id = ref_files.file_id
+                             AND files.repository_id = ref_files.repository_id
+                  WHERE ref_files.repository_id = ?1
+                    AND ref_files.repository_ref_id = ?2
+                  ORDER BY ref_files.path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], |row| {
+                Ok(FileFreshnessSnapshot {
+                    path: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    indexed_at: row.get(2)?,
+                    index_run_id: row.get(3)?,
+                    parser_version: row.get(4)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn rust_symbols_for_repository(&self, repository_id: &str) -> Result<Vec<SymbolRecord>> {
         let mut statement = self
             .connection
@@ -4637,6 +5515,27 @@ pub struct FileRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStateRecord {
+    pub path: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIndexEventRecord {
+    pub id: String,
+    pub index_run_id: String,
+    pub repository_id: String,
+    pub repository_ref_id: Option<String>,
+    pub path: String,
+    pub old_content_hash: Option<String>,
+    pub new_content_hash: Option<String>,
+    pub action: String,
+    pub reason: String,
+    pub status: String,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkRecord {
     pub id: String,
     pub file_id: String,
@@ -4686,6 +5585,21 @@ pub struct CallRecord {
     pub parser_version: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolReferenceRecord {
+    pub id: String,
+    pub file_id: String,
+    pub source_symbol_id: Option<String>,
+    pub target_symbol_id: Option<String>,
+    pub reference_text: String,
+    pub reference_kind: String,
+    pub line: usize,
+    pub confidence: f32,
+    pub resolution_status: String,
+    pub index_run_id: String,
+    pub parser_version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestRecord {
     pub id: String,
@@ -4716,6 +5630,33 @@ pub struct TestSearchRow {
     pub start_line: usize,
     pub end_line: usize,
     pub provenance: EvidenceProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeObservationRecord {
+    pub observation_kind: String,
+    pub ordinal: Option<usize>,
+    pub runtime_symbol: Option<String>,
+    pub runtime_path: Option<String>,
+    pub normalized_path: Option<String>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub failing_test_name: Option<String>,
+    pub mapped_test_name: Option<String>,
+    pub matched: bool,
+    pub match_kind: String,
+    pub match_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeObservationCacheSummary {
+    pub observation_id: String,
+    pub input_hash: String,
+    pub stored_rows: usize,
+    pub previous_observations: usize,
+    pub pruned_expired: usize,
+    pub observed_at: String,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4819,6 +5760,7 @@ pub struct FastEmbeddingManifestRecord {
 #[derive(Debug, Clone, Copy)]
 pub struct FastSemanticGenerationInput<'a> {
     pub repository_id: &'a str,
+    pub repository_ref_id: Option<&'a str>,
     pub fast_model: &'a str,
     pub fast_dimension: usize,
     pub vector_table: &'a str,
@@ -5483,6 +6425,17 @@ fn env_path(upper: &str, legacy: &str) -> Option<PathBuf> {
     env_value(upper, legacy).map(PathBuf::from)
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn env_value(upper: &str, legacy: &str) -> Option<String> {
     env::var(upper).ok().or_else(|| env::var(legacy).ok())
 }
@@ -5490,6 +6443,7 @@ fn env_value(upper: &str, legacy: &str) -> Option<String> {
 #[derive(Debug)]
 pub enum StoreError {
     Io(std::io::Error),
+    Json(serde_json::Error),
     Sqlite(rusqlite::Error),
     SqliteVecRegistration(symdex_sqlite_vec::SqliteVecRegistrationError),
     InvalidVectorTableName(String),
@@ -5503,6 +6457,9 @@ pub enum StoreError {
         previous_dimension: usize,
         current_dimension: usize,
     },
+    WriterBusy {
+        owner: Option<Box<WriterLeaseInfo>>,
+    },
     UnexpectedResponse(String),
 }
 
@@ -5510,6 +6467,7 @@ impl Display for StoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "filesystem error: {error}"),
+            Self::Json(error) => write!(f, "JSON error: {error}"),
             Self::Sqlite(error) => write!(f, "SQLite error: {error}"),
             Self::SqliteVecRegistration(error) => write!(f, "{error}"),
             Self::InvalidVectorTableName(name) => {
@@ -5530,11 +6488,28 @@ impl Display for StoreError {
                 f,
                 "embedding dimension changed for repository `{repository_id}` and model `{embedding_model}`: previous={previous_dimension} current={current_dimension}; reset the collection or use a new model name before reindexing"
             ),
+            Self::WriterBusy { owner } => {
+                write!(f, "{}", writer_busy_message(owner.as_deref()))
+            }
             Self::UnexpectedResponse(message) => {
                 write!(f, "unexpected vector store response: {message}")
             }
         }
     }
+}
+
+pub fn writer_busy_message(owner: Option<&WriterLeaseInfo>) -> String {
+    let Some(owner) = owner else {
+        return "database writer busy: owner=<unknown>; stop the active writer or wait for it to finish"
+            .to_owned();
+    };
+    format!(
+        "database writer busy: owner={} pid={} repo={} operation={}; stop the active writer or wait for it to finish",
+        owner.owner_kind,
+        owner.pid,
+        owner.repo_root.as_deref().unwrap_or("<none>"),
+        owner.operation
+    )
 }
 
 impl std::error::Error for StoreError {}
@@ -5549,6 +6524,366 @@ fn collect_rows<T>(
         values.push(row.map_err(StoreError::Sqlite)?);
     }
     Ok(values)
+}
+
+fn insert_inferred_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    tests: &[TestRecord],
+    indexed_at: &str,
+) -> Result<()> {
+    for test in tests {
+        if let Some(symbol_id) = test.symbol_id.as_deref() {
+            insert_direct_call_test_targets(transaction, file, test, symbol_id, indexed_at)?;
+        }
+        insert_same_module_test_target(transaction, file, test, indexed_at)?;
+        insert_naming_convention_test_targets(transaction, file, test, indexed_at)?;
+        insert_fixture_path_test_targets(transaction, file, test, indexed_at)?;
+    }
+    Ok(())
+}
+
+fn insert_direct_call_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    test_symbol_id: &str,
+    indexed_at: &str,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO test_targets (
+                id, repository_id, test_id, target_symbol_id, target_file_id,
+                relationship_kind, confidence, reason, index_run_id, parser_version, indexed_at
+             )
+             SELECT ?1 || ':' || calls.id,
+                    ?2,
+                    ?3,
+                    calls.callee_symbol_id,
+                    callee.file_id,
+                    'direct_call',
+                    CASE WHEN calls.confidence > 0.95 THEN 0.95 ELSE calls.confidence END,
+                    'resolved call from test symbol to target symbol',
+                    COALESCE(calls.index_run_id, ?4),
+                    COALESCE(calls.parser_version, ?5),
+                    ?6
+               FROM calls
+               JOIN symbols callee ON calls.callee_symbol_id = callee.id
+              WHERE calls.caller_symbol_id = ?7
+                AND calls.callee_symbol_id IS NOT NULL
+                AND calls.resolution_status IN ('resolved_exact', 'resolved_local_candidate')
+             ON CONFLICT(id) DO UPDATE SET
+                repository_id = excluded.repository_id,
+                test_id = excluded.test_id,
+                target_symbol_id = excluded.target_symbol_id,
+                target_file_id = excluded.target_file_id,
+                relationship_kind = excluded.relationship_kind,
+                confidence = excluded.confidence,
+                reason = excluded.reason,
+                index_run_id = excluded.index_run_id,
+                parser_version = excluded.parser_version,
+                indexed_at = excluded.indexed_at",
+            params![
+                stable_id(&["test-target", &test.id, "direct_call"]),
+                file.repository_id,
+                test.id,
+                test.index_run_id,
+                test.parser_version,
+                indexed_at,
+                test_symbol_id,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn insert_same_module_test_target(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    indexed_at: &str,
+) -> Result<()> {
+    if is_likely_test_file_path(&test.path) {
+        return Ok(());
+    }
+    let has_non_test_symbol: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                  FROM symbols
+                 WHERE file_id = ?1
+                   AND (?2 IS NULL OR id <> ?2)
+                 LIMIT 1
+             )",
+            params![test.file_id, test.symbol_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    if !has_non_test_symbol {
+        return Ok(());
+    }
+    insert_test_target(
+        transaction,
+        TestTargetInsert {
+            id: stable_id(&["test-target", &test.id, "same_module", &test.file_id]),
+            repository_id: &file.repository_id,
+            test_id: &test.id,
+            target_symbol_id: None,
+            target_file_id: &test.file_id,
+            relationship_kind: "same_module",
+            confidence: 0.45,
+            reason: "test shares a source file with indexed code symbols",
+            index_run_id: &test.index_run_id,
+            parser_version: &test.parser_version,
+            indexed_at,
+        },
+    )
+}
+
+fn insert_naming_convention_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    indexed_at: &str,
+) -> Result<()> {
+    let normalized_test_name = normalized_identifier(&test.name);
+    if normalized_test_name.is_empty() {
+        return Ok(());
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, name, file_id
+               FROM symbols
+              WHERE file_id = ?1
+                AND (?2 IS NULL OR id <> ?2)
+              ORDER BY start_line, id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let rows = statement
+        .query_map(params![test.file_id, test.symbol_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(StoreError::Sqlite)?;
+    let candidates = collect_rows(rows)?;
+    drop(statement);
+
+    for (symbol_id, symbol_name, target_file_id) in candidates {
+        if !test_name_matches_symbol(&normalized_test_name, &symbol_name) {
+            continue;
+        }
+        insert_test_target(
+            transaction,
+            TestTargetInsert {
+                id: stable_id(&["test-target", &test.id, "naming_convention", &symbol_id]),
+                repository_id: &file.repository_id,
+                test_id: &test.id,
+                target_symbol_id: Some(&symbol_id),
+                target_file_id: &target_file_id,
+                relationship_kind: "naming_convention",
+                confidence: 0.7,
+                reason: "test name matches an indexed symbol in the same file",
+                index_run_id: &test.index_run_id,
+                parser_version: &test.parser_version,
+                indexed_at,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_fixture_path_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    indexed_at: &str,
+) -> Result<()> {
+    let fixture_stems = fixture_target_stems(&test.path);
+    if fixture_stems.is_empty() {
+        return Ok(());
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, path
+               FROM files
+              WHERE repository_id = ?1
+                AND id <> ?2
+              ORDER BY path, id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let rows = statement
+        .query_map(params![file.repository_id, test.file_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(StoreError::Sqlite)?;
+    let candidate_files = collect_rows(rows)?;
+    drop(statement);
+
+    for (target_file_id, target_path) in candidate_files {
+        if is_likely_test_file_path(&target_path) {
+            continue;
+        }
+        let Some(target_stem) = normalized_file_stem(&target_path) else {
+            continue;
+        };
+        if !fixture_stems.contains(&target_stem) {
+            continue;
+        }
+        insert_test_target(
+            transaction,
+            TestTargetInsert {
+                id: stable_id(&["test-target", &test.id, "fixture_path", &target_file_id]),
+                repository_id: &file.repository_id,
+                test_id: &test.id,
+                target_symbol_id: None,
+                target_file_id: &target_file_id,
+                relationship_kind: "fixture_path",
+                confidence: 0.55,
+                reason: "test file path matches an indexed source file stem",
+                index_run_id: &test.index_run_id,
+                parser_version: &test.parser_version,
+                indexed_at,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+struct TestTargetInsert<'a> {
+    id: String,
+    repository_id: &'a str,
+    test_id: &'a str,
+    target_symbol_id: Option<&'a str>,
+    target_file_id: &'a str,
+    relationship_kind: &'a str,
+    confidence: f32,
+    reason: &'a str,
+    index_run_id: &'a str,
+    parser_version: &'a str,
+    indexed_at: &'a str,
+}
+
+fn insert_test_target(
+    transaction: &rusqlite::Transaction<'_>,
+    target: TestTargetInsert<'_>,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO test_targets (
+                id, repository_id, test_id, target_symbol_id, target_file_id,
+                relationship_kind, confidence, reason, index_run_id, parser_version, indexed_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                repository_id = excluded.repository_id,
+                test_id = excluded.test_id,
+                target_symbol_id = excluded.target_symbol_id,
+                target_file_id = excluded.target_file_id,
+                relationship_kind = excluded.relationship_kind,
+                confidence = excluded.confidence,
+                reason = excluded.reason,
+                index_run_id = excluded.index_run_id,
+                parser_version = excluded.parser_version,
+                indexed_at = excluded.indexed_at",
+            params![
+                target.id,
+                target.repository_id,
+                target.test_id,
+                target.target_symbol_id,
+                target.target_file_id,
+                target.relationship_kind,
+                target.confidence,
+                target.reason,
+                target.index_run_id,
+                target.parser_version,
+                target.indexed_at,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn fixture_target_stems(path: &str) -> BTreeSet<String> {
+    let mut stems = BTreeSet::new();
+    let Some(stem) = normalized_file_stem(path) else {
+        return stems;
+    };
+    if is_likely_test_file_path(path) {
+        stems.insert(strip_test_affixes(&stem));
+    }
+    stems.remove("");
+    stems
+}
+
+fn normalized_file_stem(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(normalized_identifier)
+}
+
+fn normalized_identifier(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn strip_test_affixes(stem: &str) -> String {
+    let mut stripped = stem;
+    for prefix in ["test_", "tests_"] {
+        if let Some(rest) = stripped.strip_prefix(prefix) {
+            stripped = rest;
+        }
+    }
+    for suffix in ["_test", "_tests", "_spec", "_specs"] {
+        if let Some(rest) = stripped.strip_suffix(suffix) {
+            stripped = rest;
+        }
+    }
+    stripped.to_owned()
+}
+
+fn is_likely_test_file_path(path: &str) -> bool {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized_path.as_str());
+    normalized_path.starts_with("tests/")
+        || normalized_path.contains("/tests/")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_tests.rs")
+        || file_name.ends_with("_spec.rs")
+        || file_name.ends_with("_specs.rs")
+}
+
+fn test_name_matches_symbol(normalized_test_name: &str, symbol_name: &str) -> bool {
+    let normalized_symbol = normalized_identifier(symbol_name);
+    if normalized_symbol.is_empty() {
+        return false;
+    }
+    normalized_test_name == normalized_symbol
+        || normalized_test_name == format!("test_{normalized_symbol}")
+        || normalized_test_name == format!("{normalized_symbol}_test")
+        || normalized_test_name == format!("tests_{normalized_symbol}")
+        || normalized_test_name == format!("{normalized_symbol}_tests")
 }
 
 fn ref_identity(kind: RepositoryRefKind, ref_name: Option<&str>, head_oid: Option<&str>) -> String {
@@ -5613,6 +6948,13 @@ fn repository_ref_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repository
     })
 }
 
+fn file_state_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileStateRecord> {
+    Ok(FileStateRecord {
+        path: row.get(0)?,
+        content_hash: row.get(1)?,
+    })
+}
+
 fn usize_count(value: i64, label: &str) -> Result<usize> {
     value
         .try_into()
@@ -5637,11 +6979,23 @@ fn quality_job_status_counts_in_transaction(
     let mut counts = QualityJobStatusCounts::default();
     let mut statement = transaction
         .prepare(
-            "SELECT status, COUNT(*)
-             FROM quality_embedding_jobs
-             WHERE repository_id = ?1
-               AND generation_id = ?2
-             GROUP BY status",
+            "SELECT jobs.status, COUNT(*)
+                             FROM quality_embedding_jobs AS jobs
+                            WHERE jobs.repository_id = ?1
+                                AND jobs.generation_id = ?2
+                                AND EXISTS (
+                                        SELECT 1
+                                            FROM chunk_embeddings AS fast
+                                         WHERE fast.repository_id = jobs.repository_id
+                                             AND fast.generation_id = jobs.generation_id
+                                             AND fast.file_id = jobs.file_id
+                                             AND fast.chunk_id = jobs.chunk_id
+                                             AND fast.semantic_layer = 'fast'
+                                             AND fast.status = 'current'
+                                             AND fast.content_hash = jobs.content_hash
+                                             AND fast.text_hash = jobs.text_hash
+                                )
+                            GROUP BY jobs.status",
         )
         .map_err(StoreError::Sqlite)?;
     let rows = statement
@@ -5853,6 +7207,7 @@ fn upsert_chunk_embedding_in_transaction(
 fn current_fast_embedding_manifest(
     transaction: &rusqlite::Transaction<'_>,
     repository_id: &str,
+    repository_ref_id: Option<&str>,
     fast_model: &str,
     fast_dimension: usize,
     upserted_embeddings: &[FastEmbeddingManifestRecord],
@@ -5860,46 +7215,91 @@ fn current_fast_embedding_manifest(
     use std::collections::BTreeMap;
 
     let mut manifest = BTreeMap::new();
-    let mut statement = transaction
-        .prepare(
-            "SELECT chunk_embeddings.file_id, chunk_embeddings.chunk_id,
-                    files.content_hash, chunks.text_hash, chunk_embeddings.vector_point_id
-             FROM chunk_embeddings
-             JOIN chunks ON chunk_embeddings.chunk_id = chunks.id
-             JOIN files ON chunk_embeddings.file_id = files.id
-                       AND chunks.file_id = files.id
-             WHERE files.repository_id = ?1
-               AND chunk_embeddings.repository_id = ?1
-               AND chunk_embeddings.semantic_layer = 'fast'
-               AND chunk_embeddings.embedding_model = ?2
-               AND chunk_embeddings.embedding_dimension = ?3
-               AND chunk_embeddings.vector_store = 'sqlite_vec'
-               AND chunk_embeddings.status = 'current'
-               AND chunks.excluded_reason IS NULL
-             ORDER BY chunk_embeddings.chunk_id",
-        )
-        .map_err(StoreError::Sqlite)?;
-    let rows = statement
-        .query_map(
-            params![repository_id, fast_model, fast_dimension as i64],
-            |row| {
-                Ok(FastEmbeddingManifestRecord {
-                    file_id: row.get(0)?,
-                    chunk_id: row.get(1)?,
-                    content_hash: row.get(2)?,
-                    text_hash: row.get(3)?,
-                    vector_point_id: row.get(4)?,
-                })
-            },
-        )
-        .map_err(StoreError::Sqlite)?;
-    for row in collect_rows(rows)? {
-        manifest.insert(row.chunk_id.clone(), row);
+    if let Some(repository_ref_id) = repository_ref_id {
+        let mut statement = transaction
+            .prepare(
+                "SELECT chunk_embeddings.file_id, chunk_embeddings.chunk_id,
+                        files.content_hash, chunks.text_hash, chunk_embeddings.vector_point_id
+                 FROM chunk_embeddings
+                 JOIN chunks ON chunk_embeddings.chunk_id = chunks.id
+                 JOIN files ON chunk_embeddings.file_id = files.id
+                           AND chunks.file_id = files.id
+                 JOIN ref_files
+                   ON ref_files.repository_id = files.repository_id
+                  AND ref_files.repository_ref_id = ?4
+                  AND ref_files.file_id = files.id
+                  AND ref_files.path = files.path
+                 WHERE files.repository_id = ?1
+                   AND chunk_embeddings.repository_id = ?1
+                   AND chunk_embeddings.semantic_layer = 'fast'
+                   AND chunk_embeddings.embedding_model = ?2
+                   AND chunk_embeddings.embedding_dimension = ?3
+                   AND chunk_embeddings.vector_store = 'sqlite_vec'
+                   AND chunk_embeddings.status = 'current'
+                   AND chunks.excluded_reason IS NULL
+                 ORDER BY chunk_embeddings.chunk_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![
+                    repository_id,
+                    fast_model,
+                    fast_dimension as i64,
+                    repository_ref_id
+                ],
+                fast_embedding_manifest_record,
+            )
+            .map_err(StoreError::Sqlite)?;
+        for row in collect_rows(rows)? {
+            manifest.insert(row.chunk_id.clone(), row);
+        }
+    } else {
+        let mut statement = transaction
+            .prepare(
+                "SELECT chunk_embeddings.file_id, chunk_embeddings.chunk_id,
+                        files.content_hash, chunks.text_hash, chunk_embeddings.vector_point_id
+                 FROM chunk_embeddings
+                 JOIN chunks ON chunk_embeddings.chunk_id = chunks.id
+                 JOIN files ON chunk_embeddings.file_id = files.id
+                           AND chunks.file_id = files.id
+                 WHERE files.repository_id = ?1
+                   AND chunk_embeddings.repository_id = ?1
+                   AND chunk_embeddings.semantic_layer = 'fast'
+                   AND chunk_embeddings.embedding_model = ?2
+                   AND chunk_embeddings.embedding_dimension = ?3
+                   AND chunk_embeddings.vector_store = 'sqlite_vec'
+                   AND chunk_embeddings.status = 'current'
+                   AND chunks.excluded_reason IS NULL
+                 ORDER BY chunk_embeddings.chunk_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, fast_model, fast_dimension as i64],
+                fast_embedding_manifest_record,
+            )
+            .map_err(StoreError::Sqlite)?;
+        for row in collect_rows(rows)? {
+            manifest.insert(row.chunk_id.clone(), row);
+        }
     }
     for row in upserted_embeddings {
         manifest.insert(row.chunk_id.clone(), row.clone());
     }
     Ok(manifest.into_values().collect())
+}
+
+fn fast_embedding_manifest_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<FastEmbeddingManifestRecord> {
+    Ok(FastEmbeddingManifestRecord {
+        file_id: row.get(0)?,
+        chunk_id: row.get(1)?,
+        content_hash: row.get(2)?,
+        text_hash: row.get(3)?,
+        vector_point_id: row.get(4)?,
+    })
 }
 
 fn fast_semantic_generation_id(
@@ -6121,6 +7521,27 @@ fn test_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestSearchRow> {
             index_run_id: row.get(9)?,
             parser_version: row.get(10)?,
             indexed_at: row.get(11)?,
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        },
+    })
+}
+
+fn symbol_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolSearchRow> {
+    Ok(SymbolSearchRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        qualified_name: row.get(2)?,
+        kind: row.get(3)?,
+        path: row.get(4)?,
+        start_line: row.get::<_, i64>(5)? as usize,
+        end_line: row.get::<_, i64>(6)? as usize,
+        provenance: EvidenceProvenance {
+            content_hash: row.get(7)?,
+            index_run_id: row.get(8)?,
+            parser_version: row.get(9)?,
+            indexed_at: row.get(10)?,
             embedding_model: None,
             embedding_dimension: None,
             embedded_at: None,
@@ -6775,6 +8196,26 @@ CREATE TABLE IF NOT EXISTS index_runs (
     FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS file_index_events (
+  id TEXT PRIMARY KEY,
+  index_run_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  repository_ref_id TEXT,
+  path TEXT NOT NULL,
+  old_content_hash TEXT,
+  new_content_hash TEXT,
+  action TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL,
+  error_summary TEXT,
+  occurred_at TEXT NOT NULL,
+  CHECK(action IN ('created', 'updated', 'deleted', 'skipped', 'failed')),
+  CHECK(status IN ('success', 'failed', 'skipped')),
+  FOREIGN KEY(index_run_id) REFERENCES index_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+  FOREIGN KEY(repository_ref_id) REFERENCES repository_refs(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS watchers (
   repository_id TEXT PRIMARY KEY,
   root_path TEXT NOT NULL,
@@ -6872,6 +8313,38 @@ CREATE TABLE IF NOT EXISTS calls (
   parser_version TEXT
 );
 
+CREATE TABLE IF NOT EXISTS symbol_references (
+    id TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    source_symbol_id TEXT,
+    target_symbol_id TEXT,
+    reference_text TEXT NOT NULL,
+    reference_kind TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    resolution_status TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    CHECK(reference_kind IN (
+        'import',
+        'type_reference',
+        'implementation',
+        'attribute',
+        'inheritance',
+        'decorator',
+        'config_link'
+    )),
+    CHECK(resolution_status IN (
+        'resolved_exact',
+        'resolved_local_candidate',
+        'unresolved',
+        'ambiguous'
+    )),
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+    FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS tests (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -6892,6 +8365,55 @@ CREATE TABLE IF NOT EXISTS tests (
     FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
     FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
     FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS test_targets (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    test_id TEXT NOT NULL,
+    target_symbol_id TEXT,
+    target_file_id TEXT NOT NULL,
+    relationship_kind TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    indexed_at TEXT NOT NULL,
+    CHECK(relationship_kind IN (
+        'direct_call',
+        'same_module',
+        'naming_convention',
+        'fixture_path'
+    )),
+    CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE,
+    FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL,
+    FOREIGN KEY(target_file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS runtime_observations (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    observation_kind TEXT NOT NULL,
+    ordinal INTEGER,
+    runtime_symbol TEXT,
+    runtime_path TEXT,
+    normalized_path TEXT,
+    line INTEGER,
+    column INTEGER,
+    failing_test_name TEXT,
+    mapped_test_name TEXT,
+    matched INTEGER NOT NULL,
+    match_kind TEXT NOT NULL,
+    match_summary TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    CHECK(observation_kind IN ('frame', 'failing_test')),
+    CHECK(matched IN (0, 1)),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS semantic_generations (
@@ -7019,12 +8541,26 @@ CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_calls_caller_symbol_id ON calls(caller_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_calls_callee_symbol_id ON calls(callee_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_file_kind ON symbol_references(file_id, reference_kind);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_source_kind ON symbol_references(source_symbol_id, reference_kind);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_target_kind ON symbol_references(target_symbol_id, reference_kind);
+CREATE INDEX IF NOT EXISTS idx_symbol_references_kind_status ON symbol_references(reference_kind, resolution_status);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_name ON tests(repository_id, name);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_qualified_name ON tests(repository_id, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_tests_file_id ON tests(file_id);
 CREATE INDEX IF NOT EXISTS idx_tests_symbol_id ON tests(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_test_targets_repository_kind ON test_targets(repository_id, relationship_kind);
+CREATE INDEX IF NOT EXISTS idx_test_targets_test_id ON test_targets(test_id);
+CREATE INDEX IF NOT EXISTS idx_test_targets_target_symbol ON test_targets(target_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_test_targets_target_file ON test_targets(target_file_id);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_repository_hash ON runtime_observations(repository_id, input_hash, observed_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_observation ON runtime_observations(observation_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_expires ON runtime_observations(expires_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_run_path ON file_index_events(index_run_id, path);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_path_time ON file_index_events(repository_id, path, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_action_status ON file_index_events(repository_id, action, status, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON semantic_generations(repository_id, fast_completed_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_semantic_generation_refs_generation ON semantic_generation_refs(repository_id, generation_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
@@ -7049,6 +8585,14 @@ fn timestamp() -> String {
     current_timestamp()
 }
 
+fn timestamp_after_secs(seconds: u64) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() + seconds)
+        .unwrap_or(seconds);
+    seconds.to_string()
+}
+
 fn timestamp_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7062,19 +8606,22 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use rusqlite::params;
+    use rusqlite::{Connection, params};
     use symdex_core::{
-        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
+        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, content_hash,
+        stable_id,
     };
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
-        FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus, FileRecord,
-        PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
-        RepositoryRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
-        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, TestRecord, VectorPoint,
-        WatcherClientRecord, WatcherStatusRecord, validate_vector_table_name, vector_point_id,
-        vector_rowid, vector_table_name,
+        FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus,
+        FileIndexEventRecord, FileRecord, PointPayload, QualityActivationReason,
+        QualityEmbeddingJobRecord, QualityJobCompletion, RepositoryRecord,
+        RuntimeObservationRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
+        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, SymbolReferenceRecord,
+        TestRecord, VectorPoint, WatcherClientRecord, WatcherStatusRecord, WriterLease,
+        WriterLeaseInfo, WriterLeaseKind, WriterLeaseRequest, validate_vector_table_name,
+        vector_point_id, vector_rowid, vector_table_name,
     };
 
     #[test]
@@ -7122,6 +8669,111 @@ mod tests {
             .health_check()
             .expect("sqlite-vec should report a version");
         assert!(version.starts_with("v"));
+    }
+
+    #[test]
+    fn sqlite_open_initializes_new_database_in_wal_mode() {
+        let db = TestDb::new("sqlite-new-wal");
+        let store = SqliteStore::open(&db.config()).expect("store should open");
+
+        let journal_mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode should be readable");
+
+        assert_eq!(journal_mode, "wal");
+    }
+
+    #[test]
+    fn sqlite_open_existing_database_does_not_change_journal_mode() {
+        let db = TestDb::new("sqlite-existing-journal");
+        let config = db.config();
+        let connection = Connection::open(&config.sqlite_path).expect("raw database should open");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 CREATE TABLE existing_table (id INTEGER PRIMARY KEY);",
+            )
+            .expect("raw database should be initialized");
+        drop(connection);
+
+        let store = SqliteStore::open(&config).expect("store should open");
+        let journal_mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode should be readable");
+
+        assert_eq!(journal_mode, "delete");
+    }
+
+    #[test]
+    fn writer_lease_excludes_second_writer_for_same_database() {
+        let db = TestDb::new("writer-lease-exclusive");
+        let config = db.config();
+        let _lease = WriterLease::acquire(
+            &config,
+            WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index")
+                .for_repo("repo", "/tmp/repo"),
+        )
+        .expect("first writer should acquire lease");
+
+        let error = WriterLease::acquire(
+            &config,
+            WriterLeaseRequest::new(WriterLeaseKind::QualityIndex, "index-quality"),
+        )
+        .expect_err("second writer should fail");
+
+        match error {
+            StoreError::WriterBusy { owner } => {
+                let owner = owner.expect("owner metadata should be available");
+                assert_eq!(owner.owner_kind, "manual_index");
+                assert_eq!(owner.operation, "index");
+                assert_eq!(owner.repo_root.as_deref(), Some("/tmp/repo"));
+            }
+            other => panic!("expected writer busy, got {other}"),
+        }
+    }
+
+    #[test]
+    fn writer_lease_allows_different_database_paths() {
+        let first = TestDb::new("writer-lease-first");
+        let second = TestDb::new("writer-lease-second");
+
+        let _first_lease = WriterLease::acquire(
+            &first.config(),
+            WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index"),
+        )
+        .expect("first database should acquire lease");
+        let _second_lease = WriterLease::acquire(
+            &second.config(),
+            WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index"),
+        )
+        .expect("second database should acquire lease independently");
+    }
+
+    #[test]
+    fn writer_lease_drop_allows_reacquisition_and_replaces_metadata() {
+        let db = TestDb::new("writer-lease-reacquire");
+        let config = db.config();
+        {
+            let _lease = WriterLease::acquire(
+                &config,
+                WriterLeaseRequest::new(WriterLeaseKind::ManualIndex, "index"),
+            )
+            .expect("first lease should acquire");
+        }
+
+        let _lease = WriterLease::acquire(
+            &config,
+            WriterLeaseRequest::new(WriterLeaseKind::QualityIndex, "index-quality"),
+        )
+        .expect("lease should reacquire after drop");
+        let info = WriterLeaseInfo::read_for(&config)
+            .expect("lease metadata should read")
+            .expect("lease metadata should exist");
+
+        assert_eq!(info.owner_kind, "quality_index");
+        assert_eq!(info.operation, "index-quality");
     }
 
     #[test]
@@ -7270,6 +8922,68 @@ mod tests {
     }
 
     #[test]
+    fn freshness_snapshots_can_be_scoped_to_repository_ref() {
+        let db = TestDb::new("ref-freshness-snapshots");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should be stored");
+        let main = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let feature = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "feature"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("feature".to_owned()),
+            head_oid: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            local_branches: vec!["main".to_owned(), "feature".to_owned()],
+        };
+        let old = sample_file_at("old-file", "src/lib.rs", "hash-old");
+        let current = sample_file_at("current-file", "src/lib.rs", "hash-current");
+        store
+            .sync_repository_ref(&feature)
+            .expect("feature should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(&feature.id, &old, &[], &[], &[], &[])
+            .expect("old ref snapshot should persist");
+        store.sync_repository_ref(&main).expect("main should sync");
+        store
+            .replace_file_facts_for_ref_with_tests(&main.id, &current, &[], &[], &[], &[])
+            .expect("current ref snapshot should persist");
+
+        let mut repository_hashes = store
+            .indexed_file_freshness_snapshots("repo")
+            .expect("repo snapshots should load")
+            .into_iter()
+            .map(|row| row.content_hash)
+            .collect::<Vec<_>>();
+        repository_hashes.sort();
+        assert_eq!(
+            repository_hashes,
+            vec!["hash-current".to_owned(), "hash-old".to_owned()]
+        );
+        assert_eq!(
+            store
+                .indexed_file_freshness_snapshots_for_ref("repo", &main.id)
+                .expect("ref snapshots should load")
+                .into_iter()
+                .map(|row| row.content_hash)
+                .collect::<Vec<_>>(),
+            vec!["hash-current".to_owned()]
+        );
+    }
+
+    #[test]
     fn scoped_queries_filter_through_ref_files() {
         let db = TestDb::new("ref-scoped-queries");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -7401,6 +9115,43 @@ mod tests {
         assert_eq!(pack.direct_callers.len(), 1);
         assert_eq!(pack.files, vec!["src/main.rs".to_owned()]);
         assert!(pack.notes.contains(&"repository_ref_scoped".to_owned()));
+    }
+
+    #[test]
+    fn symbols_intersecting_range_returns_only_overlapping_symbols() {
+        let db = TestDb::new("symbols-intersecting-range");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let mut outer = sample_symbol("outer-symbol", "outer", "crate::outer");
+        outer.start_line = 1;
+        outer.end_line = 12;
+        let mut inner = sample_symbol("inner-symbol", "inner", "crate::outer::inner");
+        inner.start_line = 5;
+        inner.end_line = 7;
+        let mut later = sample_symbol("later-symbol", "later", "crate::later");
+        later.start_line = 20;
+        later.end_line = 24;
+        store
+            .replace_file_facts(&sample_file("hash-1"), &[outer, inner, later], &[], &[])
+            .expect("file facts should persist");
+
+        let symbols = store
+            .symbols_intersecting_range("repo", "src/lib.rs", 6, 10)
+            .expect("symbols should load");
+
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crate::outer", "crate::outer::inner"]
+        );
     }
 
     #[test]
@@ -7772,12 +9523,26 @@ mod tests {
             "idx_symbols_qualified_name",
             "idx_calls_caller_symbol_id",
             "idx_calls_callee_symbol_id",
+            "idx_symbol_references_file_kind",
+            "idx_symbol_references_source_kind",
+            "idx_symbol_references_target_kind",
+            "idx_symbol_references_kind_status",
             "idx_tests_repository_name",
             "idx_tests_repository_qualified_name",
             "idx_tests_file_id",
             "idx_tests_symbol_id",
+            "idx_test_targets_repository_kind",
+            "idx_test_targets_test_id",
+            "idx_test_targets_target_symbol",
+            "idx_test_targets_target_file",
+            "idx_runtime_observations_repository_hash",
+            "idx_runtime_observations_observation",
+            "idx_runtime_observations_expires",
             "idx_index_runs_repository_status",
             "idx_index_runs_repository_model_status",
+            "idx_file_index_events_run_path",
+            "idx_file_index_events_repository_path_time",
+            "idx_file_index_events_repository_action_status",
             "idx_semantic_generations_repository_fast_completed",
             "idx_semantic_generation_refs_generation",
             "idx_chunk_embeddings_repository_layer_model",
@@ -7861,6 +9626,8 @@ mod tests {
         let tables = sqlite_table_names(&store);
 
         for expected in [
+            "file_index_events",
+            "symbol_references",
             "semantic_generations",
             "semantic_generation_refs",
             "chunk_embeddings",
@@ -8310,6 +10077,17 @@ mod tests {
         store
             .upsert_quality_embedding_job(&failed_job)
             .expect("failed job should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "embedding-2".to_owned(),
+                chunk_id: "chunk-2".to_owned(),
+                text_hash: "text-chunk-2".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("second fast embedding should persist");
 
         store
             .complete_quality_embedding_job(
@@ -8373,6 +10151,9 @@ mod tests {
                 "pending",
             ))
             .expect("pending job should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
 
         let progress = store
             .quality_generation_progress("repo", "generation-1")
@@ -8380,6 +10161,48 @@ mod tests {
 
         assert_eq!(progress.quality_embedded_chunks, 0);
         assert_eq!(progress.pending_jobs, 1);
+    }
+
+    #[test]
+    fn latest_quality_generation_error_ignores_excluded_jobs() {
+        let db = TestDb::new("quality-latest-error-ignores-excluded");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        let mut excluded =
+            sample_quality_embedding_job_for("generation-1", "chunk-1", "skipped_excluded");
+        excluded.error_summary = Some("quality_chunk_too_large_for_embedding".to_owned());
+        excluded.updated_at = "500".to_owned();
+        store
+            .upsert_quality_embedding_job(&excluded)
+            .expect("excluded job should persist");
+
+        assert_eq!(
+            store
+                .latest_quality_generation_error("repo", "generation-1")
+                .expect("latest quality error should load"),
+            None
+        );
+
+        let mut failed = sample_quality_embedding_job_for("generation-1", "chunk-2", "failed");
+        failed.error_summary = Some("quality embedding service unavailable".to_owned());
+        failed.updated_at = "400".to_owned();
+        store
+            .upsert_quality_embedding_job(&failed)
+            .expect("failed job should persist");
+
+        assert_eq!(
+            store
+                .latest_quality_generation_error("repo", "generation-1")
+                .expect("latest quality error should load"),
+            Some("quality embedding service unavailable".to_owned())
+        );
     }
 
     #[test]
@@ -8427,6 +10250,66 @@ mod tests {
         assert_eq!(jobs[1].chunk_id, "chunk-2");
         assert!(jobs.iter().all(|job| job.status == "pending"));
         assert!(jobs.iter().all(|job| job.created_at == "500"));
+    }
+
+    #[test]
+    fn quality_jobs_for_fast_generation_do_not_requeue_current_terminal_jobs() {
+        let db = TestDb::new("quality-jobs-skip-terminal-current");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        let mut generation = sample_semantic_generation();
+        generation.embeddable_chunks = 2;
+        generation.fast_embedded_chunks = 2;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-embedding-1".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("first fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-embedding-2".to_owned(),
+                chunk_id: "chunk-2".to_owned(),
+                text_hash: "text-chunk-2".to_owned(),
+                vector_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("second fast embedding should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-1",
+                "skipped_excluded",
+            ))
+            .expect("excluded job should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-2",
+                "failed",
+            ))
+            .expect("failed job should persist");
+
+        let jobs = store
+            .quality_embedding_jobs_for_fast_generation(
+                "repo",
+                "generation-1",
+                "mxbai-embed-large",
+                "500",
+            )
+            .expect("quality jobs should load");
+
+        assert!(
+            jobs.is_empty(),
+            "current terminal quality jobs should not be re-queued as missing coverage"
+        );
     }
 
     #[test]
@@ -8518,6 +10401,9 @@ mod tests {
         store
             .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
             .expect("quality embedding should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
 
         let summary = store
             .refresh_quality_activation("repo", "generation-1", Some(768), "700")
@@ -8552,6 +10438,9 @@ mod tests {
                 "pending",
             ))
             .expect("job should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
 
         let summary = store
             .refresh_quality_activation("repo", "generation-1", Some(768), "700")
@@ -8587,6 +10476,9 @@ mod tests {
         store
             .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
             .expect("quality embedding should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
 
         let summary = store
             .refresh_quality_activation("repo", "generation-1", Some(768), "700")
@@ -8618,6 +10510,17 @@ mod tests {
         store
             .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
             .expect("quality embedding should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "embedding-2".to_owned(),
+                chunk_id: "chunk-2".to_owned(),
+                text_hash: "text-chunk-2".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("second fast embedding should persist");
         store
             .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
                 "generation-1",
@@ -8664,6 +10567,9 @@ mod tests {
                 "failed",
             ))
             .expect("job should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
 
         let summary = store
             .refresh_quality_activation("repo", "generation-1", Some(768), "700")
@@ -8687,6 +10593,9 @@ mod tests {
         store
             .upsert_chunk_embedding(&sample_quality_chunk_embedding("current"))
             .expect("quality embedding should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
         store
             .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
                 "generation-1",
@@ -8771,6 +10680,7 @@ mod tests {
         let generation = store
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
+                repository_ref_id: None,
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "mxbai-embed-large",
@@ -8799,6 +10709,7 @@ mod tests {
         let unchanged = store
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
+                repository_ref_id: None,
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "mxbai-embed-large",
@@ -8988,6 +10899,7 @@ mod tests {
         let generation = store
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
+                repository_ref_id: None,
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
@@ -9032,6 +10944,106 @@ mod tests {
     }
 
     #[test]
+    fn fast_semantic_generation_scopes_carried_embeddings_to_repository_ref() {
+        let db = TestDb::new("fast-generation-ref-scoped-manifest");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let repository_ref = RepositoryRefSnapshot {
+            id: stable_id(&["repository-ref", "repo", "branch", "main"]),
+            repository_id: "repo".to_owned(),
+            kind: RepositoryRefKind::Branch,
+            name: Some("main".to_owned()),
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            local_branches: vec!["main".to_owned()],
+        };
+        store
+            .sync_repository_ref(&repository_ref)
+            .expect("repository ref should sync");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("seed generation should persist");
+
+        let old_file = sample_file_at("old-file", "src/lib.rs", "old-content-hash");
+        let mut old_chunk = sample_chunk("old-chunk");
+        old_chunk.file_id = old_file.id.clone();
+        old_chunk.text_hash = "old-text-hash".to_owned();
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &repository_ref.id,
+                &old_file,
+                &[],
+                &[old_chunk.clone()],
+                &[],
+                &[],
+            )
+            .expect("old ref file facts should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "old-fast-embedding".to_owned(),
+                file_id: old_file.id.clone(),
+                chunk_id: old_chunk.id.clone(),
+                content_hash: old_file.content_hash.clone(),
+                text_hash: old_chunk.text_hash.clone(),
+                vector_point_id: "old-point".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("old fast embedding should persist");
+
+        let current_file = sample_file_at("current-file", "src/lib.rs", "current-content-hash");
+        let mut current_chunk = sample_chunk("current-chunk");
+        current_chunk.file_id = current_file.id.clone();
+        current_chunk.text_hash = "current-text-hash".to_owned();
+        store
+            .replace_file_facts_for_ref_with_tests(
+                &repository_ref.id,
+                &current_file,
+                &[],
+                &[current_chunk.clone()],
+                &[],
+                &[],
+            )
+            .expect("current ref file facts should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "current-fast-embedding".to_owned(),
+                file_id: current_file.id.clone(),
+                chunk_id: current_chunk.id.clone(),
+                content_hash: current_file.content_hash.clone(),
+                text_hash: current_chunk.text_hash.clone(),
+                vector_point_id: "current-point".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("current fast embedding should persist");
+
+        let generation = store
+            .record_fast_semantic_generation(FastSemanticGenerationInput {
+                repository_id: "repo",
+                repository_ref_id: Some(&repository_ref.id),
+                fast_model: "nomic-embed-text",
+                fast_dimension: 768,
+                vector_table: "symdex_repo_nomic_embed_text",
+                upserted_embeddings: &[],
+                files_seen: 1,
+                completed_at: "200",
+            })
+            .expect("ref-scoped generation should persist");
+
+        let embeddings = store
+            .chunk_embeddings_for_generation("repo", &generation.id, "fast")
+            .expect("fast manifest should load");
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].file_id, current_file.id);
+        assert_eq!(embeddings[0].chunk_id, current_chunk.id);
+        assert_eq!(generation.embeddable_chunks, 1);
+    }
+
+    #[test]
     fn sqlite_fast_semantic_generation_ids_are_manifest_stable() {
         let db = TestDb::new("fast-generation-idempotent");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -9055,6 +11067,7 @@ mod tests {
         let first = store
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
+                repository_ref_id: None,
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
@@ -9066,6 +11079,7 @@ mod tests {
         let second = store
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
+                repository_ref_id: None,
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
@@ -9095,6 +11109,7 @@ mod tests {
         let changed = store
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
+                repository_ref_id: None,
                 fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
@@ -9140,6 +11155,22 @@ mod tests {
             ("tests", "qualified_name"),
             ("tests", "framework"),
             ("tests", "parser_version"),
+            ("test_targets", "test_id"),
+            ("test_targets", "target_symbol_id"),
+            ("test_targets", "target_file_id"),
+            ("test_targets", "relationship_kind"),
+            ("test_targets", "confidence"),
+            ("test_targets", "reason"),
+            ("runtime_observations", "observation_id"),
+            ("runtime_observations", "input_hash"),
+            ("runtime_observations", "observation_kind"),
+            ("runtime_observations", "runtime_symbol"),
+            ("runtime_observations", "normalized_path"),
+            ("runtime_observations", "failing_test_name"),
+            ("runtime_observations", "mapped_test_name"),
+            ("runtime_observations", "match_kind"),
+            ("runtime_observations", "match_summary"),
+            ("runtime_observations", "expires_at"),
         ] {
             assert!(
                 store
@@ -9228,6 +11259,15 @@ mod tests {
             .expect("likely tests should load");
         assert_eq!(likely.len(), 1);
         assert_eq!(likely[0].qualified_name, "tests::covers_target");
+        let target_kind = store
+            .connection
+            .query_row(
+                "SELECT relationship_kind FROM test_targets WHERE test_id = 'test-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("test target should persist");
+        assert_eq!(target_kind, "direct_call");
 
         store
             .replace_file_facts_with_tests(&sample_file("hash-2"), &symbols[..1], &[], &[], &[])
@@ -9238,6 +11278,119 @@ mod tests {
                 .expect("likely tests should load")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn sqlite_uses_fixture_path_test_targets_for_likely_tests() {
+        let db = TestDb::new("fixture-test-targets");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let source_file = sample_file_at("source-file", "src/calculator.rs", "hash-source");
+        let source_symbols = vec![sample_symbol_in_file(
+            "target-symbol",
+            "source-file",
+            "add",
+            "crate::calculator::add",
+        )];
+        store
+            .replace_file_facts(&source_file, &source_symbols, &[], &[])
+            .expect("source file should persist");
+
+        let test_file = sample_file_at("test-file", "tests/calculator_tests.rs", "hash-test");
+        let test = TestRecord {
+            id: "test-calculator".to_owned(),
+            repository_id: "repo".to_owned(),
+            file_id: "test-file".to_owned(),
+            symbol_id: None,
+            name: "adds numbers".to_owned(),
+            qualified_name: "tests::calculator_tests::adds numbers".to_owned(),
+            framework: "rust_test".to_owned(),
+            language: "rust".to_owned(),
+            path: "tests/calculator_tests.rs".to_owned(),
+            start_line: 4,
+            end_line: 8,
+            start_byte: 32,
+            end_byte: 96,
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        };
+        store
+            .replace_file_facts_with_tests(&test_file, &[], &[], &[], &[test])
+            .expect("fixture test should persist");
+
+        let likely = store
+            .likely_tests_for_symbol("repo", "add")
+            .expect("likely tests should load from test targets");
+        assert_eq!(
+            likely
+                .iter()
+                .map(|test| test.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tests::calculator_tests::adds numbers"]
+        );
+        let relationship = store
+            .connection
+            .query_row(
+                "SELECT relationship_kind, confidence, reason
+                   FROM test_targets
+                  WHERE test_id = 'test-calculator'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("fixture relationship should persist");
+        assert_eq!(relationship.0, "fixture_path");
+        assert!((relationship.1 - 0.55).abs() < 0.001);
+        assert_eq!(
+            relationship.2,
+            "test file path matches an indexed source file stem"
+        );
+    }
+
+    #[test]
+    fn sqlite_uses_naming_convention_test_targets_for_likely_tests() {
+        let db = TestDb::new("naming-test-targets");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let symbols = vec![
+            sample_symbol("target-symbol", "target", "crate::target"),
+            sample_symbol("test-symbol", "test_target", "crate::tests::test_target"),
+        ];
+        let tests = vec![sample_test(
+            "test-naming",
+            "test-symbol",
+            "crate::tests::test_target",
+        )];
+        store
+            .replace_file_facts_with_tests(&sample_file("hash-1"), &symbols, &[], &[], &tests)
+            .expect("test facts should persist");
+
+        let likely = store
+            .likely_tests_for_symbol("repo", "target")
+            .expect("likely tests should load from naming target");
+        assert_eq!(likely.len(), 1);
+        assert_eq!(likely[0].qualified_name, "crate::tests::test_target");
+        let kinds = test_target_kinds(&store);
+        assert!(kinds.iter().any(|kind| kind == "naming_convention"));
+        assert!(kinds.iter().any(|kind| kind == "same_module"));
     }
 
     #[test]
@@ -9273,6 +11426,77 @@ mod tests {
                 .expect("likely tests should load")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn sqlite_records_runtime_observations_without_runtime_text() {
+        let db = TestDb::new("runtime-observations");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let runtime_input = "thread 'tests::fails' panicked at src/lib.rs:42:5";
+        let summary = store
+            .record_runtime_observations(
+                "repo",
+                runtime_input,
+                &[
+                    RuntimeObservationRecord {
+                        observation_kind: "frame".to_owned(),
+                        ordinal: Some(0),
+                        runtime_symbol: Some("crate::fails".to_owned()),
+                        runtime_path: Some("src/lib.rs".to_owned()),
+                        normalized_path: Some("src/lib.rs".to_owned()),
+                        line: Some(42),
+                        column: Some(5),
+                        failing_test_name: None,
+                        mapped_test_name: None,
+                        matched: true,
+                        match_kind: "symbols_at_runtime_location".to_owned(),
+                        match_summary: "{\"reasons\":[\"metadata_only\"]}".to_owned(),
+                    },
+                    RuntimeObservationRecord {
+                        observation_kind: "failing_test".to_owned(),
+                        ordinal: None,
+                        runtime_symbol: None,
+                        runtime_path: None,
+                        normalized_path: None,
+                        line: None,
+                        column: None,
+                        failing_test_name: Some("tests::fails".to_owned()),
+                        mapped_test_name: Some("crate::tests::fails".to_owned()),
+                        matched: true,
+                        match_kind: "indexed_test_match".to_owned(),
+                        match_summary: "{\"metadata_only\":true}".to_owned(),
+                    },
+                ],
+            )
+            .expect("runtime observations should persist");
+
+        assert_eq!(summary.stored_rows, 2);
+        assert_eq!(summary.previous_observations, 0);
+        assert_eq!(summary.input_hash, content_hash(runtime_input.as_bytes()));
+        let second = store
+            .record_runtime_observations("repo", runtime_input, &[])
+            .expect("second observation should persist");
+        assert_eq!(second.previous_observations, 1);
+
+        let rows = runtime_observation_rows(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, _, summary)| {
+            !summary.contains("panicked") && !summary.contains("thread 'tests::fails'")
+        }));
+        assert!(rows.iter().any(|(kind, match_kind, _)| {
+            kind == "frame" && match_kind == "symbols_at_runtime_location"
+        }));
+        assert!(rows.iter().any(|(kind, match_kind, _)| {
+            kind == "failing_test" && match_kind == "indexed_test_match"
+        }));
     }
 
     #[test]
@@ -9597,6 +11821,68 @@ mod tests {
         let callees = store.callees("repo", "caller").expect("callees query");
         assert_eq!(callees.len(), 1);
         assert_eq!(callees[0].symbol_qualified_name.as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn sqlite_persists_symbol_references() {
+        let db = TestDb::new("symbol-references");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let symbols = vec![sample_symbol("source-symbol", "run", "run")];
+        let references = vec![SymbolReferenceRecord {
+            id: "reference-1".to_owned(),
+            file_id: "file".to_owned(),
+            source_symbol_id: Some("source-symbol".to_owned()),
+            target_symbol_id: None,
+            reference_text: "use crate::worker::Task;".to_owned(),
+            reference_kind: "import".to_owned(),
+            line: 2,
+            confidence: 0.4,
+            resolution_status: "unresolved".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        }];
+
+        store
+            .replace_file_facts_with_references_and_tests(
+                &sample_file("hash-1"),
+                &symbols,
+                &[],
+                &[],
+                &references,
+                &[],
+            )
+            .expect("symbol references should persist");
+
+        let row: (String, String, i64, f64, String) = store
+            .connection
+            .query_row(
+                "SELECT source_symbol_id, reference_kind, line, confidence, resolution_status
+                   FROM symbol_references
+                  WHERE id = 'reference-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("symbol reference should load");
+        assert_eq!(row.0, "source-symbol");
+        assert_eq!(row.1, "import");
+        assert_eq!(row.2, 2);
+        assert_eq!(row.4, "unresolved");
     }
 
     #[test]
@@ -10147,6 +12433,101 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_records_per_file_index_events() {
+        let db = TestDb::new("file-index-events");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let mut run = sample_index_run("offline", 0);
+        run.id = "run-events".to_owned();
+        store
+            .start_index_run(&run)
+            .expect("index run should persist");
+
+        store
+            .record_file_index_events(&[
+                FileIndexEventRecord {
+                    id: "event-created".to_owned(),
+                    index_run_id: "run-events".to_owned(),
+                    repository_id: "repo".to_owned(),
+                    repository_ref_id: None,
+                    path: "src/lib.rs".to_owned(),
+                    old_content_hash: None,
+                    new_content_hash: Some("hash-new".to_owned()),
+                    action: "created".to_owned(),
+                    reason: "new_file".to_owned(),
+                    status: "success".to_owned(),
+                    error_summary: None,
+                },
+                FileIndexEventRecord {
+                    id: "event-skipped".to_owned(),
+                    index_run_id: "run-events".to_owned(),
+                    repository_id: "repo".to_owned(),
+                    repository_ref_id: None,
+                    path: "src/unchanged.rs".to_owned(),
+                    old_content_hash: Some("hash-same".to_owned()),
+                    new_content_hash: Some("hash-same".to_owned()),
+                    action: "skipped".to_owned(),
+                    reason: "unchanged_content_hash".to_owned(),
+                    status: "skipped".to_owned(),
+                    error_summary: None,
+                },
+            ])
+            .expect("file events should persist");
+
+        type FileIndexEventRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+        );
+        let rows: Vec<FileIndexEventRow> = store
+            .connection
+            .prepare(
+                "SELECT path, old_content_hash, new_content_hash, action, reason, status
+                   FROM file_index_events
+                  WHERE index_run_id = 'run-events'
+                  ORDER BY path",
+            )
+            .expect("query should prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .expect("query should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows should load");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (
+                "src/lib.rs".to_owned(),
+                None,
+                Some("hash-new".to_owned()),
+                "created".to_owned(),
+                "new_file".to_owned(),
+                "success".to_owned(),
+            )
+        );
+        assert_eq!(rows[1].3, "skipped");
+        assert_eq!(rows[1].5, "skipped");
+    }
+
+    #[test]
     fn sqlite_persists_watcher_status() {
         let db = TestDb::new("watcher-status");
         let store = SqliteStore::open(&db.config()).expect("store should open");
@@ -10226,6 +12607,11 @@ mod tests {
         let clients = store.watcher_clients("repo").expect("clients should load");
         assert_ne!(clients[0].heartbeat_at.as_deref(), Some("1"));
 
+        let updated = store
+            .heartbeat_watcher_client("repo", "missing")
+            .expect("missing heartbeat should not fail");
+        assert_eq!(updated, 0);
+
         let removed = store
             .prune_stale_watcher_clients("repo", "999999999999")
             .expect("stale clients should prune");
@@ -10235,6 +12621,181 @@ mod tests {
                 .watcher_clients("repo")
                 .expect("clients should load")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn quality_worker_requeues_current_stale_jobs() {
+        let db = TestDb::new("quality-worker-requeue-current-stale");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-1",
+                "skipped_stale",
+            ))
+            .expect("stale job should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+
+        let requeued = store
+            .requeue_current_terminal_quality_embedding_jobs("repo", "generation-1", "600")
+            .expect("current stale jobs should requeue");
+
+        assert_eq!(requeued, 1);
+        let jobs = store
+            .quality_jobs_by_status("repo", "generation-1", "pending")
+            .expect("pending jobs should load");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].error_summary, None);
+        assert_eq!(jobs[0].updated_at, "600");
+    }
+
+    #[test]
+    fn quality_worker_does_not_requeue_mismatched_stale_jobs() {
+        let db = TestDb::new("quality-worker-keeps-mismatched-stale");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("new-content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-1",
+                "skipped_stale",
+            ))
+            .expect("stale job should persist");
+
+        let requeued = store
+            .requeue_current_terminal_quality_embedding_jobs("repo", "generation-1", "600")
+            .expect("mismatched stale jobs should be ignored");
+
+        assert_eq!(requeued, 0);
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "skipped_stale")
+                .expect("stale jobs should load")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quality_worker_requeues_current_transient_failed_jobs() {
+        let db = TestDb::new("quality-worker-requeue-transient-failed");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        let mut job = sample_quality_embedding_job_for("generation-1", "chunk-1", "failed");
+        job.error_summary = Some("SQLite error: database is locked".to_owned());
+        store
+            .upsert_quality_embedding_job(&job)
+            .expect("failed job should persist");
+        store
+            .upsert_chunk_embedding(&sample_chunk_embedding())
+            .expect("fast embedding should persist");
+
+        let requeued = store
+            .requeue_current_terminal_quality_embedding_jobs("repo", "generation-1", "600")
+            .expect("transient failed jobs should requeue");
+
+        assert_eq!(requeued, 1);
+        let jobs = store
+            .quality_jobs_by_status("repo", "generation-1", "pending")
+            .expect("pending jobs should load");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].error_summary, None);
+    }
+
+    #[test]
+    fn quality_worker_keeps_non_transient_failed_jobs() {
+        let db = TestDb::new("quality-worker-keeps-non-transient-failed");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        let mut job = sample_quality_embedding_job_for("generation-1", "chunk-1", "failed");
+        job.error_summary = Some("embedding model returned an invalid vector".to_owned());
+        store
+            .upsert_quality_embedding_job(&job)
+            .expect("failed job should persist");
+
+        let requeued = store
+            .requeue_current_terminal_quality_embedding_jobs("repo", "generation-1", "600")
+            .expect("non-transient failed jobs should be ignored");
+
+        assert_eq!(requeued, 0);
+        assert_eq!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "failed")
+                .expect("failed jobs should load")
+                .len(),
+            1
         );
     }
 
@@ -10832,6 +13393,38 @@ mod tests {
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
         }
+    }
+
+    fn test_target_kinds(store: &SqliteStore) -> Vec<String> {
+        let mut statement = store
+            .connection
+            .prepare("SELECT relationship_kind FROM test_targets ORDER BY relationship_kind")
+            .expect("statement should prepare");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query should run");
+        rows.map(|row| row.expect("row should load")).collect()
+    }
+
+    fn runtime_observation_rows(store: &SqliteStore) -> Vec<(String, String, String)> {
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT observation_kind, match_kind, match_summary
+                   FROM runtime_observations
+                  ORDER BY observation_kind, match_kind",
+            )
+            .expect("statement should prepare");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query should run");
+        rows.map(|row| row.expect("row should load")).collect()
     }
 
     fn unresolved_call(

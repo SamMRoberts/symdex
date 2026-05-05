@@ -25,7 +25,16 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Support a local continuous indexing mode that can be toggled on or off.
 - In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
-- SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
+- SQLite stores repositories, files, symbols, chunks, calls, tests,
+  conservative test targets, short-lived runtime observations, and index
+  metadata.
+- Only ONE process may write to the configured local SQLite/sqlite-vec database
+  at a time. The guard is database-file scoped, not repository scoped. TUI, MCP,
+  diagnostics, query, and status paths must be read-only unless they are
+  starting or attaching the single writer. Manual indexing, continuous indexing,
+  quality catch-up, repair, and future write tools must coordinate through that
+  writer, queue/coalesce work, or refuse while another writer is active to
+  prevent SQLite database lock errors.
 - SQLite stores local Git/ref metadata for repository indexes. Branch-aware
   work must preserve local branch/ref identity, detached HEAD support, and
   non-Git repository behavior.
@@ -51,7 +60,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Use `crates/symdex-core` for parsing, chunking, symbols, calls, hashing, and domain types.
 - Use `crates/symdex-diagnostics` for local service and configuration diagnostics shared by CLI and TUI.
 - Use `crates/symdex-index` for indexing orchestration shared by CLI and TUI.
-- Use `crates/symdex-query` for search, symbol-query, call-graph, impact, and context-pack orchestration shared by CLI and TUI.
+- Use `crates/symdex-query` for search, symbol-query, call-graph, impact, pre-edit change explanation, and context-pack orchestration shared by CLI and TUI.
 - Use `crates/symdex-store` for SQLite and sqlite-vec adapters.
 - Use `crates/symdex-embed` for the Ollama embedding client.
 - Use `crates/symdex-cli` for command-line orchestration.
@@ -116,6 +125,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Store symbol identity separately from display names.
 - Preserve unresolved call edges instead of dropping them.
 - Keep call resolution conservative; false certainty is worse than an unresolved edge.
+- Persist conservative test-to-code relationships in `test_targets` when
+  evidence supports direct calls, naming conventions, fixture paths, or
+  same-module file relationships. Store relationship kind, confidence, and
+  reason; do not turn weak hints into exact coverage claims.
 - Record embedding model name and vector dimension with every semantic layer.
 - A model or dimension change requires collection migration or full reindex for
   the affected layer.
@@ -135,6 +148,14 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Continuous indexing uses one background watcher per repository. TUI, MCP, and
   CLI clients hold visible watcher leases; when no clients remain, the watcher
   exits after a short grace period.
+- The database-file-scoped writer service is the only SQLite/sqlite-vec writer.
+  Watchers, manual index jobs, quality jobs, repair, migrations, and future
+  write-capable tools must submit write jobs to that service. Read paths use
+  read-only SQLite connections and do not depend on the writer service.
+- Runtime/debug evidence caching is a narrow metadata-write exception for
+  `symdex_debug_context`: store only parsed stack-frame metadata, failing test
+  names, normalized paths, match summaries, hashes, and expiry timestamps in
+  `runtime_observations`; never store pasted logs or source text.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 - Branch-aware indexing must read only local Git metadata. Do not execute hooks,
   fetch remotes, contact hosted services, or treat branch names as trusted input.
@@ -143,13 +164,19 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   from any retained local ref.
 
 ## MCP Rules
-- MCP evidence tools are read-only for the MVP. `symdex_watch_start` is the
+- MCP evidence tools are read-only by default. `symdex_watch_start` is the
   explicit local-only exception for starting or attaching the scoped background
-  watcher.
+  watcher, and `symdex_debug_context` may append metadata-only
+  `runtime_observations` rows for short-lived repeated-failure comparison.
 - Write-capable tools require a future design doc before implementation.
 - Tool names must be stable, descriptive, and versionable.
 - Tool outputs must fit agent context windows.
 - Include file paths, line ranges, scores, and confidence where relevant.
+- `symdex_explain_change` must stay read-only and metadata-only: it accepts
+  proposed `{ path, start_line, end_line, description }` targets, maps them to
+  intersecting indexed symbols, reuses impact analysis, and returns likely
+  tests, direct/transitive relationships, freshness, trust, and reason tags
+  without storing the proposal or source text.
 - Include active semantic layer, embedding model, and quality-layer status in
   semantic outputs when available.
 - Never return full files unless the tool contract explicitly allows it.

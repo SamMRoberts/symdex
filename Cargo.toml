@@ -11,6 +11,7 @@ members = [
     "crates/symdex-store",
     "crates/symdex-tui",
     "crates/symdex-watch",
+    "crates/symdex-writer",
 ]
 resolver = "3"
 

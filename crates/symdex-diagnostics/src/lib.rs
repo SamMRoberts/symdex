@@ -5,9 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
+use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, SemanticLayerStatus};
 use symdex_embed::{EmbedConfig, OllamaClient};
-use symdex_query::FreshnessSummary;
+use symdex_query::{FreshnessSummary, SemanticStatusSummary};
 use symdex_store::{EvidenceFreshness, SqliteVectorStore, StoreConfig, sqlite_parent};
 
 const RUST_ANALYZER_ENABLE_ENV: &str = "SYMDEX_RUST_ANALYZER";
@@ -34,6 +34,7 @@ pub struct DiagnosticCheck {
 pub enum DiagnosticState {
     Ok,
     Missing,
+    Pending,
     Unreachable,
     Error,
     Skipped,
@@ -44,6 +45,7 @@ impl DiagnosticState {
         match self {
             Self::Ok => "ok",
             Self::Missing => "missing",
+            Self::Pending => "pending",
             Self::Unreachable => "unreachable",
             Self::Error => "error",
             Self::Skipped => "skipped",
@@ -139,6 +141,11 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 state: DiagnosticState::Skipped,
                 message: "pass a repository path to check watcher status".to_owned(),
             },
+            DiagnosticCheck {
+                label: "semantic_quality".to_owned(),
+                state: DiagnosticState::Skipped,
+                message: "pass a repository path to check semantic quality status".to_owned(),
+            },
         ];
     };
 
@@ -149,6 +156,7 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 provenance_consistency_check(&summary),
             ];
             checks.push(watcher_status_check(repo));
+            checks.push(semantic_quality_check(repo));
             checks
         }
         Err(error) => {
@@ -165,8 +173,91 @@ fn cross_agent_repo_checks(repo: Option<&str>) -> Vec<DiagnosticCheck> {
                 },
             ];
             checks.push(watcher_status_check(repo));
+            checks.push(semantic_quality_check(repo));
             checks
         }
+    }
+}
+
+fn semantic_quality_check(repo: &str) -> DiagnosticCheck {
+    match symdex_query::run_semantic_status(repo) {
+        Ok(status) => semantic_quality_status_check(&status),
+        Err(error) => DiagnosticCheck {
+            label: "semantic_quality".to_owned(),
+            state: DiagnosticState::Error,
+            message: error,
+        },
+    }
+}
+
+fn semantic_quality_status_check(status: &SemanticStatusSummary) -> DiagnosticCheck {
+    if !status.quality_enabled {
+        return DiagnosticCheck {
+            label: "semantic_quality".to_owned(),
+            state: DiagnosticState::Skipped,
+            message: format!(
+                "quality_enabled=false active_layer={} quality_status={}",
+                status.active_layer.as_str(),
+                status.quality_status.as_str()
+            ),
+        };
+    }
+    if status.generation_id.is_none() {
+        return DiagnosticCheck {
+            label: "semantic_quality".to_owned(),
+            state: DiagnosticState::Missing,
+            message: "no semantic generation recorded; run `symdex index` first".to_owned(),
+        };
+    }
+
+    let progress = status.quality_progress.as_ref();
+    let pending = progress.map(|value| value.pending_jobs).unwrap_or(0);
+    let running = progress.map(|value| value.running_jobs).unwrap_or(0);
+    let failed = progress.map(|value| value.failed_jobs).unwrap_or(0);
+    let skipped_stale = progress.map(|value| value.skipped_stale_jobs).unwrap_or(0);
+    let skipped_excluded = progress
+        .map(|value| value.skipped_excluded_jobs)
+        .unwrap_or(0);
+    let embedded = progress
+        .map(|value| value.quality_embedded_chunks)
+        .unwrap_or(0);
+    let eligible = progress
+        .map(|value| value.quality_eligible_chunks)
+        .unwrap_or(0);
+    let state = if matches!(status.quality_status, SemanticLayerStatus::QualityReady)
+        && failed == 0
+        && skipped_stale == 0
+    {
+        DiagnosticState::Ok
+    } else if failed > 0
+        || skipped_stale > 0
+        || matches!(
+            status.quality_status,
+            SemanticLayerStatus::QualityFailed | SemanticLayerStatus::QualityStale
+        )
+    {
+        DiagnosticState::Error
+    } else if pending > 0
+        || running > 0
+        || matches!(status.quality_status, SemanticLayerStatus::QualityPending)
+    {
+        DiagnosticState::Pending
+    } else if matches!(status.quality_status, SemanticLayerStatus::QualityBlocked) {
+        DiagnosticState::Unreachable
+    } else {
+        DiagnosticState::Missing
+    };
+
+    DiagnosticCheck {
+        label: "semantic_quality".to_owned(),
+        state,
+        message: format!(
+            "quality_status={} active_layer={} reason={} pending={pending} running={running} failed={failed} stale={skipped_stale} excluded={skipped_excluded} embedded={embedded}/{eligible} latest_error={}",
+            status.quality_status.as_str(),
+            status.active_layer.as_str(),
+            status.fallback_reason.as_deref().unwrap_or("<none>"),
+            status.latest_quality_error.as_deref().unwrap_or("<none>")
+        ),
     }
 }
 
@@ -394,14 +485,22 @@ impl RustAnalyzerDiagnosticsConfig {
     }
 
     fn from_values(enabled: Option<&str>, command: Option<&str>) -> Self {
-        Self {
-            enabled: enabled.is_some_and(env_flag_enabled),
-            command: command
-                .map(str::trim)
-                .filter(|command| !command.is_empty())
-                .unwrap_or("rust-analyzer")
-                .to_owned(),
-        }
+        Self::from_values_with_detector(enabled, command, rust_analyzer_command_exists)
+    }
+
+    fn from_values_with_detector(
+        enabled: Option<&str>,
+        command: Option<&str>,
+        command_exists: impl FnOnce(&str) -> bool,
+    ) -> Self {
+        let command = command
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .unwrap_or("rust-analyzer")
+            .to_owned();
+        let enabled = enabled.map_or_else(|| command_exists(&command), env_flag_enabled);
+
+        Self { enabled, command }
     }
 }
 
@@ -410,6 +509,13 @@ fn env_flag_enabled(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn rust_analyzer_command_exists(command: &str) -> bool {
+    match Command::new(command).arg("--version").output() {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 fn rust_analyzer_check(config: &RustAnalyzerDiagnosticsConfig) -> DiagnosticCheck {
@@ -474,13 +580,16 @@ fn rust_analyzer_version_message(command: &str, output: &std::process::Output) -
 
 #[cfg(test)]
 mod tests {
-    use symdex_query::{FileFreshnessRow, FreshnessSummary};
-    use symdex_store::EvidenceFreshness;
+    use symdex_core::{SemanticLayer, SemanticLayerStatus};
+    use symdex_query::{
+        FileFreshnessRow, FreshnessSummary, SemanticStatusLayerSummary, SemanticStatusSummary,
+    };
+    use symdex_store::{EvidenceFreshness, QualityGenerationProgress};
 
     use crate::{
         DiagnosticState, RustAnalyzerDiagnosticsConfig, env_flag_enabled, index_freshness_check,
-        provenance_consistency_check, rust_analyzer_check, sqlite_database_check,
-        writable_dir_check,
+        provenance_consistency_check, rust_analyzer_check, semantic_quality_status_check,
+        sqlite_database_check, writable_dir_check,
     };
 
     #[test]
@@ -542,15 +651,42 @@ mod tests {
     }
 
     #[test]
-    fn rust_analyzer_config_is_disabled_by_default_and_honors_command_override() {
-        let default = RustAnalyzerDiagnosticsConfig::from_values(None, None);
-        assert!(!default.enabled);
-        assert_eq!(default.command, "rust-analyzer");
+    fn rust_analyzer_config_auto_detects_by_default_and_honors_command_override() {
+        let detected =
+            RustAnalyzerDiagnosticsConfig::from_values_with_detector(None, None, |command| {
+                command == "rust-analyzer"
+            });
+        assert!(detected.enabled);
+        assert_eq!(detected.command, "rust-analyzer");
 
-        let configured =
-            RustAnalyzerDiagnosticsConfig::from_values(Some("yes"), Some("/bin/rust-analyzer"));
-        assert!(configured.enabled);
-        assert_eq!(configured.command, "/bin/rust-analyzer");
+        let missing =
+            RustAnalyzerDiagnosticsConfig::from_values_with_detector(None, None, |_| false);
+        assert!(!missing.enabled);
+        assert_eq!(missing.command, "rust-analyzer");
+
+        let command_override = RustAnalyzerDiagnosticsConfig::from_values_with_detector(
+            None,
+            Some("/bin/custom-rust-analyzer"),
+            |command| command == "/bin/custom-rust-analyzer",
+        );
+        assert!(command_override.enabled);
+        assert_eq!(command_override.command, "/bin/custom-rust-analyzer");
+
+        let forced_disabled =
+            RustAnalyzerDiagnosticsConfig::from_values_with_detector(Some("0"), None, |_| true);
+        assert!(!forced_disabled.enabled);
+        assert_eq!(forced_disabled.command, "rust-analyzer");
+
+        let forced_enabled = RustAnalyzerDiagnosticsConfig::from_values_with_detector(
+            Some("yes"),
+            Some("/bin/rust-analyzer"),
+            |_| false,
+        );
+        assert!(forced_enabled.enabled);
+        assert_eq!(forced_enabled.command, "/bin/rust-analyzer");
+
+        let default = RustAnalyzerDiagnosticsConfig::from_values(None, None);
+        assert_eq!(default.command, "rust-analyzer");
     }
 
     #[test]
@@ -578,6 +714,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantic_quality_pending_is_reported_as_pending_not_unreachable() {
+        let status = semantic_status(
+            SemanticLayerStatus::QualityPending,
+            Some("quality_manifest_incomplete_using_fast_layer"),
+            Some(QualityGenerationProgress {
+                repository_id: "repo".to_owned(),
+                generation_id: "generation".to_owned(),
+                embeddable_chunks: 1_788,
+                quality_eligible_chunks: 1_772,
+                quality_ineligible_chunks: 16,
+                quality_embedded_chunks: 23,
+                pending_jobs: 1_749,
+                running_jobs: 0,
+                succeeded_jobs: 0,
+                failed_jobs: 0,
+                skipped_stale_jobs: 0,
+                skipped_excluded_jobs: 16,
+            }),
+            Some("quality_chunk_too_large_for_embedding"),
+        );
+
+        let check = semantic_quality_status_check(&status);
+
+        assert_eq!(check.state, DiagnosticState::Pending);
+        assert!(check.message.contains("quality_status=quality_pending"));
+        assert!(check.message.contains("embedded=23/1772"));
+    }
+
+    #[test]
+    fn semantic_quality_blocked_is_reported_as_unreachable() {
+        let status = semantic_status(
+            SemanticLayerStatus::QualityBlocked,
+            Some("quality_status_quality_blocked_using_fast_layer"),
+            None,
+            Some("quality model unavailable"),
+        );
+
+        let check = semantic_quality_status_check(&status);
+
+        assert_eq!(check.state, DiagnosticState::Unreachable);
+        assert!(check.message.contains("quality_status=quality_blocked"));
+    }
+
     fn freshness_summary(files: Vec<FileFreshnessRow>) -> FreshnessSummary {
         FreshnessSummary {
             repository_id: "repo".to_owned(),
@@ -585,6 +765,43 @@ mod tests {
             files,
             focus_symbols: Vec::new(),
             context_pack: None,
+        }
+    }
+
+    fn semantic_status(
+        quality_status: SemanticLayerStatus,
+        fallback_reason: Option<&str>,
+        quality_progress: Option<QualityGenerationProgress>,
+        latest_quality_error: Option<&str>,
+    ) -> SemanticStatusSummary {
+        SemanticStatusSummary {
+            repository_id: "repo".to_owned(),
+            generation_id: Some("generation".to_owned()),
+            active_layer: SemanticLayer::Fast,
+            quality_status,
+            fallback_reason: fallback_reason.map(str::to_owned),
+            fast: semantic_status_layer(SemanticLayer::Fast),
+            quality: semantic_status_layer(SemanticLayer::Quality),
+            quality_progress,
+            latest_quality_error: latest_quality_error.map(str::to_owned),
+            quality_enabled: true,
+        }
+    }
+
+    fn semantic_status_layer(semantic_layer: SemanticLayer) -> SemanticStatusLayerSummary {
+        SemanticStatusLayerSummary {
+            semantic_layer,
+            embedding_model: "model".to_owned(),
+            embedding_dimension: Some(768),
+            vector_table: "vectors".to_owned(),
+            current_chunks: 0,
+            stale_chunks: 0,
+            blocked_chunks: 0,
+            failed_chunks: 0,
+            other_chunks: 0,
+            total_chunks: 0,
+            expected_chunks: 0,
+            is_complete: false,
         }
     }
 

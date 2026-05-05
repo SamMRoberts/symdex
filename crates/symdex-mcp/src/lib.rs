@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, RepositoryRefSnapshot, content_hash};
 use symdex_query::{
-    ContextPackMode, FreshnessScope, SemanticSearchSummary, evidence_trust, run_context_pack,
-    run_debug_context_pack, run_scoped_freshness_report_with_store_config, run_semantic_search,
-    run_unified_context_pack,
+    ChangeTarget, ContextPackMode, FreshnessScope, SemanticSearchSummary, evidence_trust,
+    run_context_pack, run_debug_context_pack, run_explain_change,
+    run_scoped_freshness_report_with_store_config, run_semantic_search, run_unified_context_pack,
 };
 use symdex_store::{
     EvidenceProvenance, SqliteStore, StoreConfig, clamp_call_path_depth, freshness_for_hash,
@@ -24,6 +24,7 @@ pub const TOOL_CALLERS: &str = "symdex_callers";
 pub const TOOL_CALLEES: &str = "symdex_callees";
 pub const TOOL_CALL_PATH: &str = "symdex_call_path";
 pub const TOOL_IMPACT: &str = "symdex_impact";
+pub const TOOL_EXPLAIN_CHANGE: &str = "symdex_explain_change";
 pub const TOOL_CONTEXT_PACK: &str = "symdex_context_pack";
 pub const TOOL_DEBUG_CONTEXT: &str = "symdex_debug_context";
 pub const TOOL_STALENESS_CHECK: &str = "symdex_staleness_check";
@@ -33,7 +34,7 @@ pub const TOOL_WATCH_START: &str = "symdex_watch_start";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub fn tool_names() -> [&'static str; 12] {
+pub fn tool_names() -> [&'static str; 13] {
     [
         TOOL_SEARCH,
         TOOL_FIND_SYMBOL,
@@ -41,6 +42,7 @@ pub fn tool_names() -> [&'static str; 12] {
         TOOL_CALLEES,
         TOOL_CALL_PATH,
         TOOL_IMPACT,
+        TOOL_EXPLAIN_CHANGE,
         TOOL_CONTEXT_PACK,
         TOOL_DEBUG_CONTEXT,
         TOOL_STALENESS_CHECK,
@@ -207,6 +209,7 @@ fn dispatch_tool(
         TOOL_CALLEES => tool_callees(arguments),
         TOOL_CALL_PATH => tool_call_path(arguments),
         TOOL_IMPACT => tool_impact(arguments),
+        TOOL_EXPLAIN_CHANGE => tool_explain_change(arguments),
         TOOL_CONTEXT_PACK => tool_context_pack(arguments),
         TOOL_DEBUG_CONTEXT => tool_debug_context(arguments),
         TOOL_STALENESS_CHECK => tool_staleness_check(arguments),
@@ -218,7 +221,11 @@ fn dispatch_tool(
 }
 
 fn tool_is_read_only(name: &str) -> bool {
-    name != TOOL_WATCH_START
+    !matches!(name, TOOL_WATCH_START | TOOL_DEBUG_CONTEXT)
+}
+
+fn tool_is_idempotent(name: &str) -> bool {
+    name != TOOL_DEBUG_CONTEXT
 }
 
 fn tool_search(arguments: &Value) -> Result<Value, String> {
@@ -406,9 +413,9 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         .into_iter()
         .collect::<Vec<_>>();
     let test_note = if tests_likely.is_empty() {
-        "likely_tests_unavailable_without_indexed_direct_test_evidence"
+        "likely_tests_unavailable_without_indexed_test_target_evidence"
     } else {
-        "likely_tests_from_indexed_direct_test_calls"
+        "likely_tests_from_indexed_test_targets_or_direct_calls"
     };
     Ok(json!({
         "repository_id": root.id(),
@@ -427,6 +434,17 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
             test_note
         ]
     }))
+}
+
+fn tool_explain_change(arguments: &Value) -> Result<Value, String> {
+    let repo = required_string(arguments, "repo")?;
+    let targets_value = arguments
+        .get("targets")
+        .ok_or_else(|| "missing required array argument `targets`".to_owned())?;
+    let targets = serde_json::from_value::<Vec<ChangeTarget>>(targets_value.clone())
+        .map_err(|error| format!("parse change targets: {error}"))?;
+    let summary = run_explain_change(repo, &targets)?;
+    serde_json::to_value(summary).map_err(|error| error.to_string())
 }
 
 fn tool_context_pack(arguments: &Value) -> Result<Value, String> {
@@ -883,9 +901,7 @@ fn sqlite() -> Result<SqliteStore, String> {
 }
 
 fn sqlite_with_config(config: &StoreConfig) -> Result<SqliteStore, String> {
-    let store = SqliteStore::open(config).map_err(|error| error.to_string())?;
-    store.migrate().map_err(|error| error.to_string())?;
-    Ok(store)
+    SqliteStore::open_read_only(config).map_err(|error| error.to_string())
 }
 
 fn required_string<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -1049,6 +1065,7 @@ fn tool_definitions() -> Vec<Value> {
                 ("depth", "integer", "Maximum traversal depth, capped at 8"),
             ],
         ),
+        explain_change_tool_definition(),
         tool_definition(
             TOOL_CONTEXT_PACK,
             "Context Pack",
@@ -1166,6 +1183,56 @@ fn watch_start_tool_definition() -> Value {
     })
 }
 
+fn explain_change_tool_definition() -> Value {
+    json!({
+        "name": TOOL_EXPLAIN_CHANGE,
+        "title": "Explain Change",
+        "description": "Return a compact metadata-only pre-edit safety report for proposed line-range changes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository root path"
+                },
+                "targets": {
+                    "type": "array",
+                    "description": "Proposed changes with path, start_line, end_line, and description",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository-relative path, or absolute path inside the repository root"
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "1-based inclusive start line"
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "1-based inclusive end line"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Short metadata-only description of the proposed change"
+                            }
+                        },
+                        "required": ["path", "start_line", "end_line", "description"]
+                    }
+                }
+            },
+            "required": ["repo", "targets"]
+        },
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
+}
+
 fn tool_definition(
     name: &str,
     title: &str,
@@ -1195,9 +1262,9 @@ fn tool_definition(
             "required": required
         },
         "annotations": {
-            "readOnlyHint": true,
+            "readOnlyHint": tool_is_read_only(name),
             "destructiveHint": false,
-            "idempotentHint": true,
+            "idempotentHint": tool_is_idempotent(name),
             "openWorldHint": false
         }
     })
@@ -1221,9 +1288,9 @@ mod tests {
 
     use crate::{
         EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, TOOL_CONTEXT_PACK, TOOL_DEBUG_CONTEXT,
-        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, TOOL_STALENESS_CHECK, TOOL_WATCH_START,
-        TOOL_WATCH_STATUS, evidence_tool_result, semantic_search_summary_json, serve,
-        tool_definitions, tool_index_status_with_store, tool_names,
+        TOOL_EXPLAIN_CHANGE, TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, TOOL_STALENESS_CHECK,
+        TOOL_WATCH_START, TOOL_WATCH_STATUS, evidence_tool_result, semantic_search_summary_json,
+        serve, tool_definitions, tool_index_status_with_store, tool_names,
         tool_staleness_check_with_store, tool_success, tool_success_with_read_only,
     };
 
@@ -1279,6 +1346,7 @@ mod tests {
         }));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_FIND_SYMBOL));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_CONTEXT_PACK));
+        assert!(tools.iter().any(|tool| tool["name"] == TOOL_EXPLAIN_CHANGE));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_DEBUG_CONTEXT));
         assert!(
             tools
@@ -1289,7 +1357,8 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_WATCH_STATUS));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_WATCH_START));
         assert!(tools.iter().all(|tool| {
-            let expected_read_only = tool["name"] != TOOL_WATCH_START;
+            let expected_read_only =
+                tool["name"] != TOOL_WATCH_START && tool["name"] != TOOL_DEBUG_CONTEXT;
             tool["annotations"]["readOnlyHint"]
                 .as_bool()
                 .expect("readOnlyHint should be bool")
@@ -1324,6 +1393,52 @@ mod tests {
                 .iter()
                 .any(|value| value == "mode")
         );
+    }
+
+    #[test]
+    fn explain_change_tool_schema_advertises_targets_array() {
+        let tools = tool_definitions();
+        let explain_change = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_EXPLAIN_CHANGE)
+            .expect("explain-change tool should be listed");
+
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["type"],
+            "array"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["type"],
+            "object"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["required"],
+            json!(["path", "start_line", "end_line", "description"])
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["path"]["type"],
+            "string"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["start_line"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["end_line"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["description"]
+                ["type"],
+            "string"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["required"],
+            json!(["repo", "targets"])
+        );
+        assert_eq!(explain_change["annotations"]["readOnlyHint"], json!(true));
     }
 
     #[test]
@@ -1465,6 +1580,8 @@ mod tests {
     #[test]
     fn multiple_agents_can_read_same_index_without_write_tools() {
         let store_config = temp_store_config();
+        let store = SqliteStore::open(&store_config).expect("store should open");
+        store.migrate().expect("store should migrate");
         let arguments = json!({ "repo": "." });
 
         let agent_one = tool_index_status_with_store(&arguments, &store_config)

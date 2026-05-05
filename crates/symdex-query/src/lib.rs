@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use symdex_core::{
     DiscoveryOptions, NormalizedRepoPath, RepoRoot, RepositoryRefSnapshot, SemanticLayer,
     SemanticLayerMode, SemanticLayerStatus, discover_indexable_files,
@@ -14,7 +14,8 @@ use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, ExpectedVectorPoint,
     FileFreshnessSnapshot, IndexCoverageSummary, IndexRunsTimelineSummary,
-    QualityGenerationProgress, RetrievedPoint, ScoredPoint, SemanticLayerManifestSummary,
+    QualityGenerationProgress, RetrievedPoint, RuntimeObservationCacheSummary,
+    RuntimeObservationRecord, ScoredPoint, SemanticLayerManifestSummary,
     SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore, SqliteVectorStore,
     StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
     SymbolOutlineSummary, SymbolSearchRow, TestSearchRow, clamp_call_path_depth,
@@ -373,7 +374,7 @@ pub struct CallPathSummary {
     pub paths: Vec<CallPath>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactSummary {
     pub repository_id: String,
     pub query: String,
@@ -385,6 +386,60 @@ pub struct ImpactSummary {
     pub related_files: Vec<ImpactRelatedFile>,
     pub tests_likely: Vec<String>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeTarget {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExplainChangeSummary {
+    pub format: String,
+    pub repository_id: String,
+    pub targets: Vec<ExplainChangeTarget>,
+    pub affected_symbols: Vec<ExplainChangeSymbol>,
+    pub direct_callers: Vec<ImpactCallEvidence>,
+    pub direct_callees: Vec<ImpactCallEvidence>,
+    pub transitive_callers: Vec<ImpactPathEvidence>,
+    pub transitive_callees: Vec<ImpactPathEvidence>,
+    pub related_files: Vec<ImpactRelatedFile>,
+    pub likely_tests: Vec<String>,
+    pub limits: ExplainChangeLimits,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExplainChangeTarget {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub description: String,
+    pub matched: bool,
+    pub symbols: Vec<String>,
+    pub freshness: EvidenceFreshness,
+    pub provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExplainChangeSymbol {
+    pub symbol: SymbolSearchRow,
+    pub target_indexes: Vec<usize>,
+    pub freshness: EvidenceFreshness,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExplainChangeLimits {
+    pub max_targets: usize,
+    pub max_symbols_per_target: usize,
+    pub max_depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,7 +503,7 @@ pub struct VectorVerifyOptions {
     pub semantic_layer: VectorVerifySemanticLayer,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactCallEvidence {
     pub row: CallSearchRow,
     pub freshness: EvidenceFreshness,
@@ -456,7 +511,7 @@ pub struct ImpactCallEvidence {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactPathEvidence {
     pub path: CallPath,
     pub edge_freshness: Vec<EvidenceFreshness>,
@@ -466,7 +521,7 @@ pub struct ImpactPathEvidence {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactRelatedFile {
     pub path: String,
     pub relationship_count: usize,
@@ -519,6 +574,7 @@ pub struct RuntimeFrame {
 pub struct DebugContextPack {
     pub format: String,
     pub repository_id: String,
+    pub runtime_observation: Option<Box<RuntimeObservationCacheSummary>>,
     pub frames: Vec<DebugFrameMatch>,
     pub call_paths_between_frames: Vec<DebugFrameCallPath>,
     pub likely_tests: Vec<String>,
@@ -679,6 +735,193 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
     build_impact_summary(&root, &sqlite, repository_ref_id.as_deref(), query)
 }
 
+pub fn run_explain_change(
+    repo: &str,
+    targets: &[ChangeTarget],
+) -> Result<ExplainChangeSummary, String> {
+    if targets.is_empty() {
+        return Err("explain-change requires at least one change target".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    build_explain_change_summary(&root, &sqlite, repository_ref_id.as_deref(), targets)
+}
+
+fn build_explain_change_summary(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    repository_ref_id: Option<&str>,
+    targets: &[ChangeTarget],
+) -> Result<ExplainChangeSummary, String> {
+    let max_targets = 25;
+    if targets.len() > max_targets {
+        return Err(format!(
+            "explain-change accepts at most {max_targets} change targets"
+        ));
+    }
+    let current_hashes = current_hashes(root)?;
+    let mut output_targets = Vec::new();
+    let mut symbol_map: BTreeMap<String, ExplainChangeSymbol> = BTreeMap::new();
+    let mut direct_callers: BTreeMap<String, ImpactCallEvidence> = BTreeMap::new();
+    let mut direct_callees: BTreeMap<String, ImpactCallEvidence> = BTreeMap::new();
+    let mut transitive_callers: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
+    let mut transitive_callees: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
+    let mut related_files: BTreeMap<String, ImpactRelatedFile> = BTreeMap::new();
+    let mut likely_tests = BTreeSet::new();
+    let mut notes = vec![
+        "metadata_only_no_source_text".to_owned(),
+        "read_only_pre_edit_analysis".to_owned(),
+    ];
+
+    for (target_index, target) in targets.iter().enumerate() {
+        let normalized_path = normalize_change_target_path(root, &target.path)?;
+        validate_change_target(target, &normalized_path)?;
+        let symbols = if let Some(repository_ref_id) = repository_ref_id {
+            sqlite.symbols_intersecting_range_for_ref(
+                root.id(),
+                repository_ref_id,
+                &normalized_path,
+                target.start_line,
+                target.end_line,
+            )
+        } else {
+            sqlite.symbols_intersecting_range(
+                root.id(),
+                &normalized_path,
+                target.start_line,
+                target.end_line,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        let symbol_names = symbols
+            .iter()
+            .map(|symbol| symbol.qualified_name.clone())
+            .collect::<Vec<_>>();
+        let provenance = sqlite
+            .file_provenance(root.id(), &normalized_path)
+            .map_err(|error| error.to_string())?;
+        let current_hash = current_hashes.get(&normalized_path).map(String::as_str);
+        let freshness = freshness_for_hash(
+            provenance
+                .as_ref()
+                .and_then(|provenance| provenance.content_hash.as_deref()),
+            current_hash,
+        );
+        let trust = evidence_trust(freshness, provenance.as_ref(), None);
+        let mut target_reasons = vec![
+            format!("change_target:{target_index}"),
+            format!("path:{normalized_path}"),
+            format!("line_range:{}-{}", target.start_line, target.end_line),
+        ];
+        if symbols.is_empty() {
+            target_reasons.push("no_intersecting_indexed_symbols".to_owned());
+            notes.push(format!(
+                "target_without_symbols:{target_index}:{normalized_path}"
+            ));
+        } else {
+            target_reasons.push(format!("intersecting_symbols:{}", symbols.len()));
+        }
+        if provenance.is_some() {
+            target_reasons.push("file_provenance_match".to_owned());
+        } else {
+            target_reasons.push("file_provenance:missing".to_owned());
+        }
+        output_targets.push(ExplainChangeTarget {
+            path: normalized_path.clone(),
+            start_line: target.start_line,
+            end_line: target.end_line,
+            description: target.description.trim().to_owned(),
+            matched: !symbols.is_empty(),
+            symbols: symbol_names,
+            freshness,
+            provenance,
+            trust,
+            reasons: target_reasons,
+        });
+
+        for symbol in symbols {
+            let symbol_freshness = freshness_for_hash(
+                symbol.provenance.content_hash.as_deref(),
+                current_hashes.get(&symbol.path).map(String::as_str),
+            );
+            let symbol_trust = evidence_trust(symbol_freshness, Some(&symbol.provenance), None);
+            let symbol_entry =
+                symbol_map
+                    .entry(symbol.id.clone())
+                    .or_insert_with(|| ExplainChangeSymbol {
+                        symbol: symbol.clone(),
+                        target_indexes: Vec::new(),
+                        freshness: symbol_freshness,
+                        trust: symbol_trust,
+                        reasons: vec![
+                            "intersects_change_target_range".to_owned(),
+                            format!("path:{}", symbol.path),
+                            format!("symbol:{}", symbol.qualified_name),
+                        ],
+                    });
+            if !symbol_entry.target_indexes.contains(&target_index) {
+                symbol_entry.target_indexes.push(target_index);
+            }
+            symbol_entry
+                .reasons
+                .push(format!("change_target:{target_index}"));
+
+            let impact =
+                build_impact_summary(root, sqlite, repository_ref_id, &symbol.qualified_name)?;
+            for evidence in impact.direct_callers {
+                direct_callers
+                    .entry(impact_call_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for evidence in impact.direct_callees {
+                direct_callees
+                    .entry(impact_call_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for evidence in impact.transitive_callers {
+                transitive_callers
+                    .entry(impact_path_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for evidence in impact.transitive_callees {
+                transitive_callees
+                    .entry(impact_path_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for file in impact.related_files {
+                merge_related_file(&mut related_files, file);
+            }
+            likely_tests.extend(impact.tests_likely);
+        }
+    }
+
+    if symbol_map.is_empty() {
+        notes.push("no_impacted_symbols_from_change_targets".to_owned());
+    } else {
+        notes.push("impact_reused_for_intersecting_symbols".to_owned());
+    }
+
+    Ok(ExplainChangeSummary {
+        format: "symdex.explain_change.v1".to_owned(),
+        repository_id: root.id().to_owned(),
+        targets: output_targets,
+        affected_symbols: symbol_map.into_values().collect(),
+        direct_callers: direct_callers.into_values().collect(),
+        direct_callees: direct_callees.into_values().collect(),
+        transitive_callers: transitive_callers.into_values().collect(),
+        transitive_callees: transitive_callees.into_values().collect(),
+        related_files: related_files.into_values().collect(),
+        likely_tests: likely_tests.into_iter().collect(),
+        limits: ExplainChangeLimits {
+            max_targets,
+            max_symbols_per_target: 25,
+            max_depth: 4,
+        },
+        notes,
+    })
+}
+
 fn build_impact_summary(
     root: &RepoRoot,
     sqlite: &SqliteStore,
@@ -728,9 +971,9 @@ fn build_impact_summary(
         .map_err(|error| error.to_string())?;
     let mut notes = vec!["metadata_only_no_source_text".to_owned()];
     if tests_likely.is_empty() {
-        notes.push("likely_tests_unavailable_without_indexed_direct_test_evidence".to_owned());
+        notes.push("likely_tests_unavailable_without_indexed_test_target_evidence".to_owned());
     } else {
-        notes.push("likely_tests_from_indexed_direct_test_calls".to_owned());
+        notes.push("likely_tests_from_indexed_test_targets_or_direct_calls".to_owned());
     }
 
     Ok(ImpactSummary {
@@ -896,9 +1139,16 @@ pub fn run_debug_context_pack(
         return Err("debug-context requires runtime failure input".to_owned());
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
+    let mut sqlite = sqlite_for_write()?;
     let current_hashes = current_hashes(&root)?;
-    build_debug_context_pack(&root, &sqlite, runtime_input, limit, &current_hashes)
+    let mut pack = build_debug_context_pack(&root, &sqlite, runtime_input, limit, &current_hashes)?;
+    let observations = runtime_observation_records(&sqlite, root.id(), runtime_input, &pack)?;
+    let cache_summary = sqlite
+        .record_runtime_observations(root.id(), runtime_input, &observations)
+        .map_err(|error| error.to_string())?;
+    pack.runtime_observation = Some(Box::new(cache_summary));
+    pack.notes.push("runtime_observation_cached".to_owned());
+    Ok(pack)
 }
 
 pub fn run_freshness_report(
@@ -937,9 +1187,13 @@ fn build_freshness_report(
     scope: FreshnessScope,
 ) -> Result<FreshnessSummary, String> {
     let current_hashes = current_hashes(root)?;
-    let indexed = sqlite
-        .indexed_file_freshness_snapshots(root.id())
-        .map_err(|error| error.to_string())?;
+    let repository_ref_id = active_ref_scope(root, sqlite)?;
+    let indexed = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+        sqlite.indexed_file_freshness_snapshots_for_ref(root.id(), repository_ref_id)
+    } else {
+        sqlite.indexed_file_freshness_snapshots(root.id())
+    }
+    .map_err(|error| error.to_string())?;
 
     let explicit_paths = normalize_freshness_paths(&scope.paths)?;
 
@@ -953,15 +1207,21 @@ fn build_freshness_report(
         .filter(|query| !query.is_empty())
         .map(str::to_owned);
     if let Some(query) = &query {
-        focus_symbols = sqlite
-            .find_symbols(root.id(), query)
-            .map_err(|error| error.to_string())?;
+        focus_symbols = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+            sqlite.find_symbols_for_ref(root.id(), repository_ref_id, query)
+        } else {
+            sqlite.find_symbols(root.id(), query)
+        }
+        .map_err(|error| error.to_string())?;
         for symbol in &focus_symbols {
             symbol_scoped_paths.insert(symbol.path.clone());
         }
-        let pack = sqlite
-            .context_pack(root.id(), query, 8)
-            .map_err(|error| error.to_string())?;
+        let pack = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
+            sqlite.context_pack_for_ref(root.id(), repository_ref_id, query, 8)
+        } else {
+            sqlite.context_pack(root.id(), query, 8)
+        }
+        .map_err(|error| error.to_string())?;
         for path in &pack.files {
             symbol_scoped_paths.insert(path.clone());
         }
@@ -2571,6 +2831,7 @@ fn build_debug_context_pack(
     Ok(DebugContextPack {
         format: "symdex.debug_context.v1".to_owned(),
         repository_id: root.id().to_owned(),
+        runtime_observation: None,
         frames,
         call_paths_between_frames,
         likely_tests: mapped_tests.tests,
@@ -2582,6 +2843,103 @@ fn build_debug_context_pack(
         },
         notes,
     })
+}
+
+fn runtime_observation_records(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    runtime_input: &str,
+    pack: &DebugContextPack,
+) -> Result<Vec<RuntimeObservationRecord>, String> {
+    let parsed = parse_runtime_input(runtime_input);
+    let mut rows = Vec::new();
+    for frame in &pack.frames {
+        let match_summary = serde_json::json!({
+            "metadata_only": true,
+            "reasons": &frame.reasons,
+            "file_freshness": frame.file_freshness.label(),
+            "trust_level": &frame.trust.level,
+            "trust_score": frame.trust.score,
+            "matched_symbol_count": frame.matched_symbols.len(),
+            "calls_at_line_count": frame.calls_at_line.len(),
+            "matched_symbol_qualified_names": frame
+                .matched_symbols
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        rows.push(RuntimeObservationRecord {
+            observation_kind: "frame".to_owned(),
+            ordinal: Some(frame.frame.ordinal),
+            runtime_symbol: frame.frame.symbol.clone(),
+            runtime_path: frame.frame.path.clone(),
+            normalized_path: frame.normalized_path.clone(),
+            line: frame.frame.line,
+            column: frame.frame.column,
+            failing_test_name: None,
+            mapped_test_name: None,
+            matched: frame.matched,
+            match_kind: debug_frame_match_kind(frame).to_owned(),
+            match_summary,
+        });
+    }
+
+    for failing_test in parsed.failing_tests {
+        let mapped_test = map_single_failing_test(sqlite, repository_id, &failing_test)?;
+        let matched = mapped_test.is_some();
+        let match_kind = if matched {
+            "indexed_test_match"
+        } else {
+            "runtime_name_fallback"
+        };
+        let match_summary = serde_json::json!({
+            "metadata_only": true,
+            "runtime_failing_test": failing_test.clone(),
+            "mapped_test_name": mapped_test.clone(),
+            "match_kind": match_kind,
+        })
+        .to_string();
+        rows.push(RuntimeObservationRecord {
+            observation_kind: "failing_test".to_owned(),
+            ordinal: None,
+            runtime_symbol: None,
+            runtime_path: None,
+            normalized_path: None,
+            line: None,
+            column: None,
+            failing_test_name: Some(failing_test),
+            mapped_test_name: mapped_test,
+            matched,
+            match_kind: match_kind.to_owned(),
+            match_summary,
+        });
+    }
+    Ok(rows)
+}
+
+fn debug_frame_match_kind(frame: &DebugFrameMatch) -> &'static str {
+    if !frame.matched {
+        "unmatched_runtime_frame"
+    } else if frame
+        .reasons
+        .iter()
+        .any(|reason| reason == "symbols_at_runtime_location")
+    {
+        "symbols_at_runtime_location"
+    } else if frame
+        .reasons
+        .iter()
+        .any(|reason| reason == "symbol_name_fallback_match")
+    {
+        "symbol_name_fallback_match"
+    } else if !frame.calls_at_line.is_empty() {
+        "calls_at_runtime_line"
+    } else if frame.file_provenance.is_some() {
+        "file_provenance_match"
+    } else {
+        "metadata_match"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2600,25 +2958,13 @@ fn map_failing_tests(
     let mut used_indexed_tests = false;
     let mut used_runtime_fallbacks = false;
     for failing_test in failing_tests {
-        let mut matches = Vec::new();
-        for candidate in runtime_test_name_candidates(failing_test) {
-            matches.extend(
-                sqlite
-                    .tests_matching_name(repository_id, &candidate)
-                    .map_err(|error| error.to_string())?,
-            );
-            if !matches.is_empty() {
-                break;
-            }
-        }
+        let matches = map_failing_test_matches(sqlite, repository_id, failing_test)?;
         if matches.is_empty() {
             used_runtime_fallbacks = true;
             tests.insert(failing_test.clone());
         } else {
             used_indexed_tests = true;
-            for test in matches {
-                tests.insert(test.qualified_name);
-            }
+            tests.extend(matches);
         }
     }
     Ok(MappedTests {
@@ -2626,6 +2972,37 @@ fn map_failing_tests(
         used_indexed_tests,
         used_runtime_fallbacks,
     })
+}
+
+fn map_single_failing_test(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    failing_test: &str,
+) -> Result<Option<String>, String> {
+    Ok(
+        map_failing_test_matches(sqlite, repository_id, failing_test)?
+            .into_iter()
+            .next(),
+    )
+}
+
+fn map_failing_test_matches(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    failing_test: &str,
+) -> Result<Vec<String>, String> {
+    for candidate in runtime_test_name_candidates(failing_test) {
+        let matches = sqlite
+            .tests_matching_name(repository_id, &candidate)
+            .map_err(|error| error.to_string())?;
+        if !matches.is_empty() {
+            return Ok(matches
+                .into_iter()
+                .map(|test| test.qualified_name)
+                .collect());
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn runtime_test_name_candidates(name: &str) -> Vec<String> {
@@ -2913,9 +3290,14 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
 }
 
 fn sqlite_for_read_with_config(store_config: &StoreConfig) -> Result<SqliteStore, String> {
-    let sqlite = SqliteStore::open(store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
-    Ok(sqlite)
+    SqliteStore::open_read_only(store_config).map_err(|error| error.to_string())
+}
+
+fn sqlite_for_write() -> Result<SqliteStore, String> {
+    let store_config = StoreConfig::from_env();
+    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 fn active_ref_scope(root: &RepoRoot, sqlite: &SqliteStore) -> Result<Option<String>, String> {
@@ -2930,7 +3312,7 @@ fn active_ref_scope(root: &RepoRoot, sqlite: &SqliteStore) -> Result<Option<Stri
 }
 
 fn current_hashes(root: &RepoRoot) -> Result<BTreeMap<String, String>, String> {
-    discover_indexable_files(root, &DiscoveryOptions::default())
+    discover_indexable_files(root, &DiscoveryOptions::from_env())
         .map_err(|error| error.to_string())
         .map(|files| {
             files
@@ -3235,6 +3617,79 @@ fn aggregate_trust(trust: &[EvidenceTrust]) -> EvidenceTrust {
     }
 }
 
+fn normalize_change_target_path(root: &RepoRoot, path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("change target path must not be empty".to_owned());
+    }
+    let path_value = Path::new(trimmed);
+    if path_value.is_absolute() {
+        return root
+            .normalize_existing_path(path_value)
+            .map(|path| path.as_str().to_owned())
+            .map_err(|error| {
+                format!("absolute change target paths must exist inside the repository: {error}")
+            });
+    }
+    NormalizedRepoPath::new(trimmed)
+        .map(|path| path.as_str().to_owned())
+        .map_err(|error| error.to_string())
+}
+
+fn validate_change_target(target: &ChangeTarget, normalized_path: &str) -> Result<(), String> {
+    if target.start_line == 0 || target.end_line == 0 {
+        return Err(format!(
+            "change target `{normalized_path}` line ranges are 1-based"
+        ));
+    }
+    if target.end_line < target.start_line {
+        return Err(format!(
+            "change target `{normalized_path}` has end_line before start_line"
+        ));
+    }
+    if target.description.trim().is_empty() {
+        return Err(format!(
+            "change target `{normalized_path}` requires a non-empty description"
+        ));
+    }
+    Ok(())
+}
+
+fn impact_call_key(evidence: &ImpactCallEvidence) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        evidence.row.path.as_deref().unwrap_or("<unknown>"),
+        evidence.row.start_line.unwrap_or(0),
+        evidence.row.symbol_id.as_deref().unwrap_or("<unresolved>"),
+        evidence.row.callee_text,
+        evidence.row.call_line
+    )
+}
+
+fn impact_path_key(evidence: &ImpactPathEvidence) -> String {
+    evidence
+        .path
+        .edges
+        .iter()
+        .map(|edge| edge.call_id.as_str())
+        .collect::<Vec<_>>()
+        .join(">")
+}
+
+fn merge_related_file(files: &mut BTreeMap<String, ImpactRelatedFile>, file: ImpactRelatedFile) {
+    if let Some(existing) = files.get_mut(&file.path) {
+        existing.relationship_count += file.relationship_count;
+        extend_unique(&mut existing.reasons, file.reasons);
+        if file.trust.score > existing.trust.score {
+            existing.freshness = file.freshness;
+            existing.provenance = file.provenance;
+            existing.trust = file.trust;
+        }
+    } else {
+        files.insert(file.path.clone(), file);
+    }
+}
+
 fn impact_related_files(
     direct_callers: &[ImpactCallEvidence],
     direct_callees: &[ImpactCallEvidence],
@@ -3352,7 +3807,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
-        RepoRoot, SemanticLayer, SemanticLayerMode, SemanticLayerStatus, content_hash,
+        RepoRoot, RepositoryRefSnapshot, SemanticLayer, SemanticLayerMode, SemanticLayerStatus,
+        content_hash,
     };
     use symdex_embed::LayeredEmbedConfig;
     use symdex_store::{
@@ -3364,14 +3820,15 @@ mod tests {
     };
 
     use crate::{
-        CallDirection, ContextEvidenceSource, ContextPackMode, FreshnessScope, QueryMode,
-        SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
-        VectorVerifySemanticLayer, build_debug_context_pack, build_freshness_report,
-        build_impact_summary, build_unified_context_pack, evidence_trust, freshness_rows,
-        parse_runtime_input, resolve_semantic_search_target, run_call_graph, run_call_path,
-        run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
-        run_symbol_search, semantic_reasons, semantic_result_from_point,
-        semantic_status_from_routing, vector_verify_all_summary, vector_verify_summary,
+        CallDirection, ChangeTarget, ContextEvidenceSource, ContextPackMode, FreshnessScope,
+        QueryMode, SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
+        VectorVerifySemanticLayer, build_debug_context_pack, build_explain_change_summary,
+        build_freshness_report, build_impact_summary, build_unified_context_pack, evidence_trust,
+        freshness_rows, parse_runtime_input, resolve_semantic_search_target, run_call_graph,
+        run_call_path, run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
+        run_symbol_search, runtime_observation_records, semantic_reasons,
+        semantic_result_from_point, semantic_status_from_routing, vector_verify_all_summary,
+        vector_verify_summary,
     };
     use symdex_store::QualityGenerationProgress;
 
@@ -4217,6 +4674,41 @@ mod tests {
     }
 
     #[test]
+    fn debug_context_builds_metadata_only_runtime_observation_rows() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+        let input = "test tests::covers_callee ... FAILED\n\
+                     thread 'tests::covers_callee' panicked at src/fresh.rs:1:1:\n\
+                     stack backtrace:\n\
+                     0: crate::fresh\n\
+                        at src/fresh.rs:1:1\n";
+        let pack =
+            build_debug_context_pack(&fixture.root, &fixture.store, input, 8, &BTreeMap::new())
+                .expect("debug context should build");
+
+        let rows = runtime_observation_records(&fixture.store, &repository_id, input, &pack)
+            .expect("runtime observation rows should build");
+
+        assert!(rows.iter().any(|row| {
+            row.observation_kind == "frame"
+                && row.normalized_path.as_deref() == Some("src/fresh.rs")
+                && row.match_kind == "symbols_at_runtime_location"
+                && row.matched
+        }));
+        assert!(rows.iter().any(|row| {
+            row.observation_kind == "failing_test"
+                && row.failing_test_name.as_deref() == Some("tests::covers_callee")
+                && row.mapped_test_name.as_deref() == Some("crate::tests::covers_callee")
+                && row.match_kind == "indexed_test_match"
+        }));
+        assert!(rows.iter().all(|row| {
+            !row.match_summary.contains("stack backtrace")
+                && !row.match_summary.contains("thread 'tests::covers_callee'")
+        }));
+    }
+
+    #[test]
     fn impact_includes_tests_that_directly_call_target_symbol() {
         let mut fixture = DebugFixture::new();
         let repository_id = fixture.root.id().to_owned();
@@ -4263,8 +4755,52 @@ mod tests {
             summary
                 .notes
                 .iter()
-                .any(|note| note == "likely_tests_from_indexed_direct_test_calls")
+                .any(|note| note == "likely_tests_from_indexed_test_targets_or_direct_calls")
         );
+    }
+
+    #[test]
+    fn explain_change_maps_line_range_to_impact_and_likely_tests() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+        let targets = vec![ChangeTarget {
+            path: "src/callee.rs".to_owned(),
+            start_line: 1,
+            end_line: 2,
+            description: "adjust callee behavior".to_owned(),
+        }];
+
+        let summary = build_explain_change_summary(&fixture.root, &fixture.store, None, &targets)
+            .expect("explain-change summary should build");
+
+        assert_eq!(summary.format, "symdex.explain_change.v1");
+        assert_eq!(summary.targets.len(), 1);
+        assert!(summary.targets[0].matched);
+        assert_eq!(summary.targets[0].symbols, vec!["crate::callee"]);
+        assert_eq!(summary.affected_symbols.len(), 1);
+        assert_eq!(
+            summary.affected_symbols[0].symbol.qualified_name,
+            "crate::callee"
+        );
+        assert_eq!(summary.likely_tests, vec!["crate::tests::covers_callee"]);
+        assert!(summary.direct_callers.iter().any(|evidence| {
+            evidence.row.symbol_qualified_name.as_deref() == Some("crate::tests::covers_callee")
+        }));
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note == "metadata_only_no_source_text")
+        );
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note == "read_only_pre_edit_analysis")
+        );
+        assert!(format!("{summary:?}").contains("adjust callee behavior"));
+        assert!(!format!("{summary:?}").contains("fn callee"));
     }
 
     #[test]
@@ -4284,7 +4820,7 @@ mod tests {
             summary
                 .notes
                 .iter()
-                .any(|note| note == "likely_tests_from_indexed_direct_test_calls")
+                .any(|note| note == "likely_tests_from_indexed_test_targets_or_direct_calls")
         );
     }
 
@@ -4384,6 +4920,91 @@ mod tests {
                 ("src/fresh.rs", EvidenceFreshness::Fresh),
                 ("src/missing.rs", EvidenceFreshness::Missing),
                 ("src/unknown.rs", EvidenceFreshness::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn freshness_report_uses_active_ref_manifest_when_available() {
+        let mut fixture = DebugFixture::new();
+        let active_ref =
+            RepositoryRefSnapshot::detect(&fixture.root).expect("active ref should detect");
+        let fresh_hash = content_hash(b"fn fresh() {}\n");
+        let stale_hash = content_hash(b"fn stale() {}\n");
+        fixture
+            .store
+            .sync_repository_ref(&active_ref)
+            .expect("active ref should sync");
+        fixture
+            .store
+            .replace_file_facts_for_ref_with_tests(
+                &active_ref.id,
+                &FileRecord {
+                    id: "file-fresh-current".to_owned(),
+                    repository_id: fixture.root.id().to_owned(),
+                    path: "src/fresh.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: fresh_hash,
+                    index_run_id: "run-current".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-fresh-current",
+                    "file-fresh-current",
+                    "fresh",
+                    "crate::fresh",
+                )],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("fresh file should persist for active ref");
+        fixture
+            .store
+            .replace_file_facts_for_ref_with_tests(
+                &active_ref.id,
+                &FileRecord {
+                    id: "file-stale-current".to_owned(),
+                    repository_id: fixture.root.id().to_owned(),
+                    path: "src/stale.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    content_hash: stale_hash,
+                    index_run_id: "run-current".to_owned(),
+                    parser_version: "parser".to_owned(),
+                },
+                &[sample_symbol(
+                    "sym-stale-current",
+                    "file-stale-current",
+                    "stale",
+                    "crate::stale",
+                )],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("stale file should persist for active ref");
+
+        let summary = build_freshness_report(
+            &fixture.root,
+            &fixture.store,
+            FreshnessScope {
+                symbol_query: None,
+                paths: Vec::new(),
+            },
+        )
+        .expect("freshness report should build");
+
+        assert_eq!(summary.count(EvidenceFreshness::Stale), 0);
+        assert_eq!(summary.count(EvidenceFreshness::Deleted), 0);
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .map(|row| (row.path.as_str(), row.freshness))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/fresh.rs", EvidenceFreshness::Fresh),
+                ("src/stale.rs", EvidenceFreshness::Fresh),
             ]
         );
     }

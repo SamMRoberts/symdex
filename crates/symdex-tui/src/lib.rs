@@ -27,8 +27,8 @@ use symdex_diagnostics::{
 };
 use symdex_embed::EmbedConfig;
 use symdex_index::{
-    ContinuousIndexEvent, ContinuousQualityState, EmbeddingSummary, IndexOptions, IndexProgress,
-    IndexScope, IndexSummary, RustAnalyzerEnrichmentSummary, run_index_with_progress,
+    ContinuousIndexEvent, ContinuousQualityState, EmbeddingSummary, IndexProgress, IndexScope,
+    IndexSummary, RustAnalyzerEnrichmentSummary,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, DebugContextPack, FreshnessSummary,
@@ -49,6 +49,7 @@ use symdex_store::{
     VectorStorageProjection, vector_table_name,
 };
 use symdex_watch::{WatcherAttachment, WatcherClientKind, WatcherStatus};
+use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse, WriterProgress};
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
 
@@ -113,8 +114,8 @@ impl App {
         let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
         let store_config = StoreConfig::from_env();
         let embed_config = EmbedConfig::from_env();
-        let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-        sqlite.migrate().map_err(|error| error.to_string())?;
+        let sqlite =
+            SqliteStore::open_read_only(&store_config).map_err(|error| error.to_string())?;
         let status = sqlite
             .repository_status(root.id())
             .map_err(|error| error.to_string())?;
@@ -747,6 +748,9 @@ impl App {
                     next_selection(self.storage.selection, self.storage_row_count());
                 self.message = "Storage row selection moved.".to_owned();
             }
+            KeyCode::Char('f') if self.view == View::Storage => {
+                self.request_stale_evidence_repair();
+            }
             KeyCode::Up if self.view == View::Diagnostics && self.diagnostics_row_count() > 0 => {
                 self.diagnostics_selection =
                     previous_selection(self.diagnostics_selection, self.diagnostics_row_count());
@@ -884,6 +888,52 @@ impl App {
             mode,
             scope: self.index_scope,
         }
+    }
+
+    fn repairable_freshness_count(&self) -> Option<usize> {
+        match &self.storage.freshness {
+            FreshnessStatus::Completed(summary) => Some(
+                summary.count(EvidenceFreshness::Stale)
+                    + summary.count(EvidenceFreshness::Deleted)
+                    + summary.count(EvidenceFreshness::Missing),
+            ),
+            FreshnessStatus::Failed(_) => None,
+        }
+    }
+
+    fn request_stale_evidence_repair(&mut self) {
+        if !self.screen.accepts_new_index_request() {
+            self.message =
+                "Dismiss or finish the current indexing job before fixing stale evidence."
+                    .to_owned();
+            return;
+        }
+
+        let Some(repairable_rows) = self.repairable_freshness_count() else {
+            self.storage.mode = StorageMode::Freshness;
+            self.storage.selection = 0;
+            self.message =
+                "Freshness status is unavailable; press r to refresh storage first.".to_owned();
+            return;
+        };
+
+        self.storage.mode = StorageMode::Freshness;
+        self.storage.selection = 0;
+        if repairable_rows == 0 {
+            self.message = "No stale, deleted, or missing evidence rows need repair.".to_owned();
+            return;
+        }
+
+        let request = ManualIndexRequest {
+            mode: IndexMode::Semantic,
+            scope: IndexScope::Incremental,
+        };
+        self.index_scope = IndexScope::Incremental;
+        self.view = View::Indexing;
+        self.screen = reduce_screen(self.screen, UiAction::RequestIndex(request));
+        self.message = format!(
+            "Confirm semantic incremental indexing to repair {repairable_rows} stale evidence rows."
+        );
     }
 
     fn select_primary_tab(&mut self, reverse: bool) {
@@ -1070,18 +1120,27 @@ impl App {
         let repo = self.repo_input.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
+            let _ = sender.send(IndexJobMessage::Progress(IndexProgress {
+                phase: "queue",
+                completed: 0,
+                total: 1,
+                message: "Submitting index job to writer service".to_owned(),
+            }));
+            let job = WriterJob::Index {
+                repo,
+                offline: matches!(request.mode, IndexMode::Offline),
+                scope: writer_scope(request.scope),
+            };
             let progress_sender = sender.clone();
-            let result = run_index_with_progress(
-                &IndexOptions {
-                    repo,
-                    offline: matches!(request.mode, IndexMode::Offline),
-                    scope: request.scope,
-                },
-                move |progress| {
-                    let _ = progress_sender.send(IndexJobMessage::Progress(progress));
-                },
-            );
-            let _ = sender.send(IndexJobMessage::Finished(result.map(Box::new)));
+            let result = WriterClient::from_env()
+                .submit_and_wait_with_progress(&job, move |progress| {
+                    let _ = progress_sender.send(IndexJobMessage::Progress(
+                        index_progress_from_writer(progress),
+                    ));
+                })
+                .and_then(index_summary_from_writer_response)
+                .map(Box::new);
+            let _ = sender.send(IndexJobMessage::Finished(result));
         });
         self.index_receiver = Some(receiver);
         self.last_index_summary = None;
@@ -1118,17 +1177,26 @@ impl App {
     }
 
     fn stop_continuous_index(&mut self) {
-        self.watcher_attachment = None;
+        let had_attachment = self.watcher_attachment.take().is_some();
         match symdex_watch::stop_daemon(&self.repo_input) {
             Ok(status) => {
                 self.apply_watcher_status(&status);
+                self.continuous.enabled = false;
+                self.continuous.status = ContinuousIndexStatus::Off;
                 self.last_watcher_status_refresh = Some(Instant::now());
                 self.message = "Continuous indexing stopped.".to_owned();
             }
             Err(error) => {
-                self.continuous.status = ContinuousIndexStatus::Failed;
-                self.continuous.latest_error = Some(error);
-                self.message = "Continuous indexing stop failed.".to_owned();
+                if had_attachment {
+                    self.continuous.status = ContinuousIndexStatus::Failed;
+                    self.continuous.latest_error = Some(error);
+                    self.message = "Continuous indexing stop failed.".to_owned();
+                } else {
+                    self.continuous.enabled = false;
+                    self.continuous.status = ContinuousIndexStatus::Off;
+                    self.continuous.queued_events = 0;
+                    self.message = "Continuous indexing stopped.".to_owned();
+                }
             }
         }
         self.continuous_receiver = None;
@@ -1316,10 +1384,9 @@ impl App {
                 self.last_index_summary = Some(*summary);
                 self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
-                if self.start_status_refresh(
-                    StatusRefreshScope::Index,
-                    Some(completed_message.clone()),
-                ) {
+                if self
+                    .start_status_refresh(StatusRefreshScope::Full, Some(completed_message.clone()))
+                {
                     self.last_index_status_refresh = Some(Instant::now());
                 } else {
                     self.message = completed_message;
@@ -3016,8 +3083,7 @@ fn collect_status_refresh(
     scope: StatusRefreshScope,
 ) -> Result<StatusRefreshSnapshot, String> {
     let store_config = StoreConfig::from_env();
-    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
+    let sqlite = SqliteStore::open_read_only(&store_config).map_err(|error| error.to_string())?;
     let status = sqlite
         .repository_status(repository_id)
         .map_err(|error| error.to_string())?;
@@ -5439,6 +5505,9 @@ fn diagnostic_hint(check: &DiagnosticCheck) -> &'static str {
     match check.state {
         DiagnosticState::Ok => "No action needed.",
         DiagnosticState::Missing => "Create or configure the missing local path or dependency.",
+        DiagnosticState::Pending => {
+            "Let the local job finish or run the matching catch-up command."
+        }
         DiagnosticState::Unreachable => {
             "Start the local service or verify the configured localhost endpoint."
         }
@@ -5936,6 +6005,7 @@ fn diagnostic_status(state: DiagnosticState) -> (&'static str, StatusTone) {
     match state {
         DiagnosticState::Ok => ("ok", StatusTone::Success),
         DiagnosticState::Missing => ("missing", StatusTone::Warning),
+        DiagnosticState::Pending => ("pending", StatusTone::Info),
         DiagnosticState::Unreachable => ("unreachable", StatusTone::Error),
         DiagnosticState::Error => ("error", StatusTone::Error),
         DiagnosticState::Skipped => ("skipped", StatusTone::Warning),
@@ -6031,6 +6101,79 @@ fn progress_label(progress: Option<&IndexProgress>) -> String {
         ),
         None => "starting 0/1".to_owned(),
     }
+}
+
+fn writer_scope(scope: IndexScope) -> WriterIndexScope {
+    match scope {
+        IndexScope::Full => WriterIndexScope::Full,
+        IndexScope::Incremental => WriterIndexScope::Incremental,
+    }
+}
+
+fn index_progress_from_writer(progress: WriterProgress) -> IndexProgress {
+    IndexProgress {
+        phase: writer_progress_phase(&progress.phase),
+        completed: progress.completed,
+        total: progress.total,
+        message: progress.message,
+    }
+}
+
+fn writer_progress_phase(phase: &str) -> &'static str {
+    match phase {
+        "open" => "open",
+        "discover" => "discover",
+        "parse" => "parse",
+        "resolve" => "resolve",
+        "rust_analyzer" => "rust_analyzer",
+        "sqlite" => "sqlite",
+        "semantic" => "semantic",
+        "quality_queue" => "quality_queue",
+        "quality_index" => "quality_index",
+        "vector_repair" => "vector_repair",
+        "queue" => "queue",
+        "start" => "start",
+        _ => "writer",
+    }
+}
+
+fn index_summary_from_writer_response(response: WriterJobResponse) -> Result<IndexSummary, String> {
+    if !response.ok {
+        return Err(response.message);
+    }
+    let data = response.data;
+    Ok(IndexSummary {
+        repository_id: string_field(&data, "repository_id"),
+        repository_root: string_field(&data, "repository_root"),
+        files_seen: usize_field(&data, "files_seen"),
+        files_skipped_unchanged: usize_field(&data, "files_skipped_unchanged"),
+        files: Vec::new(),
+        chunks_seen: usize_field(&data, "chunks_seen"),
+        chunks_excluded_from_embedding: usize_field(&data, "chunks_excluded_from_embedding"),
+        sqlite_files_indexed: usize_field(&data, "sqlite_files_indexed"),
+        sqlite_chunks_indexed: usize_field(&data, "sqlite_chunks_indexed"),
+        sqlite_symbols_indexed: usize_field(&data, "sqlite_symbols_indexed"),
+        sqlite_calls_indexed: usize_field(&data, "sqlite_calls_indexed"),
+        sqlite_files_removed: usize_field(&data, "sqlite_files_removed"),
+        rust_analyzer: RustAnalyzerEnrichmentSummary::Disabled {
+            enable_env: "SYMDEX_RUST_ANALYZER".to_owned(),
+        },
+        embedding: EmbeddingSummary::SkippedNoChunks,
+    })
+}
+
+fn string_field(data: &serde_json::Value, key: &str) -> String {
+    data.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn usize_field(data: &serde_json::Value, key: &str) -> usize {
+    data.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 fn layer_readiness_percent(layer: &SemanticStatusLayerSummary) -> u16 {
@@ -6161,6 +6304,7 @@ impl View {
                 ("[ ]", "tabs"),
                 ("Tab", "storage view"),
                 ("Up/Down", "select"),
+                ("f", "fix stale"),
                 ("r", "refresh"),
                 ("q", "quit"),
             ],
@@ -7084,6 +7228,73 @@ mod tests {
         assert!(rendered.contains("Selected"));
         assert!(rendered.contains("SQLite / files"));
         assert!(rendered.contains("Indexed file rows in SQLite."));
+    }
+
+    #[test]
+    fn storage_fix_stale_requests_confirmed_incremental_semantic_index() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            sample_freshness_summary(),
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+        app.storage.mode = StorageMode::Explorer;
+        app.index_scope = IndexScope::Full;
+
+        assert!(!app.handle_key(KeyCode::Char('f')));
+
+        assert_eq!(app.view, View::Indexing);
+        assert_eq!(app.storage.mode, StorageMode::Freshness);
+        assert_eq!(app.index_scope, IndexScope::Incremental);
+        assert!(matches!(
+            app.screen,
+            Screen::ConfirmIndex(ManualIndexRequest {
+                mode: IndexMode::Semantic,
+                scope: IndexScope::Incremental,
+            })
+        ));
+        assert!(
+            app.message
+                .contains("Confirm semantic incremental indexing")
+        );
+    }
+
+    #[test]
+    fn storage_fix_stale_reports_when_freshness_is_current() {
+        let mut app = App::from_status("/tmp/repo", "repo", sample_status());
+        app.view = View::Storage;
+        let mut freshness = sample_freshness_summary();
+        for file in &mut freshness.files {
+            file.freshness = EvidenceFreshness::Fresh;
+        }
+        app.storage = StorageExplorerState::completed(
+            sample_storage_summary(),
+            sample_index_coverage_summary(),
+            sample_symbol_outline_summary(),
+            sample_call_resolution_summary(),
+            sample_embedding_coverage_summary(),
+            sample_index_runs_timeline_summary(),
+            freshness,
+            sample_semantic_neighborhood_summary(),
+            sample_cross_store_health_summary(),
+        );
+
+        assert!(!app.handle_key(KeyCode::Char('f')));
+
+        assert_eq!(app.view, View::Storage);
+        assert_eq!(app.storage.mode, StorageMode::Freshness);
+        assert!(matches!(app.screen, Screen::Dashboard));
+        assert_eq!(
+            app.message,
+            "No stale, deleted, or missing evidence rows need repair."
+        );
     }
 
     #[test]
@@ -9632,6 +9843,7 @@ mod tests {
         DebugContextPack {
             format: "symdex.debug_context.v1".to_owned(),
             repository_id: "repo".to_owned(),
+            runtime_observation: None,
             frames: vec![
                 DebugFrameMatch {
                     frame: RuntimeFrame {

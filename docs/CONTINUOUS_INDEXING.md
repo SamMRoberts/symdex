@@ -26,6 +26,17 @@ enabled, modified or newly created eligible files are automatically reindexed.
   `mxbai-embed-large` layer as deferred work.
 - Continuous indexing must not wait for quality indexing before returning to
   watch mode.
+- Single-writer rule: only ONE process may write to the configured local
+  SQLite/sqlite-vec database at a time. A database-file-scoped writer service
+  owns all mutations. Continuous indexing, manual indexing, quality catch-up,
+  repair, migrations, and future write-capable tools submit jobs to that
+  service. TUI, MCP, diagnostics, status, and query paths read shared state
+  without migrations or cleanup writes.
+- Manual writer jobs take priority over watcher writes. The watcher may keep
+  polling and coalescing filesystem changes, but watcher status updates,
+  incremental indexing batches, idle quality catch-up, and stop/failure state
+  writes wait on the writer-service gate while a manual index, repair,
+  migration, or quality job is running.
 
 ## Event Handling
 
@@ -107,9 +118,12 @@ outputs to distinguish these states:
   already completed index updates intact.
 - The status row should show the latest watch event, latest reindexed file,
   pending debounce state, current indexing state, and any error.
-- Because the shared watcher daemon owns continuous indexing, the TUI should
+- Because the writer service owns continuous indexing, the TUI should
   refresh watcher status and semantic/index readiness from shared state on an
   interval rather than relying only on in-process events.
+- TUI refreshes must stay read-only while continuous indexing is active. They
+  must not run SQLite migrations, prune watcher leases, repair vectors, or
+  perform quality catch-up from the UI refresh path.
 - Continuous indexing must not block query, storage, or diagnostics views.
 - Manual indexing should remain available while continuous mode is off.
 - If a manual indexing job is running, continuous indexing should queue or
@@ -128,6 +142,9 @@ outputs to distinguish these states:
   hashing, symbol extraction, and call extraction.
 - `symdex-store` owns SQLite updates, semantic generation state,
   quality-job persistence, sqlite-vec point replacement, and index run metadata.
+- `symdex-store` is the persistence boundary, but it does not grant permission
+  for every process to write. Write-capable callers must first satisfy the
+  single-writer rule for the configured database.
 - `symdex-query` owns active semantic layer routing for search. It must not
   decide to use a partial quality layer unless an explicit future diagnostic
   mode is added.
@@ -142,18 +159,37 @@ Current implementation status:
 
 - `symdex-index` exposes shared watch snapshot, diff, and continuous polling
   APIs.
+- `symdex-writer` owns the local writer daemon, writer client, job protocol, and
+  database-path-keyed IPC endpoint. `symdex-store` still exposes the advisory
+  lock primitives, but only the writer daemon should acquire them.
 - `symdex watch start <repo>` starts or attaches the background watcher and
   prints status. Watchers are client-scoped, so this command alone does not make
   a permanent daemon; without a live TUI, MCP server, or foreground watcher the
   daemon exits after about 10 seconds. `symdex watch status <repo>` reads shared
-  SQLite watcher state. `symdex watch stop <repo>` asks the daemon to stop.
-- `symdex index --watch <repo>` remains a foreground watch loop, but it refuses
-  to run while a background or foreground watcher is already active.
+  SQLite watcher state without running migrations or pruning stale client rows,
+  keeping status polling read-only while the watcher writes index updates.
+  `symdex watch stop <repo>` asks the writer service to stop the managed watcher.
+  Watcher clients attach, heartbeat, detach, and request status through writer
+  jobs, and the service writes `watchers` / `watcher_clients` rows on their
+  behalf.
+- `symdex index --watch <repo>` attaches a foreground client to the same
+  writer-managed watcher rather than opening a separate SQLite writer.
+- Manual `symdex index`, `symdex index-quality`, `vector-repair`, migrations,
+  and future write-capable MCP tools submit jobs to the same writer service
+  before mutating SQLite or sqlite-vec.
 - `symdex serve-mcp --watch <repo>` starts or attaches the single background
   watcher before serving MCP and holds a client lease until the MCP process
-  exits. MCP stdout remains protocol-only.
+  exits. Live TUI/MCP/CLI clients heartbeat their lease and reinsert it if a
+  transient stale-client prune removed the row. MCP stdout remains
+  protocol-only.
 - Continuous batches call the incremental index path so unchanged files are
   skipped by content hash.
+- Quality progress and activation are evaluated against the current fast
+  embedding manifest. Superseded terminal quality jobs are retained as history
+  but do not keep the latest generation stale, and manual quality catch-up queues
+  missing current-fast quality jobs before claiming work. Continuous quality
+  catch-up also treats current stale quality jobs as work because the worker
+  requeues those terminal rows before claiming the next batch.
 - Watch-driven batches are recorded with `run_kind = watch` in local index-run
   metadata so storage views can distinguish watch updates from manual runs.
 - In semantic watch mode, when `SYMDEX_QUALITY_INDEX` is enabled, watch mode
@@ -176,6 +212,9 @@ Current implementation status:
 - Do not log source text.
 - Record index run summaries for continuous indexing batches so storage views
   can show when watch-driven updates occurred.
+- Record per-file `file_index_events` for watch batches so created, modified,
+  deleted, skipped unchanged, and paths removed from discovery by ignore or
+  support rules can be debugged from local metadata.
 - Surface watch health in diagnostics when available, including watcher active
   state and the most recent error.
 - Surface quality-layer status separately from fast-layer indexing status.
@@ -192,6 +231,9 @@ Current implementation status:
 - Integration test that a modified eligible implemented-language file replaces
   stale SQLite facts.
 - Integration test that unchanged content after a filesystem event is skipped.
+- Test that only one process can own write-capable indexing/quality/repair work
+  for a repository database at a time, and that TUI/MCP/status/query refreshes
+  remain read-only while the writer is active.
 - Test offline continuous indexing without sqlite-vec or Ollama.
 - Test semantic continuous indexing with mocked or opt-in local Ollama/sqlite-vec.
 - Test that continuous indexing marks quality stale, queues quality jobs, and

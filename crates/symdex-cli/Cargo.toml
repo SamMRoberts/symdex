@@ -23,3 +23,4 @@ symdex-query = { path = "../symdex-query" }
 symdex-store = { path = "../symdex-store" }
 symdex-tui = { path = "../symdex-tui" }
 symdex-watch = { path = "../symdex-watch" }
+symdex-writer = { path = "../symdex-writer" }

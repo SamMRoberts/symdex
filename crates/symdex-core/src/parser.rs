@@ -5,7 +5,7 @@ use tree_sitter::{Node, Parser};
 use crate::{
     ByteRange, CallEdge, ChunkKind, CodeChunk, CoreError, DiscoveredTest, FileFacts, Language,
     LineRange, ParseDiagnostic, ResolutionStatus, Result, SourceFileIndex, Symbol, SymbolKind,
-    content_hash, secret_exclusion_reason, stable_id,
+    SymbolReference, SymbolReferenceKind, content_hash, secret_exclusion_reason, stable_id,
 };
 
 pub fn extract_chunks(file: &FileFacts, source: &str) -> Result<Vec<CodeChunk>> {
@@ -21,6 +21,10 @@ pub fn index_rust_file(file: &FileFacts, source: &str) -> Result<SourceFileIndex
 }
 
 pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileIndex> {
+    if file.language.is_config() {
+        return Ok(index_config_file(file, source));
+    }
+
     let mut parser = Parser::new();
     set_parser_language(&mut parser, file.language, is_tsx_path(&file.relative_path))?;
 
@@ -90,19 +94,44 @@ pub fn index_source_file(file: &FileFacts, source: &str) -> Result<SourceFileInd
             &mut calls,
         );
     }
+    let mut symbol_references = collect_symbol_references(file, tree.root_node(), source, &symbols);
 
     chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
     symbols.sort_by_key(|symbol| (symbol.byte_range.start, symbol.byte_range.end));
     calls.sort_by_key(|call| (call.call_line, call.callee_text.clone()));
+    symbol_references.sort_by_key(|reference| {
+        (
+            reference.line,
+            reference.reference_kind.as_str(),
+            reference.reference_text.clone(),
+        )
+    });
     tests.sort_by_key(|test| (test.line_range.start, test.qualified_name.clone()));
 
     Ok(SourceFileIndex {
         chunks,
         symbols,
         calls,
+        symbol_references,
         parse_diagnostics,
         tests,
     })
+}
+
+fn index_config_file(file: &FileFacts, source: &str) -> SourceFileIndex {
+    let chunks = if source.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![file_fallback_chunk(file, source)]
+    };
+    SourceFileIndex {
+        chunks,
+        symbols: Vec::new(),
+        calls: Vec::new(),
+        symbol_references: Vec::new(),
+        parse_diagnostics: Vec::new(),
+        tests: Vec::new(),
+    }
 }
 
 fn collect_parse_diagnostics(root: Node<'_>) -> Vec<ParseDiagnostic> {
@@ -189,6 +218,11 @@ fn set_parser_language(parser: &mut Parser, language: Language, tsx: bool) -> Re
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::TypeScript if tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Json | Language::Toml | Language::Yaml => {
+            return Err(CoreError::ParserLanguage {
+                message: "configuration files use fallback indexing".to_owned(),
+            });
+        }
     };
     parser
         .set_language(&grammar)
@@ -809,6 +843,201 @@ fn javascript_static_string(node: Node<'_>, source: &str) -> Option<String> {
             .replace("\\\"", "\"")
             .replace("\\`", "`"),
     )
+}
+
+fn collect_symbol_references(
+    file: &FileFacts,
+    root: Node<'_>,
+    source: &str,
+    symbols: &[Symbol],
+) -> Vec<SymbolReference> {
+    let mut references = Vec::new();
+    collect_symbol_references_from_node(file, root, source, symbols, &mut references);
+    references
+}
+
+fn collect_symbol_references_from_node(
+    file: &FileFacts,
+    node: Node<'_>,
+    source: &str,
+    symbols: &[Symbol],
+    references: &mut Vec<SymbolReference>,
+) {
+    if let Some((reference_kind, reference_text, confidence)) =
+        symbol_reference_candidate(file.language, node, source)
+    {
+        let source_symbol_id = containing_symbol_id(node, symbols);
+        let (target_symbol_id, resolution_status, confidence) =
+            resolve_symbol_reference(&reference_text, symbols, confidence);
+        references.push(SymbolReference {
+            id: stable_id(&[
+                "symbol-reference",
+                source_symbol_id.as_deref().unwrap_or("file"),
+                &reference_text,
+                reference_kind.as_str(),
+                &(node.start_position().row + 1).to_string(),
+                &node.start_byte().to_string(),
+            ]),
+            file_id: file.id.clone(),
+            source_symbol_id,
+            target_symbol_id,
+            reference_text,
+            reference_kind,
+            line: node.start_position().row + 1,
+            confidence,
+            resolution_status,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_symbol_references_from_node(file, child, source, symbols, references);
+    }
+}
+
+fn symbol_reference_candidate(
+    language: Language,
+    node: Node<'_>,
+    source: &str,
+) -> Option<(SymbolReferenceKind, String, f32)> {
+    match language {
+        Language::Rust => rust_symbol_reference_candidate(node, source),
+        Language::CSharp => csharp_symbol_reference_candidate(node, source),
+        Language::JavaScript | Language::TypeScript => {
+            javascript_symbol_reference_candidate(node, source)
+        }
+        _ => None,
+    }
+}
+
+fn rust_symbol_reference_candidate(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(SymbolReferenceKind, String, f32)> {
+    match node.kind() {
+        "use_declaration" => Some((
+            SymbolReferenceKind::Import,
+            node_text(node, source).map(clean_expression_text)?,
+            0.4,
+        )),
+        "attribute_item" => Some((
+            SymbolReferenceKind::Attribute,
+            node_text(node, source).map(clean_expression_text)?,
+            0.3,
+        )),
+        "impl_item" => Some((
+            SymbolReferenceKind::Implementation,
+            impl_display_name(node, source)?,
+            0.5,
+        )),
+        "type_identifier" | "scoped_type_identifier" | "generic_type" => Some((
+            SymbolReferenceKind::TypeReference,
+            node_text(node, source).map(clean_expression_text)?,
+            0.45,
+        )),
+        _ => None,
+    }
+}
+
+fn csharp_symbol_reference_candidate(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(SymbolReferenceKind, String, f32)> {
+    match node.kind() {
+        "using_directive" => Some((
+            SymbolReferenceKind::Import,
+            node_text(node, source).map(clean_expression_text)?,
+            0.4,
+        )),
+        "attribute_list" => Some((
+            SymbolReferenceKind::Attribute,
+            node_text(node, source).map(clean_expression_text)?,
+            0.3,
+        )),
+        "base_list" => Some((
+            SymbolReferenceKind::Inheritance,
+            node_text(node, source).map(clean_expression_text)?,
+            0.5,
+        )),
+        "identifier" if has_ancestor_kind(node, "base_list") => Some((
+            SymbolReferenceKind::TypeReference,
+            node_text(node, source).map(clean_expression_text)?,
+            0.45,
+        )),
+        _ => None,
+    }
+}
+
+fn javascript_symbol_reference_candidate(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(SymbolReferenceKind, String, f32)> {
+    match node.kind() {
+        "import_statement" => Some((
+            SymbolReferenceKind::Import,
+            node_text(node, source).map(clean_expression_text)?,
+            0.4,
+        )),
+        "decorator" => Some((
+            SymbolReferenceKind::Decorator,
+            node_text(node, source).map(clean_expression_text)?,
+            0.3,
+        )),
+        "class_heritage" => Some((
+            SymbolReferenceKind::Inheritance,
+            node_text(node, source).map(clean_expression_text)?,
+            0.5,
+        )),
+        "type_identifier" | "generic_type" | "predefined_type" => Some((
+            SymbolReferenceKind::TypeReference,
+            node_text(node, source).map(clean_expression_text)?,
+            0.45,
+        )),
+        _ => None,
+    }
+}
+
+fn containing_symbol_id(node: Node<'_>, symbols: &[Symbol]) -> Option<String> {
+    if let Some(containing) = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.byte_range.start <= node.start_byte() && node.end_byte() <= symbol.byte_range.end
+        })
+        .min_by_key(|symbol| symbol.byte_range.end - symbol.byte_range.start)
+        .map(|symbol| symbol.id.clone())
+    {
+        return Some(containing);
+    }
+
+    let line = node.start_position().row + 1;
+    symbols
+        .iter()
+        .filter(|symbol| {
+            node.end_byte() <= symbol.byte_range.start && symbol.line_range.start <= line + 2
+        })
+        .min_by_key(|symbol| symbol.byte_range.start - node.end_byte())
+        .map(|symbol| symbol.id.clone())
+}
+
+fn resolve_symbol_reference(
+    reference_text: &str,
+    symbols: &[Symbol],
+    unresolved_confidence: f32,
+) -> (Option<String>, ResolutionStatus, f32) {
+    let suffix = symbol_suffix(reference_text);
+    let candidates = symbols
+        .iter()
+        .filter(|symbol| symbol.name == suffix || symbol.qualified_name.ends_with(suffix))
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [symbol] => (
+            Some(symbol.id.clone()),
+            ResolutionStatus::ResolvedLocalCandidate,
+            0.7,
+        ),
+        [] => (None, ResolutionStatus::Unresolved, unresolved_confidence),
+        _ => (None, ResolutionStatus::Ambiguous, 0.35),
+    }
 }
 
 fn collect_call_edges(
@@ -1543,6 +1772,7 @@ fn is_call_expression(language: Language, node: Node<'_>) -> bool {
         Language::JavaScript | Language::Rust | Language::TypeScript => {
             node.kind() == "call_expression"
         }
+        _ => false,
     }
 }
 
@@ -1655,6 +1885,33 @@ impl Counter {
         assert_eq!(chunks[0].kind, ChunkKind::FileFallback);
         assert_eq!(chunks[0].line_range.start, 1);
         assert_eq!(chunks[0].line_range.end, 1);
+    }
+
+    #[test]
+    fn indexes_config_files_as_fallback_chunks_without_symbols() {
+        let file = file_with_language("Cargo.toml", Language::Toml);
+        let source = "[package]\nname = \"demo\"\n";
+
+        let index = index_source_file(&file, source).expect("config should index");
+
+        assert_eq!(index.chunks.len(), 1);
+        assert_eq!(index.chunks[0].kind, ChunkKind::FileFallback);
+        assert_eq!(index.chunks[0].line_range.start, 1);
+        assert_eq!(index.chunks[0].line_range.end, 2);
+        assert!(index.symbols.is_empty());
+        assert!(index.calls.is_empty());
+        assert!(index.tests.is_empty());
+        assert!(index.parse_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn skips_empty_config_chunks() {
+        let file = file_with_language("config/app.yaml", Language::Yaml);
+
+        let index = index_source_file(&file, "\n  \n").expect("config should index");
+
+        assert!(index.chunks.is_empty());
+        assert!(index.symbols.is_empty());
     }
 
     #[test]
@@ -2054,6 +2311,42 @@ pub fn caller() {
             ResolutionStatus::Unresolved
         );
         assert!(external_call.callee_symbol_id.is_none());
+    }
+
+    #[test]
+    fn extracts_conservative_symbol_references_beyond_calls() {
+        let source = r#"use crate::worker::Task;
+
+#[tokio::main]
+fn run(task: Task) {
+    let _next: Option<Task> = None;
+}
+
+impl Runnable for Task {
+    fn execute(&self) {}
+}
+"#;
+
+        let index = index_rust_file(&file(), source).expect("index should parse");
+
+        assert!(index.symbol_references.iter().any(|reference| {
+            reference.reference_kind.as_str() == "import"
+                && reference.reference_text == "usecrate::worker::Task;"
+                && reference.source_symbol_id.is_none()
+        }));
+        assert!(index.symbol_references.iter().any(|reference| {
+            reference.reference_kind.as_str() == "attribute"
+                && reference.reference_text == "#[tokio::main]"
+                && reference.source_symbol_id.is_some()
+        }));
+        assert!(index.symbol_references.iter().any(|reference| {
+            reference.reference_kind.as_str() == "implementation"
+                && reference.reference_text == "Runnable for Task"
+        }));
+        assert!(index.symbol_references.iter().any(|reference| {
+            reference.reference_kind.as_str() == "type_reference"
+                && reference.reference_text.contains("Task")
+        }));
     }
 
     #[test]

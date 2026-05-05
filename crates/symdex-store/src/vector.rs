@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use zerocopy::IntoBytes;
 
 use crate::{Result, StoreConfig, StoreError, collect_rows};
@@ -354,6 +355,9 @@ impl SqliteVectorStore {
         }
         let connection =
             rusqlite::Connection::open(&self.sqlite_path).map_err(StoreError::Sqlite)?;
+        connection
+            .busy_timeout(Duration::from_secs(30))
+            .map_err(StoreError::Sqlite)?;
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(StoreError::Sqlite)?;

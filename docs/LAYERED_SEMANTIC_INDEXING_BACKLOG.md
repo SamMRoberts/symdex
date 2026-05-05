@@ -56,7 +56,8 @@ This backlog is specific to the `quality-index` branch. It supplements
 ## Phase Q6 — Quality queue and manual worker
 
 - [x] Queue quality jobs after successful fast indexing.
-- [x] Exclude secret-blocked and too-large chunks from quality jobs.
+- [x] Exclude secret-blocked chunks from quality jobs; split too-large chunks
+      into bounded overlapping segments before quality embedding.
 - [x] Mark old jobs stale when a new fast generation supersedes them.
 - [x] Add manual `symdex index-quality <repo>` command.
 - [x] Implement worker hash verification before embedding.

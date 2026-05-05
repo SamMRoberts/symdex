@@ -35,6 +35,7 @@
 - [x] qualified names.
 - [x] call extraction.
 - [x] unresolved calls.
+- [x] conservative symbol references beyond calls.
 - [x] direct callers/callees CLI.
 - [x] basic impact analysis.
 
@@ -158,6 +159,8 @@
 - [x] CLI command for building debug context packs from runtime failure input.
 - [x] TUI debug context-pack viewer with matched frames, call paths, likely tests, provenance, and staleness.
 - [x] MCP tool for debug context packs with compact context-window-safe output.
+- [x] Short-lived metadata-only `runtime_observations` cache for repeated
+  debug-context comparisons without storing logs or source text.
 - [x] Tests for mapped frames, unmapped frames, stale frames, deleted files, and malformed stack traces.
 
 ## Phase 14 — Cross-agent local reuse
@@ -241,7 +244,8 @@ architecture, and compatibility with the local-first evidence contract.
 - [x] Link discovered tests to symbols when syntax evidence is clear; otherwise
   preserve metadata without overclaiming call coverage.
 - [x] Surface non-Rust `tests_likely` in impact and debug-context outputs only
-  when indexed test facts and call evidence justify it.
+  when indexed test facts, persisted `test_targets`, or compatibility
+  direct-call evidence justify it.
 - [x] Add fixture-backed tests for each framework family.
 
 ### A5 — C# and Node stack trace parsing
@@ -268,14 +272,14 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### A7 — Pre-edit change explanation design
 
-- [ ] Write a design doc for `symdex_explain_change` before implementation.
-- [ ] Accept proposed change targets as `{ path, start_line, end_line,
+- [x] Write a design doc for `symdex_explain_change` before implementation.
+- [x] Accept proposed change targets as `{ path, start_line, end_line,
   description }`.
-- [ ] Map line ranges to intersecting symbols, run impact analysis for those
+- [x] Map line ranges to intersecting symbols, run impact analysis for those
   symbols, deduplicate the evidence, and return a compact safety report.
-- [ ] Include likely tests, direct and transitive relationships, freshness,
+- [x] Include likely tests, direct and transitive relationships, freshness,
   trust, and reason tags.
-- [ ] Keep the tool read-only and metadata-only.
+- [x] Keep the tool read-only and metadata-only.
 
 ### A8 — Semantic neighborhood MCP tool
 
@@ -318,8 +322,8 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### P2 — Semantic precision
 
-- [x] Add optional rust-analyzer enrichment readiness gate.
-- [x] Add opt-in rust-analyzer enrichment planning and reporting.
+- [x] Add optional rust-analyzer enrichment readiness gate with default command auto-detection.
+- [x] Add rust-analyzer enrichment planning and reporting with environment overrides.
 - [ ] Add opt-in rust-analyzer symbol and call fact application.
 - [x] Improve Rust crate-prefix and simple `use` alias call resolution.
 - [x] Add conservative Rust `self.method()` and `Self::method()` local resolution.
@@ -336,6 +340,8 @@ architecture, and compatibility with the local-first evidence contract.
 - [x] Add macro-aware limitations and diagnostics.
 - [x] Add Rust type-definition, trait, and impl-summary chunks.
 - [x] Add cross-file and cross-module call resolution.
+- [x] Add `symbol_references` storage for imports, type references,
+  implementations, inheritance, attributes, decorators, and future config links.
 
 ### P3 — Operational polish
 

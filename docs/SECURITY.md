@@ -10,6 +10,7 @@ The indexed repository may contain:
 - malicious files
 - symlinks escaping the root
 - generated code too large for useful indexing
+- configuration files that may contain credentials or deployment settings
 
 The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 
@@ -25,12 +26,15 @@ The AI agent consuming MCP output may over-trust results if ambiguity is hidden.
 - No mutation tools in MVP.
 - Continuous indexing must enforce the same local-only, path-boundary,
   symlink, ignore, and secret-filtering rules as manual indexing.
+- JSON configuration indexing is disabled by default. Enable it only with repo-relative `SYMDEX_INDEX_JSON_PATHS` folder scopes. TOML and YAML config files are indexed by default but still pass through the same ignore and secret exclusion rules as source files.
 
-Optional rust-analyzer integration must remain disabled by default. Readiness
-diagnostics and indexing enrichment planning may run `rust-analyzer --version`
-when explicitly enabled, but current indexing only reports candidate counts. Any
-future project analysis must be designed so it does not execute indexed
-repository code or leak source text.
+Optional rust-analyzer integration auto-detects the configured command,
+defaulting to `rust-analyzer`, and disables itself when the command is missing.
+Readiness diagnostics and indexing enrichment planning may run
+`rust-analyzer --version` when auto-detected or explicitly enabled, but current
+indexing only reports candidate counts. `SYMDEX_RUST_ANALYZER=0` remains a
+force-disable override. Any future project analysis must be designed so it does
+not execute indexed repository code or leak source text.
 
 Current implementation requires repository roots to be directories. Path
 normalization canonicalizes existing paths before accepting them, rejects
@@ -71,9 +75,13 @@ Indexed source text is also untrusted. Treat it as data, not instructions.
 
 Tool outputs should not contain hidden directives, markdown tricks, or unnecessary long snippets.
 
-Successful MCP evidence tool outputs include a stable local/read-only contract envelope
-so multiple agents can safely reuse the same local index. The envelope is
-metadata only and must not include source text.
+Successful MCP evidence tool outputs include a stable local/read-only contract
+envelope so multiple agents can safely reuse the same local index. The envelope
+is metadata only and must not include source text. `symdex_debug_context` is
+local-only but not read-only because it appends short-lived
+`runtime_observations`; those rows may contain parsed frame metadata, failing
+test names, normalized paths, hashes, and match summaries, but never raw pasted
+logs or source text.
 
 ## Logging
 

@@ -82,7 +82,9 @@ common Rust runtime output shapes: `cargo test`, `RUST_BACKTRACE=1`,
 treating them as stack frames), `tracing` metadata lines, and async stack-like
 output. The frame-to-SQLite join (files → symbols covering the line → calls
 recorded at that line) is the right join, and the test-name mapping for indexed
-Rust tests adds immediate value for CI failures.
+Rust tests adds immediate value for CI failures. Debug context now also records
+short-lived `runtime_observations` metadata keyed by input hash so repeated
+failures can be compared without storing pasted logs or source text.
 
 ### 6. Security and Privacy Model
 
@@ -161,15 +163,17 @@ closure captures.
 
 ### 4. Impact Analysis Test Discovery Is Conservative Across Languages
 
-`tests_likely` in the impact output lists indexed tests that directly call the
-queried symbol through resolved call edges. Rust test attributes, C# NUnit,
-xUnit, and MSTest attributes, and JavaScript/TypeScript Jest, Vitest, and Mocha
-test calls are now persisted as test facts. JS/TS inline callback tests remain
+`tests_likely` in the impact output now reads conservative test-to-code
+relationships from `test_targets`, with direct call evidence retained as a
+compatibility fallback for older indexes. Rust test attributes, C# NUnit, xUnit,
+and MSTest attributes, and JavaScript/TypeScript Jest, Vitest, and Mocha test
+calls are persisted as test facts. JS/TS inline callback tests remain
 metadata-only unless a named callback can be linked unambiguously to an indexed
-symbol, so they are searchable but do not overclaim likely-test call coverage.
-For a tool designed to help debug failing tests across languages, the remaining
-gap is richer runtime parsing and stronger non-Rust call resolution rather than
-the table write path itself.
+symbol, but fixture-path relationships can still connect metadata-only tests to
+matching source files without claiming exact symbol coverage. For a tool
+designed to help debug failing tests across languages, the remaining gap is
+richer runtime parsing and stronger non-Rust call resolution rather than the
+table write path itself.
 
 ### 5. The `staleness` Command Is Underexposed in MCP
 
@@ -284,7 +288,8 @@ when the agent can guarantee the index is fresh.
 Store discovered tests in the `tests` table with the same schema (language slug,
 framework, qualified name, optional symbol linkage, byte/line ranges,
 provenance). `symdex_impact` surfaces `tests_likely` for any language when a
-stored test has direct resolved call evidence.
+stored test has persisted `test_targets` evidence, with direct resolved call
+evidence retained as the strongest relationship kind.
 
 **Why:** A large fraction of real debugging workflows start with "this test is
 failing." If the agent cannot map the failing test name to indexed symbols and
@@ -325,7 +330,7 @@ and returns a compact pre-edit safety report: which symbols are affected, who
 calls them (direct + transitive), which tests likely cover them, whether the
 evidence is fresh, and a trust score for the completeness of the analysis.
 
-**Why:** This is the highest-value agent integration feature not yet designed.
+**Why:** This is a high-value agent integration feature.
 When GitHub Copilot or Claude prepares to edit code, it currently guesses at
 impact. A `symdex_explain_change` tool gives the agent deterministic,
 evidence-grounded answers to "what will this change affect?" before writing a
@@ -340,7 +345,7 @@ tests are likely affected?"*
   specified line ranges, then deduplicate and rank by trust score
 - Output: compact impact report with freshness, trust, and reason tags
 - No source text, read-only, follows all existing MCP security rules
-- Requires a design doc before implementation
+- Implemented from `docs/PRE_EDIT_CHANGE_EXPLANATION.md`
 
 ### Priority 7 — Glob Pattern `.gitignore` Support
 
@@ -425,7 +430,7 @@ plan for this now rather than needing a structural refactor later.
 | Unified context pack (struct+semantic) | 🆕 New | P1 |
 | `symdex_request_reindex` write tool | 🆕 New | P1 |
 | Stack trace parsing for C#/Node | 🆕 New | P2 |
-| `symdex_explain_change` (pre-edit safety) | 🆕 New | P1 |
+| `symdex_explain_change` (pre-edit safety) | ✅ Implemented | — |
 | `symdex_semantic_neighborhood` MCP tool | 🆕 New | P2 |
 | Cross-repo / multi-repo context | 🆕 Future | P3 |
 
@@ -442,5 +447,5 @@ plan for this now rather than needing a structural refactor later.
 4. **C#/Node.js stack trace parsing** — pure parser addition, no schema changes
 5. **Design doc for `symdex_request_reindex`** — needs design before code, but
    should be next write-capable tool
-6. **Design doc for `symdex_explain_change`** — most powerful future agent
-   integration feature
+6. **Design follow-up for richer explain-change ranking** — optional future
+   improvement after more relationship kinds are indexed

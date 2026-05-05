@@ -11,16 +11,21 @@ use std::time::Duration;
 use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, NormalizedRepoPath,
     ParseDiagnostic, RepoRoot, RepositoryRefSnapshot, ResolutionStatus, SemanticLayer, Symbol,
-    SymbolKind, content_hash, discover_indexable_files, index_source_file,
+    SymbolKind, SymbolReference, content_hash, discover_indexable_files, index_source_file,
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallRecord, ChunkEmbeddingRecord, ChunkRecord, FastEmbeddingManifestRecord,
-    FastSemanticGenerationInput, FileRecord, IndexRunRecord, PointPayload,
+    FastSemanticGenerationInput, FileIndexEventRecord, FileRecord, IndexRunRecord, PointPayload,
     QualityActivationSummary, QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow,
     QualityQueueSummary, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
-    SymbolRecord, TestRecord, VectorPoint, current_timestamp, vector_point_id, vector_table_name,
+    SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint, WriterLease, WriterLeaseKind,
+    WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
 };
+
+const EMBEDDING_SEGMENT_OVERLAP_DIVISOR: usize = 5;
+const MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES: usize = 256;
+const MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOptions {
@@ -195,7 +200,7 @@ pub struct ContinuousQualityState {
 
 impl ContinuousQualityState {
     fn has_work(&self) -> bool {
-        self.pending_jobs > 0 || self.running_jobs > 0
+        self.pending_jobs > 0 || self.running_jobs > 0 || self.skipped_stale_jobs > 0
     }
 }
 
@@ -335,24 +340,67 @@ pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
     run_index_with_progress(options, |_| {})
 }
 
+pub fn run_index_with_existing_writer(options: &IndexOptions) -> Result<IndexSummary, String> {
+    run_index_with_existing_writer_and_progress(options, |_| {})
+}
+
+pub fn run_index_with_existing_writer_and_progress(
+    options: &IndexOptions,
+    mut on_progress: impl FnMut(IndexProgress),
+) -> Result<IndexSummary, String> {
+    run_index_internal(
+        options,
+        options.scope.skips_unchanged(),
+        None,
+        false,
+        &mut on_progress,
+    )
+}
+
 pub fn run_quality_index(options: &QualityIndexOptions) -> Result<QualityIndexSummary, String> {
     run_quality_index_with_progress(options, |_| {})
+}
+
+pub fn run_quality_index_with_existing_writer(
+    options: &QualityIndexOptions,
+) -> Result<QualityIndexSummary, String> {
+    run_quality_index_with_existing_writer_and_progress(options, |_| {})
+}
+
+pub fn run_quality_index_with_existing_writer_and_progress(
+    options: &QualityIndexOptions,
+    on_progress: impl FnMut(IndexProgress),
+) -> Result<QualityIndexSummary, String> {
+    run_quality_index_limited_with_progress(options, None, false, on_progress)
 }
 
 pub fn run_quality_index_with_progress(
     options: &QualityIndexOptions,
     on_progress: impl FnMut(IndexProgress),
 ) -> Result<QualityIndexSummary, String> {
-    run_quality_index_limited_with_progress(options, None, on_progress)
+    run_quality_index_limited_with_progress(options, None, true, on_progress)
 }
 
 fn run_quality_index_limited_with_progress(
     options: &QualityIndexOptions,
     max_jobs: Option<usize>,
+    acquire_writer: bool,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<QualityIndexSummary, String> {
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
+    let _writer_lease = if acquire_writer {
+        Some(
+            WriterLease::acquire(
+                &store_config,
+                WriterLeaseRequest::new(WriterLeaseKind::QualityIndex, "index-quality")
+                    .for_repo(root.id(), root.path().display().to_string()),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     let repository = RepositoryRecord {
@@ -393,6 +441,40 @@ fn run_quality_index_limited_with_progress(
     let mut stats = QualityWorkerStats::default();
     let mut quality_dimension = generation.quality_dimension;
     let batch_size = layered_embed_config.quality_batch_size.max(1);
+    let requeued_at = current_timestamp();
+    let requeued_stale_jobs = sqlite
+        .requeue_current_terminal_quality_embedding_jobs(root.id(), &generation.id, &requeued_at)
+        .map_err(|error| error.to_string())?;
+    let queued_jobs = sqlite
+        .quality_embedding_jobs_for_fast_generation(
+            root.id(),
+            &generation.id,
+            &quality_model,
+            &requeued_at,
+        )
+        .map_err(|error| error.to_string())?;
+    let queued_missing_jobs = queued_jobs.len();
+    if queued_missing_jobs > 0 {
+        sqlite
+            .queue_quality_embedding_jobs(&generation, &quality_model, &queued_jobs, &requeued_at)
+            .map_err(|error| error.to_string())?;
+    }
+    if requeued_stale_jobs > 0 {
+        on_progress(IndexProgress::new(
+            "quality_index",
+            0,
+            requeued_stale_jobs,
+            format!("Requeued {requeued_stale_jobs} current terminal quality jobs"),
+        ));
+    }
+    if queued_missing_jobs > 0 {
+        on_progress(IndexProgress::new(
+            "quality_index",
+            0,
+            queued_missing_jobs,
+            format!("Queued {queued_missing_jobs} missing current quality jobs"),
+        ));
+    }
 
     loop {
         let remaining_limit = max_jobs.map(|limit| limit.saturating_sub(stats.claimed_jobs));
@@ -489,11 +571,11 @@ fn run_quality_index_limited_with_progress(
 }
 
 pub fn run_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
-    run_index_internal(options, true, None, |_| {})
+    run_index_internal(options, true, None, true, |_| {})
 }
 
 fn run_watch_incremental_index(options: &IndexOptions) -> Result<IndexSummary, String> {
-    run_index_internal(options, true, Some("watch"), |_| {})
+    run_index_internal(options, true, Some("watch"), false, |_| {})
 }
 
 pub fn run_continuous_index(
@@ -508,12 +590,30 @@ pub fn run_continuous_index_until(
     mut on_event: impl FnMut(ContinuousIndexEvent),
     mut should_continue: impl FnMut() -> bool,
 ) -> Result<(), String> {
+    run_continuous_index_until_with_write_gate(
+        options,
+        &mut on_event,
+        &mut should_continue,
+        |job| job(),
+    )
+}
+
+pub fn run_continuous_index_until_with_write_gate(
+    options: &ContinuousIndexOptions,
+    mut on_event: impl FnMut(ContinuousIndexEvent),
+    mut should_continue: impl FnMut() -> bool,
+    mut with_writer: impl FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+) -> Result<(), String> {
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let mut snapshot = watch_snapshot(&root)?;
-    on_event(ContinuousIndexEvent::Started {
-        repository_id: root.id().to_owned(),
-        files_seen: snapshot.len(),
-    });
+    emit_continuous_event_with_writer(
+        ContinuousIndexEvent::Started {
+            repository_id: root.id().to_owned(),
+            files_seen: snapshot.len(),
+        },
+        &mut on_event,
+        &mut with_writer,
+    )?;
 
     while should_continue() {
         thread::sleep(options.poll_interval);
@@ -523,16 +623,23 @@ pub fn run_continuous_index_until(
         let (next_snapshot, first_changes) = detect_watch_changes(&root, &snapshot)?;
         if first_changes.is_empty() {
             snapshot = next_snapshot;
-            on_event(ContinuousIndexEvent::Idle {
-                files_seen: snapshot.len(),
-            });
-            run_continuous_quality_catch_up(options, &mut on_event, false);
+            with_writer(&mut || {
+                on_event(ContinuousIndexEvent::Idle {
+                    files_seen: snapshot.len(),
+                });
+                run_continuous_quality_catch_up(options, &mut on_event, false);
+                Ok(())
+            })?;
             continue;
         }
 
-        on_event(ContinuousIndexEvent::ChangesPending {
-            changes: first_changes.clone(),
-        });
+        emit_continuous_event_with_writer(
+            ContinuousIndexEvent::ChangesPending {
+                changes: first_changes.clone(),
+            },
+            &mut on_event,
+            &mut with_writer,
+        )?;
         thread::sleep(options.debounce);
         if !should_continue() {
             break;
@@ -543,30 +650,61 @@ pub fn run_continuous_index_until(
         } else {
             changes
         };
-        on_event(ContinuousIndexEvent::ChangesDetected {
-            changes: changes.clone(),
-        });
+        emit_continuous_event_with_writer(
+            ContinuousIndexEvent::ChangesDetected {
+                changes: changes.clone(),
+            },
+            &mut on_event,
+            &mut with_writer,
+        )?;
 
-        match run_watch_incremental_index(&IndexOptions {
-            repo: options.repo.clone(),
-            offline: options.offline,
-            scope: IndexScope::Incremental,
-        }) {
-            Ok(summary) => {
-                snapshot = watch_snapshot(&root).unwrap_or(debounced_snapshot);
+        let batch_job = || {
+            run_watch_incremental_index(&IndexOptions {
+                repo: options.repo.clone(),
+                offline: options.offline,
+                scope: IndexScope::Incremental,
+            })
+        };
+        match with_writer(&mut || {
+            batch_job().map(|summary| {
+                snapshot = watch_snapshot(&root).unwrap_or(debounced_snapshot.clone());
                 on_event(ContinuousIndexEvent::BatchCompleted {
-                    changes,
+                    changes: changes.clone(),
                     summary: Box::new(summary),
                 });
-                run_continuous_quality_catch_up(options, &mut on_event, true);
+            })
+        }) {
+            Ok(()) => {
+                with_writer(&mut || {
+                    run_continuous_quality_catch_up(options, &mut on_event, true);
+                    Ok(())
+                })?;
             }
             Err(error) => {
                 snapshot = debounced_snapshot;
-                on_event(ContinuousIndexEvent::BatchFailed { changes, error });
+                emit_continuous_event_with_writer(
+                    ContinuousIndexEvent::BatchFailed { changes, error },
+                    &mut on_event,
+                    &mut with_writer,
+                )?;
             }
         }
     }
     Ok(())
+}
+
+fn emit_continuous_event_with_writer(
+    event: ContinuousIndexEvent,
+    on_event: &mut impl FnMut(ContinuousIndexEvent),
+    with_writer: &mut impl FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut event = Some(event);
+    with_writer(&mut || {
+        if let Some(event) = event.take() {
+            on_event(event);
+        }
+        Ok(())
+    })
 }
 
 fn run_continuous_quality_catch_up(
@@ -603,6 +741,7 @@ fn run_continuous_quality_catch_up(
             repo: options.repo.clone(),
         },
         Some(layered_config.quality_batch_size.max(1)),
+        false,
         |progress| on_event(ContinuousIndexEvent::QualityProgress { progress }),
     ) {
         Ok(summary) => on_event(ContinuousIndexEvent::QualityCompleted {
@@ -631,7 +770,6 @@ fn continuous_quality_state(
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
     let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
     let Some(routing) = sqlite
         .semantic_routing_summary(root.id())
         .map_err(|error| error.to_string())?
@@ -661,7 +799,14 @@ fn continuous_quality_state(
 }
 
 pub fn watch_snapshot(root: &RepoRoot) -> Result<WatchSnapshot, String> {
-    let files = discover_indexable_files(root, &DiscoveryOptions::default())
+    watch_snapshot_with_options(root, &DiscoveryOptions::from_env())
+}
+
+fn watch_snapshot_with_options(
+    root: &RepoRoot,
+    options: &DiscoveryOptions,
+) -> Result<WatchSnapshot, String> {
+    let files = discover_indexable_files(root, options)
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|file| (file.facts.relative_path, file.facts.content_hash))
@@ -702,6 +847,7 @@ pub fn run_index_with_progress(
         options,
         options.scope.skips_unchanged(),
         None,
+        true,
         &mut on_progress,
     )
 }
@@ -710,6 +856,7 @@ fn run_index_internal(
     options: &IndexOptions,
     skip_unchanged: bool,
     run_kind_override: Option<&'static str>,
+    acquire_writer: bool,
     mut on_progress: impl FnMut(IndexProgress),
 ) -> Result<IndexSummary, String> {
     on_progress(IndexProgress::new(
@@ -720,6 +867,22 @@ fn run_index_internal(
     ));
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
+    let _writer_lease = if acquire_writer {
+        let kind = match run_kind_override {
+            Some("watch") => WriterLeaseKind::WatcherDaemon,
+            _ => WriterLeaseKind::ManualIndex,
+        };
+        Some(
+            WriterLease::acquire(
+                &store_config,
+                WriterLeaseRequest::new(kind, "index")
+                    .for_repo(root.id(), root.path().display().to_string()),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     sqlite
@@ -766,24 +929,22 @@ fn run_index_internal(
         ))
         .map_err(|error| error.to_string())?;
 
-    let mut collection = match collect_index_reports(
-        &root,
-        if skip_unchanged { Some(&sqlite) } else { None },
-        &mut on_progress,
-    ) {
-        Ok(collection) => collection,
-        Err(error) => {
-            finish_failed_index_run(
-                &sqlite,
-                &run_scope,
-                "unknown",
-                RunCounts::default(),
-                "failed",
-                &error,
-            )?;
-            return Err(error);
-        }
-    };
+    let mut collection =
+        match collect_index_reports(&root, Some(&sqlite), skip_unchanged, &mut on_progress) {
+            Ok(collection) => collection,
+            Err(error) => {
+                record_collect_failure_file_event(&mut sqlite, &run_scope, &error)?;
+                finish_failed_index_run(
+                    &sqlite,
+                    &run_scope,
+                    "unknown",
+                    RunCounts::default(),
+                    "failed",
+                    &error,
+                )?;
+                return Err(error);
+            }
+        };
     let persisted_rust_symbols = match sqlite.rust_symbols_for_repository(root.id()) {
         Ok(symbols) => symbols,
         Err(error) => {
@@ -804,7 +965,6 @@ fn run_index_internal(
         }
     };
     resolve_cross_file_rust_calls(&mut collection, &persisted_rust_symbols);
-    apply_embedding_size_limits(&mut collection.reports, embed_config.max_chunk_bytes);
     let files = file_summaries(&collection.reports);
     let rust_analyzer =
         rust_analyzer_enrichment_summary(&collection, &RustAnalyzerEnrichmentConfig::from_env());
@@ -1001,10 +1161,27 @@ fn index_run_kind(offline: bool, override_kind: Option<&'static str>) -> &'stati
 fn collect_index_reports(
     root: &RepoRoot,
     sqlite: Option<&SqliteStore>,
+    skip_unchanged: bool,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<IndexCollection, String> {
-    let files = discover_indexable_files(root, &DiscoveryOptions::default())
-        .map_err(|error| error.to_string())?;
+    collect_index_reports_with_options(
+        root,
+        sqlite,
+        skip_unchanged,
+        &DiscoveryOptions::from_env(),
+        on_progress,
+    )
+}
+
+fn collect_index_reports_with_options(
+    root: &RepoRoot,
+    sqlite: Option<&SqliteStore>,
+    skip_unchanged: bool,
+    discovery_options: &DiscoveryOptions,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<IndexCollection, String> {
+    let files =
+        discover_indexable_files(root, discovery_options).map_err(|error| error.to_string())?;
     on_progress(IndexProgress::new(
         "discover",
         0,
@@ -1015,7 +1192,17 @@ fn collect_index_reports(
     let mut reports = Vec::new();
     let mut files_skipped_unchanged = 0usize;
     for (index, file) in files.iter().enumerate() {
-        if let Some(sqlite) = sqlite
+        let old_content_hash = sqlite
+            .map(|sqlite| {
+                sqlite
+                    .latest_file_state_for_path(root.id(), &file.facts.relative_path)
+                    .map(|state| state.map(|state| state.content_hash))
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if skip_unchanged
+            && let Some(sqlite) = sqlite
             && sqlite
                 .file_unchanged(
                     root.id(),
@@ -1032,10 +1219,12 @@ fn collect_index_reports(
                 chunks: Vec::new(),
                 symbols: Vec::new(),
                 calls: Vec::new(),
+                symbol_references: Vec::new(),
                 tests: Vec::new(),
                 parse_diagnostics: Vec::new(),
                 source: String::new(),
                 skipped_unchanged: true,
+                old_content_hash,
             });
             on_progress(IndexProgress::new(
                 "parse",
@@ -1048,18 +1237,20 @@ fn collect_index_reports(
 
         let source = fs::read_to_string(&file.absolute_path)
             .map_err(|error| format!("read {}: {error}", file.absolute_path.display()))?;
-        let file_index =
-            index_source_file(&file.facts, &source).map_err(|error| error.to_string())?;
+        let file_index = index_source_file(&file.facts, &source)
+            .map_err(|error| format!("parse {}: {error}", file.facts.relative_path))?;
         let parse_diagnostic_count = file_index.parse_diagnostics.len();
         reports.push(IndexReport {
             file: file.facts.clone(),
             chunks: file_index.chunks,
             symbols: file_index.symbols,
             calls: file_index.calls,
+            symbol_references: file_index.symbol_references,
             tests: file_index.tests,
             parse_diagnostics: file_index.parse_diagnostics,
             source,
             skipped_unchanged: false,
+            old_content_hash,
         });
         let message = if parse_diagnostic_count == 0 {
             format!("Parsed {}", file.facts.relative_path)
@@ -1139,14 +1330,22 @@ impl RustAnalyzerEnrichmentConfig {
     }
 
     fn from_values(enabled: Option<&str>, command: Option<&str>) -> Self {
-        Self {
-            enabled: enabled.is_some_and(env_flag_enabled),
-            command: command
-                .map(str::trim)
-                .filter(|command| !command.is_empty())
-                .unwrap_or("rust-analyzer")
-                .to_owned(),
-        }
+        Self::from_values_with_detector(enabled, command, rust_analyzer_command_exists)
+    }
+
+    fn from_values_with_detector(
+        enabled: Option<&str>,
+        command: Option<&str>,
+        command_exists: impl FnOnce(&str) -> bool,
+    ) -> Self {
+        let command = command
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .unwrap_or("rust-analyzer")
+            .to_owned();
+        let enabled = enabled.map_or_else(|| command_exists(&command), env_flag_enabled);
+
+        Self { enabled, command }
     }
 }
 
@@ -1162,6 +1361,13 @@ fn env_flag_enabled(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn rust_analyzer_command_exists(command: &str) -> bool {
+    match Command::new(command).arg("--version").output() {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 fn rust_analyzer_enrichment_summary(
@@ -1572,6 +1778,7 @@ fn persist_structural_index(
     let mut chunks_indexed = 0usize;
     let mut symbols_indexed = 0usize;
     let mut calls_indexed = 0usize;
+    let mut file_index_events = Vec::new();
     for (index, report) in collection.reports.iter().enumerate() {
         let file = FileRecord {
             id: report.file.id.clone(),
@@ -1599,6 +1806,17 @@ fn persist_structural_index(
             .iter()
             .map(|call| call_record(call, index_run_id, report.file.language.parser_version()))
             .collect::<Vec<_>>();
+        let symbol_references = report
+            .symbol_references
+            .iter()
+            .map(|reference| {
+                symbol_reference_record(
+                    reference,
+                    index_run_id,
+                    report.file.language.parser_version(),
+                )
+            })
+            .collect::<Vec<_>>();
         let tests = report
             .tests
             .iter()
@@ -1612,6 +1830,21 @@ fn persist_structural_index(
             })
             .collect::<Vec<_>>();
         if report.skipped_unchanged {
+            file_index_events.push(file_index_event(FileIndexEventInput {
+                index_run_id,
+                repository_id: root.id(),
+                repository_ref_id,
+                path: &report.file.relative_path,
+                old_content_hash: report
+                    .old_content_hash
+                    .clone()
+                    .or_else(|| Some(report.file.content_hash.clone())),
+                new_content_hash: Some(report.file.content_hash.clone()),
+                action: "skipped",
+                reason: "unchanged_content_hash",
+                status: "skipped",
+                error_summary: None,
+            }));
             if let Some(repository_ref_id) = repository_ref_id {
                 sqlite
                     .link_file_to_ref(repository_ref_id, &file)
@@ -1625,23 +1858,55 @@ fn persist_structural_index(
             ));
             continue;
         }
+        let action = if report.old_content_hash.is_some() {
+            "updated"
+        } else {
+            "created"
+        };
+        let reason = if !report.parse_diagnostics.is_empty() {
+            "parsed_with_diagnostics"
+        } else if report.old_content_hash.is_some() {
+            "content_changed"
+        } else {
+            "new_file"
+        };
+        file_index_events.push(file_index_event(FileIndexEventInput {
+            index_run_id,
+            repository_id: root.id(),
+            repository_ref_id,
+            path: &report.file.relative_path,
+            old_content_hash: report.old_content_hash.clone(),
+            new_content_hash: Some(report.file.content_hash.clone()),
+            action,
+            reason,
+            status: "success",
+            error_summary: None,
+        }));
         chunks_indexed += chunks.len();
         symbols_indexed += symbols.len();
         calls_indexed += calls.len();
         if let Some(repository_ref_id) = repository_ref_id {
             sqlite
-                .replace_file_facts_for_ref_with_tests(
+                .replace_file_facts_for_ref_with_references_and_tests(
                     repository_ref_id,
                     &file,
                     &symbols,
                     &chunks,
                     &calls,
+                    &symbol_references,
                     &tests,
                 )
                 .map_err(|error| error.to_string())?;
         } else {
             sqlite
-                .replace_file_facts_with_tests(&file, &symbols, &chunks, &calls, &tests)
+                .replace_file_facts_with_references_and_tests(
+                    &file,
+                    &symbols,
+                    &chunks,
+                    &calls,
+                    &symbol_references,
+                    &tests,
+                )
                 .map_err(|error| error.to_string())?;
         }
         on_progress(IndexProgress::new(
@@ -1651,6 +1916,40 @@ fn persist_structural_index(
             format!("Persisted {}", report.file.relative_path),
         ));
     }
+
+    let active_paths: BTreeSet<&str> = collection.active_paths.iter().map(String::as_str).collect();
+    let deleted_states = if let Some(repository_ref_id) = repository_ref_id {
+        sqlite
+            .ref_file_index_states(repository_ref_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|state| !active_paths.contains(state.path.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        sqlite
+            .file_index_states(root.id())
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|state| !active_paths.contains(state.path.as_str()))
+            .collect::<Vec<_>>()
+    };
+    for deleted in deleted_states {
+        file_index_events.push(file_index_event(FileIndexEventInput {
+            index_run_id,
+            repository_id: root.id(),
+            repository_ref_id,
+            path: &deleted.path,
+            old_content_hash: Some(deleted.content_hash),
+            new_content_hash: None,
+            action: "deleted",
+            reason: "missing_from_discovery",
+            status: "success",
+            error_summary: None,
+        }));
+    }
+    sqlite
+        .record_file_index_events(&file_index_events)
+        .map_err(|error| error.to_string())?;
 
     let ref_files_removed = if let Some(repository_ref_id) = repository_ref_id {
         sqlite
@@ -1688,6 +1987,41 @@ fn persist_structural_index(
     })
 }
 
+struct FileIndexEventInput<'a> {
+    index_run_id: &'a str,
+    repository_id: &'a str,
+    repository_ref_id: Option<&'a str>,
+    path: &'a str,
+    old_content_hash: Option<String>,
+    new_content_hash: Option<String>,
+    action: &'a str,
+    reason: &'a str,
+    status: &'a str,
+    error_summary: Option<String>,
+}
+
+fn file_index_event(input: FileIndexEventInput<'_>) -> FileIndexEventRecord {
+    FileIndexEventRecord {
+        id: symdex_core::stable_id(&[
+            "file-index-event",
+            input.index_run_id,
+            input.path,
+            input.action,
+            input.status,
+        ]),
+        index_run_id: input.index_run_id.to_owned(),
+        repository_id: input.repository_id.to_owned(),
+        repository_ref_id: input.repository_ref_id.map(str::to_owned),
+        path: input.path.to_owned(),
+        old_content_hash: input.old_content_hash,
+        new_content_hash: input.new_content_hash,
+        action: input.action.to_owned(),
+        reason: input.reason.to_owned(),
+        status: input.status.to_owned(),
+        error_summary: input.error_summary,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PreparedSemanticIndex {
     SkippedNoChunks,
@@ -1722,7 +2056,7 @@ fn prepare_semantic_index(
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<PreparedSemanticIndex, String> {
     let embed_config = layered_embed_config.fast_embed_config();
-    let chunk_texts = chunk_texts(&collection.reports);
+    let chunk_texts = chunk_texts(&collection.reports, embed_config.max_chunk_bytes);
     if chunk_texts.is_empty() {
         on_progress(IndexProgress::new(
             "embedding",
@@ -1757,15 +2091,18 @@ fn prepare_semantic_index(
         format!("Embedding {} chunks", chunk_texts.len()),
     ));
 
+    let embedding_segments = chunk_texts
+        .iter()
+        .flat_map(|chunk| chunk.text_segments.iter().cloned())
+        .collect::<Vec<_>>();
     let embeddings = embed_client
-        .embed_batch(
-            &chunk_texts
-                .iter()
-                .map(|chunk| chunk.text.clone())
-                .collect::<Vec<_>>(),
-        )
+        .embed_batch(&embedding_segments)
         .map_err(|error| error.to_string())?;
-    let dimension = embeddings.dimension().unwrap_or(0);
+    let chunk_vectors = aggregate_segment_embeddings(&chunk_texts, embeddings.embeddings)?;
+    let dimension = chunk_vectors
+        .first()
+        .map(|vector| vector.len())
+        .unwrap_or(0);
     on_progress(IndexProgress::new(
         "embedding",
         3,
@@ -1785,12 +2122,16 @@ fn prepare_semantic_index(
         "vector",
         4,
         5,
-        format!("Upserting {} vector points", chunk_texts.len()),
+        format!(
+            "Upserting {} vector points from {} embedding segments",
+            chunk_texts.len(),
+            embedding_segments.len()
+        ),
     ));
 
     let points = chunk_texts
         .iter()
-        .zip(embeddings.embeddings)
+        .zip(chunk_vectors)
         .map(|(chunk, vector)| {
             vector_point(
                 root.id(),
@@ -1888,6 +2229,7 @@ fn finalize_semantic_index(
     let generation = sqlite
         .record_fast_semantic_generation(FastSemanticGenerationInput {
             repository_id: root.id(),
+            repository_ref_id: context.repository_ref_id,
             fast_model: &prepared.model,
             fast_dimension: prepared.dimension,
             vector_table: &prepared.vector_table,
@@ -2160,10 +2502,7 @@ fn process_quality_job(
         }
     };
 
-    let embeddings = match context
-        .embed_client
-        .embed_batch(std::slice::from_ref(&prepared.text))
-    {
+    let embeddings = match context.embed_client.embed_batch(&prepared.text_segments) {
         Ok(embeddings) => embeddings,
         Err(error) => {
             sqlite
@@ -2227,15 +2566,18 @@ fn process_quality_job(
         return Ok(());
     }
 
-    let Some(vector) = embeddings.embeddings.into_iter().next() else {
-        complete_failed_quality_job(
-            sqlite,
-            &prepared.row.job.id,
-            "quality embedding response did not include a vector",
-            &completed_at,
-            stats,
-        )?;
-        return Ok(());
+    let vector = match average_embedding(&embeddings.embeddings) {
+        Ok(vector) => vector,
+        Err(error) => {
+            complete_failed_quality_job(
+                sqlite,
+                &prepared.row.job.id,
+                &error,
+                &completed_at,
+                stats,
+            )?;
+            return Ok(());
+        }
     };
     let point = match quality_vector_point(
         context.root.id(),
@@ -2317,7 +2659,7 @@ fn complete_failed_quality_job(
 #[derive(Debug)]
 struct PreparedQualityJob {
     row: QualityJobSourceRow,
-    text: String,
+    text_segments: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2353,11 +2695,6 @@ fn prepare_quality_job(
     if start_byte >= end_byte {
         return Ok(QualityJobPreparation::Stale);
     }
-    if end_byte.saturating_sub(start_byte) > max_chunk_bytes {
-        return Ok(QualityJobPreparation::Excluded {
-            reason: "quality_chunk_too_large_for_embedding".to_owned(),
-        });
-    }
     let normalized = NormalizedRepoPath::new(&row.job.path).map_err(|error| error.to_string())?;
     let path = root.path().join(normalized.as_str());
     let source =
@@ -2377,9 +2714,13 @@ fn prepare_quality_job(
     if content_hash(text.as_bytes()) != row.job.text_hash {
         return Ok(QualityJobPreparation::Stale);
     }
+    let text_segments = embedding_text_segments(&text, max_chunk_bytes);
+    if text_segments.is_empty() {
+        return Ok(QualityJobPreparation::Stale);
+    }
     Ok(QualityJobPreparation::Ready(Box::new(PreparedQualityJob {
         row: row.clone(),
-        text,
+        text_segments,
     })))
 }
 
@@ -2547,7 +2888,7 @@ fn stale_vector_point_ids_to_delete(
         .collect()
 }
 
-fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
+fn chunk_texts(reports: &[IndexReport], max_chunk_bytes: usize) -> Vec<ChunkText<'_>> {
     reports
         .iter()
         .flat_map(|report| {
@@ -2555,27 +2896,157 @@ fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
                 .chunks
                 .iter()
                 .filter(|chunk| chunk.excluded_reason.is_none())
-                .map(|chunk| ChunkText {
-                    file: &report.file,
-                    chunk,
-                    text: report.source[chunk.byte_range.start..chunk.byte_range.end].to_owned(),
+                .filter_map(|chunk| {
+                    let text = &report.source[chunk.byte_range.start..chunk.byte_range.end];
+                    let text_segments = embedding_text_segments(text, max_chunk_bytes);
+                    (!text_segments.is_empty()).then_some(ChunkText {
+                        file: &report.file,
+                        chunk,
+                        text_segments,
+                    })
                 })
         })
         .collect()
 }
 
-fn apply_embedding_size_limits(reports: &mut [IndexReport], max_chunk_bytes: usize) -> usize {
-    let mut excluded = 0;
-    for report in reports {
-        for chunk in &mut report.chunks {
-            let chunk_bytes = chunk.byte_range.end.saturating_sub(chunk.byte_range.start);
-            if chunk.excluded_reason.is_none() && chunk_bytes > max_chunk_bytes {
-                chunk.excluded_reason = Some("chunk_too_large_for_embedding".to_owned());
-                excluded += 1;
-            }
+fn embedding_text_segments(text: &str, max_chunk_bytes: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if max_chunk_bytes == 0 || text.len() <= max_chunk_bytes {
+        return vec![text.to_owned()];
+    }
+
+    let overlap = embedding_overlap_bytes(max_chunk_bytes);
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let hard_end =
+            floor_char_boundary(text, start.saturating_add(max_chunk_bytes).min(text.len()));
+        let mut end = preferred_embedding_segment_end(text, start, hard_end, max_chunk_bytes);
+        if end <= start {
+            end = next_char_boundary(text, start);
+        }
+        segments.push(text[start..end].to_owned());
+        if end >= text.len() {
+            break;
+        }
+
+        let next_start = if overlap == 0 {
+            end
+        } else {
+            floor_char_boundary(text, end.saturating_sub(overlap))
+        };
+        start = if next_start <= start { end } else { next_start };
+    }
+    segments
+}
+
+fn embedding_overlap_bytes(max_chunk_bytes: usize) -> usize {
+    if max_chunk_bytes < 32 {
+        0
+    } else {
+        (max_chunk_bytes / EMBEDDING_SEGMENT_OVERLAP_DIVISOR)
+            .min(MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES)
+            .min(max_chunk_bytes - 1)
+    }
+}
+
+fn preferred_embedding_segment_end(
+    text: &str,
+    start: usize,
+    hard_end: usize,
+    max_chunk_bytes: usize,
+) -> usize {
+    if hard_end >= text.len() {
+        return text.len();
+    }
+    let min_end = start + (max_chunk_bytes / MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR).max(1);
+    if let Some(relative_newline) = text[start..hard_end].rfind('\n') {
+        let newline_end = start + relative_newline + 1;
+        if newline_end >= min_end {
+            return newline_end;
         }
     }
-    excluded
+    hard_end
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(text: &str, start: usize) -> usize {
+    text[start..]
+        .chars()
+        .next()
+        .map(|character| start + character.len_utf8())
+        .unwrap_or(text.len())
+}
+
+fn aggregate_segment_embeddings(
+    chunks: &[ChunkText<'_>],
+    segment_embeddings: Vec<Vec<f32>>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let expected_segments = chunks
+        .iter()
+        .map(|chunk| chunk.text_segments.len())
+        .sum::<usize>();
+    if expected_segments != segment_embeddings.len() {
+        return Err(format!(
+            "embedding response count mismatch: expected {expected_segments}, got {}",
+            segment_embeddings.len()
+        ));
+    }
+
+    let mut offset = 0usize;
+    let mut vectors = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let end = offset + chunk.text_segments.len();
+        vectors.push(average_embedding(&segment_embeddings[offset..end])?);
+        offset = end;
+    }
+    Ok(vectors)
+}
+
+fn average_embedding(embeddings: &[Vec<f32>]) -> Result<Vec<f32>, String> {
+    let Some(first) = embeddings.first() else {
+        return Err("cannot average an empty embedding set".to_owned());
+    };
+    let dimension = first.len();
+    if embeddings
+        .iter()
+        .any(|embedding| embedding.len() != dimension)
+    {
+        return Err("embedding response included inconsistent vector dimensions".to_owned());
+    }
+    if embeddings.len() == 1 {
+        return Ok(first.clone());
+    }
+
+    let mut averaged = vec![0.0f32; dimension];
+    for embedding in embeddings {
+        for (index, value) in embedding.iter().enumerate() {
+            averaged[index] += *value;
+        }
+    }
+    let count = embeddings.len() as f32;
+    for value in &mut averaged {
+        *value /= count;
+    }
+    let norm = averaged
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut averaged {
+            *value /= norm;
+        }
+    }
+    Ok(averaged)
 }
 
 fn vector_point(
@@ -2668,6 +3139,26 @@ fn call_record(call: &CallEdge, index_run_id: &str, parser_version: &str) -> Cal
     }
 }
 
+fn symbol_reference_record(
+    reference: &SymbolReference,
+    index_run_id: &str,
+    parser_version: &str,
+) -> SymbolReferenceRecord {
+    SymbolReferenceRecord {
+        id: reference.id.clone(),
+        file_id: reference.file_id.clone(),
+        source_symbol_id: reference.source_symbol_id.clone(),
+        target_symbol_id: reference.target_symbol_id.clone(),
+        reference_text: reference.reference_text.clone(),
+        reference_kind: reference.reference_kind.as_str().to_owned(),
+        line: reference.line,
+        confidence: reference.confidence,
+        resolution_status: reference.resolution_status.as_str().to_owned(),
+        index_run_id: index_run_id.to_owned(),
+        parser_version: parser_version.to_owned(),
+    }
+}
+
 fn test_record(
     repository_id: &str,
     test: &DiscoveredTest,
@@ -2752,6 +3243,48 @@ fn finish_failed_index_run(
         })
 }
 
+fn record_collect_failure_file_event(
+    sqlite: &mut SqliteStore,
+    scope: &RunScope<'_>,
+    error: &str,
+) -> Result<(), String> {
+    let Some((reason, path)) = collect_failure_reason_and_path(error) else {
+        return Ok(());
+    };
+    let event = file_index_event(FileIndexEventInput {
+        index_run_id: scope.index_run_id,
+        repository_id: scope.repository_id,
+        repository_ref_id: scope.repository_ref_id,
+        path,
+        old_content_hash: None,
+        new_content_hash: None,
+        action: "failed",
+        reason,
+        status: "failed",
+        error_summary: Some(error_summary(error)),
+    });
+    sqlite
+        .record_file_index_events(&[event])
+        .map_err(|record_error| {
+            format!("{error}; additionally failed to record file index event: {record_error}")
+        })
+}
+
+fn collect_failure_reason_and_path(error: &str) -> Option<(&'static str, &str)> {
+    let (reason, rest) = if let Some(rest) = error.strip_prefix("read ") {
+        ("read_failed", rest)
+    } else if let Some(rest) = error.strip_prefix("parse ") {
+        ("parse_failed", rest)
+    } else {
+        return None;
+    };
+    let (path, _) = rest.split_once(": ")?;
+    if path.is_empty() {
+        return None;
+    }
+    Some((reason, path))
+}
+
 fn error_summary(error: &str) -> String {
     let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
     const MAX_ERROR_SUMMARY_CHARS: usize = 512;
@@ -2778,16 +3311,18 @@ struct IndexReport {
     chunks: Vec<CodeChunk>,
     symbols: Vec<Symbol>,
     calls: Vec<CallEdge>,
+    symbol_references: Vec<SymbolReference>,
     tests: Vec<DiscoveredTest>,
     parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
     skipped_unchanged: bool,
+    old_content_hash: Option<String>,
 }
 
 struct ChunkText<'a> {
     file: &'a FileFacts,
     chunk: &'a CodeChunk,
-    text: String,
+    text_segments: Vec<String>,
 }
 
 #[cfg(test)]
@@ -2796,11 +3331,11 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
-        ByteRange, CallEdge, ChunkKind, CodeChunk, FileFacts, Language, LineRange, RepoRoot,
-        ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
+        ByteRange, CallEdge, ChunkKind, CodeChunk, DiscoveryOptions, FileFacts, Language,
+        LineRange, RepoRoot, ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
     };
     use symdex_embed::{LayeredEmbedConfig, LayeredEmbedConfigValues};
     use symdex_store::{
@@ -2809,13 +3344,15 @@ mod tests {
     };
 
     use crate::{
-        ContinuousIndexOptions, IndexCollection, IndexReport, IndexScope, QualityJobPreparation,
-        RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness,
-        WatchSnapshot, apply_embedding_size_limits, chunk_record, chunk_texts,
-        collect_index_reports, detect_watch_changes, diff_watch_snapshots, index_run_kind,
-        plan_rust_analyzer_enrichment, prepare_quality_job, quality_chunk_embedding_record,
-        quality_vector_point, resolve_cross_file_rust_calls,
-        should_run_continuous_quality_catch_up, watch_snapshot,
+        ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, IndexCollection,
+        IndexReport, IndexScope, QualityJobPreparation, RustAnalyzerEnrichmentConfig,
+        RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness, WatchSnapshot,
+        aggregate_segment_embeddings, chunk_record, chunk_texts, collect_index_reports,
+        collect_index_reports_with_options, detect_watch_changes, diff_watch_snapshots,
+        embedding_text_segments, index_run_kind, plan_rust_analyzer_enrichment,
+        prepare_quality_job, quality_chunk_embedding_record, quality_vector_point,
+        resolve_cross_file_rust_calls, run_continuous_index_until_with_write_gate,
+        should_run_continuous_quality_catch_up, watch_snapshot, watch_snapshot_with_options,
     };
 
     #[test]
@@ -2824,6 +3361,22 @@ mod tests {
         assert!(IndexScope::Incremental.skips_unchanged());
         assert_eq!(IndexScope::Full.label(), "full");
         assert_eq!(IndexScope::Incremental.label(), "incremental");
+    }
+
+    #[test]
+    fn collect_failure_reason_extracts_path_specific_failures() {
+        assert_eq!(
+            super::collect_failure_reason_and_path("read src/lib.rs: permission denied"),
+            Some(("read_failed", "src/lib.rs"))
+        );
+        assert_eq!(
+            super::collect_failure_reason_and_path("parse src/lib.rs: parser unavailable"),
+            Some(("parse_failed", "src/lib.rs"))
+        );
+        assert_eq!(
+            super::collect_failure_reason_and_path("database unavailable"),
+            None
+        );
     }
 
     #[test]
@@ -2837,14 +3390,16 @@ mod tests {
             chunks: vec![public.clone(), secret.clone()],
             symbols: Vec::new(),
             calls: Vec::new(),
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
             skipped_unchanged: false,
+            old_content_hash: None,
         };
 
         let reports = [report];
-        let chunks = chunk_texts(&reports);
+        let chunks = chunk_texts(&reports, 2 * 1024);
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk.id, public.id);
@@ -2875,7 +3430,7 @@ mod tests {
             other => panic!("job should be current, got {other:?}"),
         };
 
-        assert_eq!(prepared.text, source);
+        assert_eq!(prepared.text_segments, vec![source.to_owned()]);
         assert_eq!(prepared.row.job.id, "quality-job-1");
     }
 
@@ -2902,19 +3457,27 @@ mod tests {
     }
 
     #[test]
-    fn prepare_quality_job_skips_chunks_over_quality_size_limit() {
-        let repo = TestRepo::new("quality-prepare-too-large");
-        let source = "pub fn public() {}\n";
+    fn prepare_quality_job_splits_chunks_over_quality_size_limit() {
+        let repo = TestRepo::new("quality-prepare-split-large");
+        let source = "pub fn public() {\n    println!(\"first\");\n    println!(\"second\");\n}\n";
         repo.write("src/lib.rs", source);
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
         let row = sample_quality_source_row(source, 0, source.len(), None);
 
-        assert!(matches!(
-            prepare_quality_job(&root, "generation-1", 8, &row)
-                .expect("oversized quality job should not fail"),
-            QualityJobPreparation::Excluded { reason }
-                if reason == "quality_chunk_too_large_for_embedding"
-        ));
+        let prepared = match prepare_quality_job(&root, "generation-1", 8, &row)
+            .expect("oversized quality job should not fail")
+        {
+            QualityJobPreparation::Ready(prepared) => prepared,
+            other => panic!("oversized job should be split, got {other:?}"),
+        };
+
+        assert!(prepared.text_segments.len() > 1);
+        assert!(
+            prepared
+                .text_segments
+                .iter()
+                .all(|segment| segment.len() <= 8)
+        );
     }
 
     #[test]
@@ -2957,33 +3520,81 @@ mod tests {
     }
 
     #[test]
-    fn embedding_size_limits_exclude_oversized_chunks_before_embedding() {
+    fn chunk_texts_split_oversized_chunks_before_embedding() {
         let file = sample_file();
         let source = "a".repeat(128);
         let small = sample_chunk("small", 0, 16, None);
         let large = sample_chunk("large", 16, 128, None);
-        let mut reports = vec![IndexReport {
+        let reports = vec![IndexReport {
             file,
             chunks: vec![small.clone(), large.clone()],
             symbols: Vec::new(),
             calls: Vec::new(),
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
             skipped_unchanged: false,
+            old_content_hash: None,
         }];
 
-        let excluded = apply_embedding_size_limits(&mut reports, 64);
-        let chunks = chunk_texts(&reports);
+        let chunks = chunk_texts(&reports, 64);
 
-        assert_eq!(excluded, 1);
         assert_eq!(reports[0].chunks[0].excluded_reason, None);
-        assert_eq!(
-            reports[0].chunks[1].excluded_reason.as_deref(),
-            Some("chunk_too_large_for_embedding")
-        );
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(reports[0].chunks[1].excluded_reason, None);
+        assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chunk.id, small.id);
+        assert_eq!(chunks[0].text_segments, vec!["a".repeat(16)]);
+        assert_eq!(chunks[1].chunk.id, large.id);
+        assert!(chunks[1].text_segments.len() > 1);
+        assert!(
+            chunks[1]
+                .text_segments
+                .iter()
+                .all(|segment| segment.len() <= 64)
+        );
+    }
+
+    #[test]
+    fn embedding_text_segments_overlap_and_aggregate_to_one_vector_per_chunk() {
+        let file = sample_file();
+        let chunk = sample_chunk("large", 0, 96, None);
+        let report = IndexReport {
+            file,
+            chunks: vec![chunk],
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            symbol_references: Vec::new(),
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: "x".repeat(96),
+            skipped_unchanged: false,
+            old_content_hash: None,
+        };
+        let reports = [report];
+
+        let chunks = chunk_texts(&reports, 64);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text_segments.len(), 2);
+        assert_eq!(chunks[0].text_segments[0].len(), 64);
+        assert_eq!(chunks[0].text_segments[1].len(), 44);
+
+        let vectors = aggregate_segment_embeddings(&chunks, vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("segments should aggregate");
+
+        assert_eq!(vectors.len(), 1);
+        assert!((vectors[0][0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+        assert!((vectors[0][1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn embedding_text_segments_preserve_utf8_boundaries() {
+        let segments = embedding_text_segments("ééé", 3);
+
+        assert_eq!(
+            segments,
+            vec!["é".to_owned(), "é".to_owned(), "é".to_owned()]
+        );
     }
 
     #[test]
@@ -3054,6 +3665,72 @@ mod tests {
     }
 
     #[test]
+    fn continuous_indexing_idle_status_runs_through_writer_gate() {
+        let repo = TestRepo::new("continuous-idle-writer-gate");
+        repo.write("src/lib.rs", "fn main() {}\n");
+        let mut options = ContinuousIndexOptions::new(repo.path().display().to_string(), true);
+        options.poll_interval = Duration::from_millis(1);
+        options.debounce = Duration::from_millis(1);
+
+        let mut should_continue_calls = 0usize;
+        let mut gate_calls = 0usize;
+        let mut events = Vec::new();
+        run_continuous_index_until_with_write_gate(
+            &options,
+            |event| events.push(event),
+            || {
+                should_continue_calls += 1;
+                should_continue_calls <= 2
+            },
+            |job| {
+                gate_calls += 1;
+                job()
+            },
+        )
+        .expect("continuous loop should stop cleanly");
+
+        assert!(matches!(
+            events.first(),
+            Some(ContinuousIndexEvent::Started { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ContinuousIndexEvent::Idle { .. }))
+        );
+        assert!(
+            gate_calls >= events.len(),
+            "watcher status events should be serialized through the writer gate"
+        );
+    }
+
+    #[test]
+    fn continuous_quality_state_treats_stale_jobs_as_work() {
+        let mut state = ContinuousQualityState {
+            repository_id: "repo".to_owned(),
+            generation_id: "generation-1".to_owned(),
+            active_layer: "fast".to_owned(),
+            quality_status: "quality_pending".to_owned(),
+            activation_reason: None,
+            embeddable_chunks: 1,
+            quality_eligible_chunks: 1,
+            quality_ineligible_chunks: 0,
+            quality_embedded_chunks: 0,
+            pending_jobs: 0,
+            running_jobs: 0,
+            succeeded_jobs: 0,
+            failed_jobs: 0,
+            skipped_stale_jobs: 0,
+            skipped_excluded_jobs: 0,
+        };
+
+        assert!(!state.has_work());
+        state.skipped_stale_jobs = 1;
+
+        assert!(state.has_work());
+    }
+
+    #[test]
     fn deferred_vector_cleanup_keeps_newly_upserted_point_ids() {
         let stale = BTreeSet::from([
             "deleted-file-point".to_owned(),
@@ -3083,6 +3760,45 @@ mod tests {
 
         assert_eq!(changes.created, vec!["src/created.cs", "web/util.ts"]);
         assert_eq!(changes.modified, vec!["src/lib.rs", "web/app.js"]);
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn watch_snapshot_tracks_default_config_files() {
+        let repo = TestRepo::new("watch-config");
+        repo.write("Cargo.toml", "[package]\nname = \"old\"\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let snapshot = watch_snapshot(&root).expect("snapshot should load");
+
+        repo.write("Cargo.toml", "[package]\nname = \"new\"\n");
+        repo.write("config/app.yaml", "service: app\n");
+        let (_next, changes) =
+            detect_watch_changes(&root, &snapshot).expect("changes should detect");
+
+        assert_eq!(changes.created, vec!["config/app.yaml"]);
+        assert_eq!(changes.modified, vec!["Cargo.toml"]);
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn watch_snapshot_tracks_scoped_json_with_options() {
+        let repo = TestRepo::new("watch-scoped-json");
+        repo.write("src/lib.rs", "pub fn lib() {}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+        let options = DiscoveryOptions::default().with_json_include_roots("config");
+        let snapshot = watch_snapshot_with_options(&root, &options).expect("snapshot should load");
+
+        repo.write("config/app.json", "{\"service\":\"app\"}\n");
+        repo.write("config/sub/app.json", "{\"service\":\"sub\"}\n");
+        repo.write("config2/app.json", "{\"service\":\"other\"}\n");
+        let next = watch_snapshot_with_options(&root, &options).expect("snapshot should reload");
+        let changes = diff_watch_snapshots(&snapshot, &next);
+
+        assert_eq!(
+            changes.created,
+            vec!["config/app.json", "config/sub/app.json"]
+        );
+        assert!(changes.modified.is_empty());
         assert!(changes.deleted.is_empty());
     }
 
@@ -3165,7 +3881,7 @@ mod tests {
             )
             .expect("file facts should persist");
 
-        let collection = collect_index_reports(&root, Some(&store), &mut |_| {})
+        let collection = collect_index_reports(&root, Some(&store), true, &mut |_| {})
             .expect("collection should succeed");
         let _ = fs::remove_dir_all(db_dir);
 
@@ -3189,7 +3905,7 @@ mod tests {
         let repo = TestRepo::new("partial-parse-diagnostics");
         repo.write("src/lib.rs", "pub fn ok() {}\npub fn broken( {}\n");
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
-        let collection = collect_index_reports(&root, None, &mut |_| {})
+        let collection = collect_index_reports(&root, None, false, &mut |_| {})
             .expect("syntax errors should not abort collection");
 
         assert_eq!(collection.reports.len(), 1);
@@ -3197,6 +3913,37 @@ mod tests {
         assert!(!collection.reports[0].parse_diagnostics.is_empty());
         let summaries = super::file_summaries(&collection.reports);
         assert!(!summaries[0].parse_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn index_collection_indexes_default_config_files_without_json() {
+        let repo = TestRepo::new("config-collection");
+        repo.write("Cargo.toml", "[package]\nname = \"demo\"\n");
+        repo.write(".github/workflows/ci.yml", "name: ci\n");
+        repo.write("config/app.json", "{\"service\":\"app\"}\n");
+        let root = RepoRoot::open(repo.path()).expect("repo root should open");
+
+        let collection = collect_index_reports_with_options(
+            &root,
+            None,
+            false,
+            &DiscoveryOptions::default(),
+            &mut |_| {},
+        )
+        .expect("collection should index config files");
+
+        let summaries = super::file_summaries(&collection.reports);
+        let paths: Vec<_> = summaries
+            .iter()
+            .map(|summary| summary.path.as_str())
+            .collect();
+        assert_eq!(paths, vec![".github/workflows/ci.yml", "Cargo.toml"]);
+        assert!(summaries.iter().all(|summary| summary.chunks.len() == 1));
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.chunks[0].kind == "file_fallback")
+        );
     }
 
     #[test]
@@ -3208,7 +3955,7 @@ mod tests {
         );
         repo.write("src/worker.rs", "pub fn helper() {}\n");
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
-        let mut collection = collect_index_reports(&root, None, &mut |_| {})
+        let mut collection = collect_index_reports(&root, None, false, &mut |_| {})
             .expect("collection should parse both files");
 
         resolve_cross_file_rust_calls(&mut collection, &[]);
@@ -3252,10 +3999,12 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let persisted_helper = sample_symbol_record("worker::helper", "file-worker");
 
@@ -3291,10 +4040,12 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![outer_caller, sibling_caller],
             calls: vec![outer_call, sibling_call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let outer_helper = sample_symbol_record("outer::helper", "file-outer-helper");
         let root_helper = sample_symbol_record("helper", "file-root-helper");
@@ -3333,10 +4084,12 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let outer_run = sample_symbol_record("outer::Worker::run", "file-outer-worker");
         let root_run = sample_symbol_record("Worker::run", "file-root-worker");
@@ -3371,10 +4124,12 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![self_call, self_type_call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let mut helper = sample_symbol_record("Worker::helper", "file-worker-methods");
         helper.kind = SymbolKind::Method.as_str().to_owned();
@@ -3419,10 +4174,12 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![call],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let parent_helper = sample_symbol_record("outer::worker::helper", "file-parent-worker");
         let root_helper = sample_symbol_record("worker::helper", "file-root-worker");
@@ -3451,10 +4208,12 @@ mod tests {
             chunks: Vec::new(),
             symbols: vec![caller],
             calls: vec![sample_unresolved_call("run", "crate::worker::helper")],
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }]);
         let stale_symbol = sample_symbol_record("worker::helper", &collection_file_id);
 
@@ -3466,9 +4225,44 @@ mod tests {
     }
 
     #[test]
-    fn rust_analyzer_enrichment_plan_is_disabled_by_default() {
+    fn rust_analyzer_enrichment_config_auto_detects_by_default_and_honors_overrides() {
+        let detected =
+            RustAnalyzerEnrichmentConfig::from_values_with_detector(None, None, |command| {
+                command == "rust-analyzer"
+            });
+        assert!(detected.enabled);
+        assert_eq!(detected.command, "rust-analyzer");
+
+        let missing =
+            RustAnalyzerEnrichmentConfig::from_values_with_detector(None, None, |_| false);
+        assert!(!missing.enabled);
+        assert_eq!(missing.command, "rust-analyzer");
+
+        let command_override = RustAnalyzerEnrichmentConfig::from_values_with_detector(
+            None,
+            Some("/bin/custom-rust-analyzer"),
+            |command| command == "/bin/custom-rust-analyzer",
+        );
+        assert!(command_override.enabled);
+        assert_eq!(command_override.command, "/bin/custom-rust-analyzer");
+
+        let forced_disabled =
+            RustAnalyzerEnrichmentConfig::from_values_with_detector(Some("false"), None, |_| true);
+        assert!(!forced_disabled.enabled);
+
+        let forced_enabled = RustAnalyzerEnrichmentConfig::from_values_with_detector(
+            Some("on"),
+            Some("missing-rust-analyzer"),
+            |_| false,
+        );
+        assert!(forced_enabled.enabled);
+        assert_eq!(forced_enabled.command, "missing-rust-analyzer");
+    }
+
+    #[test]
+    fn rust_analyzer_enrichment_plan_reports_disabled_state() {
         let collection = collection_with_reports(Vec::new());
-        let config = RustAnalyzerEnrichmentConfig::from_values(None, None);
+        let config = RustAnalyzerEnrichmentConfig::from_values_with_detector(None, None, |_| false);
 
         let summary =
             plan_rust_analyzer_enrichment(&collection, &config, RustAnalyzerReadiness::Disabled);
@@ -3573,10 +4367,12 @@ mod tests {
             chunks: Vec::new(),
             symbols: Vec::new(),
             calls: Vec::new(),
+            symbol_references: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
             skipped_unchanged: false,
+            old_content_hash: None,
         }
     }
 

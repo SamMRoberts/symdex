@@ -94,7 +94,10 @@ A quality-layer failure must not disable a valid fast layer.
 ## Semantic generation lifecycle
 
 A semantic generation represents one coherent fast semantic index projection for
-the current SQLite structural facts.
+the current SQLite structural facts. When branch-aware `ref_files` manifests are
+present, the fast manifest is scoped to the active ref's linked file snapshots;
+historical same-path snapshots are preserved as facts but excluded from the
+latest ref-linked generation and its quality job accounting.
 
 State transitions:
 
@@ -135,10 +138,13 @@ The shared query layer exposes a semantic status summary used by CLI and TUI
 surfaces. It reports the repository ID, latest semantic generation ID, default
 active search layer, quality status, fallback-to-fast reason, fast and quality
 model/collection metadata, per-layer coverage counts, quality job counts, and
-the latest quality job error when one is recorded. This summary is metadata-only
-and does not return source text or vectors. Quality embedded progress is counted
-from current quality `chunk_embeddings` manifest rows so stale generation
-metadata cannot make a pending quality layer appear partially complete.
+latest quality job error. Diagnostics treat `quality_pending` with pending or
+running jobs as in-progress local work rather than unreachable service state;
+`quality_blocked` is the state that indicates the configured quality model or
+local service is unavailable. This summary is metadata-only and does not return
+source text or vectors. Quality embedded progress is counted from current
+quality `chunk_embeddings` manifest rows so stale generation metadata cannot
+make a pending quality layer appear partially complete.
 
 The CLI command is:
 

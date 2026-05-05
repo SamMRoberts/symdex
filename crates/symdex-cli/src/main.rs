@@ -1,27 +1,36 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use serde_json::json;
-use symdex_core::{RepoRoot, RepositoryRefSnapshot};
+use symdex_core::RepoRoot;
 use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
 use symdex_index::{
-    ContinuousIndexEvent, EmbeddingSummary, IndexOptions, IndexScope, IndexSummary,
+    ContinuousIndexEvent, EmbeddingSummary, IndexOptions, IndexProgress, IndexScope, IndexSummary,
     QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
-    run_index, run_quality_index, run_quality_index_with_progress,
+    run_index_with_existing_writer, run_index_with_existing_writer_and_progress,
+    run_quality_index_with_existing_writer, run_quality_index_with_existing_writer_and_progress,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
-    ImpactSummary, SemanticStatusLayerSummary, SemanticStatusSummary, VectorVerifyOptions,
-    VectorVerifySemanticLayer, VectorVerifySummary, run_call_graph, run_call_path,
-    run_context_pack, run_debug_context_pack, run_freshness_report, run_impact,
-    run_semantic_search, run_semantic_status, run_symbol_search, run_unified_context_pack,
-    run_vector_verify_with_options,
+    CallDirection, CallGraphSummary, CallPathSummary, ChangeTarget, ContextPackMode,
+    ExplainChangeSummary, FreshnessSummary, ImpactSummary, SemanticStatusLayerSummary,
+    SemanticStatusSummary, VectorVerifyOptions, VectorVerifySemanticLayer, VectorVerifySummary,
+    run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_explain_change,
+    run_freshness_report, run_impact, run_semantic_search, run_semantic_status, run_symbol_search,
+    run_unified_context_pack, run_vector_verify_with_options,
 };
-use symdex_store::{EvidenceFreshness, SqliteStore, SqliteVectorStore, StoreConfig, sqlite_parent};
+use symdex_store::{
+    EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
+    WatcherClientRecord, WatcherStatusRecord, current_timestamp, debug_db_lock_log, sqlite_parent,
+};
 use symdex_watch::{WatcherClientKind, WatcherStatus};
+use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse, WriterProgress};
+
+static WRITER_WRITE_GATE: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -60,8 +69,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "watch-daemon" => {
             require_text_output(command, output)?;
-            let repo = args.get(1).map(String::as_str).unwrap_or(".");
-            symdex_watch::run_daemon(repo)
+            symdex_writer::run_daemon(|job, on_progress| {
+                execute_writer_job_with_progress(job, on_progress)
+            })
+        }
+        "writer-daemon" => {
+            require_text_output(command, output)?;
+            symdex_writer::run_daemon(|job, on_progress| {
+                execute_writer_job_with_progress(job, on_progress)
+            })
         }
         "index-quality" => {
             require_text_output(command, output)?;
@@ -133,6 +149,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
             impact(repo, query, output)
+        }
+        "explain-change" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let target_parts = if args.len() > 2 { &args[2..] } else { &[] };
+            explain_change(repo, target_parts, output)
         }
         "context-pack" => {
             let context_args = parse_context_pack_args(&args[1..])?;
@@ -233,51 +254,475 @@ fn require_text_output(command: &str, output: OutputMode) -> Result<(), String> 
     Ok(())
 }
 
+fn execute_writer_job_with_progress(
+    job: WriterJob,
+    mut on_progress: impl FnMut(WriterProgress),
+) -> WriterJobResponse {
+    let operation = job.operation();
+    let details = job.debug_details();
+    let started = Instant::now();
+    debug_db_lock_log(
+        "writer-job",
+        format_args!("execute_start operation={} {}", operation, details),
+    );
+    let response = match job {
+        WriterJob::Ping => WriterJobResponse::ok("writer daemon ready"),
+        WriterJob::Init => match with_writer_gate(init_with_existing_writer) {
+            Ok(message) => WriterJobResponse::ok(message),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::Index {
+            repo,
+            offline,
+            scope,
+        } => match with_writer_gate(|| {
+            run_index_with_existing_writer_and_progress(
+                &IndexOptions {
+                    repo,
+                    offline,
+                    scope: index_scope(scope),
+                },
+                |progress| on_progress(writer_progress(progress)),
+            )
+        }) {
+            Ok(summary) => WriterJobResponse::ok_with_data(
+                "index completed",
+                json!({
+                    "kind": "index",
+                    "repository_id": summary.repository_id,
+                    "repository_root": summary.repository_root,
+                    "files_seen": summary.files_seen,
+                    "files_skipped_unchanged": summary.files_skipped_unchanged,
+                    "chunks_seen": summary.chunks_seen,
+                    "chunks_excluded_from_embedding": summary.chunks_excluded_from_embedding,
+                    "sqlite_files_indexed": summary.sqlite_files_indexed,
+                    "sqlite_chunks_indexed": summary.sqlite_chunks_indexed,
+                    "sqlite_symbols_indexed": summary.sqlite_symbols_indexed,
+                    "sqlite_calls_indexed": summary.sqlite_calls_indexed,
+                    "sqlite_files_removed": summary.sqlite_files_removed,
+                }),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::IndexQuality { repo } => {
+            match with_writer_gate(|| {
+                run_quality_index_with_existing_writer_and_progress(
+                    &QualityIndexOptions { repo },
+                    |progress| on_progress(writer_progress(progress)),
+                )
+            }) {
+                Ok(summary) => WriterJobResponse::ok_with_data(
+                    "quality index completed",
+                    json!({
+                        "kind": "index-quality",
+                        "repository_id": summary.repository_id,
+                        "generation_id": summary.generation_id,
+                        "quality_model": summary.quality_model,
+                        "quality_dimension": summary.quality_dimension,
+                        "quality_status": summary.quality_status,
+                        "active_layer": summary.active_layer,
+                        "activation_reason": summary.activation_reason,
+                        "vector_table": summary.vector_table,
+                        "claimed_jobs": summary.claimed_jobs,
+                        "succeeded_jobs": summary.succeeded_jobs,
+                        "failed_jobs": summary.failed_jobs,
+                        "skipped_stale_jobs": summary.skipped_stale_jobs,
+                        "skipped_excluded_jobs": summary.skipped_excluded_jobs,
+                        "remaining_pending_jobs": summary.remaining_pending_jobs,
+                    }),
+                ),
+                Err(error) => WriterJobResponse::error(error),
+            }
+        }
+        WriterJob::VectorRepair {
+            repo,
+            semantic_layer,
+        } => match VectorVerifySemanticLayer::parse(&semantic_layer).and_then(|semantic_layer| {
+            with_writer_gate(|| {
+                vector_repair_with_existing_writer(&VectorMaintenanceArgs {
+                    repo,
+                    semantic_layer,
+                })
+            })
+        }) {
+            Ok(message) => WriterJobResponse::ok(message),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::StartWatcher {
+            repo,
+            client_kind,
+            client_id,
+            pid,
+        } => match writer_start_watcher(&repo, &client_kind, &client_id, pid) {
+            Ok(status) => WriterJobResponse::ok_with_data(
+                "watcher started",
+                serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::StopWatcher { repo } => match writer_stop_watcher(&repo) {
+            Ok(status) => WriterJobResponse::ok_with_data(
+                "watcher stopped",
+                serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::AttachWatcherClient {
+            repo,
+            client_kind,
+            client_id,
+            pid,
+        } => match writer_attach_watcher_client(&repo, &client_kind, &client_id, pid) {
+            Ok(status) => WriterJobResponse::ok_with_data(
+                "watcher client attached",
+                serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(error) => WriterJobResponse::error(error),
+        },
+        WriterJob::HeartbeatWatcherClient { repo, client_id } => {
+            match writer_heartbeat_watcher_client(&repo, &client_id) {
+                Ok(status) => WriterJobResponse::ok_with_data(
+                    "watcher client heartbeat",
+                    serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+                ),
+                Err(error) => WriterJobResponse::error(error),
+            }
+        }
+        WriterJob::DetachWatcherClient { repo, client_id } => {
+            match writer_detach_watcher_client(&repo, &client_id) {
+                Ok(status) => WriterJobResponse::ok_with_data(
+                    "watcher client detached",
+                    serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+                ),
+                Err(error) => WriterJobResponse::error(error),
+            }
+        }
+    };
+    debug_db_lock_log(
+        "writer-job",
+        format_args!(
+            "execute_finish operation={} ok={} elapsed_ms={} message={}",
+            operation,
+            response.ok,
+            started.elapsed().as_millis(),
+            response.message
+        ),
+    );
+    response
+}
+
+fn writer_progress(progress: IndexProgress) -> WriterProgress {
+    WriterProgress {
+        phase: progress.phase.to_owned(),
+        completed: progress.completed,
+        total: progress.total,
+        message: progress.message,
+    }
+}
+
+fn writer_start_watcher(
+    repo: &str,
+    client_kind: &str,
+    client_id: &str,
+    pid: i32,
+) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "start_watcher repo={} client_kind={} client_id={} client_pid={}",
+            root.path().display(),
+            client_kind,
+            client_id,
+            pid
+        ),
+    );
+    let was_active = symdex_watch::status(repo)
+        .map(|status| status.is_active())
+        .unwrap_or(false);
+    let store_config = StoreConfig::from_env();
+    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    store
+        .upsert_repository(&RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    let now = current_timestamp();
+    store
+        .upsert_watcher_status(&WatcherStatusRecord {
+            repository_id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+            mode: "semantic".to_owned(),
+            owner_kind: "writer-daemon".to_owned(),
+            owner_pid: Some(std::process::id() as i32),
+            socket_path: None,
+            state: "running".to_owned(),
+            started_at: Some(now.clone()),
+            updated_at: Some(now.clone()),
+            heartbeat_at: Some(now),
+            files_seen: 0,
+            queued_events: 0,
+            last_indexed_path: None,
+            last_error: None,
+            active_layer: None,
+            quality_status: None,
+            quality_pending_jobs: 0,
+            quality_running_jobs: 0,
+            quality_failed_jobs: 0,
+            quality_stale_jobs: 0,
+        })
+        .map_err(|error| error.to_string())?;
+    let status = writer_attach_watcher_client(repo, client_kind, client_id, pid)?;
+    if !was_active {
+        debug_db_lock_log(
+            "watcher-writer",
+            format_args!("spawn_managed_watcher repo={}", root.path().display()),
+        );
+        symdex_watch::spawn_writer_managed_daemon(
+            root.path().display().to_string(),
+            writer_write_gate(),
+        );
+    } else {
+        debug_db_lock_log(
+            "watcher-writer",
+            format_args!("reuse_active_watcher repo={}", root.path().display()),
+        );
+    }
+    Ok(status)
+}
+
+fn writer_stop_watcher(repo: &str) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!("stop_watcher repo={}", root.path().display()),
+    );
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    store
+        .mark_watcher_stopped(root.id())
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_attach_watcher_client(
+    repo: &str,
+    client_kind: &str,
+    client_id: &str,
+    pid: i32,
+) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "attach_client repo={} client_kind={} client_id={} client_pid={}",
+            root.path().display(),
+            client_kind,
+            client_id,
+            pid
+        ),
+    );
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let now = current_timestamp();
+    store
+        .upsert_watcher_client(&WatcherClientRecord {
+            repository_id: root.id().to_owned(),
+            client_id: client_id.to_owned(),
+            client_kind: client_kind.to_owned(),
+            pid: Some(pid),
+            started_at: Some(now.clone()),
+            heartbeat_at: Some(now),
+            last_seen_at: None,
+        })
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_heartbeat_watcher_client(repo: &str, client_id: &str) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "heartbeat_client repo={} client_id={}",
+            root.path().display(),
+            client_id
+        ),
+    );
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    store
+        .heartbeat_watcher_client(root.id(), client_id)
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_detach_watcher_client(repo: &str, client_id: &str) -> Result<WatcherStatus, String> {
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "detach_client repo={} client_id={}",
+            root.path().display(),
+            client_id
+        ),
+    );
+    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    store
+        .remove_watcher_client(root.id(), client_id)
+        .map_err(|error| error.to_string())?;
+    symdex_watch::status(repo)
+}
+
+fn writer_scope(scope: IndexScope) -> WriterIndexScope {
+    match scope {
+        IndexScope::Full => WriterIndexScope::Full,
+        IndexScope::Incremental => WriterIndexScope::Incremental,
+    }
+}
+
+fn index_scope(scope: WriterIndexScope) -> IndexScope {
+    match scope {
+        WriterIndexScope::Full => IndexScope::Full,
+        WriterIndexScope::Incremental => IndexScope::Incremental,
+    }
+}
+
+fn writer_write_gate() -> Arc<Mutex<()>> {
+    WRITER_WRITE_GATE
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn with_writer_gate<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let gate = writer_write_gate();
+    let wait_started = Instant::now();
+    debug_db_lock_log("writer-gate", format_args!("wait_start"));
+    let _guard = gate
+        .lock()
+        .map_err(|_| "writer gate lock poisoned".to_owned())?;
+    debug_db_lock_log(
+        "writer-gate",
+        format_args!("acquired wait_ms={}", wait_started.elapsed().as_millis()),
+    );
+    let run_started = Instant::now();
+    let result = job();
+    debug_db_lock_log(
+        "writer-gate",
+        format_args!(
+            "release ok={} held_ms={}",
+            result.is_ok(),
+            run_started.elapsed().as_millis()
+        ),
+    );
+    result
+}
+
+fn print_writer_response(response: &WriterJobResponse) -> Result<(), String> {
+    for progress in &response.progress {
+        println!(
+            "progress phase={} completed={} total={} message={}",
+            progress.phase, progress.completed, progress.total, progress.message
+        );
+    }
+    if !response.ok {
+        return Err(response.message.clone());
+    }
+    match response
+        .data
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("index") => print_writer_index_summary(&response.data),
+        Some("index-quality") => print_writer_quality_summary(&response.data),
+        _ => println!("{}", response.message),
+    }
+    Ok(())
+}
+
+fn print_writer_index_summary(data: &serde_json::Value) {
+    for key in [
+        "repository_id",
+        "repository_root",
+        "files_seen",
+        "files_skipped_unchanged",
+        "chunks_seen",
+        "chunks_excluded_from_embedding",
+        "sqlite_files_indexed",
+        "sqlite_chunks_indexed",
+        "sqlite_symbols_indexed",
+        "sqlite_calls_indexed",
+        "sqlite_files_removed",
+    ] {
+        println!(
+            "{key}: {}",
+            data.get(key).unwrap_or(&serde_json::Value::Null)
+        );
+    }
+}
+
+fn print_writer_quality_summary(data: &serde_json::Value) {
+    for key in [
+        "repository_id",
+        "generation_id",
+        "quality_model",
+        "quality_dimension",
+        "quality_status",
+        "active_layer",
+        "activation_reason",
+        "vector_table",
+        "claimed_jobs",
+        "succeeded_jobs",
+        "failed_jobs",
+        "skipped_stale_jobs",
+        "skipped_excluded_jobs",
+        "remaining_pending_jobs",
+    ] {
+        println!(
+            "{key}: {}",
+            data.get(key).unwrap_or(&serde_json::Value::Null)
+        );
+    }
+}
+
 fn doctor(repo: Option<&str>) -> Result<(), String> {
     print_diagnostic_report(&run_diagnostics_for_repo(repo)?);
     Ok(())
 }
 
 fn init() -> Result<(), String> {
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::Init)?;
+    print_writer_response(&response)?;
+    Ok(())
+}
+
+fn init_with_existing_writer() -> Result<String, String> {
     let store = StoreConfig::from_env();
     if let Some(parent) = sqlite_parent(&store) {
         fs::create_dir_all(&parent)
             .map_err(|error| format!("create sqlite directory {}: {error}", parent.display()))?;
-        println!("created {}", parent.display());
     }
     let sqlite = SqliteStore::open(&store).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
-    println!("initialized symdex local state");
-    Ok(())
+    Ok("initialized symdex local state".to_owned())
 }
 
 fn index(args: &IndexArgs) -> Result<(), String> {
     if args.watch {
         return continuous_index(args);
     }
-    let summary = run_index(&IndexOptions {
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::Index {
         repo: args.repo.clone(),
         offline: args.offline,
-        scope: args.scope,
+        scope: writer_scope(args.scope),
     })?;
-    print_index_summary(&summary);
-    Ok(())
+    print_writer_response(&response)
 }
 
 fn index_quality(repo: &str) -> Result<(), String> {
-    let summary = run_quality_index_with_progress(
-        &QualityIndexOptions {
-            repo: repo.to_owned(),
-        },
-        |progress| {
-            println!(
-                "quality_progress phase={} completed={} total={} message={}",
-                progress.phase, progress.completed, progress.total, progress.message
-            );
-        },
-    )?;
-    print_quality_index_summary(&summary);
-    Ok(())
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::IndexQuality {
+        repo: repo.to_owned(),
+    })?;
+    print_writer_response(&response)
 }
 
 fn continuous_index(args: &IndexArgs) -> Result<(), String> {
@@ -295,18 +740,7 @@ fn index_status(repo: &str, output: OutputMode) -> Result<(), String> {
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
     let store_config = StoreConfig::from_env();
-    let sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
-    sqlite
-        .upsert_repository(&symdex_store::RepositoryRecord {
-            id: root.id().to_owned(),
-            root_path: root.path().display().to_string(),
-        })
-        .map_err(|error| error.to_string())?;
-    let repository_ref = RepositoryRefSnapshot::detect(&root).map_err(|error| error.to_string())?;
-    sqlite
-        .sync_repository_ref(&repository_ref)
-        .map_err(|error| error.to_string())?;
+    let sqlite = SqliteStore::open_read_only(&store_config).map_err(|error| error.to_string())?;
     let status = sqlite
         .repository_status(root.id())
         .map_err(|error| error.to_string())?;
@@ -512,6 +946,14 @@ fn vector_verify(args: &VectorMaintenanceArgs) -> Result<(), String> {
 }
 
 fn vector_repair(args: &VectorMaintenanceArgs) -> Result<(), String> {
+    let response = WriterClient::from_env().submit_and_wait(&WriterJob::VectorRepair {
+        repo: args.repo.clone(),
+        semantic_layer: args.semantic_layer.as_str().to_owned(),
+    })?;
+    print_writer_response(&response)
+}
+
+fn vector_repair_with_existing_writer(args: &VectorMaintenanceArgs) -> Result<String, String> {
     let options = VectorVerifyOptions {
         semantic_layer: args.semantic_layer,
     };
@@ -527,7 +969,7 @@ fn vector_repair(args: &VectorMaintenanceArgs) -> Result<(), String> {
     let after = run_vector_verify_with_options(&args.repo, options)?;
     println!("post_repair_verify:");
     print_vector_verify_summary(&after);
-    Ok(())
+    Ok("vector repair completed".to_owned())
 }
 
 fn repair_vector_summary(repo: &str, summary: &VectorVerifySummary) -> Result<(), String> {
@@ -550,7 +992,7 @@ fn repair_vector_summary(repo: &str, summary: &VectorVerifySummary) -> Result<()
     match VectorVerifySemanticLayer::parse(&summary.semantic_layer)? {
         VectorVerifySemanticLayer::Fast => {
             println!("semantic_repair layer=fast action=reindex_started");
-            let index_summary = run_index(&IndexOptions {
+            let index_summary = run_index_with_existing_writer(&IndexOptions {
                 repo: repo.to_owned(),
                 offline: false,
                 scope: IndexScope::Full,
@@ -559,7 +1001,7 @@ fn repair_vector_summary(repo: &str, summary: &VectorVerifySummary) -> Result<()
         }
         VectorVerifySemanticLayer::Quality => {
             println!("semantic_repair layer=quality action=quality_worker_started");
-            let quality_summary = run_quality_index(&QualityIndexOptions {
+            let quality_summary = run_quality_index_with_existing_writer(&QualityIndexOptions {
                 repo: repo.to_owned(),
             })?;
             print_quality_index_summary(&quality_summary);
@@ -698,6 +1140,48 @@ fn impact(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
     Ok(())
 }
 
+fn explain_change(repo: &str, target_parts: &[String], output: OutputMode) -> Result<(), String> {
+    let targets = change_targets_input(target_parts)?;
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_EXPLAIN_CHANGE,
+            json!({ "repo": repo, "targets": targets }),
+        );
+    }
+    let summary = run_explain_change(repo, &targets)?;
+    print_explain_change_summary(&summary);
+    Ok(())
+}
+
+fn change_targets_input(input_parts: &[String]) -> Result<Vec<ChangeTarget>, String> {
+    let Some(first) = input_parts.first() else {
+        return Err(
+            "explain-change requires change targets JSON, a JSON file path, or `-` for stdin"
+                .to_owned(),
+        );
+    };
+    let input = if first == "-" {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("read change targets from stdin: {error}"))?;
+        input
+    } else if input_parts.len() == 1 {
+        fs::read_to_string(first).unwrap_or_else(|_| first.to_owned())
+    } else {
+        input_parts.join(" ")
+    };
+    parse_change_targets_json(&input)
+}
+
+fn parse_change_targets_json(input: &str) -> Result<Vec<ChangeTarget>, String> {
+    let value: serde_json::Value = serde_json::from_str(input)
+        .map_err(|error| format!("parse change targets JSON: {error}"))?;
+    let targets_value = value.get("targets").unwrap_or(&value);
+    serde_json::from_value(targets_value.clone())
+        .map_err(|error| format!("parse change targets array: {error}"))
+}
+
 fn print_call_path_summary(summary: &CallPathSummary) {
     println!("repository_id: {}", summary.repository_id);
     println!("source: {}", summary.source_query);
@@ -771,6 +1255,78 @@ fn print_impact_summary(summary: &ImpactSummary) {
     }
     println!("tests_likely: {}", summary.tests_likely.len());
     for test in &summary.tests_likely {
+        println!("test: {test}");
+    }
+    for note in &summary.notes {
+        println!("note: {note}");
+    }
+}
+
+fn print_explain_change_summary(summary: &ExplainChangeSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!("format: {}", summary.format);
+    println!("targets: {}", summary.targets.len());
+    for (index, target) in summary.targets.iter().enumerate() {
+        println!(
+            "target {index}: {}:{}-{} matched={} freshness={} trust={:.2}/{} description={}",
+            target.path,
+            target.start_line,
+            target.end_line,
+            target.matched,
+            target.freshness.label(),
+            target.trust.score,
+            target.trust.level,
+            target.description
+        );
+        for symbol in &target.symbols {
+            println!("  symbol: {symbol}");
+        }
+    }
+    println!("affected_symbols: {}", summary.affected_symbols.len());
+    for symbol in &summary.affected_symbols {
+        println!(
+            "symbol: {} {}:{}-{} freshness={} trust={:.2}/{} targets={:?} reasons={}",
+            symbol.symbol.qualified_name,
+            symbol.symbol.path,
+            symbol.symbol.start_line,
+            symbol.symbol.end_line,
+            symbol.freshness.label(),
+            symbol.trust.score,
+            symbol.trust.level,
+            symbol.target_indexes,
+            reason_list(&symbol.reasons)
+        );
+    }
+    println!("direct_callers: {}", summary.direct_callers.len());
+    for evidence in &summary.direct_callers {
+        print_impact_call_evidence(evidence);
+    }
+    println!("direct_callees: {}", summary.direct_callees.len());
+    for evidence in &summary.direct_callees {
+        print_impact_call_evidence(evidence);
+    }
+    println!("transitive_callers: {}", summary.transitive_callers.len());
+    for evidence in &summary.transitive_callers {
+        print_impact_path_evidence(evidence);
+    }
+    println!("transitive_callees: {}", summary.transitive_callees.len());
+    for evidence in &summary.transitive_callees {
+        print_impact_path_evidence(evidence);
+    }
+    println!("related_files: {}", summary.related_files.len());
+    for file in &summary.related_files {
+        println!(
+            "{} relationships={} freshness={} trust={:.2}/{} reasons={}",
+            file.path,
+            file.relationship_count,
+            file.freshness.label(),
+            file.trust.score,
+            file.trust.level,
+            reason_list(&file.reasons)
+        );
+    }
+    println!("likely_tests: {}", summary.likely_tests.len());
+    for test in &summary.likely_tests {
         println!("test: {test}");
     }
     for note in &summary.notes {
@@ -1113,7 +1669,7 @@ fn print_index_summary(summary: &IndexSummary) {
     println!("sqlite_files_removed: {}", summary.sqlite_files_removed);
     match &summary.rust_analyzer {
         RustAnalyzerEnrichmentSummary::Disabled { enable_env } => {
-            println!("rust_analyzer_enrichment: disabled (set {enable_env}=1)");
+            println!("rust_analyzer_enrichment: disabled (set {enable_env}=1 to force)");
         }
         RustAnalyzerEnrichmentSummary::NotReady { command, reason } => {
             println!("rust_analyzer_enrichment: not_ready command={command} reason={reason}");
@@ -1653,7 +2209,7 @@ fn print_help() {
     println!(
         "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--full|--incremental] [--offline] [--watch] <repo>  Index code with explicit full or incremental scope\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    vector-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against sqlite-vec rows
     qdrant-verify <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-verify\n    vector-repair <repo> [--semantic-layer fast|quality|all]  Repair sqlite-vec orphaned, missing, and stale vector metadata
-    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-repair\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    watch start|status|stop <repo>  Manage the single background watcher for a repository\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp [--watch <repo>]  Run the MCP server, optionally attaching the repository watcher\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-repair\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    explain-change <repo> <targets-json|file|->  Explain proposed line-range changes before editing\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    watch start|status|stop <repo>  Manage the single background watcher for a repository\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp [--watch <repo>]  Run the MCP server, optionally attaching the repository watcher\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, explain-change, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1661,9 +2217,10 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextPackMode, OutputMode, VectorVerifySemanticLayer, WatchAction, parse_cli_invocation,
-        parse_context_pack_args, parse_index_args, parse_serve_mcp_args,
-        parse_vector_maintenance_args, parse_watch_args, require_text_output, semantic_status_json,
+        ContextPackMode, OutputMode, VectorVerifySemanticLayer, WatchAction,
+        parse_change_targets_json, parse_cli_invocation, parse_context_pack_args, parse_index_args,
+        parse_serve_mcp_args, parse_vector_maintenance_args, parse_watch_args, require_text_output,
+        semantic_status_json,
     };
     use symdex_core::{SemanticLayer, SemanticLayerStatus};
     use symdex_index::IndexScope;
@@ -1838,6 +2395,41 @@ mod tests {
             .expect("context-pack args should parse");
 
         assert_eq!(args.mode, ContextPackMode::Structural);
+    }
+
+    #[test]
+    fn explain_change_targets_parse_array_and_object_wrapper() {
+        let array_targets = parse_change_targets_json(
+            r#"[
+                {
+                    "path": "src/lib.rs",
+                    "start_line": 10,
+                    "end_line": 12,
+                    "description": "adjust retry timeout"
+                }
+            ]"#,
+        )
+        .expect("array targets should parse");
+        let object_targets = parse_change_targets_json(
+            r#"{
+                "targets": [
+                    {
+                        "path": "src/main.rs",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "description": "rename entrypoint"
+                    }
+                ]
+            }"#,
+        )
+        .expect("object wrapper should parse");
+
+        assert_eq!(array_targets.len(), 1);
+        assert_eq!(array_targets[0].path, "src/lib.rs");
+        assert_eq!(array_targets[0].start_line, 10);
+        assert_eq!(array_targets[0].end_line, 12);
+        assert_eq!(object_targets.len(), 1);
+        assert_eq!(object_targets[0].path, "src/main.rs");
     }
 
     #[test]

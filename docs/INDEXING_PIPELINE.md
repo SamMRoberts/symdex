@@ -20,6 +20,7 @@ repo root
   -> embed allowed chunks with Ollama
   -> upsert new vectors to sqlite-vec
   -> persist facts to SQLite
+  -> record per-file indexing decisions
   -> record the fast semantic generation and queue quality work
   -> delete stale sqlite-vec points not reused by the new manifest
   -> finish index run summary as success, skipped, partial, or failed
@@ -61,13 +62,29 @@ Active language targets:
 | C# | `.cs` | `tree-sitter-c-sharp` | `csharp` |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | `tree-sitter-javascript` | `javascript` |
 | TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | `tree-sitter-typescript` | `typescript` |
+| TOML config | `.toml` | fallback config chunk | `toml` |
+| YAML config | `.yaml`, `.yml` | fallback config chunk | `yaml` |
+| JSON config | `.json` | fallback config chunk, opt-in by path | `json` |
 
 Rust, C#, JavaScript, and TypeScript are implemented language targets. C#, JS,
 and TS support starts conservatively with syntax-aware function/method chunks,
-symbols, and call-like references; it does not claim whole-language type
-inference. Future languages must be added through the same discovery, parsing,
-chunking, symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec,
-manual indexing, and continuous indexing contracts.
+symbols, call-like references, and conservative symbol-reference edges for
+imports/usings, type-like references, implementation or inheritance syntax, and
+attributes/decorators; it does not claim whole-language type inference. TOML
+and YAML configuration files are indexed as fallback-only configuration
+evidence with no symbols, calls, tests, or tree-sitter parse diagnostics. JSON
+configuration files are disabled by default and are indexed only when
+`SYMDEX_INDEX_JSON_PATHS` contains a matching repo-relative folder scope.
+Future languages must be added through the same discovery, parsing, chunking,
+symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec, manual
+indexing, and continuous indexing contracts.
+
+`SYMDEX_INDEX_JSON_PATHS` is an optional comma-separated list of repo-relative
+directory scopes for JSON indexing, such as `config,.vscode,packages/app`.
+Configured scopes include subfolders, use path-boundary matching, and keep the
+same root-boundary, symlink, built-in exclude, and `.gitignore` behavior as
+other discovered files. Use `.` only when all repository JSON should be indexed
+explicitly.
 
 Current implementation applies built-in directory excludes and scoped
 `.gitignore` rules from the repository root and nested directories. Rules are
@@ -106,6 +123,8 @@ Rust structural chunks for `struct`, `enum`, `union`, `type`, `trait`, and
 nominal types, and traits use `type_definition` chunks. Trait impl summaries
 preserve both sides of the implementation, for example `impl Runnable for Mode`.
 A file fallback chunk is emitted only when no better chunkable unit exists.
+Configuration files always use this fallback chunk strategy because they are
+semantic configuration evidence rather than syntax-aware code evidence.
 Files with tree-sitter syntax errors produce partial chunks where possible and
 return metadata-only parse diagnostics with line and byte ranges instead of
 failing the whole index run.
@@ -123,6 +142,14 @@ symbol only when the callback reference is unambiguous; anonymous callback tests
 are persisted as metadata-only rows with no symbol link so they cannot overclaim
 call coverage.
 
+After test facts, symbols, files, and calls are persisted, the store derives
+conservative `test_targets` rows. Direct resolved calls from symbol-linked tests
+produce symbol targets. Exact normalized test-name matches, fixture-path stems
+such as `tests/calculator_tests.rs` to `src/calculator.rs`, and low-confidence
+same-module file relationships produce additional metadata-only target evidence.
+Each row stores `relationship_kind`, `confidence`, and `reason`; weak hints are
+kept below the likely-test threshold instead of being promoted to exact coverage.
+
 Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token
 prefixes, and credentialed database connection strings set `excluded_reason` on
@@ -135,15 +162,18 @@ Use Ollama with `nomic-embed-text`.
 
 Current implementation uses Ollama `POST /api/embed` for batch embeddings and
 `GET /api/tags` for local model availability. `SYMDEX_EMBED_TRUNCATE` defaults
-to `true`, but Symdex also excludes large chunks before embedding because some
-Ollama/model combinations return context-length errors instead of truncating.
+to `true`, but Symdex also bounds each embedding input because some Ollama/model
+combinations return context-length errors instead of truncating. 
 `SYMDEX_EMBED_BATCH_SIZE` defaults to `16`, so full-repository semantic indexing
 is split into smaller Ollama requests while preserving embedding order.
 `SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `2048` for fast indexing, while
 `SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` defaults to `512` for quality indexing.
-Larger chunks are kept as metadata-only structural evidence with
-`chunk_too_large_for_embedding` and are omitted from Ollama/sqlite-vec. Vector
-dimension probing embeds a tiny diagnostic string through the same local model.
+Chunks larger than the active layer limit are split into overlapping, UTF-8-safe
+embedding segments. Segment vectors are averaged back into one vector point for
+the original structural chunk, preserving chunk-level SQLite and sqlite-vec
+metadata. Secret-blocked chunks are still kept as metadata-only structural
+evidence and are omitted from Ollama/sqlite-vec. Vector dimension probing embeds
+a tiny diagnostic string through the same local model.
 
 Store:
 
@@ -167,6 +197,12 @@ metadata-only error summaries. Before upserting vectors, semantic indexing
 rejects a same-repository, same-model dimension change so an existing sqlite-vec
 collection is not reused with incompatible vector sizes. Different model names
 map to different sqlite-vec collection names.
+Indexing also records per-file decisions in `file_index_events`. Each event
+links back to the run and active repository ref when known, and stores the path,
+old content hash, new content hash, action, reason, status, and metadata-only
+error summary. This makes created, updated, deleted, skipped unchanged,
+ignored or unsupported-by-discovery, and parser-diagnostic paths debuggable
+without reading source text.
 Continuous watch batches use the same incremental indexing path and are recorded
 with `run_kind = watch` in index-run metadata.
 
@@ -175,7 +211,10 @@ The SQLite schema also includes additive layered semantic tables for
 After a successful fast sqlite-vec upsert, semantic indexing records a deterministic
 fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
 The older chunk-level vector columns remain nullable compatibility schema, but
-new indexing does not use them as the authoritative fast manifest.
+new indexing does not use them as the authoritative fast manifest. When the
+active ref has a `ref_files` manifest, carried-forward fast embeddings are
+filtered through that manifest so superseded same-path file snapshots do not
+enter the latest ref-linked generation.
 When quality indexing is enabled and the quality model is locally available,
 semantic indexing then marks superseded pending/running quality jobs stale and
 first carries forward current quality `chunk_embeddings` rows whose chunk ID,
@@ -274,6 +313,11 @@ Resolution states:
 
 Never drop unresolved calls. They are useful evidence.
 
+Never drop unresolved symbol references. Imports, type references,
+implementations, inheritance, attributes, decorators, and future config-to-code
+links are useful debugging evidence even when they cannot be resolved to a local
+target symbol.
+
 Current implementation extracts Rust function and method symbols from
 `function_item` nodes. Free functions use module-derived qualified names, while
 methods include the enclosing `impl` container when tree-sitter exposes it.
@@ -304,6 +348,15 @@ expansion is not analyzed. Each macro invocation also emits a
 metadata-only diagnostic noting that the invocation was preserved without
 expansion.
 
+Symbol-reference extraction is intentionally broader than call extraction.
+Current indexing records conservative reference rows in `symbol_references` for
+Rust `use` declarations, type-like nodes, `impl` relationships, and attributes.
+C#, JavaScript, and TypeScript use parser-backed hooks for imports/usings,
+base-list or class-heritage inheritance, attributes/decorators, and type-like
+syntax where available. Resolution is local and conservative: a single local
+symbol suffix/name match becomes `resolved_local_candidate`, multiple matches
+are `ambiguous`, and otherwise the reference is preserved as `unresolved`.
+
 After per-file parsing, the indexer performs a conservative Rust cross-file
 resolution pass before persisting SQLite facts. Qualified module calls such as
 `crate::module::function()` are normalized and matched against Rust symbols from
@@ -318,14 +371,16 @@ also resolve to persisted unchanged methods on the same impl receiver. Symbols
 from files being replaced are ignored so incremental indexing does not resolve
 against stale facts.
 
-Optional rust-analyzer enrichment is guarded behind explicit opt-in readiness
-diagnostics. `symdex doctor` can check whether a local `rust-analyzer` binary is
-available when `SYMDEX_RUST_ANALYZER=1` is set, but indexing does not invoke
-project analysis by default. Index runs also report a metadata-only enrichment
-plan when explicitly enabled: disabled, not ready, skipped because no changed
-Rust files were indexed, or planned with eligible Rust file, symbol, and call
-counts. This plan is reporting only; it does not mutate persisted symbols or
-calls. Future symbol and call fact application must keep this opt-in boundary,
+Optional rust-analyzer enrichment auto-detects the configured command, defaulting
+to `rust-analyzer`. If that command can be launched, `symdex doctor` checks
+readiness with `rust-analyzer --version`; if it is missing, enrichment is
+disabled. `SYMDEX_RUST_ANALYZER=0` force-disables enrichment and
+`SYMDEX_RUST_ANALYZER=1` forces readiness checking for the configured command.
+Index runs report a metadata-only enrichment plan when enabled: disabled, not
+ready, skipped because no changed Rust files were indexed, or planned with
+eligible Rust file, symbol, and call counts. This plan is reporting only; it does
+not invoke rust-analyzer project analysis or mutate persisted symbols or calls.
+Future symbol and call fact application must keep an explicit override boundary,
 preserve source-text privacy, and avoid executing indexed repository code.
 
 ## Incremental indexing
@@ -360,6 +415,34 @@ file contents.
 Current SQLite migrations include indexes for file cleanup, symbol lookup,
 caller/callee traversal, and index-run metadata. This keeps structural queries
 from degrading into broad table scans as repositories grow.
+
+## Local Database Writer Contract
+
+Only ONE process may write to the configured local SQLite/sqlite-vec database at
+a time. This is a product invariant, not just an implementation detail:
+competing write loops cause SQLite lock errors and make index provenance hard to
+reason about.
+
+The writer is database-file scoped, not repository scoped. `symdex-writer`
+starts or attaches to one local writer daemon keyed by `StoreConfig.sqlite_path`.
+The daemon owns the advisory sidecar lock internally as a duplicate-start guard,
+then serializes write jobs in process. Clients do not acquire the lock directly.
+
+Write-capable work includes manual indexing, continuous indexing, quality
+catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
+tool. These paths submit jobs to the writer service and wait for the result
+instead of opening a second writer. Continuous indexing runs as writer-managed
+watcher work and uses the same in-process write gate as queued manual jobs. A
+manual index, repair, migration, or quality job pauses watcher database writes:
+the watcher can continue polling and coalescing filesystem changes, but watcher
+status writes, incremental batches, idle quality catch-up, and terminal
+stop/failure state writes wait for the writer gate before touching SQLite.
+Read paths such as TUI refreshes, MCP evidence tools,
+diagnostics, semantic status, staleness checks, and query tools must not run
+migrations, stale-client pruning, repair, or quality catch-up as a side effect
+while a writer is active. Structural read helpers open SQLite in read-only mode;
+missing or unmigrated local state should be reported to the caller rather than
+self-initialized from a read path.
 
 ## Continuous indexing
 

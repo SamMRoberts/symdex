@@ -20,6 +20,7 @@ tests/fixtures/
   rust_ignore/
   rust_secrets/
   csharp_basic/
+  config_basic/
   javascript_basic/
   typescript_basic/
 ```
@@ -44,6 +45,9 @@ Fixtures should be tiny and purpose-built.
 - repo-root path enforcement
 - ignored files not indexed
 - likely secrets excluded from embeddings
+- TOML/YAML config files indexed as fallback chunks
+- JSON config files excluded by default and included only under scoped
+  `SYMDEX_INDEX_JSON_PATHS` folders and subfolders
 - MCP tools reject invalid paths
 - TUI navigation and confirmation flows
 - TUI loading, empty, and error states
@@ -59,8 +63,8 @@ Fixtures should be tiny and purpose-built.
   confidence, and index metadata completeness, including impact and
   debug-context evidence rows.
 - Evidence explainability coverage for semantic result reasons, direct impact
-  call reasons, related-file reasons, MCP contract reason availability, and
-  debug-context frame match reasons.
+  call reasons, related-file reasons, pre-edit change explanation reasons, MCP
+  contract reason availability, and debug-context frame match reasons.
 - Unified context-pack coverage for structural-only fallback, semantic-only
   chunks, overlapping structural/semantic evidence marked as `both`, stale
   freshness labels, missing-vector or unavailable-semantic notes, and continued
@@ -69,13 +73,16 @@ Fixtures should be tiny and purpose-built.
   failing test names, mapped frames, unmapped frames, stale frames, deleted
   files, malformed runtime input, common Rust `cargo test`, `anyhow`, `tracing`,
   full backtrace, panic-hook, and async stack-like output, and TUI debug context
-  pack rendering.
+  pack rendering. Runtime observation cache tests should assert that only
+  metadata is stored: input hashes, normalized paths, failing test names, match
+  kinds, summaries, and expiry metadata, never raw logs or source text.
 - Test discovery coverage for Rust recognized test attributes, C# NUnit/xUnit/
   MSTest attributes, JavaScript and TypeScript Jest/Vitest/Mocha `test` / `it` /
   `describe` shapes, module- or suite-qualified test names, SQLite test
-  persistence/replacement, failing-test name mapping, metadata-only anonymous
-  callback rows, and impact likely-test evidence only from direct indexed test
-  calls.
+  persistence/replacement, conservative `test_targets` inference for direct
+  calls, naming conventions, and fixture paths, failing-test name mapping,
+  metadata-only anonymous callback rows, and impact likely-test evidence only
+  from indexed test-target evidence or compatibility direct-call joins.
 - Rust call-resolution coverage for exact local calls, unresolved calls,
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
   module aliases used in scoped calls, simple grouped `use` aliases,
@@ -96,9 +103,9 @@ Fixtures should be tiny and purpose-built.
 - Rust chunking coverage for function, method, type-definition, trait,
   impl-summary, trait impl-summary names, trait impl method qualified names, and
   fallback chunks.
-- Optional rust-analyzer readiness coverage for default-off behavior, explicit
-  truthy opt-in flags, command override parsing, and doctor check status without
-  requiring rust-analyzer in ordinary tests.
+- Optional rust-analyzer readiness coverage for default auto-detection, explicit
+  enable/disable flags, command override parsing, and doctor check status
+  without requiring rust-analyzer in ordinary tests.
 - Optional rust-analyzer enrichment planning coverage for disabled, not-ready,
   no-Rust-file, and planned eligible Rust file/symbol/call count states without
   requiring rust-analyzer in ordinary tests.
@@ -155,6 +162,14 @@ uses the verifier's captured point IDs for orphan deletion and the existing
 semantic index path for vector rebuilds, so focused tests cover the repair plan
 classification while live end-to-end repair remains service-dependent.
 
+Single-writer tests should stay split between deterministic store/unit coverage,
+writer-service protocol coverage, and higher-level watcher/CLI behavior. Store
+tests cover the daemon-internal advisory lock. Writer tests cover stable
+database-path endpoints, job serialization, and one daemon per DB path. Watcher
+and CLI tests should prove attach/heartbeat/detach route through writer jobs,
+manual writers queue through the service, and read-only status/evidence commands
+keep working while writer-managed work is active.
+
 Service-dependent checks:
 
 ```bash
@@ -205,17 +220,21 @@ and two independent MCP readers using the same SQLite index-status path without
 write-capable tools. Current MCP staleness tests cover tool schema, path
 validation, symbol scope, explicit paths, stale/deleted/missing/unknown states,
 and source-free envelope output.
-Current diagnostics tests cover optional rust-analyzer readiness configuration
-without invoking project analysis or requiring rust-analyzer to be installed.
+Current diagnostics tests cover optional rust-analyzer readiness auto-detection
+and override configuration without invoking project analysis or requiring
+rust-analyzer to be installed.
 
 Current call path tests cover deterministic path order, unresolved terminal
 edges matched by callee text, ambiguous terminal edges matched by callee text,
 cycle avoidance, depth limits, and deterministic transitive impact paths.
+Current pre-edit explanation tests cover target JSON parsing, line-range to
+symbol intersection, impact reuse, likely-test propagation, and metadata-only
+output shape.
 Current debug context tests cover runtime input parsing, mapped frame evidence,
 unmapped frames, fresh/stale/deleted freshness labels, calls at failing lines,
 malformed runtime lines, indexed failing-test mapping, unmatched failing-test
 fallbacks, common Rust runtime output shapes, and impact likely-test evidence
-from direct indexed test calls.
+from indexed test-target evidence.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level sqlite-vec metadata for semantic
