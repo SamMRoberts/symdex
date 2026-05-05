@@ -547,20 +547,17 @@ Output:
 ```
 
 The tool parses panic/file locations, stack-frame symbols, indexed-language file
-paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
+paths, Rust backtraces, C# `at Namespace.Type.Method(...) in path.cs:line N`
+frames, Node/V8 `at name (path.js:line:column)` frames, async JS/TS variants,
+and failing test names. It maps frames to indexed SQLite file/symbol/call
 evidence, maps failing test names to indexed tests when available, keeps
 unmatched runtime test names as fallbacks, adds freshness, trust, and
 provenance, and returns source-free metadata only. It also appends short-lived
 metadata rows to `runtime_observations` so repeated failures can be compared by
 input hash, normalized paths, failing test names, and match results without
 storing logs or source text. Because of that cache write, this MCP tool is
-local-only, non-destructive, and not read-only or idempotent. C# and Node/V8 stack-frame
-parsing remains planned separately; this mapping only uses test names that the
-runtime parser already extracts.
-
-Planned parser expansion: keep the Rust parser behavior and add conservative C#
-and Node/V8 stack frame patterns. Unmapped frames must remain visible with an
-explicit status instead of being dropped.
+local-only, non-destructive, and not read-only or idempotent. Unmapped frames
+remain visible with explicit status instead of being dropped.
 
 ### `symdex_staleness_check`
 

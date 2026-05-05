@@ -100,8 +100,6 @@ feature contracts.
 - Unified context packs that merge structural and semantic evidence in one
   agent-facing response.
 - Multi-language test discovery for C#, JavaScript, and TypeScript.
-- Runtime-to-source mapping for C# and Node/V8 stack traces in addition to the
-  existing Rust-focused debug context behavior.
 - Future write-capable reindex requests only after an explicit design doc and
   trust/confirmation model.
 - Future languages beyond Rust, C#, JavaScript, and TypeScript, added only
