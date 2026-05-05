@@ -261,9 +261,11 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   such as stack traces, panic locations, failing test names, frame symbols, and
   indexed-language file paths, then prints `symdex.debug_context.v1` JSON. Rust
   parsing covers common `cargo test`, panic-hook, `anyhow`, `tracing`, full
-  backtrace, and async stack-like output shapes. The pack maps frames to indexed
-  files, symbols, calls at the failing line, freshness, and provenance when
-  available. Passing `-` reads from stdin; a single existing path reads that
+  backtrace, and async stack-like output shapes. C# parsing covers
+  `at Namespace.Type.Method(...) in path.cs:line N`, and Node/V8 parsing covers
+  `at name (path.js:line:column)` plus async JS/TS variants. The pack maps
+  frames to indexed files, symbols, calls at the failing line, freshness, and
+  provenance when available. Passing `-` reads from stdin; a single existing path reads that
   file; otherwise remaining arguments are treated as inline runtime text. Frame
   matches include trust scores and reason tags, and the pack does not include
   source text. Each run also appends short-lived metadata-only
