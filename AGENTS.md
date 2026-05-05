@@ -10,7 +10,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Read this file before changing code, docs, tests, or configuration.
 - Read `docs/README.md` next; it maps tasks to the right deeper docs.
 - For using symdex MCP tools during development, read
-  `.github/instructions/symdex-mcp-tools.instructions.md`.
+  `docs/references/symdex-mcp-tools-usage.md`.
 - For semantic indexing changes, read `docs/LAYERED_SEMANTIC_INDEXING.md`,
   `docs/INDEXING_PIPELINE.md`, `docs/DATA_MODEL.md`, and
   `docs/CONTINUOUS_INDEXING.md` before implementation.
