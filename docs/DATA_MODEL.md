@@ -7,8 +7,9 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, symbol references, tests, conservative test targets, short-lived
-runtime observations, fast semantic generations, and fast/quality
+symbols, calls, symbol references, external dependency facts, dependency usage
+links, tests, conservative test targets, short-lived runtime observations,
+fast semantic generations, and fast/quality
 `chunk_embeddings` manifests. The older chunk-level vector columns remain
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
@@ -18,6 +19,8 @@ lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
 caller/callee traversal, and index-run metadata checks.
 Symbol-reference indexes cover source-symbol, target-symbol, kind, and
 resolution-status scans for broader structural evidence beyond calls.
+Dependency indexes cover package-name lookup, manifest cleanup, usage-by-file,
+usage-by-source-symbol, and dependency-to-import joins for impact evidence.
 Layered semantic indexes cover latest generation lookup, per-layer embedding
 manifests, and quality job status scans.
 
@@ -323,6 +326,60 @@ attributes/decorators, and type-like syntax where tree-sitter exposes stable
 nodes. The table stores no source text beyond the compact reference expression,
 and unresolved or ambiguous references are retained with confidence and
 `resolution_status` metadata.
+
+### `dependencies`
+
+```sql
+CREATE TABLE dependencies (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  manifest_path TEXT NOT NULL,
+  package_manager TEXT NOT NULL,
+  dependency_name TEXT NOT NULL,
+  package_name TEXT NOT NULL,
+  version_req TEXT,
+  dependency_kind TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+`dependencies` stores metadata-only package manifest facts. Current indexing
+extracts conservative Cargo facts from root `Cargo.toml` dependency sections,
+including package aliases, plus npm facts from root `package.json` dependency
+maps. It stores manifest path, package manager, manifest key, package name,
+requested version, and dependency kind; it does not store lockfile resolution
+graphs or downloaded package metadata.
+
+### `dependency_usages`
+
+```sql
+CREATE TABLE dependency_usages (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  dependency_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  source_symbol_id TEXT,
+  usage_kind TEXT NOT NULL,
+  import_path TEXT NOT NULL,
+  referenced_symbol TEXT,
+  line INTEGER NOT NULL,
+  confidence REAL NOT NULL,
+  reason TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+`dependency_usages` links manifest dependencies to conservative import evidence
+from `symbol_references`. It records usage kind, import path, optional
+referenced symbol, line, confidence, and reason. Current matching is limited to
+import/use/using statements that match known Cargo or npm dependency names.
+These rows let impact and debug workflows answer questions such as "which
+symbols import sqlx/sqlite?" without storing source text.
 
 ### `tests`
 
@@ -666,6 +723,8 @@ Use SQLite tables to show repository structure:
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
 - `symbol_references`: imports, type references, implementations, inheritance,
   attributes/decorators, confidence, and resolution status.
+- `dependencies` and `dependency_usages`: manifest package facts plus
+  conservative import-to-dependency links.
 - `tests` and `test_targets`: discovered test metadata plus conservative
   test-to-code relationship kind, confidence, and reason.
 
@@ -684,6 +743,8 @@ Group by `files.path` and aggregate:
 - call count from `calls` joined through caller symbols
 - symbol-reference count from `symbol_references` joined through files and,
   when present, source symbols
+- dependency and dependency-usage counts from `dependencies` and
+  `dependency_usages`
 - embeddable chunk count from chunks where `excluded_reason IS NULL`
 - vector-backed chunk count from current fast `chunk_embeddings` rows for the
   latest semantic generation

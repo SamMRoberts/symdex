@@ -240,7 +240,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   compact reason tags explaining why each evidence row was returned. Likely tests
   list indexed tests with moderate-confidence `test_targets` evidence for the
   queried symbol or its file, with direct-call joins retained as a compatibility
-  fallback for older indexes.
+  fallback for older indexes. When package manifests and import references
+  match, impact also prints metadata-only `external_dependencies` rows with
+  package manager, package name, import path, freshness, trust, and reason tags.
 - `explain-change <repo> <targets-json|file|->`: accepts proposed
   `{ path, start_line, end_line, description }` targets, maps the line ranges
   to intersecting indexed symbols, reuses impact analysis, and prints a

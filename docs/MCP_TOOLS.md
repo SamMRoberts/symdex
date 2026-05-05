@@ -279,13 +279,18 @@ Output separates:
 - transitive callers
 - transitive callees
 - related files
+- external dependency usage evidence
 - same-file symbols
 - tests likely to cover the symbol
 - unresolved candidates
 
 Direct and transitive evidence rows include provenance, freshness labels, and
 trust scores. Related-file rows include path, relationship count, freshness,
-trust, and provenance.
+trust, and provenance. `external_dependencies` contains metadata-only
+import-to-dependency evidence when indexed manifest facts and import references
+support it, including package manager, package name, version requirement,
+manifest path, import path, referenced symbol, freshness, trust, and reason
+tags.
 `tests_likely` contains indexed test qualified names when a discovered test
 has a moderate-confidence `test_targets` relationship to the queried symbol or
 its file. Direct call evidence is still supported as a compatibility fallback

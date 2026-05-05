@@ -12,15 +12,17 @@ use symdex_core::{
     CallEdge, CodeChunk, DiscoveredTest, DiscoveryOptions, FileFacts, Language, NormalizedRepoPath,
     ParseDiagnostic, RepoRoot, RepositoryRefSnapshot, ResolutionStatus, SemanticLayer, Symbol,
     SymbolKind, SymbolReference, content_hash, discover_indexable_files, index_source_file,
+    stable_id,
 };
 use symdex_embed::{LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
-    CallRecord, ChunkEmbeddingRecord, ChunkRecord, FastEmbeddingManifestRecord,
-    FastSemanticGenerationInput, FileIndexEventRecord, FileRecord, IndexRunRecord, PointPayload,
-    QualityActivationSummary, QualityGenerationProgress, QualityJobCompletion, QualityJobSourceRow,
-    QualityQueueSummary, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
-    SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint, WriterLease, WriterLeaseKind,
-    WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
+    CallRecord, ChunkEmbeddingRecord, ChunkRecord, DependencyRecord, DependencyUsageRecord,
+    FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileIndexEventRecord, FileRecord,
+    IndexRunRecord, PointPayload, QualityActivationSummary, QualityGenerationProgress,
+    QualityJobCompletion, QualityJobSourceRow, QualityQueueSummary, RepositoryRecord, SqliteStore,
+    SqliteVectorStore, StoreConfig, SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint,
+    WriterLease, WriterLeaseKind, WriterLeaseRequest, current_timestamp, vector_point_id,
+    vector_table_name,
 };
 
 const EMBEDDING_SEGMENT_OVERLAP_DIVISOR: usize = 5;
@@ -1220,6 +1222,8 @@ fn collect_index_reports_with_options(
                 symbols: Vec::new(),
                 calls: Vec::new(),
                 symbol_references: Vec::new(),
+                dependencies: Vec::new(),
+                dependency_usages: Vec::new(),
                 tests: Vec::new(),
                 parse_diagnostics: Vec::new(),
                 source: String::new(),
@@ -1246,6 +1250,8 @@ fn collect_index_reports_with_options(
             symbols: file_index.symbols,
             calls: file_index.calls,
             symbol_references: file_index.symbol_references,
+            dependencies: dependency_facts(root.id(), &file.facts, &source),
+            dependency_usages: Vec::new(),
             tests: file_index.tests,
             parse_diagnostics: file_index.parse_diagnostics,
             source,
@@ -1262,6 +1268,7 @@ fn collect_index_reports_with_options(
         };
         on_progress(IndexProgress::new("parse", index + 1, files.len(), message));
     }
+    populate_dependency_usages(root.id(), &mut reports);
     Ok(IndexCollection {
         files_seen: files.len(),
         files_skipped_unchanged,
@@ -1817,6 +1824,24 @@ fn persist_structural_index(
                 )
             })
             .collect::<Vec<_>>();
+        let dependencies = report
+            .dependencies
+            .iter()
+            .map(|dependency| {
+                dependency_record(
+                    dependency,
+                    index_run_id,
+                    report.file.language.parser_version(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let dependency_usages = report
+            .dependency_usages
+            .iter()
+            .map(|usage| {
+                dependency_usage_record(usage, index_run_id, report.file.language.parser_version())
+            })
+            .collect::<Vec<_>>();
         let tests = report
             .tests
             .iter()
@@ -1887,24 +1912,28 @@ fn persist_structural_index(
         calls_indexed += calls.len();
         if let Some(repository_ref_id) = repository_ref_id {
             sqlite
-                .replace_file_facts_for_ref_with_references_and_tests(
+                .replace_file_facts_for_ref_with_references_dependencies_and_tests(
                     repository_ref_id,
                     &file,
                     &symbols,
                     &chunks,
                     &calls,
                     &symbol_references,
+                    &dependencies,
+                    &dependency_usages,
                     &tests,
                 )
                 .map_err(|error| error.to_string())?;
         } else {
             sqlite
-                .replace_file_facts_with_references_and_tests(
+                .replace_file_facts_with_references_dependencies_and_tests(
                     &file,
                     &symbols,
                     &chunks,
                     &calls,
                     &symbol_references,
+                    &dependencies,
+                    &dependency_usages,
                     &tests,
                 )
                 .map_err(|error| error.to_string())?;
@@ -3082,6 +3111,284 @@ fn vector_point(
     })
 }
 
+fn dependency_facts(repository_id: &str, file: &FileFacts, source: &str) -> Vec<DependencyFact> {
+    match file.relative_path.as_str() {
+        "Cargo.toml" => cargo_dependency_facts(repository_id, file, source),
+        "package.json" => package_json_dependency_facts(repository_id, file, source),
+        _ => Vec::new(),
+    }
+}
+
+fn cargo_dependency_facts(
+    repository_id: &str,
+    file: &FileFacts,
+    source: &str,
+) -> Vec<DependencyFact> {
+    let mut current_kind: Option<&str> = None;
+    let mut facts = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.split('#').next().unwrap_or("").trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_kind = match trimmed.trim_matches(['[', ']']) {
+                "dependencies" => Some("runtime"),
+                "dev-dependencies" => Some("dev"),
+                "build-dependencies" => Some("build"),
+                _ => None,
+            };
+            continue;
+        }
+        let Some(dependency_kind) = current_kind else {
+            continue;
+        };
+        let Some((name, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let dependency_name = name.trim().trim_matches('"');
+        if dependency_name.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let package_name = cargo_package_alias(value).unwrap_or(dependency_name);
+        facts.push(dependency_fact(
+            repository_id,
+            file,
+            "cargo",
+            dependency_name,
+            package_name,
+            cargo_version_req(value),
+            dependency_kind,
+        ));
+    }
+    facts
+}
+
+fn cargo_package_alias(value: &str) -> Option<&str> {
+    value
+        .trim()
+        .trim_matches(['{', '}'])
+        .split(',')
+        .map(str::trim)
+        .find_map(|part| {
+            part.strip_prefix("package")
+                .and_then(|part| part.split_once('='))
+        })
+        .map(|(_, package)| package.trim().trim_matches('"'))
+        .filter(|package| !package.is_empty())
+}
+
+fn cargo_version_req(value: &str) -> Option<String> {
+    if value.trim().starts_with('{') {
+        return value
+            .trim()
+            .trim_matches(['{', '}'])
+            .split(',')
+            .map(str::trim)
+            .find_map(|part| {
+                part.strip_prefix("version")
+                    .and_then(|part| part.split_once('='))
+            })
+            .map(|(_, version)| version.trim().trim_matches('"').to_owned())
+            .filter(|version| !version.is_empty());
+    }
+    let version = value.trim().trim_matches('"');
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_owned())
+    }
+}
+
+fn package_json_dependency_facts(
+    repository_id: &str,
+    file: &FileFacts,
+    source: &str,
+) -> Vec<DependencyFact> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(source) else {
+        return Vec::new();
+    };
+    let dependency_sets = [
+        ("dependencies", "runtime"),
+        ("devDependencies", "dev"),
+        ("peerDependencies", "peer"),
+        ("optionalDependencies", "optional"),
+    ];
+    let mut facts = Vec::new();
+    for (property, dependency_kind) in dependency_sets {
+        let Some(dependencies) = value.get(property).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, version) in dependencies {
+            facts.push(dependency_fact(
+                repository_id,
+                file,
+                "npm",
+                name,
+                name,
+                version.as_str().map(str::to_owned),
+                dependency_kind,
+            ));
+        }
+    }
+    facts
+}
+
+fn dependency_fact(
+    repository_id: &str,
+    file: &FileFacts,
+    package_manager: &str,
+    dependency_name: &str,
+    package_name: &str,
+    version_req: Option<String>,
+    dependency_kind: &str,
+) -> DependencyFact {
+    DependencyFact {
+        id: stable_id(&[
+            "dependency",
+            repository_id,
+            &file.relative_path,
+            package_manager,
+            dependency_kind,
+            dependency_name,
+            package_name,
+        ]),
+        repository_id: repository_id.to_owned(),
+        file_id: file.id.clone(),
+        manifest_path: file.relative_path.clone(),
+        package_manager: package_manager.to_owned(),
+        dependency_name: dependency_name.to_owned(),
+        package_name: package_name.to_owned(),
+        version_req,
+        dependency_kind: dependency_kind.to_owned(),
+    }
+}
+
+fn populate_dependency_usages(repository_id: &str, reports: &mut [IndexReport]) {
+    let dependencies = reports
+        .iter()
+        .flat_map(|report| report.dependencies.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    if dependencies.is_empty() {
+        return;
+    }
+    for report in reports
+        .iter_mut()
+        .filter(|report| !report.skipped_unchanged)
+    {
+        report.dependency_usages =
+            dependency_usages_for_report(repository_id, report, &dependencies);
+    }
+}
+
+fn dependency_usages_for_report(
+    repository_id: &str,
+    report: &IndexReport,
+    dependencies: &[DependencyFact],
+) -> Vec<DependencyUsageFact> {
+    let mut usages = Vec::new();
+    for reference in report
+        .symbol_references
+        .iter()
+        .filter(|reference| reference.reference_kind.as_str() == "import")
+    {
+        let Some(import_path) = import_path_from_reference(&reference.reference_text) else {
+            continue;
+        };
+        let Some(dependency) = dependencies
+            .iter()
+            .find(|dependency| import_matches_dependency(&import_path, dependency))
+        else {
+            continue;
+        };
+        usages.push(DependencyUsageFact {
+            id: stable_id(&[
+                "dependency-usage",
+                repository_id,
+                &dependency.id,
+                &report.file.id,
+                reference.source_symbol_id.as_deref().unwrap_or("file"),
+                &import_path,
+                &reference.line.to_string(),
+            ]),
+            repository_id: repository_id.to_owned(),
+            dependency_id: dependency.id.clone(),
+            file_id: report.file.id.clone(),
+            source_symbol_id: reference.source_symbol_id.clone(),
+            usage_kind: "import".to_owned(),
+            import_path: import_path.clone(),
+            referenced_symbol: referenced_symbol_from_import(&import_path),
+            line: reference.line,
+            confidence: (reference.confidence + 0.35).min(0.85),
+            reason: "import_matches_manifest_dependency".to_owned(),
+        });
+    }
+    usages
+}
+
+fn import_path_from_reference(reference_text: &str) -> Option<String> {
+    let text = reference_text.trim();
+    if let Some(rust_path) = text.strip_prefix("use ") {
+        return Some(rust_path.trim_end_matches(';').trim().to_owned())
+            .filter(|path| !path.is_empty());
+    }
+    if let Some(csharp_path) = text.strip_prefix("using ") {
+        return Some(csharp_path.trim_end_matches(';').trim().to_owned())
+            .filter(|path| !path.is_empty());
+    }
+    if let Some(module) = quoted_module_after(text, " from ") {
+        return Some(module);
+    }
+    quoted_module_after(text, "import ")
+}
+
+fn quoted_module_after(text: &str, marker: &str) -> Option<String> {
+    let (_, rest) = text.split_once(marker)?;
+    let quote_index = rest.find(['"', '\''])?;
+    let quote = rest.as_bytes()[quote_index] as char;
+    let module = &rest[quote_index + 1..];
+    let end = module.find(quote)?;
+    Some(module[..end].to_owned()).filter(|module| !module.is_empty())
+}
+
+fn import_matches_dependency(import_path: &str, dependency: &DependencyFact) -> bool {
+    let normalized_import = normalize_dependency_token(package_root(import_path));
+    let dependency_name = normalize_dependency_token(&dependency.dependency_name);
+    let package_name = normalize_dependency_token(&dependency.package_name);
+    normalized_import == dependency_name
+        || normalized_import == package_name
+        || import_path.starts_with(&dependency.package_name)
+        || import_path.starts_with(&dependency.dependency_name)
+}
+
+fn package_root(import_path: &str) -> &str {
+    if import_path.starts_with('@') {
+        let mut parts = import_path.split('/');
+        let Some(scope) = parts.next() else {
+            return import_path;
+        };
+        let Some(package) = parts.next() else {
+            return import_path;
+        };
+        return &import_path[..scope.len() + package.len() + 1];
+    }
+    import_path
+        .split([':', '/', '.', '{', ' '])
+        .next()
+        .unwrap_or(import_path)
+}
+
+fn normalize_dependency_token(token: &str) -> String {
+    token.trim().replace('-', "_").to_ascii_lowercase()
+}
+
+fn referenced_symbol_from_import(import_path: &str) -> Option<String> {
+    import_path
+        .split([':', '/', '.', '{', ' ', ','])
+        .rfind(|part| !part.is_empty())
+        .map(|part| part.trim_matches(['}', ';']).to_owned())
+        .filter(|part| !part.is_empty())
+}
+
 fn chunk_record(
     chunk: &CodeChunk,
     index_run_id: &str,
@@ -3154,6 +3461,48 @@ fn symbol_reference_record(
         line: reference.line,
         confidence: reference.confidence,
         resolution_status: reference.resolution_status.as_str().to_owned(),
+        index_run_id: index_run_id.to_owned(),
+        parser_version: parser_version.to_owned(),
+    }
+}
+
+fn dependency_record(
+    dependency: &DependencyFact,
+    index_run_id: &str,
+    parser_version: &str,
+) -> DependencyRecord {
+    DependencyRecord {
+        id: dependency.id.clone(),
+        repository_id: dependency.repository_id.clone(),
+        file_id: dependency.file_id.clone(),
+        manifest_path: dependency.manifest_path.clone(),
+        package_manager: dependency.package_manager.clone(),
+        dependency_name: dependency.dependency_name.clone(),
+        package_name: dependency.package_name.clone(),
+        version_req: dependency.version_req.clone(),
+        dependency_kind: dependency.dependency_kind.clone(),
+        index_run_id: index_run_id.to_owned(),
+        parser_version: parser_version.to_owned(),
+    }
+}
+
+fn dependency_usage_record(
+    usage: &DependencyUsageFact,
+    index_run_id: &str,
+    parser_version: &str,
+) -> DependencyUsageRecord {
+    DependencyUsageRecord {
+        id: usage.id.clone(),
+        repository_id: usage.repository_id.clone(),
+        dependency_id: usage.dependency_id.clone(),
+        file_id: usage.file_id.clone(),
+        source_symbol_id: usage.source_symbol_id.clone(),
+        usage_kind: usage.usage_kind.clone(),
+        import_path: usage.import_path.clone(),
+        referenced_symbol: usage.referenced_symbol.clone(),
+        line: usage.line,
+        confidence: usage.confidence,
+        reason: usage.reason.clone(),
         index_run_id: index_run_id.to_owned(),
         parser_version: parser_version.to_owned(),
     }
@@ -3312,11 +3661,41 @@ struct IndexReport {
     symbols: Vec<Symbol>,
     calls: Vec<CallEdge>,
     symbol_references: Vec<SymbolReference>,
+    dependencies: Vec<DependencyFact>,
+    dependency_usages: Vec<DependencyUsageFact>,
     tests: Vec<DiscoveredTest>,
     parse_diagnostics: Vec<ParseDiagnostic>,
     source: String,
     skipped_unchanged: bool,
     old_content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependencyFact {
+    id: String,
+    repository_id: String,
+    file_id: String,
+    manifest_path: String,
+    package_manager: String,
+    dependency_name: String,
+    package_name: String,
+    version_req: Option<String>,
+    dependency_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DependencyUsageFact {
+    id: String,
+    repository_id: String,
+    dependency_id: String,
+    file_id: String,
+    source_symbol_id: Option<String>,
+    usage_kind: String,
+    import_path: String,
+    referenced_symbol: Option<String>,
+    line: usize,
+    confidence: f32,
+    reason: String,
 }
 
 struct ChunkText<'a> {
@@ -3335,7 +3714,8 @@ mod tests {
 
     use symdex_core::{
         ByteRange, CallEdge, ChunkKind, CodeChunk, DiscoveryOptions, FileFacts, Language,
-        LineRange, RepoRoot, ResolutionStatus, Symbol, SymbolKind, content_hash, stable_id,
+        LineRange, RepoRoot, ResolutionStatus, Symbol, SymbolKind, SymbolReference,
+        SymbolReferenceKind, content_hash, stable_id,
     };
     use symdex_embed::{LayeredEmbedConfig, LayeredEmbedConfigValues};
     use symdex_store::{
@@ -3391,6 +3771,8 @@ mod tests {
             symbols: Vec::new(),
             calls: Vec::new(),
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
@@ -3531,6 +3913,8 @@ mod tests {
             symbols: Vec::new(),
             calls: Vec::new(),
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source,
@@ -3565,6 +3949,8 @@ mod tests {
             symbols: Vec::new(),
             calls: Vec::new(),
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: "x".repeat(96),
@@ -4000,6 +4386,8 @@ mod tests {
             symbols: vec![caller],
             calls: vec![call],
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -4041,6 +4429,8 @@ mod tests {
             symbols: vec![outer_caller, sibling_caller],
             calls: vec![outer_call, sibling_call],
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -4085,6 +4475,8 @@ mod tests {
             symbols: vec![caller],
             calls: vec![call],
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -4125,6 +4517,8 @@ mod tests {
             symbols: vec![caller],
             calls: vec![self_call, self_type_call],
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -4175,6 +4569,8 @@ mod tests {
             symbols: vec![caller],
             calls: vec![call],
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -4209,6 +4605,8 @@ mod tests {
             symbols: vec![caller],
             calls: vec![sample_unresolved_call("run", "crate::worker::helper")],
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),
@@ -4347,6 +4745,133 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dependency_facts_parse_cargo_and_package_json_manifests() {
+        let mut cargo_file = sample_file();
+        cargo_file.id = "cargo-file".to_owned();
+        cargo_file.relative_path = "Cargo.toml".to_owned();
+        cargo_file.language = Language::Toml;
+        let cargo = super::dependency_facts(
+            "repo",
+            &cargo_file,
+            r#"
+            [dependencies]
+            sqlx = { version = "0.7", features = ["sqlite"] }
+            serde-json = { package = "serde_json", version = "1" }
+            [dev-dependencies]
+            insta = "1"
+            "#,
+        );
+        let mut package_file = sample_file();
+        package_file.id = "package-file".to_owned();
+        package_file.relative_path = "package.json".to_owned();
+        package_file.language = Language::Json;
+        let npm = super::dependency_facts(
+            "repo",
+            &package_file,
+            r#"{
+                "dependencies": { "@scope/pkg": "^1.2.0" },
+                "devDependencies": { "vitest": "latest" }
+            }"#,
+        );
+
+        assert!(cargo.iter().any(|dependency| {
+            dependency.dependency_name == "sqlx"
+                && dependency.package_name == "sqlx"
+                && dependency.version_req.as_deref() == Some("0.7")
+                && dependency.dependency_kind == "runtime"
+        }));
+        assert!(cargo.iter().any(|dependency| {
+            dependency.dependency_name == "serde-json"
+                && dependency.package_name == "serde_json"
+                && dependency.version_req.as_deref() == Some("1")
+        }));
+        assert!(cargo.iter().any(|dependency| {
+            dependency.dependency_name == "insta" && dependency.dependency_kind == "dev"
+        }));
+        assert!(npm.iter().any(|dependency| {
+            dependency.package_manager == "npm"
+                && dependency.package_name == "@scope/pkg"
+                && dependency.version_req.as_deref() == Some("^1.2.0")
+        }));
+        assert!(npm.iter().any(|dependency| {
+            dependency.package_name == "vitest" && dependency.dependency_kind == "dev"
+        }));
+    }
+
+    #[test]
+    fn dependency_usages_link_imports_to_manifest_facts() {
+        let mut manifest = sample_file();
+        manifest.id = "manifest-file".to_owned();
+        manifest.relative_path = "Cargo.toml".to_owned();
+        manifest.language = Language::Toml;
+        let dependencies = super::dependency_facts(
+            "repo",
+            &manifest,
+            r#"[dependencies]
+            sqlx = { version = "0.7", features = ["sqlite"] }
+            "#,
+        );
+        let mut code_file = sample_file();
+        code_file.id = "code-file".to_owned();
+        let mut reports = vec![
+            IndexReport {
+                file: manifest,
+                chunks: Vec::new(),
+                symbols: Vec::new(),
+                calls: Vec::new(),
+                symbol_references: Vec::new(),
+                dependencies,
+                dependency_usages: Vec::new(),
+                tests: Vec::new(),
+                parse_diagnostics: Vec::new(),
+                source: String::new(),
+                skipped_unchanged: false,
+                old_content_hash: None,
+            },
+            IndexReport {
+                file: code_file,
+                chunks: Vec::new(),
+                symbols: Vec::new(),
+                calls: Vec::new(),
+                symbol_references: vec![SymbolReference {
+                    id: "reference-sqlx".to_owned(),
+                    file_id: "code-file".to_owned(),
+                    source_symbol_id: Some("symbol-run".to_owned()),
+                    target_symbol_id: None,
+                    reference_text: "use sqlx::SqlitePool;".to_owned(),
+                    reference_kind: SymbolReferenceKind::Import,
+                    line: 2,
+                    confidence: 0.4,
+                    resolution_status: ResolutionStatus::Unresolved,
+                }],
+                dependencies: Vec::new(),
+                dependency_usages: Vec::new(),
+                tests: Vec::new(),
+                parse_diagnostics: Vec::new(),
+                source: String::new(),
+                skipped_unchanged: false,
+                old_content_hash: None,
+            },
+        ];
+
+        super::populate_dependency_usages("repo", &mut reports);
+
+        assert_eq!(reports[1].dependency_usages.len(), 1);
+        assert_eq!(
+            reports[1].dependency_usages[0].import_path,
+            "sqlx::SqlitePool"
+        );
+        assert_eq!(
+            reports[1].dependency_usages[0].referenced_symbol.as_deref(),
+            Some("SqlitePool")
+        );
+        assert_eq!(
+            reports[1].dependency_usages[0].reason,
+            "import_matches_manifest_dependency"
+        );
+    }
+
     fn sample_file() -> FileFacts {
         FileFacts {
             id: "file-1".to_owned(),
@@ -4368,6 +4893,8 @@ mod tests {
             symbols: Vec::new(),
             calls: Vec::new(),
             symbol_references: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_usages: Vec::new(),
             tests: Vec::new(),
             parse_diagnostics: Vec::new(),
             source: String::new(),

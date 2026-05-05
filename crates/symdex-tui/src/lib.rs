@@ -6725,6 +6725,7 @@ impl EvidenceViewerState {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum EvidenceStatus {
     Idle,
     Running,
@@ -9137,6 +9138,7 @@ mod tests {
             transitive_callers: Vec::new(),
             transitive_callees: Vec::new(),
             related_files: Vec::new(),
+            external_dependencies: Vec::new(),
             tests_likely: Vec::new(),
             notes: vec![
                 "likely_tests_unavailable_until_test_discovery_mapping_is_indexed".to_owned(),

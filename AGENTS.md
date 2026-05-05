@@ -129,6 +129,13 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   evidence supports direct calls, naming conventions, fixture paths, or
   same-module file relationships. Store relationship kind, confidence, and
   reason; do not turn weak hints into exact coverage claims.
+- Persist external dependency facts from local package manifests in
+  `dependencies`, and import-to-dependency links in `dependency_usages` when
+  conservative import evidence matches a declared package or crate. Store
+  package manager, manifest path, package/crate name, version requirement,
+  import path, source symbol when available, confidence, and reason; do not
+  execute package managers, read lockfile resolution graphs as authority, or
+  claim dependency usage without manifest evidence.
 - Record embedding model name and vector dimension with every semantic layer.
 - A model or dimension change requires collection migration or full reindex for
   the affected layer.

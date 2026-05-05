@@ -404,6 +404,9 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         callers.iter().chain(callees.iter()),
         transitive_callers.iter().chain(transitive_callees.iter()),
     );
+    let external_dependencies = sqlite
+        .dependency_usages_for_symbol(root.id(), symbol)
+        .map_err(|error| error.to_string())?;
     let tests_likely = sqlite
         .likely_tests_for_symbol(root.id(), symbol)
         .map_err(|error| error.to_string())?
@@ -427,6 +430,7 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         "transitive_callees": call_paths_json(&root, transitive_callees, "transitive_callee"),
         "same_file_symbols": [],
         "related_files": related_files,
+        "external_dependencies": dependency_usage_rows(&root, external_dependencies),
         "tests_likely": tests_likely,
         "unresolved_candidates": [],
         "notes": [
@@ -798,6 +802,42 @@ fn call_rows(
                 "end_line": row.end_line,
                 "freshness": freshness.label(),
                 "trust": trust_json(freshness, &row.provenance, Some(row.confidence)),
+                "reasons": reasons,
+                "provenance": provenance_json(&row.provenance)
+            })
+        })
+        .collect()
+}
+
+fn dependency_usage_rows(
+    root: &RepoRoot,
+    rows: Vec<symdex_store::DependencyUsageSearchRow>,
+) -> Vec<Value> {
+    rows.into_iter()
+        .map(|row| {
+            let freshness = evidence_freshness(root, Some(&row.path), &row.provenance);
+            let reasons = vec![
+                "relationship:external_dependency_import".to_owned(),
+                format!("dependency:{}", row.package_name),
+                format!("usage_kind:{}", row.usage_kind),
+                row.reason.clone(),
+            ];
+            json!({
+                "dependency_id": row.dependency_id,
+                "package_manager": row.package_manager,
+                "dependency_name": row.dependency_name,
+                "package_name": row.package_name,
+                "version_req": row.version_req,
+                "dependency_kind": row.dependency_kind,
+                "manifest_path": row.manifest_path,
+                "usage_kind": row.usage_kind,
+                "import_path": row.import_path,
+                "referenced_symbol": row.referenced_symbol,
+                "path": row.path,
+                "line": row.line,
+                "confidence": row.confidence,
+                "freshness": freshness.label(),
+                "trust": trust_json(freshness, &row.provenance, Some(row.confidence as f64)),
                 "reasons": reasons,
                 "provenance": provenance_json(&row.provenance)
             })

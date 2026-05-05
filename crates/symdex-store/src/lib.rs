@@ -761,7 +761,7 @@ impl SqliteStore {
         calls: &[CallRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(None, file, symbols, chunks, calls, &[], tests)
+        self.replace_file_facts_inner(None, file, symbols, chunks, calls, &[], &[], &[], tests)
     }
 
     pub fn replace_file_facts_with_references_and_tests(
@@ -773,7 +773,42 @@ impl SqliteStore {
         symbol_references: &[SymbolReferenceRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
-        self.replace_file_facts_inner(None, file, symbols, chunks, calls, symbol_references, tests)
+        self.replace_file_facts_inner(
+            None,
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            &[],
+            &[],
+            tests,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_facts_with_references_dependencies_and_tests(
+        &mut self,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        dependencies: &[DependencyRecord],
+        dependency_usages: &[DependencyUsageRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
+        self.replace_file_facts_inner(
+            None,
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            dependencies,
+            dependency_usages,
+            tests,
+        )
     }
 
     pub fn replace_file_facts_for_ref_with_tests(
@@ -792,6 +827,8 @@ impl SqliteStore {
             chunks,
             calls,
             &[],
+            &[],
+            &[],
             tests,
         )
     }
@@ -807,6 +844,32 @@ impl SqliteStore {
         symbol_references: &[SymbolReferenceRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
+        self.replace_file_facts_for_ref_with_references_dependencies_and_tests(
+            repository_ref_id,
+            file,
+            symbols,
+            chunks,
+            calls,
+            symbol_references,
+            &[],
+            &[],
+            tests,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_facts_for_ref_with_references_dependencies_and_tests(
+        &mut self,
+        repository_ref_id: &str,
+        file: &FileRecord,
+        symbols: &[SymbolRecord],
+        chunks: &[ChunkRecord],
+        calls: &[CallRecord],
+        symbol_references: &[SymbolReferenceRecord],
+        dependencies: &[DependencyRecord],
+        dependency_usages: &[DependencyUsageRecord],
+        tests: &[TestRecord],
+    ) -> Result<()> {
         self.replace_file_facts_inner(
             Some(repository_ref_id),
             file,
@@ -814,6 +877,8 @@ impl SqliteStore {
             chunks,
             calls,
             symbol_references,
+            dependencies,
+            dependency_usages,
             tests,
         )
     }
@@ -827,6 +892,8 @@ impl SqliteStore {
         chunks: &[ChunkRecord],
         calls: &[CallRecord],
         symbol_references: &[SymbolReferenceRecord],
+        dependencies: &[DependencyRecord],
+        dependency_usages: &[DependencyUsageRecord],
         tests: &[TestRecord],
     ) -> Result<()> {
         let indexed_at = timestamp();
@@ -915,6 +982,20 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         transaction
             .execute(
+                "DELETE FROM dependency_usages
+                 WHERE file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM dependencies
+                 WHERE file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
                 "DELETE FROM test_targets
                  WHERE test_id IN (SELECT id FROM tests WHERE file_id = ?1)
                     OR target_file_id = ?1",
@@ -956,6 +1037,20 @@ impl SqliteStore {
             transaction
                 .execute(
                     "DELETE FROM symbol_references
+                     WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM dependency_usages
+                     WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM dependencies
                      WHERE file_id = ?1",
                     params![&stale_file_id],
                 )
@@ -1017,6 +1112,96 @@ impl SqliteStore {
                         symbol.end_byte as i64,
                         symbol.index_run_id,
                         symbol.parser_version,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO dependencies (
+                        id, repository_id, file_id, manifest_path, package_manager,
+                        dependency_name, package_name, version_req, dependency_kind,
+                        index_run_id, parser_version, indexed_at
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                      ON CONFLICT(id) DO UPDATE SET
+                        repository_id = excluded.repository_id,
+                        file_id = excluded.file_id,
+                        manifest_path = excluded.manifest_path,
+                        package_manager = excluded.package_manager,
+                        dependency_name = excluded.dependency_name,
+                        package_name = excluded.package_name,
+                        version_req = excluded.version_req,
+                        dependency_kind = excluded.dependency_kind,
+                        index_run_id = excluded.index_run_id,
+                        parser_version = excluded.parser_version,
+                        indexed_at = excluded.indexed_at",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for dependency in dependencies {
+                statement
+                    .execute(params![
+                        dependency.id,
+                        dependency.repository_id,
+                        dependency.file_id,
+                        dependency.manifest_path,
+                        dependency.package_manager,
+                        dependency.dependency_name,
+                        dependency.package_name,
+                        dependency.version_req,
+                        dependency.dependency_kind,
+                        dependency.index_run_id,
+                        dependency.parser_version,
+                        indexed_at,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO dependency_usages (
+                        id, repository_id, dependency_id, file_id, source_symbol_id,
+                        usage_kind, import_path, referenced_symbol, line, confidence,
+                        reason, index_run_id, parser_version, indexed_at
+                      )
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                      ON CONFLICT(id) DO UPDATE SET
+                        repository_id = excluded.repository_id,
+                        dependency_id = excluded.dependency_id,
+                        file_id = excluded.file_id,
+                        source_symbol_id = excluded.source_symbol_id,
+                        usage_kind = excluded.usage_kind,
+                        import_path = excluded.import_path,
+                        referenced_symbol = excluded.referenced_symbol,
+                        line = excluded.line,
+                        confidence = excluded.confidence,
+                        reason = excluded.reason,
+                        index_run_id = excluded.index_run_id,
+                        parser_version = excluded.parser_version,
+                        indexed_at = excluded.indexed_at",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for usage in dependency_usages {
+                statement
+                    .execute(params![
+                        usage.id,
+                        usage.repository_id,
+                        usage.dependency_id,
+                        usage.file_id,
+                        usage.source_symbol_id,
+                        usage.usage_kind,
+                        usage.import_path,
+                        usage.referenced_symbol,
+                        usage.line as i64,
+                        usage.confidence as f64,
+                        usage.reason,
+                        usage.index_run_id,
+                        usage.parser_version,
+                        indexed_at,
                     ])
                     .map_err(StoreError::Sqlite)?;
             }
@@ -1210,6 +1395,51 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_id, symbol_query], test_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn dependency_usages_for_symbol(
+        &self,
+        repository_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<DependencyUsageSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT dependencies.id, dependencies.package_manager,
+                        dependencies.dependency_name, dependencies.package_name,
+                        dependencies.version_req, dependencies.dependency_kind,
+                        dependencies.manifest_path, dependency_usages.usage_kind,
+                        dependency_usages.import_path, dependency_usages.referenced_symbol,
+                        files.path, dependency_usages.line, dependency_usages.confidence,
+                        dependency_usages.reason, files.content_hash,
+                        dependency_usages.index_run_id, dependency_usages.parser_version,
+                        dependency_usages.indexed_at
+                   FROM dependency_usages
+                   JOIN dependencies ON dependency_usages.dependency_id = dependencies.id
+                   JOIN files ON dependency_usages.file_id = files.id
+                   LEFT JOIN symbols source_symbol
+                     ON dependency_usages.source_symbol_id = source_symbol.id
+                  WHERE dependency_usages.repository_id = ?1
+                    AND (
+                      source_symbol.id = ?2
+                      OR source_symbol.name = ?2
+                      OR source_symbol.qualified_name = ?2
+                      OR files.path = ?2
+                    )
+                  ORDER BY dependency_usages.confidence DESC,
+                           dependencies.package_name,
+                           files.path,
+                           dependency_usages.line
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, symbol_query],
+                dependency_usage_search_row,
+            )
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }
@@ -5600,6 +5830,57 @@ pub struct SymbolReferenceRecord {
     pub parser_version: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DependencyRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub file_id: String,
+    pub manifest_path: String,
+    pub package_manager: String,
+    pub dependency_name: String,
+    pub package_name: String,
+    pub version_req: Option<String>,
+    pub dependency_kind: String,
+    pub index_run_id: String,
+    pub parser_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DependencyUsageRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub dependency_id: String,
+    pub file_id: String,
+    pub source_symbol_id: Option<String>,
+    pub usage_kind: String,
+    pub import_path: String,
+    pub referenced_symbol: Option<String>,
+    pub line: usize,
+    pub confidence: f32,
+    pub reason: String,
+    pub index_run_id: String,
+    pub parser_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DependencyUsageSearchRow {
+    pub dependency_id: String,
+    pub package_manager: String,
+    pub dependency_name: String,
+    pub package_name: String,
+    pub version_req: Option<String>,
+    pub dependency_kind: String,
+    pub manifest_path: String,
+    pub usage_kind: String,
+    pub import_path: String,
+    pub referenced_symbol: Option<String>,
+    pub path: String,
+    pub line: usize,
+    pub confidence: f32,
+    pub reason: String,
+    pub provenance: EvidenceProvenance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestRecord {
     pub id: String,
@@ -7528,6 +7809,36 @@ fn test_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestSearchRow> {
     })
 }
 
+fn dependency_usage_search_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DependencyUsageSearchRow> {
+    Ok(DependencyUsageSearchRow {
+        dependency_id: row.get(0)?,
+        package_manager: row.get(1)?,
+        dependency_name: row.get(2)?,
+        package_name: row.get(3)?,
+        version_req: row.get(4)?,
+        dependency_kind: row.get(5)?,
+        manifest_path: row.get(6)?,
+        usage_kind: row.get(7)?,
+        import_path: row.get(8)?,
+        referenced_symbol: row.get(9)?,
+        path: row.get(10)?,
+        line: row.get::<_, i64>(11)? as usize,
+        confidence: row.get::<_, f64>(12)? as f32,
+        reason: row.get(13)?,
+        provenance: EvidenceProvenance {
+            content_hash: row.get(14)?,
+            index_run_id: row.get(15)?,
+            parser_version: row.get(16)?,
+            indexed_at: row.get(17)?,
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        },
+    })
+}
+
 fn symbol_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolSearchRow> {
     Ok(SymbolSearchRow {
         id: row.get(0)?,
@@ -8345,6 +8656,44 @@ CREATE TABLE IF NOT EXISTS symbol_references (
     FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS dependencies (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    manifest_path TEXT NOT NULL,
+    package_manager TEXT NOT NULL,
+    dependency_name TEXT NOT NULL,
+    package_name TEXT NOT NULL,
+    version_req TEXT,
+    dependency_kind TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    indexed_at TEXT NOT NULL,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS dependency_usages (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    dependency_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    source_symbol_id TEXT,
+    usage_kind TEXT NOT NULL,
+    import_path TEXT NOT NULL,
+    referenced_symbol TEXT,
+    line INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    indexed_at TEXT NOT NULL,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(dependency_id) REFERENCES dependencies(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS tests (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -8545,6 +8894,11 @@ CREATE INDEX IF NOT EXISTS idx_symbol_references_file_kind ON symbol_references(
 CREATE INDEX IF NOT EXISTS idx_symbol_references_source_kind ON symbol_references(source_symbol_id, reference_kind);
 CREATE INDEX IF NOT EXISTS idx_symbol_references_target_kind ON symbol_references(target_symbol_id, reference_kind);
 CREATE INDEX IF NOT EXISTS idx_symbol_references_kind_status ON symbol_references(reference_kind, resolution_status);
+CREATE INDEX IF NOT EXISTS idx_dependencies_repository_name ON dependencies(repository_id, package_name);
+CREATE INDEX IF NOT EXISTS idx_dependencies_file ON dependencies(file_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_usages_dependency ON dependency_usages(dependency_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_usages_file ON dependency_usages(file_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_usages_symbol ON dependency_usages(source_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_name ON tests(repository_id, name);
 CREATE INDEX IF NOT EXISTS idx_tests_repository_qualified_name ON tests(repository_id, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_tests_file_id ON tests(file_id);
@@ -8614,14 +8968,14 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
-        FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus,
-        FileIndexEventRecord, FileRecord, PointPayload, QualityActivationReason,
-        QualityEmbeddingJobRecord, QualityJobCompletion, RepositoryRecord,
-        RuntimeObservationRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
-        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, SymbolReferenceRecord,
-        TestRecord, VectorPoint, WatcherClientRecord, WatcherStatusRecord, WriterLease,
-        WriterLeaseInfo, WriterLeaseKind, WriterLeaseRequest, validate_vector_table_name,
-        vector_point_id, vector_rowid, vector_table_name,
+        DependencyRecord, DependencyUsageRecord, FastEmbeddingManifestRecord,
+        FastSemanticGenerationInput, FileCoverageStatus, FileIndexEventRecord, FileRecord,
+        PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
+        RepositoryRecord, RuntimeObservationRecord, SemanticGenerationRecord, SqliteStore,
+        SqliteVectorStore, StorageHealthStatus, StoreConfig, StoreError, SymbolRecord,
+        SymbolReferenceRecord, TestRecord, VectorPoint, WatcherClientRecord, WatcherStatusRecord,
+        WriterLease, WriterLeaseInfo, WriterLeaseKind, WriterLeaseRequest,
+        validate_vector_table_name, vector_point_id, vector_rowid, vector_table_name,
     };
 
     #[test]
@@ -9527,6 +9881,11 @@ mod tests {
             "idx_symbol_references_source_kind",
             "idx_symbol_references_target_kind",
             "idx_symbol_references_kind_status",
+            "idx_dependencies_repository_name",
+            "idx_dependencies_file",
+            "idx_dependency_usages_dependency",
+            "idx_dependency_usages_file",
+            "idx_dependency_usages_symbol",
             "idx_tests_repository_name",
             "idx_tests_repository_qualified_name",
             "idx_tests_file_id",
@@ -11161,6 +11520,19 @@ mod tests {
             ("test_targets", "relationship_kind"),
             ("test_targets", "confidence"),
             ("test_targets", "reason"),
+            ("dependencies", "repository_id"),
+            ("dependencies", "manifest_path"),
+            ("dependencies", "package_manager"),
+            ("dependencies", "dependency_name"),
+            ("dependencies", "package_name"),
+            ("dependencies", "version_req"),
+            ("dependencies", "dependency_kind"),
+            ("dependency_usages", "dependency_id"),
+            ("dependency_usages", "source_symbol_id"),
+            ("dependency_usages", "usage_kind"),
+            ("dependency_usages", "import_path"),
+            ("dependency_usages", "referenced_symbol"),
+            ("dependency_usages", "reason"),
             ("runtime_observations", "observation_id"),
             ("runtime_observations", "input_hash"),
             ("runtime_observations", "observation_kind"),
@@ -11883,6 +12255,126 @@ mod tests {
         assert_eq!(row.1, "import");
         assert_eq!(row.2, 2);
         assert_eq!(row.4, "unresolved");
+    }
+
+    #[test]
+    fn sqlite_persists_dependency_facts_and_usages() {
+        let db = TestDb::new("dependency-facts");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let dependency = DependencyRecord {
+            id: "dep-sqlx".to_owned(),
+            repository_id: "repo".to_owned(),
+            file_id: "manifest-file".to_owned(),
+            manifest_path: "Cargo.toml".to_owned(),
+            package_manager: "cargo".to_owned(),
+            dependency_name: "sqlx".to_owned(),
+            package_name: "sqlx".to_owned(),
+            version_req: Some("0.7".to_owned()),
+            dependency_kind: "runtime".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        };
+        let usage = DependencyUsageRecord {
+            id: "usage-sqlx".to_owned(),
+            repository_id: "repo".to_owned(),
+            dependency_id: "dep-sqlx".to_owned(),
+            file_id: "code-file".to_owned(),
+            source_symbol_id: Some("source-symbol".to_owned()),
+            usage_kind: "import".to_owned(),
+            import_path: "sqlx::SqlitePool".to_owned(),
+            referenced_symbol: Some("SqlitePool".to_owned()),
+            line: 3,
+            confidence: 0.75,
+            reason: "import_matches_manifest_dependency".to_owned(),
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        };
+
+        store
+            .replace_file_facts_with_references_dependencies_and_tests(
+                &sample_file_at("manifest-file", "Cargo.toml", "hash-1"),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[dependency],
+                &[],
+                &[],
+            )
+            .expect("dependency facts should persist");
+        store
+            .replace_file_facts_with_references_dependencies_and_tests(
+                &sample_file_at("code-file", "src/lib.rs", "hash-2"),
+                &[sample_symbol_in_file(
+                    "source-symbol",
+                    "code-file",
+                    "run",
+                    "crate::run",
+                )],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[usage],
+                &[],
+            )
+            .expect("dependency usages should persist");
+
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = store
+            .connection
+            .query_row(
+                "SELECT dependencies.package_manager, dependencies.dependency_name,
+                        dependencies.package_name, dependencies.dependency_kind,
+                        dependencies.version_req, dependency_usages.import_path,
+                        dependency_usages.reason
+                   FROM dependencies
+                   JOIN dependency_usages ON dependency_usages.dependency_id = dependencies.id
+                  WHERE dependencies.id = 'dep-sqlx'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("dependency facts should load");
+        assert_eq!(row.0, "cargo");
+        assert_eq!(row.1, "sqlx");
+        assert_eq!(row.2, "sqlx");
+        assert_eq!(row.3, "runtime");
+        assert_eq!(row.4.as_deref(), Some("0.7"));
+        assert_eq!(row.5, "sqlx::SqlitePool");
+        assert_eq!(row.6, "import_matches_manifest_dependency");
+
+        let rows = store
+            .dependency_usages_for_symbol("repo", "crate::run")
+            .expect("dependency usages should query by symbol");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].package_name, "sqlx");
+        assert_eq!(rows[0].path, "src/lib.rs");
+        assert_eq!(rows[0].provenance.content_hash.as_deref(), Some("hash-2"));
     }
 
     #[test]

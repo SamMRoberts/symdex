@@ -75,6 +75,9 @@ and YAML configuration files are indexed as fallback-only configuration
 evidence with no symbols, calls, tests, or tree-sitter parse diagnostics. JSON
 configuration files are disabled by default and are indexed only when
 `SYMDEX_INDEX_JSON_PATHS` contains a matching repo-relative folder scope.
+Root `Cargo.toml` and `package.json` manifests also produce metadata-only
+dependency facts, and code-file import references are conservatively linked to
+those facts when the import path matches the declared package/crate name.
 Future languages must be added through the same discovery, parsing, chunking,
 symbol, call, hashing, secret-detection, embedding, SQLite, sqlite-vec, manual
 indexing, and continuous indexing contracts.
@@ -356,6 +359,10 @@ base-list or class-heritage inheritance, attributes/decorators, and type-like
 syntax where available. Resolution is local and conservative: a single local
 symbol suffix/name match becomes `resolved_local_candidate`, multiple matches
 are `ambiguous`, and otherwise the reference is preserved as `unresolved`.
+Dependency usage extraction reuses only import-kind symbol references and known
+manifest facts. It records package manager, package name, version requirement,
+import path, source symbol when available, confidence, and reason tags without
+returning source text or claiming package-manager resolution.
 
 After per-file parsing, the indexer performs a conservative Rust cross-file
 resolution pass before persisting SQLite facts. Qualified module calls such as

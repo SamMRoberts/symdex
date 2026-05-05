@@ -12,8 +12,8 @@ use symdex_core::{
 use symdex_embed::{EmbedConfig, LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
-    EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, ExpectedVectorPoint,
-    FileFreshnessSnapshot, IndexCoverageSummary, IndexRunsTimelineSummary,
+    DependencyUsageSearchRow, EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance,
+    ExpectedVectorPoint, FileFreshnessSnapshot, IndexCoverageSummary, IndexRunsTimelineSummary,
     QualityGenerationProgress, RetrievedPoint, RuntimeObservationCacheSummary,
     RuntimeObservationRecord, ScoredPoint, SemanticLayerManifestSummary,
     SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore, SqliteVectorStore,
@@ -384,6 +384,7 @@ pub struct ImpactSummary {
     pub transitive_callers: Vec<ImpactPathEvidence>,
     pub transitive_callees: Vec<ImpactPathEvidence>,
     pub related_files: Vec<ImpactRelatedFile>,
+    pub external_dependencies: Vec<ImpactDependencyEvidence>,
     pub tests_likely: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -407,6 +408,7 @@ pub struct ExplainChangeSummary {
     pub transitive_callers: Vec<ImpactPathEvidence>,
     pub transitive_callees: Vec<ImpactPathEvidence>,
     pub related_files: Vec<ImpactRelatedFile>,
+    pub external_dependencies: Vec<ImpactDependencyEvidence>,
     pub likely_tests: Vec<String>,
     pub limits: ExplainChangeLimits,
     pub notes: Vec<String>,
@@ -527,6 +529,14 @@ pub struct ImpactRelatedFile {
     pub relationship_count: usize,
     pub freshness: EvidenceFreshness,
     pub provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImpactDependencyEvidence {
+    pub row: DependencyUsageSearchRow,
+    pub freshness: EvidenceFreshness,
     pub trust: EvidenceTrust,
     pub reasons: Vec<String>,
 }
@@ -768,6 +778,7 @@ fn build_explain_change_summary(
     let mut transitive_callers: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
     let mut transitive_callees: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
     let mut related_files: BTreeMap<String, ImpactRelatedFile> = BTreeMap::new();
+    let mut external_dependencies: BTreeMap<String, ImpactDependencyEvidence> = BTreeMap::new();
     let mut likely_tests = BTreeSet::new();
     let mut notes = vec![
         "metadata_only_no_source_text".to_owned(),
@@ -892,6 +903,11 @@ fn build_explain_change_summary(
             for file in impact.related_files {
                 merge_related_file(&mut related_files, file);
             }
+            for dependency in impact.external_dependencies {
+                external_dependencies
+                    .entry(impact_dependency_key(&dependency))
+                    .or_insert(dependency);
+            }
             likely_tests.extend(impact.tests_likely);
         }
     }
@@ -912,6 +928,7 @@ fn build_explain_change_summary(
         transitive_callers: transitive_callers.into_values().collect(),
         transitive_callees: transitive_callees.into_values().collect(),
         related_files: related_files.into_values().collect(),
+        external_dependencies: external_dependencies.into_values().collect(),
         likely_tests: likely_tests.into_iter().collect(),
         limits: ExplainChangeLimits {
             max_targets,
@@ -965,6 +982,10 @@ fn build_impact_summary(
         &transitive_callees,
         &current_hashes,
     );
+    let external_dependencies = sqlite
+        .dependency_usages_for_symbol(root.id(), query)
+        .map(|rows| impact_dependency_evidence(rows, &current_hashes))
+        .map_err(|error| error.to_string())?;
     let tests_likely = sqlite
         .likely_tests_for_symbol(root.id(), query)
         .map(test_names)
@@ -985,6 +1006,7 @@ fn build_impact_summary(
         transitive_callers,
         transitive_callees,
         related_files,
+        external_dependencies,
         tests_likely,
         notes,
     })
@@ -3595,6 +3617,35 @@ fn impact_path_evidence(
         .collect()
 }
 
+fn impact_dependency_evidence(
+    rows: Vec<DependencyUsageSearchRow>,
+    current_hashes: &BTreeMap<String, String>,
+) -> Vec<ImpactDependencyEvidence> {
+    rows.into_iter()
+        .map(|row| {
+            let freshness =
+                freshness_for_provenance(Some(&row.path), &row.provenance, current_hashes);
+            let trust = evidence_trust(
+                freshness,
+                Some(&row.provenance),
+                Some(row.confidence as f64),
+            );
+            let reasons = vec![
+                "relationship:external_dependency_import".to_owned(),
+                format!("dependency:{}", row.package_name),
+                format!("usage_kind:{}", row.usage_kind),
+                row.reason.clone(),
+            ];
+            ImpactDependencyEvidence {
+                row,
+                freshness,
+                trust,
+                reasons,
+            }
+        })
+        .collect()
+}
+
 fn aggregate_trust(trust: &[EvidenceTrust]) -> EvidenceTrust {
     if trust.is_empty() {
         return evidence_trust(EvidenceFreshness::Unknown, None, None);
@@ -3663,6 +3714,13 @@ fn impact_call_key(evidence: &ImpactCallEvidence) -> String {
         evidence.row.symbol_id.as_deref().unwrap_or("<unresolved>"),
         evidence.row.callee_text,
         evidence.row.call_line
+    )
+}
+
+fn impact_dependency_key(evidence: &ImpactDependencyEvidence) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        evidence.row.dependency_id, evidence.row.path, evidence.row.line, evidence.row.import_path
     )
 }
 

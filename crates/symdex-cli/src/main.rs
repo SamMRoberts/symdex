@@ -1253,6 +1253,7 @@ fn print_impact_summary(summary: &ImpactSummary) {
                 .unwrap_or("<none>")
         );
     }
+    print_impact_dependency_evidence(&summary.external_dependencies);
     println!("tests_likely: {}", summary.tests_likely.len());
     for test in &summary.tests_likely {
         println!("test: {test}");
@@ -1325,12 +1326,30 @@ fn print_explain_change_summary(summary: &ExplainChangeSummary) {
             reason_list(&file.reasons)
         );
     }
+    print_impact_dependency_evidence(&summary.external_dependencies);
     println!("likely_tests: {}", summary.likely_tests.len());
     for test in &summary.likely_tests {
         println!("test: {test}");
     }
     for note in &summary.notes {
         println!("note: {note}");
+    }
+}
+
+fn print_impact_dependency_evidence(dependencies: &[symdex_query::ImpactDependencyEvidence]) {
+    println!("external_dependencies: {}", dependencies.len());
+    for dependency in dependencies {
+        println!(
+            "{} import={} {}:{} freshness={} trust={:.2}/{} reasons={}",
+            dependency.row.package_name,
+            dependency.row.import_path,
+            dependency.row.path,
+            dependency.row.line,
+            dependency.freshness.label(),
+            dependency.trust.score,
+            dependency.trust.level,
+            reason_list(&dependency.reasons)
+        );
     }
 }
 

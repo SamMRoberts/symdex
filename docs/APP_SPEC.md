@@ -79,6 +79,8 @@ symdex serve-mcp --watch <repo>
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.
 - MCP tools return compact JSON evidence that a coding agent can use immediately.
+- Impact evidence includes external dependency usage when local package
+  manifests and import references conservatively connect a symbol to a package.
 - Pre-edit explanation maps proposed line-range changes to indexed symbols,
   impact evidence, likely tests, freshness, trust, and reason tags without
   storing source text or mutating the index.
