@@ -445,9 +445,6 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 "watcher-managed",
                 format_args!("stop repo={}", root.path().display()),
             );
-            let _guard = write_gate
-                .lock()
-                .map_err(|_| "writer gate lock poisoned".to_owned())?;
             store
                 .mark_watcher_stopped(root.id())
                 .map_err(|error| error.to_string())
@@ -457,9 +454,6 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 "watcher-managed",
                 format_args!("fail repo={} error={}", root.path().display(), error),
             );
-            let _guard = write_gate
-                .lock()
-                .map_err(|_| "writer gate lock poisoned".to_owned())?;
             let _ = store.mark_watcher_failed(root.id(), &error);
             Err(error)
         }

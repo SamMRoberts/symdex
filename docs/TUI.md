@@ -408,6 +408,10 @@ represent the indexed repository.
   with `Tab` / `Shift+Tab` on the Index tab. Offline and semantic indexing both
   use the selected scope after explicit `y` confirmation. The selected scope
   defaults to incremental.
+- Manual semantic indexing submits the fast indexing job first, then starts the
+  quality writer job when layered quality indexing is enabled. Quality work uses
+  the quality-semantic writer lane and should report progress without blocking
+  watcher status or client lease updates.
 - Show fast and quality semantic readiness as progress bars in the Index tab.
   Each bar should display the percentage and ready/expected chunk counts for
   `fast_ready` and `quality_ready` coverage.

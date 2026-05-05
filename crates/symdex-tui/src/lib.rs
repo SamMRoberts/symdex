@@ -25,7 +25,7 @@ use symdex_core::{RepoRoot, SemanticLayer, SemanticLayerStatus};
 use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
-use symdex_embed::EmbedConfig;
+use symdex_embed::{EmbedConfig, LayeredEmbedConfig};
 use symdex_index::{
     ContinuousIndexEvent, ContinuousQualityState, EmbeddingSummary, IndexProgress, IndexScope,
     IndexSummary, RustAnalyzerEnrichmentSummary,
@@ -1127,7 +1127,7 @@ impl App {
                 message: "Submitting index job to writer service".to_owned(),
             }));
             let job = WriterJob::Index {
-                repo,
+                repo: repo.clone(),
                 offline: matches!(request.mode, IndexMode::Offline),
                 scope: writer_scope(request.scope),
             };
@@ -1139,7 +1139,19 @@ impl App {
                     ));
                 })
                 .and_then(index_summary_from_writer_response)
-                .map(Box::new);
+                .map(Box::new)
+                .and_then(|summary| {
+                    let (quality, quality_error) =
+                        match run_manual_quality_after_index(&repo, request, &sender) {
+                            Ok(quality) => (quality.map(Box::new), None),
+                            Err(error) => (None, Some(error)),
+                        };
+                    Ok(Box::new(ManualIndexJobSummary {
+                        index: summary,
+                        quality,
+                        quality_error,
+                    }))
+                });
             let _ = sender.send(IndexJobMessage::Finished(result));
         });
         self.index_receiver = Some(receiver);
@@ -1374,14 +1386,41 @@ impl App {
                     mode: IndexMode::Offline,
                     scope: self.index_scope,
                 });
-                self.message = format!(
-                    "{} indexing completed: {} files indexed, {} chunks indexed.",
-                    request.label(),
-                    summary.sqlite_files_indexed,
-                    summary.sqlite_chunks_indexed
-                );
+                self.message = if let Some(error) = &summary.quality_error {
+                    self.continuous.latest_quality_error = Some(error.clone());
+                    self.semantic_status.latest_quality_error = Some(error.clone());
+                    format!(
+                        "{} indexing completed, but quality indexing failed: {}",
+                        request.label(),
+                        error
+                    )
+                } else if let Some(quality) = &summary.quality {
+                    self.continuous.active_layer = Some(quality.active_layer.clone());
+                    self.continuous.quality_status = Some(quality.quality_status.clone());
+                    self.continuous.activation_reason = Some(quality.activation_reason.clone());
+                    self.continuous.quality_pending_jobs = quality.remaining_pending_jobs;
+                    self.continuous.quality_running_jobs = 0;
+                    self.continuous.quality_failed_jobs = quality.failed_jobs;
+                    self.continuous.quality_stale_jobs = quality.skipped_stale_jobs;
+                    self.continuous.latest_quality_error = None;
+                    format!(
+                        "{} indexing completed: {} files indexed; quality {} on {} after {} jobs.",
+                        request.label(),
+                        summary.index.sqlite_files_indexed,
+                        quality.quality_status,
+                        quality.active_layer,
+                        quality.claimed_jobs
+                    )
+                } else {
+                    format!(
+                        "{} indexing completed: {} files indexed, {} chunks indexed.",
+                        request.label(),
+                        summary.index.sqlite_files_indexed,
+                        summary.index.sqlite_chunks_indexed
+                    )
+                };
                 let completed_message = self.message.clone();
-                self.last_index_summary = Some(*summary);
+                self.last_index_summary = Some(*summary.index);
                 self.index_progress = None;
                 self.screen = reduce_screen(self.screen, UiAction::JobSucceeded);
                 if self
@@ -6119,6 +6158,37 @@ fn index_progress_from_writer(progress: WriterProgress) -> IndexProgress {
     }
 }
 
+fn run_manual_quality_after_index(
+    repo: &str,
+    request: ManualIndexRequest,
+    sender: &mpsc::Sender<IndexJobMessage>,
+) -> Result<Option<ManualQualityJobSummary>, String> {
+    if !matches!(request.mode, IndexMode::Semantic)
+        || !LayeredEmbedConfig::from_env().quality_enabled
+    {
+        return Ok(None);
+    }
+
+    let _ = sender.send(IndexJobMessage::Progress(IndexProgress {
+        phase: "quality_index",
+        completed: 0,
+        total: 1,
+        message: "Submitting quality index job to writer service".to_owned(),
+    }));
+    let progress_sender = sender.clone();
+    let response = WriterClient::from_env().submit_and_wait_with_progress(
+        &WriterJob::IndexQuality {
+            repo: repo.to_owned(),
+        },
+        move |progress| {
+            let _ = progress_sender.send(IndexJobMessage::Progress(index_progress_from_writer(
+                progress,
+            )));
+        },
+    )?;
+    manual_quality_summary_from_writer_response(response).map(Some)
+}
+
 fn writer_progress_phase(phase: &str) -> &'static str {
     match phase {
         "open" => "open",
@@ -6159,6 +6229,24 @@ fn index_summary_from_writer_response(response: WriterJobResponse) -> Result<Ind
             enable_env: "SYMDEX_RUST_ANALYZER".to_owned(),
         },
         embedding: EmbeddingSummary::SkippedNoChunks,
+    })
+}
+
+fn manual_quality_summary_from_writer_response(
+    response: WriterJobResponse,
+) -> Result<ManualQualityJobSummary, String> {
+    if !response.ok {
+        return Err(response.message);
+    }
+    let data = response.data;
+    Ok(ManualQualityJobSummary {
+        quality_status: string_field(&data, "quality_status"),
+        active_layer: string_field(&data, "active_layer"),
+        activation_reason: string_field(&data, "activation_reason"),
+        claimed_jobs: usize_field(&data, "claimed_jobs"),
+        failed_jobs: usize_field(&data, "failed_jobs"),
+        skipped_stale_jobs: usize_field(&data, "skipped_stale_jobs"),
+        remaining_pending_jobs: usize_field(&data, "remaining_pending_jobs"),
     })
 }
 
@@ -6742,7 +6830,23 @@ enum EvidenceResult {
 
 enum IndexJobMessage {
     Progress(IndexProgress),
-    Finished(Result<Box<IndexSummary>, String>),
+    Finished(Result<Box<ManualIndexJobSummary>, String>),
+}
+
+struct ManualIndexJobSummary {
+    index: Box<IndexSummary>,
+    quality: Option<Box<ManualQualityJobSummary>>,
+    quality_error: Option<String>,
+}
+
+struct ManualQualityJobSummary {
+    quality_status: String,
+    active_layer: String,
+    activation_reason: String,
+    claimed_jobs: usize,
+    failed_jobs: usize,
+    skipped_stale_jobs: usize,
+    remaining_pending_jobs: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -6962,13 +7066,15 @@ mod tests {
         StorageHealthRow, StorageHealthStatus, SymbolOutlineRow, SymbolOutlineSummary,
         SymbolSearchRow, VectorStorageProjection,
     };
+    use symdex_writer::WriterJobResponse;
 
     use crate::{
         App, ContinuousIndexStatus, DiagnosticsState, EvidenceMode, EvidenceResult, EvidenceStatus,
         GraphStatus, INDEX_STATUS_REFRESH_INTERVAL, IndexMode, ManualIndexRequest, QueryStatus,
         Screen, StorageExplorerState, StorageMode, UiAction, View, WATCHER_STATUS_REFRESH_INTERVAL,
         continuous_activity_frame, layer_count_percent, layer_readiness_percent,
-        parse_call_path_input, progress_percent, reduce_screen, render,
+        manual_quality_summary_from_writer_response, parse_call_path_input, progress_percent,
+        reduce_screen, render,
     };
 
     #[test]
@@ -8728,6 +8834,33 @@ mod tests {
         };
 
         assert_eq!(progress_percent(Some(&progress)), 100);
+    }
+
+    #[test]
+    fn manual_quality_summary_parses_writer_response() {
+        let response = WriterJobResponse::ok_with_data(
+            "quality index completed",
+            serde_json::json!({
+                "quality_status": "quality_ready",
+                "active_layer": "quality",
+                "activation_reason": "quality_complete",
+                "claimed_jobs": 4,
+                "failed_jobs": 1,
+                "skipped_stale_jobs": 2,
+                "remaining_pending_jobs": 3,
+            }),
+        );
+
+        let summary = manual_quality_summary_from_writer_response(response)
+            .expect("quality writer response should parse");
+
+        assert_eq!(summary.quality_status, "quality_ready");
+        assert_eq!(summary.active_layer, "quality");
+        assert_eq!(summary.activation_reason, "quality_complete");
+        assert_eq!(summary.claimed_jobs, 4);
+        assert_eq!(summary.failed_jobs, 1);
+        assert_eq!(summary.skipped_stale_jobs, 2);
+        assert_eq!(summary.remaining_pending_jobs, 3);
     }
 
     #[test]
