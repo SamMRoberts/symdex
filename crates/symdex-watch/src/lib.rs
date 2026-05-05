@@ -14,8 +14,8 @@ use symdex_index::{
     run_continuous_index_until_with_write_gate,
 };
 use symdex_store::{
-    RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord, WatcherStatusRecord,
-    current_timestamp, debug_db_lock_log,
+    DatabaseRole, RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord,
+    WatcherStatusRecord, current_timestamp, debug_db_lock_log,
 };
 use symdex_writer::{WriterClient, WriterJob};
 
@@ -342,7 +342,7 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
         clients: Vec::new(),
         shutdown_after_seconds: None,
     };
-    let store = {
+    {
         let wait_started = Instant::now();
         debug_db_lock_log(
             "watcher-managed",
@@ -360,16 +360,16 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
             ),
         );
         let setup_started = Instant::now();
-        let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-        store.migrate().map_err(|error| error.to_string())?;
-        store
+        let structural_store =
+            SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+        structural_store
+            .migrate()
+            .map_err(|error| error.to_string())?;
+        structural_store
             .upsert_repository(&RepositoryRecord {
                 id: root.id().to_owned(),
                 root_path: root.path().display().to_string(),
             })
-            .map_err(|error| error.to_string())?;
-        store
-            .upsert_watcher_status(&initial.record())
             .map_err(|error| error.to_string())?;
         debug_db_lock_log(
             "watcher-managed",
@@ -379,8 +379,11 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 setup_started.elapsed().as_millis()
             ),
         );
-        store
     };
+    let store = open_store_for_root(&root)?;
+    store
+        .upsert_watcher_status(&initial.record())
+        .map_err(|error| error.to_string())?;
 
     let mut current = initial;
     let mut no_clients_since: Option<Instant> = None;
@@ -520,11 +523,26 @@ fn heartbeat_attachment(
 }
 
 fn open_store() -> Result<SqliteStore, String> {
-    SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())
+    SqliteStore::open_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())
 }
 
 fn open_store_read_only() -> Result<SqliteStore, String> {
-    SqliteStore::open_read_only(&StoreConfig::from_env()).map_err(|error| error.to_string())
+    SqliteStore::open_read_only_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())
+}
+
+fn open_store_for_root(root: &RepoRoot) -> Result<SqliteStore, String> {
+    let store = SqliteStore::open_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    store
+        .upsert_repository(&RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 fn status_for_root(root: &RepoRoot) -> Result<WatcherStatus, String> {
@@ -836,14 +854,15 @@ mod control_ipc {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    use super::{BufRead, BufReader, StoreConfig, Write, handle_control_stream};
-    use symdex_store::sqlite_parent;
+    use super::{BufRead, BufReader, DatabaseRole, StoreConfig, Write, handle_control_stream};
+    use symdex_store::database_parent;
 
     pub type ControlListener = UnixListener;
 
     pub fn control_endpoint_for_repo(repository_id: &str) -> Result<String, String> {
         let config = StoreConfig::from_env();
-        let parent = sqlite_parent(&config).unwrap_or_else(|| PathBuf::from(".symdex"));
+        let parent = database_parent(&config, DatabaseRole::Watch)
+            .unwrap_or_else(|| PathBuf::from(".symdex"));
         fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
         Ok(parent
             .join(format!("watch-{repository_id}.sock"))

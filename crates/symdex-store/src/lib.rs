@@ -78,6 +78,18 @@ impl DatabaseRole {
         }
     }
 
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "structural" => Some(Self::Structural),
+            "fast_semantic" => Some(Self::FastSemantic),
+            "quality_semantic" => Some(Self::QualitySemantic),
+            "watch" => Some(Self::Watch),
+            "events" => Some(Self::Events),
+            "runtime" => Some(Self::Runtime),
+            _ => None,
+        }
+    }
+
     fn file_suffix(self) -> Option<&'static str> {
         match self {
             Self::Structural => None,
@@ -396,20 +408,31 @@ fn read_writer_lease_info(lock_path: &PathBuf) -> Result<Option<WriterLeaseInfo>
 #[derive(Debug)]
 pub struct SqliteStore {
     connection: Connection,
+    role: DatabaseRole,
+    database_path: PathBuf,
 }
 
 impl SqliteStore {
     pub fn open(config: &StoreConfig) -> Result<Self> {
+        Self::open_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn open_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Self> {
+        let database_path = config.database_path(role);
         debug_db_lock_log(
             "sqlite",
-            format_args!("open_read_write_start db={}", config.sqlite_path.display()),
+            format_args!(
+                "open_read_write_start role={} db={}",
+                role.as_str(),
+                database_path.display()
+            ),
         );
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
-        if let Some(parent) = sqlite_parent(config) {
+        if let Some(parent) = database_parent(config, role) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
-        let initialize_wal = !config.sqlite_path.exists();
-        let connection = Connection::open(&config.sqlite_path).map_err(StoreError::Sqlite)?;
+        let initialize_wal = !database_path.exists();
+        let connection = Connection::open(&database_path).map_err(StoreError::Sqlite)?;
         connection
             .busy_timeout(Duration::from_secs(30))
             .map_err(StoreError::Sqlite)?;
@@ -424,22 +447,36 @@ impl SqliteStore {
         debug_db_lock_log(
             "sqlite",
             format_args!(
-                "open_read_write_success db={} initialized_wal={} busy_timeout_ms=30000",
-                config.sqlite_path.display(),
+                "open_read_write_success role={} db={} initialized_wal={} busy_timeout_ms=30000",
+                role.as_str(),
+                database_path.display(),
                 initialize_wal
             ),
         );
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            role,
+            database_path,
+        })
     }
 
     pub fn open_read_only(config: &StoreConfig) -> Result<Self> {
+        Self::open_read_only_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn open_read_only_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Self> {
+        let database_path = config.database_path(role);
         debug_db_lock_log(
             "sqlite",
-            format_args!("open_read_only_start db={}", config.sqlite_path.display()),
+            format_args!(
+                "open_read_only_start role={} db={}",
+                role.as_str(),
+                database_path.display()
+            ),
         );
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         let connection =
-            Connection::open_with_flags(&config.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(StoreError::Sqlite)?;
         connection
             .busy_timeout(Duration::from_secs(30))
@@ -450,28 +487,54 @@ impl SqliteStore {
         debug_db_lock_log(
             "sqlite",
             format_args!(
-                "open_read_only_success db={} busy_timeout_ms=30000",
-                config.sqlite_path.display()
+                "open_read_only_success role={} db={} busy_timeout_ms=30000",
+                role.as_str(),
+                database_path.display()
             ),
         );
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            role,
+            database_path,
+        })
     }
 
     pub fn migrate(&self) -> Result<()> {
         let started = std::time::Instant::now();
-        debug_db_lock_log("sqlite", format_args!("migrate_start"));
-        self.connection
-            .execute_batch(SCHEMA)
-            .map_err(StoreError::Sqlite)?;
-        self.ensure_compatibility_columns()?;
-        self.ensure_content_addressed_files()?;
         debug_db_lock_log(
             "sqlite",
             format_args!(
-                "migrate_success elapsed_ms={}",
+                "migrate_start role={} db={}",
+                self.role.as_str(),
+                self.database_path.display()
+            ),
+        );
+        match self.role {
+            DatabaseRole::Watch => self.migrate_watch_schema()?,
+            _ => {
+                self.connection
+                    .execute_batch(SCHEMA)
+                    .map_err(StoreError::Sqlite)?;
+                self.ensure_compatibility_columns()?;
+                self.ensure_content_addressed_files()?;
+            }
+        }
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "migrate_success role={} db={} elapsed_ms={}",
+                self.role.as_str(),
+                self.database_path.display(),
                 started.elapsed().as_millis()
             ),
         );
+        Ok(())
+    }
+
+    fn migrate_watch_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(WATCH_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
         Ok(())
     }
 
@@ -9051,6 +9114,54 @@ CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heart
 CREATE INDEX IF NOT EXISTS idx_watcher_clients_repository_heartbeat ON watcher_clients(repository_id, heartbeat_at);
 "#;
 
+const WATCH_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS repositories (
+    id TEXT PRIMARY KEY,
+    root_path TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watchers (
+    repository_id TEXT PRIMARY KEY,
+    root_path TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    owner_kind TEXT NOT NULL,
+    owner_pid INTEGER,
+    socket_path TEXT,
+    state TEXT NOT NULL,
+    started_at TEXT,
+    updated_at TEXT,
+    heartbeat_at TEXT,
+    files_seen INTEGER NOT NULL DEFAULT 0,
+    queued_events INTEGER NOT NULL DEFAULT 0,
+    last_indexed_path TEXT,
+    last_error TEXT,
+    active_layer TEXT,
+    quality_status TEXT,
+    quality_pending_jobs INTEGER NOT NULL DEFAULT 0,
+    quality_running_jobs INTEGER NOT NULL DEFAULT 0,
+    quality_failed_jobs INTEGER NOT NULL DEFAULT 0,
+    quality_stale_jobs INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS watcher_clients (
+    repository_id TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    client_kind TEXT NOT NULL,
+    pid INTEGER,
+    started_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(repository_id, client_id),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchers_state_heartbeat ON watchers(state, heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_watcher_clients_repository_heartbeat ON watcher_clients(repository_id, heartbeat_at);
+"#;
+
 pub fn current_timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -13289,6 +13400,24 @@ mod tests {
         assert_eq!(status.files_seen, 3);
         assert_eq!(status.queued_events, 2);
         assert_eq!(status.last_indexed_path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn sqlite_watch_role_uses_watch_database() {
+        let db = TestDb::new("watch-role-database");
+        let config = db.config();
+        let store = SqliteStore::open_for_role(&config, DatabaseRole::Watch)
+            .expect("watch store should open");
+        store.migrate().expect("watch schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::Watch).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"repositories".to_owned()));
+        assert!(tables.contains(&"watchers".to_owned()));
+        assert!(tables.contains(&"watcher_clients".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
     }
 
     #[test]

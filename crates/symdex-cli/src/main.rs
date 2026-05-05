@@ -24,7 +24,7 @@ use symdex_query::{
     run_unified_context_pack, run_vector_verify_with_options,
 };
 use symdex_store::{
-    EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
+    DatabaseRole, EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
     WatcherClientRecord, WatcherStatusRecord, current_timestamp, debug_db_lock_log, sqlite_parent,
 };
 use symdex_watch::{WatcherClientKind, WatcherStatus};
@@ -69,13 +69,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "watch-daemon" => {
             require_text_output(command, output)?;
-            symdex_writer::run_daemon(|job, on_progress| {
+            let role = parse_writer_daemon_role(&args[1..])?;
+            symdex_writer::run_daemon_for_role(role, |job, on_progress| {
                 execute_writer_job_with_progress(job, on_progress)
             })
         }
         "writer-daemon" => {
             require_text_output(command, output)?;
-            symdex_writer::run_daemon(|job, on_progress| {
+            let role = parse_writer_daemon_role(&args[1..])?;
+            symdex_writer::run_daemon_for_role(role, |job, on_progress| {
                 execute_writer_job_with_progress(job, on_progress)
             })
         }
@@ -235,6 +237,17 @@ fn parse_cli_invocation(args: Vec<String>) -> Result<CliInvocation, String> {
         output,
         args: remaining,
     })
+}
+
+fn parse_writer_daemon_role(args: &[String]) -> Result<DatabaseRole, String> {
+    if args.is_empty() {
+        return Ok(DatabaseRole::Structural);
+    }
+    if args.len() == 2 && args[0] == "--role" {
+        return DatabaseRole::parse(&args[1])
+            .ok_or_else(|| format!("unsupported writer role `{}`", args[1]));
+    }
+    Err("writer-daemon accepts only optional `--role <role>`".to_owned())
 }
 
 fn parse_output_value(value: &str) -> Result<OutputMode, String> {
@@ -441,14 +454,17 @@ fn writer_start_watcher(
         .map(|status| status.is_active())
         .unwrap_or(false);
     let store_config = StoreConfig::from_env();
-    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    store.migrate().map_err(|error| error.to_string())?;
-    store
+    let structural_store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    structural_store
+        .migrate()
+        .map_err(|error| error.to_string())?;
+    structural_store
         .upsert_repository(&RepositoryRecord {
             id: root.id().to_owned(),
             root_path: root.path().display().to_string(),
         })
         .map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     let now = current_timestamp();
     store
         .upsert_watcher_status(&WatcherStatusRecord {
@@ -499,7 +515,7 @@ fn writer_stop_watcher(repo: &str) -> Result<WatcherStatus, String> {
         "watcher-writer",
         format_args!("stop_watcher repo={}", root.path().display()),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     store
         .mark_watcher_stopped(root.id())
         .map_err(|error| error.to_string())?;
@@ -523,7 +539,7 @@ fn writer_attach_watcher_client(
             pid
         ),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     let now = current_timestamp();
     store
         .upsert_watcher_client(&WatcherClientRecord {
@@ -549,7 +565,7 @@ fn writer_heartbeat_watcher_client(repo: &str, client_id: &str) -> Result<Watche
             client_id
         ),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     store
         .heartbeat_watcher_client(root.id(), client_id)
         .map_err(|error| error.to_string())?;
@@ -566,11 +582,24 @@ fn writer_detach_watcher_client(repo: &str, client_id: &str) -> Result<WatcherSt
             client_id
         ),
     );
-    let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
+    let store = open_watcher_store_for_root(&root)?;
     store
         .remove_watcher_client(root.id(), client_id)
         .map_err(|error| error.to_string())?;
     symdex_watch::status(repo)
+}
+
+fn open_watcher_store_for_root(root: &RepoRoot) -> Result<SqliteStore, String> {
+    let store = SqliteStore::open_for_role(&StoreConfig::from_env(), DatabaseRole::Watch)
+        .map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    store
+        .upsert_repository(&RepositoryRecord {
+            id: root.id().to_owned(),
+            root_path: root.path().display().to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 fn writer_scope(scope: IndexScope) -> WriterIndexScope {

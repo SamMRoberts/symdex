@@ -431,27 +431,33 @@ competing write loops cause SQLite lock errors and make index provenance hard to
 reason about.
 
 The writer is database-file scoped, not repository scoped. `symdex-writer`
-starts or attaches to one local writer daemon keyed by `StoreConfig.sqlite_path`.
-The daemon owns the advisory sidecar lock internally as a duplicate-start guard,
-then serializes write jobs in process. Clients do not acquire the lock directly.
+starts or attaches to local writer daemons keyed by database role and derived
+database path. Each daemon owns that role's advisory sidecar lock internally as
+a duplicate-start guard, then serializes write jobs for that database file in
+process. Clients do not acquire the lock directly.
 
-The first multi-database split moves sqlite-vec projections out of the
+The first multi-database split moved sqlite-vec projections out of the
 structural database: fast vectors use a derived `fast_semantic` SQLite file, and
-quality vectors use a derived `quality_semantic` SQLite file. Structural SQLite
-continues to own the authoritative manifests, quality jobs, generation state,
-watcher state, and index events until later slices move those tables into their
-own role databases. The current writer service still serializes high-level jobs
-while this transition is in progress.
+quality vectors use a derived `quality_semantic` SQLite file. The next split
+moves watcher control-plane state into the derived `watch` SQLite file. Watcher
+client heartbeat and detach jobs use the watch-role writer endpoint so they do
+not wait for structural indexing jobs. Structural SQLite continues to own the
+authoritative manifests, quality jobs, generation state, index runs, and
+per-file index events until later slices move those tables into their own role
+databases.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
 tool. These paths submit jobs to the writer service and wait for the result
-instead of opening a second writer. Continuous indexing runs as writer-managed
-watcher work and uses the same in-process write gate as queued manual jobs. A
-manual index, repair, migration, or quality job pauses watcher database writes:
-the watcher can continue polling and coalescing filesystem changes, but watcher
-status writes, incremental batches, idle quality catch-up, and terminal
-stop/failure state writes wait for the writer gate before touching SQLite.
+instead of opening a second structural writer. Continuous indexing runs as
+writer-managed watcher work and uses the same in-process structural write gate
+as queued manual jobs for repository facts, index runs, generation metadata, and
+quality jobs. A manual index, repair, migration, or quality job still pauses
+watch-driven structural writes: the watcher can continue polling and coalescing
+filesystem changes, but incremental batches and idle quality catch-up wait for
+the structural writer gate before touching structural SQLite. Watcher
+status/client rows write to the watch database role and do not wait for the
+structural gate.
 Read paths such as TUI refreshes, MCP evidence tools,
 diagnostics, semantic status, staleness checks, and query tools must not run
 migrations, stale-client pruning, repair, or quality catch-up as a side effect

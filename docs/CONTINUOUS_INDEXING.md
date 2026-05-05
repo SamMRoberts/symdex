@@ -26,17 +26,20 @@ enabled, modified or newly created eligible files are automatically reindexed.
   `mxbai-embed-large` layer as deferred work.
 - Continuous indexing must not wait for quality indexing before returning to
   watch mode.
-- Single-writer rule: only ONE process may write to the configured local
-  SQLite/sqlite-vec database at a time. A database-file-scoped writer service
-  owns all mutations. Continuous indexing, manual indexing, quality catch-up,
-  repair, migrations, and future write-capable tools submit jobs to that
-  service. TUI, MCP, diagnostics, status, and query paths read shared state
-  without migrations or cleanup writes.
-- Manual writer jobs take priority over watcher writes. The watcher may keep
-  polling and coalescing filesystem changes, but watcher status updates,
-  incremental indexing batches, idle quality catch-up, and stop/failure state
-  writes wait on the writer-service gate while a manual index, repair,
-  migration, or quality job is running.
+- Single-writer rule: only ONE process may write to each configured local
+  SQLite/sqlite-vec database file at a time. Database-role-scoped writer
+  services own mutations for their files. Structural indexing, manual indexing,
+  quality catch-up metadata, repair, migrations, and future write-capable tools
+  use the structural writer. Watcher status and client lease rows use the watch
+  database role. TUI, MCP, diagnostics, status, and query paths read shared
+  state without structural migrations or cleanup writes.
+- Manual structural writer jobs take priority over structural watcher writes.
+  The watcher may keep polling and coalescing filesystem changes, but
+  incremental indexing batches and idle quality catch-up wait on the structural
+  writer-service gate while a manual index, repair, migration, or quality job is
+  running. Watcher status and client lease heartbeats write to the watch
+  database role so those lightweight control-plane updates do not wait on the
+  structural SQLite writer gate.
 
 ## Event Handling
 
@@ -160,18 +163,19 @@ Current implementation status:
 - `symdex-index` exposes shared watch snapshot, diff, and continuous polling
   APIs.
 - `symdex-writer` owns the local writer daemon, writer client, job protocol, and
-  database-path-keyed IPC endpoint. `symdex-store` still exposes the advisory
-  lock primitives, but only the writer daemon should acquire them.
+  database-role-keyed IPC endpoints. `symdex-store` still exposes the advisory
+  lock primitives, but only writer daemons should acquire them.
 - `symdex watch start <repo>` starts or attaches the background watcher and
   prints status. Watchers are client-scoped, so this command alone does not make
   a permanent daemon; without a live TUI, MCP server, or foreground watcher the
   daemon exits after about 10 seconds. `symdex watch status <repo>` reads shared
   SQLite watcher state without running migrations or pruning stale client rows,
   keeping status polling read-only while the watcher writes index updates.
-  `symdex watch stop <repo>` asks the writer service to stop the managed watcher.
-  Watcher clients attach, heartbeat, detach, and request status through writer
-  jobs, and the service writes `watchers` / `watcher_clients` rows on their
-  behalf.
+  `symdex watch stop <repo>` asks the structural writer service to stop the
+  managed watcher. Watcher status, client attach, heartbeat, and detach metadata
+  are stored in the watch database role (`.symdex/symdex-watch.sqlite` by
+  default). Client heartbeat and detach jobs are routed to the watch-role writer
+  endpoint so long-running structural indexing jobs do not block lease updates.
 - `symdex index --watch <repo>` attaches a foreground client to the same
   writer-managed watcher rather than opening a separate SQLite writer.
 - Manual `symdex index`, `symdex index-quality`, `vector-repair`, migrations,
@@ -215,6 +219,8 @@ Current implementation status:
 - Record per-file `file_index_events` for watch batches so created, modified,
   deleted, skipped unchanged, and paths removed from discovery by ignore or
   support rules can be debugged from local metadata.
+- Record watcher status and client leases in the watch database role so frequent
+  control-plane updates do not compete with structural indexing writes.
 - Surface watch health in diagnostics when available, including watcher active
   state and the most recent error.
 - Surface quality-layer status separately from fast-layer indexing status.

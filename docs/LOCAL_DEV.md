@@ -34,12 +34,13 @@ SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 SYMDEX_DEBUG_DB_LOCKS=1
 ```
 
-`SYMDEX_DB_PATH` remains the structural SQLite path. Semantic vector storage now
-derives per-layer SQLite files from that path: `.symdex/symdex-fast.sqlite` for
-the fast sqlite-vec projection and `.symdex/symdex-quality.sqlite` for the
-quality sqlite-vec projection. Existing legacy vector collections in the
-structural database remain readable as a compatibility fallback until the split
-storage migration is complete.
+`SYMDEX_DB_PATH` remains the structural SQLite path. Additional database roles
+derive sibling SQLite files from that path: `.symdex/symdex-fast.sqlite` for the
+fast sqlite-vec projection, `.symdex/symdex-quality.sqlite` for the quality
+sqlite-vec projection, and `.symdex/symdex-watch.sqlite` for watcher status and
+client leases. Existing legacy vector collections in the structural database
+remain readable as a compatibility fallback until the split storage migration is
+complete.
 
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
 default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command
@@ -86,12 +87,13 @@ to Ollama.
 
 `SYMDEX_DEBUG_DB_LOCKS=1` enables stderr diagnostics for SQLite lock
 troubleshooting. Logs include writer-service daemon startup and attach attempts,
-job start/finish events, writer-gate wait and hold durations, daemon-internal
-lease acquire/release events, SQLite read-write/read-only opens, migrations, and
-watcher client attach/heartbeat/detach routing. `SYMDEX_DEBUG_WRITER=1` is an
-alias. The logs include local DB and repo paths when enabled; leave it unset for
-normal CLI/TUI output. For TUI or continuous-indexing sessions, redirect stderr
-to a file so diagnostics do not interfere with terminal rendering:
+database role names, job start/finish events, writer-gate wait and hold
+durations, daemon-internal lease acquire/release events, SQLite
+read-write/read-only opens, migrations, and watcher client
+attach/heartbeat/detach routing. `SYMDEX_DEBUG_WRITER=1` is an alias. The logs
+include local DB and repo paths when enabled; leave it unset for normal CLI/TUI
+output. For TUI or continuous-indexing sessions, redirect stderr to a file so
+diagnostics do not interfere with terminal rendering:
 
 ```bash
 SYMDEX_DEBUG_DB_LOCKS=1 cargo run -p symdex-cli -- tui . 2>symdex-db-locks.log

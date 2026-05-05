@@ -14,6 +14,14 @@ fast semantic generations, and fast/quality
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
 
+`SYMDEX_DB_PATH` names the structural database. Role-specific sibling databases
+derive from that path as the storage split progresses. The fast and quality
+sqlite-vec projections live in `fast_semantic` and `quality_semantic` database
+roles, and watcher control-plane state lives in the `watch` database role. With
+the default path this means `.symdex/symdex.sqlite`,
+`.symdex/symdex-fast.sqlite`, `.symdex/symdex-quality.sqlite`, and
+`.symdex/symdex-watch.sqlite`.
+
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
 caller/callee traversal, and index-run metadata checks.
@@ -178,6 +186,59 @@ Events store `old_content_hash` and `new_content_hash` when available, plus
 table. Parser or read failures that abort collection record `status = failed`
 and a metadata-only `error_summary` when the failing path is known; aggregate
 failure status remains in `index_runs`.
+
+### `watchers`
+
+```sql
+CREATE TABLE watchers (
+  repository_id TEXT PRIMARY KEY,
+  root_path TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  owner_kind TEXT NOT NULL,
+  owner_pid INTEGER,
+  socket_path TEXT,
+  state TEXT NOT NULL,
+  started_at TEXT,
+  updated_at TEXT,
+  heartbeat_at TEXT,
+  files_seen INTEGER NOT NULL DEFAULT 0,
+  queued_events INTEGER NOT NULL DEFAULT 0,
+  last_indexed_path TEXT,
+  last_error TEXT,
+  active_layer TEXT,
+  quality_status TEXT,
+  quality_pending_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_running_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_failed_jobs INTEGER NOT NULL DEFAULT 0,
+  quality_stale_jobs INTEGER NOT NULL DEFAULT 0
+);
+```
+
+`watchers` stores metadata-only state for the writer-managed continuous indexer:
+active/stale/failed state, latest heartbeat, coalesced event counts, latest
+indexed path, compact error text, and quality-layer progress counters. The table
+is stored in the `watch` database role so frequent status updates do not compete
+with structural index writes.
+
+### `watcher_clients`
+
+```sql
+CREATE TABLE watcher_clients (
+  repository_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  client_kind TEXT NOT NULL,
+  pid INTEGER,
+  started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  PRIMARY KEY(repository_id, client_id)
+);
+```
+
+`watcher_clients` stores live TUI, MCP, and CLI leases for the single local
+watcher per repository. Client heartbeat and detach jobs route through the watch
+writer endpoint and update the `watch` database role, keeping lightweight lease
+maintenance independent from long structural indexing jobs.
 
 ### `files`
 

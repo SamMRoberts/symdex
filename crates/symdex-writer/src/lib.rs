@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use symdex_core::stable_id;
 use symdex_store::{
     DatabaseRole, StoreConfig, WriterLease, WriterLeaseKind, WriterLeaseRequest, debug_db_lock_log,
-    debug_db_locks_enabled, writer_lock_path,
+    debug_db_locks_enabled,
 };
 
 const START_WAIT: Duration = Duration::from_secs(3);
@@ -63,6 +63,21 @@ pub enum WriterJob {
 }
 
 impl WriterJob {
+    pub fn database_role(&self) -> Option<DatabaseRole> {
+        match self {
+            Self::Ping => None,
+            Self::AttachWatcherClient { .. }
+            | Self::HeartbeatWatcherClient { .. }
+            | Self::DetachWatcherClient { .. } => Some(DatabaseRole::Watch),
+            Self::Init
+            | Self::Index { .. }
+            | Self::IndexQuality { .. }
+            | Self::VectorRepair { .. }
+            | Self::StartWatcher { .. }
+            | Self::StopWatcher { .. } => Some(DatabaseRole::Structural),
+        }
+    }
+
     pub fn operation(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -212,17 +227,19 @@ impl WriterClient {
         mut on_progress: impl FnMut(WriterProgress),
     ) -> Result<WriterJobResponse, String> {
         let started = Instant::now();
+        let role = job.database_role().unwrap_or(DatabaseRole::Structural);
+        let endpoint = writer_endpoint_for_role(&self.config, role);
         debug_db_lock_log(
             "writer-client",
             format_args!(
-                "submit_start db={} endpoint={} {}",
-                self.config.sqlite_path.display(),
-                writer_endpoint_for_config(&self.config),
+                "submit_start role={} db={} endpoint={} {}",
+                role.as_str(),
+                self.config.database_path(role).display(),
+                endpoint,
                 job.debug_details()
             ),
         );
-        self.ensure_daemon()?;
-        let endpoint = writer_endpoint_for_config(&self.config);
+        self.ensure_daemon(role)?;
         let request = serde_json::to_string(job).map_err(|error| error.to_string())?;
         let mut streamed_progress = Vec::new();
         let mut final_response = None;
@@ -254,7 +271,7 @@ impl WriterClient {
             "writer-client",
             format_args!(
                 "submit_finish db={} endpoint={} operation={} ok={} elapsed_ms={} message={}",
-                self.config.sqlite_path.display(),
+                self.config.database_path(role).display(),
                 endpoint,
                 job.operation(),
                 response.ok,
@@ -265,15 +282,16 @@ impl WriterClient {
         Ok(response)
     }
 
-    fn ensure_daemon(&self) -> Result<(), String> {
-        let endpoint = writer_endpoint_for_config(&self.config);
+    fn ensure_daemon(&self, role: DatabaseRole) -> Result<(), String> {
+        let endpoint = writer_endpoint_for_role(&self.config, role);
         let ping = serde_json::to_string(&WriterJob::Ping).unwrap_or_default();
         if ipc::send_request(&endpoint, &ping).is_ok() {
             debug_db_lock_log(
                 "writer-client",
                 format_args!(
-                    "ensure_daemon_attach db={} endpoint={}",
-                    self.config.sqlite_path.display(),
+                    "ensure_daemon_attach role={} db={} endpoint={}",
+                    role.as_str(),
+                    self.config.database_path(role).display(),
                     endpoint
                 ),
             );
@@ -282,8 +300,9 @@ impl WriterClient {
         debug_db_lock_log(
             "writer-client",
             format_args!(
-                "ensure_daemon_start db={} endpoint={}",
-                self.config.sqlite_path.display(),
+                "ensure_daemon_start role={} db={} endpoint={}",
+                role.as_str(),
+                self.config.database_path(role).display(),
                 endpoint
             ),
         );
@@ -294,8 +313,12 @@ impl WriterClient {
         } else {
             Stdio::null()
         };
-        let child = Command::new(executable)
-            .arg("writer-daemon")
+        let mut command = Command::new(executable);
+        command.arg("writer-daemon");
+        if role != DatabaseRole::Structural {
+            command.arg("--role").arg(role.as_str());
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -304,8 +327,9 @@ impl WriterClient {
         debug_db_lock_log(
             "writer-client",
             format_args!(
-                "ensure_daemon_spawned db={} endpoint={} daemon_pid={}",
-                self.config.sqlite_path.display(),
+                "ensure_daemon_spawned role={} db={} endpoint={} daemon_pid={}",
+                role.as_str(),
+                self.config.database_path(role).display(),
                 endpoint,
                 child.id()
             ),
@@ -316,8 +340,9 @@ impl WriterClient {
                 debug_db_lock_log(
                     "writer-client",
                     format_args!(
-                        "ensure_daemon_ready db={} endpoint={} wait_ms={}",
-                        self.config.sqlite_path.display(),
+                        "ensure_daemon_ready role={} db={} endpoint={} wait_ms={}",
+                        role.as_str(),
+                        self.config.database_path(role).display(),
                         endpoint,
                         started.elapsed().as_millis()
                     ),
@@ -329,8 +354,9 @@ impl WriterClient {
         debug_db_lock_log(
             "writer-client",
             format_args!(
-                "ensure_daemon_timeout db={} endpoint={} wait_ms={}",
-                self.config.sqlite_path.display(),
+                "ensure_daemon_timeout role={} db={} endpoint={} wait_ms={}",
+                role.as_str(),
+                self.config.database_path(role).display(),
                 endpoint,
                 started.elapsed().as_millis()
             ),
@@ -355,21 +381,30 @@ pub fn writer_endpoint_for_role(config: &StoreConfig, role: DatabaseRole) -> Str
 }
 
 pub fn run_daemon(
+    handler: impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
+) -> Result<(), String> {
+    run_daemon_for_role(DatabaseRole::Structural, handler)
+}
+
+pub fn run_daemon_for_role(
+    role: DatabaseRole,
     mut handler: impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
 ) -> Result<(), String> {
     let config = StoreConfig::from_env();
-    let endpoint = writer_endpoint_for_config(&config);
+    let endpoint = writer_endpoint_for_role(&config, role);
     debug_db_lock_log(
         "writer-daemon",
         format_args!(
-            "start db={} endpoint={} lock={}",
-            config.sqlite_path.display(),
+            "start role={} db={} endpoint={} lock={}",
+            role.as_str(),
+            config.database_path(role).display(),
             endpoint,
-            writer_lock_path(&config).display()
+            writer_lock_path_for_log(&config, role)
         ),
     );
-    let _lease = WriterLease::acquire(
+    let _lease = WriterLease::acquire_for_role(
         &config,
+        role,
         WriterLeaseRequest::new(WriterLeaseKind::Maintenance, "writer-daemon"),
     )
     .map_err(|error| error.to_string())?;
@@ -378,8 +413,9 @@ pub fn run_daemon(
     debug_db_lock_log(
         "writer-daemon",
         format_args!(
-            "listening db={} endpoint={}",
-            config.sqlite_path.display(),
+            "listening role={} db={} endpoint={}",
+            role.as_str(),
+            config.database_path(role).display(),
             endpoint
         ),
     );
@@ -393,7 +429,7 @@ pub fn run_daemon(
                 }
                 let job_id = next_job_id;
                 next_job_id += 1;
-                handle_stream(job_id, stream, &mut handler);
+                handle_stream(role, job_id, stream, &mut handler);
             }
             Ok(None) => {
                 let idle_for = last_activity
@@ -404,8 +440,9 @@ pub fn run_daemon(
                     debug_db_lock_log(
                         "writer-daemon",
                         format_args!(
-                            "idle_exit db={} endpoint={} idle_ms={}",
-                            config.sqlite_path.display(),
+                            "idle_exit role={} db={} endpoint={} idle_ms={}",
+                            role.as_str(),
+                            config.database_path(role).display(),
                             endpoint,
                             idle_for.as_millis()
                         ),
@@ -417,8 +454,9 @@ pub fn run_daemon(
                 debug_db_lock_log(
                     "writer-daemon",
                     format_args!(
-                        "accept_error db={} endpoint={} error={}",
-                        config.sqlite_path.display(),
+                        "accept_error role={} db={} endpoint={} error={}",
+                        role.as_str(),
+                        config.database_path(role).display(),
                         endpoint,
                         error
                     ),
@@ -431,16 +469,24 @@ pub fn run_daemon(
     debug_db_lock_log(
         "writer-daemon",
         format_args!(
-            "stop db={} endpoint={} lock={}",
-            config.sqlite_path.display(),
+            "stop role={} db={} endpoint={} lock={}",
+            role.as_str(),
+            config.database_path(role).display(),
             endpoint,
-            writer_lock_path(&config).display()
+            writer_lock_path_for_log(&config, role)
         ),
     );
     Ok(())
 }
 
+fn writer_lock_path_for_log(config: &StoreConfig, role: DatabaseRole) -> String {
+    symdex_store::writer_lock_path_for_role(config, role)
+        .display()
+        .to_string()
+}
+
 fn handle_stream(
+    role: DatabaseRole,
     job_id: usize,
     mut stream: impl Read + Write,
     handler: &mut impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
@@ -455,9 +501,23 @@ fn handle_stream(
             let started = Instant::now();
             debug_db_lock_log(
                 "writer-daemon",
-                format_args!("job_start job_id={} {}", job_id, job.debug_details()),
+                format_args!(
+                    "job_start role={} job_id={} {}",
+                    role.as_str(),
+                    job_id,
+                    job.debug_details()
+                ),
             );
-            let response = {
+            let response = if job.database_role().is_some_and(|job_role| job_role != role) {
+                WriterJobResponse::error(format!(
+                    "writer job `{}` requires {} writer, but this daemon owns {}",
+                    job.operation(),
+                    job.database_role()
+                        .map(DatabaseRole::as_str)
+                        .unwrap_or("any"),
+                    role.as_str()
+                ))
+            } else {
                 let mut on_progress = |progress: WriterProgress| {
                     let message = WriterStreamMessage::Progress { progress };
                     if let Ok(encoded) = serde_json::to_string(&message) {
@@ -713,6 +773,25 @@ mod tests {
             writer_endpoint_for_config(&config),
             writer_endpoint_for_role(&config, DatabaseRole::Events)
         );
+    }
+
+    #[test]
+    fn writer_jobs_select_database_roles() {
+        assert_eq!(WriterJob::Ping.database_role(), None);
+        assert_eq!(
+            WriterJob::Init.database_role(),
+            Some(DatabaseRole::Structural)
+        );
+        assert_eq!(
+            (WriterJob::HeartbeatWatcherClient {
+                repo: ".".to_owned(),
+                client_id: "client".to_owned(),
+            })
+            .database_role(),
+            Some(DatabaseRole::Watch)
+        );
+        assert_eq!(DatabaseRole::parse("watch"), Some(DatabaseRole::Watch));
+        assert_eq!(DatabaseRole::parse("unknown"), None);
     }
 
     #[test]
