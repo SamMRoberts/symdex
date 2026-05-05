@@ -272,14 +272,14 @@ architecture, and compatibility with the local-first evidence contract.
 
 ### A7 — Pre-edit change explanation design
 
-- [ ] Write a design doc for `symdex_explain_change` before implementation.
-- [ ] Accept proposed change targets as `{ path, start_line, end_line,
+- [x] Write a design doc for `symdex_explain_change` before implementation.
+- [x] Accept proposed change targets as `{ path, start_line, end_line,
   description }`.
-- [ ] Map line ranges to intersecting symbols, run impact analysis for those
+- [x] Map line ranges to intersecting symbols, run impact analysis for those
   symbols, deduplicate the evidence, and return a compact safety report.
-- [ ] Include likely tests, direct and transitive relationships, freshness,
+- [x] Include likely tests, direct and transitive relationships, freshness,
   trust, and reason tags.
-- [ ] Keep the tool read-only and metadata-only.
+- [x] Keep the tool read-only and metadata-only.
 
 ### A8 — Semantic neighborhood MCP tool
 

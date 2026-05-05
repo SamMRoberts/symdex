@@ -63,8 +63,8 @@ Fixtures should be tiny and purpose-built.
   confidence, and index metadata completeness, including impact and
   debug-context evidence rows.
 - Evidence explainability coverage for semantic result reasons, direct impact
-  call reasons, related-file reasons, MCP contract reason availability, and
-  debug-context frame match reasons.
+  call reasons, related-file reasons, pre-edit change explanation reasons, MCP
+  contract reason availability, and debug-context frame match reasons.
 - Unified context-pack coverage for structural-only fallback, semantic-only
   chunks, overlapping structural/semantic evidence marked as `both`, stale
   freshness labels, missing-vector or unavailable-semantic notes, and continued
@@ -227,6 +227,9 @@ rust-analyzer to be installed.
 Current call path tests cover deterministic path order, unresolved terminal
 edges matched by callee text, ambiguous terminal edges matched by callee text,
 cycle avoidance, depth limits, and deterministic transitive impact paths.
+Current pre-edit explanation tests cover target JSON parsing, line-range to
+symbol intersection, impact reuse, likely-test propagation, and metadata-only
+output shape.
 Current debug context tests cover runtime input parsing, mapped frame evidence,
 unmapped frames, fresh/stale/deleted freshness labels, calls at failing lines,
 malformed runtime lines, indexed failing-test mapping, unmatched failing-test

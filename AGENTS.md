@@ -60,7 +60,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Use `crates/symdex-core` for parsing, chunking, symbols, calls, hashing, and domain types.
 - Use `crates/symdex-diagnostics` for local service and configuration diagnostics shared by CLI and TUI.
 - Use `crates/symdex-index` for indexing orchestration shared by CLI and TUI.
-- Use `crates/symdex-query` for search, symbol-query, call-graph, impact, and context-pack orchestration shared by CLI and TUI.
+- Use `crates/symdex-query` for search, symbol-query, call-graph, impact, pre-edit change explanation, and context-pack orchestration shared by CLI and TUI.
 - Use `crates/symdex-store` for SQLite and sqlite-vec adapters.
 - Use `crates/symdex-embed` for the Ollama embedding client.
 - Use `crates/symdex-cli` for command-line orchestration.
@@ -172,6 +172,11 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Tool names must be stable, descriptive, and versionable.
 - Tool outputs must fit agent context windows.
 - Include file paths, line ranges, scores, and confidence where relevant.
+- `symdex_explain_change` must stay read-only and metadata-only: it accepts
+  proposed `{ path, start_line, end_line, description }` targets, maps them to
+  intersecting indexed symbols, reuses impact analysis, and returns likely
+  tests, direct/transitive relationships, freshness, trust, and reason tags
+  without storing the proposal or source text.
 - Include active semantic layer, embedding model, and quality-layer status in
   semantic outputs when available.
 - Never return full files unless the tool contract explicitly allows it.

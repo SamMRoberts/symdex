@@ -330,7 +330,7 @@ and returns a compact pre-edit safety report: which symbols are affected, who
 calls them (direct + transitive), which tests likely cover them, whether the
 evidence is fresh, and a trust score for the completeness of the analysis.
 
-**Why:** This is the highest-value agent integration feature not yet designed.
+**Why:** This is a high-value agent integration feature.
 When GitHub Copilot or Claude prepares to edit code, it currently guesses at
 impact. A `symdex_explain_change` tool gives the agent deterministic,
 evidence-grounded answers to "what will this change affect?" before writing a
@@ -345,7 +345,7 @@ tests are likely affected?"*
   specified line ranges, then deduplicate and rank by trust score
 - Output: compact impact report with freshness, trust, and reason tags
 - No source text, read-only, follows all existing MCP security rules
-- Requires a design doc before implementation
+- Implemented from `docs/PRE_EDIT_CHANGE_EXPLANATION.md`
 
 ### Priority 7 — Glob Pattern `.gitignore` Support
 
@@ -430,7 +430,7 @@ plan for this now rather than needing a structural refactor later.
 | Unified context pack (struct+semantic) | 🆕 New | P1 |
 | `symdex_request_reindex` write tool | 🆕 New | P1 |
 | Stack trace parsing for C#/Node | 🆕 New | P2 |
-| `symdex_explain_change` (pre-edit safety) | 🆕 New | P1 |
+| `symdex_explain_change` (pre-edit safety) | ✅ Implemented | — |
 | `symdex_semantic_neighborhood` MCP tool | 🆕 New | P2 |
 | Cross-repo / multi-repo context | 🆕 Future | P3 |
 
@@ -447,5 +447,5 @@ plan for this now rather than needing a structural refactor later.
 4. **C#/Node.js stack trace parsing** — pure parser addition, no schema changes
 5. **Design doc for `symdex_request_reindex`** — needs design before code, but
    should be next write-capable tool
-6. **Design doc for `symdex_explain_change`** — most powerful future agent
-   integration feature
+6. **Design follow-up for richer explain-change ranking** — optional future
+   improvement after more relationship kinds are indexed

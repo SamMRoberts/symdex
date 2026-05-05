@@ -294,6 +294,46 @@ fixture-path relationships, but low-confidence same-module hints are not enough
 for likely-test claims. When no indexed test-target evidence is available, the
 list stays empty and a note explains that no likely-test evidence was found.
 
+### `symdex_explain_change`
+
+Return a compact pre-edit safety report for proposed line-range changes.
+
+Input:
+
+```json
+{
+  "repo": "/path/to/repo",
+  "targets": [
+    {
+      "path": "src/lib.rs",
+      "start_line": 42,
+      "end_line": 58,
+      "description": "adjust retry backoff behavior"
+    }
+  ]
+}
+```
+
+Each target path must stay inside the repository. Relative paths are normalized
+as repository-relative paths; absolute paths must resolve to existing files
+under the repository root.
+
+Output separates:
+
+- normalized targets with matched symbol names
+- affected symbols
+- direct callers and callees
+- bounded transitive caller and callee paths
+- related files
+- likely tests
+- freshness, trust, provenance, and reason tags
+
+The tool maps every target range to indexed symbols whose line ranges intersect
+the proposed edit, runs the existing impact analysis for those symbols, and
+deduplicates repeated call, path, file, and test evidence. It is read-only and
+metadata-only; it does not persist the proposed change, request reindexing,
+return source text, or execute repository code.
+
 ### `symdex_context_pack`
 
 Return compact metadata-only evidence for editing context.
@@ -706,17 +746,3 @@ Required design decisions before code:
 - explicit `semantic: true` opt-in for sqlite-vec/Ollama work
 - concurrency with manual and continuous indexing
 - index run ID reporting and failure semantics
-
-### `symdex_explain_change`
-
-Potential future read-only pre-edit safety tool. Do not implement until a design
-doc is approved.
-
-Expected shape:
-
-- Input is a repo plus proposed change targets containing path, line range, and
-  short description.
-- The tool maps changed ranges to indexed symbols, runs impact analysis,
-  deduplicates evidence, and returns likely affected symbols, files, tests, and
-  call paths.
-- Output stays metadata-only with freshness, trust, reason tags, and provenance.

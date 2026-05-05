@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 pub use symdex_core::{EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION};
 use symdex_core::{NormalizedRepoPath, RepoRoot, RepositoryRefSnapshot, content_hash};
 use symdex_query::{
-    ContextPackMode, FreshnessScope, SemanticSearchSummary, evidence_trust, run_context_pack,
-    run_debug_context_pack, run_scoped_freshness_report_with_store_config, run_semantic_search,
-    run_unified_context_pack,
+    ChangeTarget, ContextPackMode, FreshnessScope, SemanticSearchSummary, evidence_trust,
+    run_context_pack, run_debug_context_pack, run_explain_change,
+    run_scoped_freshness_report_with_store_config, run_semantic_search, run_unified_context_pack,
 };
 use symdex_store::{
     EvidenceProvenance, SqliteStore, StoreConfig, clamp_call_path_depth, freshness_for_hash,
@@ -24,6 +24,7 @@ pub const TOOL_CALLERS: &str = "symdex_callers";
 pub const TOOL_CALLEES: &str = "symdex_callees";
 pub const TOOL_CALL_PATH: &str = "symdex_call_path";
 pub const TOOL_IMPACT: &str = "symdex_impact";
+pub const TOOL_EXPLAIN_CHANGE: &str = "symdex_explain_change";
 pub const TOOL_CONTEXT_PACK: &str = "symdex_context_pack";
 pub const TOOL_DEBUG_CONTEXT: &str = "symdex_debug_context";
 pub const TOOL_STALENESS_CHECK: &str = "symdex_staleness_check";
@@ -33,7 +34,7 @@ pub const TOOL_WATCH_START: &str = "symdex_watch_start";
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub fn tool_names() -> [&'static str; 12] {
+pub fn tool_names() -> [&'static str; 13] {
     [
         TOOL_SEARCH,
         TOOL_FIND_SYMBOL,
@@ -41,6 +42,7 @@ pub fn tool_names() -> [&'static str; 12] {
         TOOL_CALLEES,
         TOOL_CALL_PATH,
         TOOL_IMPACT,
+        TOOL_EXPLAIN_CHANGE,
         TOOL_CONTEXT_PACK,
         TOOL_DEBUG_CONTEXT,
         TOOL_STALENESS_CHECK,
@@ -207,6 +209,7 @@ fn dispatch_tool(
         TOOL_CALLEES => tool_callees(arguments),
         TOOL_CALL_PATH => tool_call_path(arguments),
         TOOL_IMPACT => tool_impact(arguments),
+        TOOL_EXPLAIN_CHANGE => tool_explain_change(arguments),
         TOOL_CONTEXT_PACK => tool_context_pack(arguments),
         TOOL_DEBUG_CONTEXT => tool_debug_context(arguments),
         TOOL_STALENESS_CHECK => tool_staleness_check(arguments),
@@ -431,6 +434,17 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
             test_note
         ]
     }))
+}
+
+fn tool_explain_change(arguments: &Value) -> Result<Value, String> {
+    let repo = required_string(arguments, "repo")?;
+    let targets_value = arguments
+        .get("targets")
+        .ok_or_else(|| "missing required array argument `targets`".to_owned())?;
+    let targets = serde_json::from_value::<Vec<ChangeTarget>>(targets_value.clone())
+        .map_err(|error| format!("parse change targets: {error}"))?;
+    let summary = run_explain_change(repo, &targets)?;
+    serde_json::to_value(summary).map_err(|error| error.to_string())
 }
 
 fn tool_context_pack(arguments: &Value) -> Result<Value, String> {
@@ -1052,6 +1066,20 @@ fn tool_definitions() -> Vec<Value> {
             ],
         ),
         tool_definition(
+            TOOL_EXPLAIN_CHANGE,
+            "Explain Change",
+            "Return a compact metadata-only pre-edit safety report for proposed line-range changes.",
+            &["repo", "targets"],
+            vec![
+                ("repo", "string", "Repository root path"),
+                (
+                    "targets",
+                    "array",
+                    "Proposed changes with path, start_line, end_line, and description",
+                ),
+            ],
+        ),
+        tool_definition(
             TOOL_CONTEXT_PACK,
             "Context Pack",
             "Return compact metadata-only evidence for an editing context. Use mode unified to merge structural and semantic evidence.",
@@ -1223,9 +1251,9 @@ mod tests {
 
     use crate::{
         EVIDENCE_CONTRACT_SCHEMA, EVIDENCE_CONTRACT_VERSION, TOOL_CONTEXT_PACK, TOOL_DEBUG_CONTEXT,
-        TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, TOOL_STALENESS_CHECK, TOOL_WATCH_START,
-        TOOL_WATCH_STATUS, evidence_tool_result, semantic_search_summary_json, serve,
-        tool_definitions, tool_index_status_with_store, tool_names,
+        TOOL_EXPLAIN_CHANGE, TOOL_FIND_SYMBOL, TOOL_INDEX_STATUS, TOOL_STALENESS_CHECK,
+        TOOL_WATCH_START, TOOL_WATCH_STATUS, evidence_tool_result, semantic_search_summary_json,
+        serve, tool_definitions, tool_index_status_with_store, tool_names,
         tool_staleness_check_with_store, tool_success, tool_success_with_read_only,
     };
 
@@ -1281,6 +1309,7 @@ mod tests {
         }));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_FIND_SYMBOL));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_CONTEXT_PACK));
+        assert!(tools.iter().any(|tool| tool["name"] == TOOL_EXPLAIN_CHANGE));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_DEBUG_CONTEXT));
         assert!(
             tools
@@ -1327,6 +1356,25 @@ mod tests {
                 .iter()
                 .any(|value| value == "mode")
         );
+    }
+
+    #[test]
+    fn explain_change_tool_schema_advertises_targets_array() {
+        let tools = tool_definitions();
+        let explain_change = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_EXPLAIN_CHANGE)
+            .expect("explain-change tool should be listed");
+
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["type"],
+            "array"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["required"],
+            json!(["repo", "targets"])
+        );
+        assert_eq!(explain_change["annotations"]["readOnlyHint"], json!(true));
     }
 
     #[test]

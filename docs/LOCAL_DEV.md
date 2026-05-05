@@ -119,6 +119,7 @@ cargo run -p symdex-cli -- callers . "my_symbol"
 cargo run -p symdex-cli -- callees . "my_symbol"
 cargo run -p symdex-cli -- call-path . "source_symbol" "target_symbol" 4
 cargo run -p symdex-cli -- impact . "my_symbol"
+cargo run -p symdex-cli -- explain-change . '[{"path":"src/lib.rs","start_line":1,"end_line":5,"description":"adjust behavior"}]'
 cargo run -p symdex-cli -- context-pack . "my_symbol"
 cargo run -p symdex-cli -- context-pack . "my_symbol" --mode unified
 cargo run -p symdex-cli -- debug-context . panic.log
@@ -134,7 +135,7 @@ Use top-level `--json` or `--output json` with read-only MCP-backed evidence
 commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
 `structuredContent`. JSON mode is currently supported for `index-status`,
 `search`, `symbol`, `callers`, `callees`, `call-path`, `impact`,
-`context-pack`, and `debug-context`. `semantic-status` supports top-level
+`explain-change`, `context-pack`, and `debug-context`. `semantic-status` supports top-level
 `--json` as plain local command JSON for semantic layer readiness metadata.
 
 - `init`: submits a migration job to the database-file-scoped writer service.
@@ -240,6 +241,11 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   list indexed tests with moderate-confidence `test_targets` evidence for the
   queried symbol or its file, with direct-call joins retained as a compatibility
   fallback for older indexes.
+- `explain-change <repo> <targets-json|file|->`: accepts proposed
+  `{ path, start_line, end_line, description }` targets, maps the line ranges
+  to intersecting indexed symbols, reuses impact analysis, and prints a
+  metadata-only pre-edit safety report with direct and transitive relationships,
+  likely tests, freshness, trust, and reason tags.
 - `context-pack <repo> <symbol> [--mode structural|unified]`: prints compact
   JSON evidence for editing context. The default structural mode preserves
   `symdex.context_pack.v1` and includes focus symbols, direct callers, direct

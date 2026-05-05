@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use symdex_core::{
     DiscoveryOptions, NormalizedRepoPath, RepoRoot, RepositoryRefSnapshot, SemanticLayer,
     SemanticLayerMode, SemanticLayerStatus, discover_indexable_files,
@@ -374,7 +374,7 @@ pub struct CallPathSummary {
     pub paths: Vec<CallPath>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactSummary {
     pub repository_id: String,
     pub query: String,
@@ -386,6 +386,60 @@ pub struct ImpactSummary {
     pub related_files: Vec<ImpactRelatedFile>,
     pub tests_likely: Vec<String>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeTarget {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExplainChangeSummary {
+    pub format: String,
+    pub repository_id: String,
+    pub targets: Vec<ExplainChangeTarget>,
+    pub affected_symbols: Vec<ExplainChangeSymbol>,
+    pub direct_callers: Vec<ImpactCallEvidence>,
+    pub direct_callees: Vec<ImpactCallEvidence>,
+    pub transitive_callers: Vec<ImpactPathEvidence>,
+    pub transitive_callees: Vec<ImpactPathEvidence>,
+    pub related_files: Vec<ImpactRelatedFile>,
+    pub likely_tests: Vec<String>,
+    pub limits: ExplainChangeLimits,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExplainChangeTarget {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub description: String,
+    pub matched: bool,
+    pub symbols: Vec<String>,
+    pub freshness: EvidenceFreshness,
+    pub provenance: Option<EvidenceProvenance>,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExplainChangeSymbol {
+    pub symbol: SymbolSearchRow,
+    pub target_indexes: Vec<usize>,
+    pub freshness: EvidenceFreshness,
+    pub trust: EvidenceTrust,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExplainChangeLimits {
+    pub max_targets: usize,
+    pub max_symbols_per_target: usize,
+    pub max_depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,7 +503,7 @@ pub struct VectorVerifyOptions {
     pub semantic_layer: VectorVerifySemanticLayer,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactCallEvidence {
     pub row: CallSearchRow,
     pub freshness: EvidenceFreshness,
@@ -457,7 +511,7 @@ pub struct ImpactCallEvidence {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactPathEvidence {
     pub path: CallPath,
     pub edge_freshness: Vec<EvidenceFreshness>,
@@ -467,7 +521,7 @@ pub struct ImpactPathEvidence {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactRelatedFile {
     pub path: String,
     pub relationship_count: usize,
@@ -679,6 +733,193 @@ pub fn run_impact(repo: &str, query: &str) -> Result<ImpactSummary, String> {
     let sqlite = sqlite_for_read()?;
     let repository_ref_id = active_ref_scope(&root, &sqlite)?;
     build_impact_summary(&root, &sqlite, repository_ref_id.as_deref(), query)
+}
+
+pub fn run_explain_change(
+    repo: &str,
+    targets: &[ChangeTarget],
+) -> Result<ExplainChangeSummary, String> {
+    if targets.is_empty() {
+        return Err("explain-change requires at least one change target".to_owned());
+    }
+    let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    let sqlite = sqlite_for_read()?;
+    let repository_ref_id = active_ref_scope(&root, &sqlite)?;
+    build_explain_change_summary(&root, &sqlite, repository_ref_id.as_deref(), targets)
+}
+
+fn build_explain_change_summary(
+    root: &RepoRoot,
+    sqlite: &SqliteStore,
+    repository_ref_id: Option<&str>,
+    targets: &[ChangeTarget],
+) -> Result<ExplainChangeSummary, String> {
+    let max_targets = 25;
+    if targets.len() > max_targets {
+        return Err(format!(
+            "explain-change accepts at most {max_targets} change targets"
+        ));
+    }
+    let current_hashes = current_hashes(root)?;
+    let mut output_targets = Vec::new();
+    let mut symbol_map: BTreeMap<String, ExplainChangeSymbol> = BTreeMap::new();
+    let mut direct_callers: BTreeMap<String, ImpactCallEvidence> = BTreeMap::new();
+    let mut direct_callees: BTreeMap<String, ImpactCallEvidence> = BTreeMap::new();
+    let mut transitive_callers: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
+    let mut transitive_callees: BTreeMap<String, ImpactPathEvidence> = BTreeMap::new();
+    let mut related_files: BTreeMap<String, ImpactRelatedFile> = BTreeMap::new();
+    let mut likely_tests = BTreeSet::new();
+    let mut notes = vec![
+        "metadata_only_no_source_text".to_owned(),
+        "read_only_pre_edit_analysis".to_owned(),
+    ];
+
+    for (target_index, target) in targets.iter().enumerate() {
+        let normalized_path = normalize_change_target_path(root, &target.path)?;
+        validate_change_target(target, &normalized_path)?;
+        let symbols = if let Some(repository_ref_id) = repository_ref_id {
+            sqlite.symbols_intersecting_range_for_ref(
+                root.id(),
+                repository_ref_id,
+                &normalized_path,
+                target.start_line,
+                target.end_line,
+            )
+        } else {
+            sqlite.symbols_intersecting_range(
+                root.id(),
+                &normalized_path,
+                target.start_line,
+                target.end_line,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        let symbol_names = symbols
+            .iter()
+            .map(|symbol| symbol.qualified_name.clone())
+            .collect::<Vec<_>>();
+        let provenance = sqlite
+            .file_provenance(root.id(), &normalized_path)
+            .map_err(|error| error.to_string())?;
+        let current_hash = current_hashes.get(&normalized_path).map(String::as_str);
+        let freshness = freshness_for_hash(
+            provenance
+                .as_ref()
+                .and_then(|provenance| provenance.content_hash.as_deref()),
+            current_hash,
+        );
+        let trust = evidence_trust(freshness, provenance.as_ref(), None);
+        let mut target_reasons = vec![
+            format!("change_target:{target_index}"),
+            format!("path:{normalized_path}"),
+            format!("line_range:{}-{}", target.start_line, target.end_line),
+        ];
+        if symbols.is_empty() {
+            target_reasons.push("no_intersecting_indexed_symbols".to_owned());
+            notes.push(format!(
+                "target_without_symbols:{target_index}:{normalized_path}"
+            ));
+        } else {
+            target_reasons.push(format!("intersecting_symbols:{}", symbols.len()));
+        }
+        if provenance.is_some() {
+            target_reasons.push("file_provenance_match".to_owned());
+        } else {
+            target_reasons.push("file_provenance:missing".to_owned());
+        }
+        output_targets.push(ExplainChangeTarget {
+            path: normalized_path.clone(),
+            start_line: target.start_line,
+            end_line: target.end_line,
+            description: target.description.trim().to_owned(),
+            matched: !symbols.is_empty(),
+            symbols: symbol_names,
+            freshness,
+            provenance,
+            trust,
+            reasons: target_reasons,
+        });
+
+        for symbol in symbols {
+            let symbol_freshness = freshness_for_hash(
+                symbol.provenance.content_hash.as_deref(),
+                current_hashes.get(&symbol.path).map(String::as_str),
+            );
+            let symbol_trust = evidence_trust(symbol_freshness, Some(&symbol.provenance), None);
+            let symbol_entry =
+                symbol_map
+                    .entry(symbol.id.clone())
+                    .or_insert_with(|| ExplainChangeSymbol {
+                        symbol: symbol.clone(),
+                        target_indexes: Vec::new(),
+                        freshness: symbol_freshness,
+                        trust: symbol_trust,
+                        reasons: vec![
+                            "intersects_change_target_range".to_owned(),
+                            format!("path:{}", symbol.path),
+                            format!("symbol:{}", symbol.qualified_name),
+                        ],
+                    });
+            if !symbol_entry.target_indexes.contains(&target_index) {
+                symbol_entry.target_indexes.push(target_index);
+            }
+            symbol_entry
+                .reasons
+                .push(format!("change_target:{target_index}"));
+
+            let impact =
+                build_impact_summary(root, sqlite, repository_ref_id, &symbol.qualified_name)?;
+            for evidence in impact.direct_callers {
+                direct_callers
+                    .entry(impact_call_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for evidence in impact.direct_callees {
+                direct_callees
+                    .entry(impact_call_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for evidence in impact.transitive_callers {
+                transitive_callers
+                    .entry(impact_path_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for evidence in impact.transitive_callees {
+                transitive_callees
+                    .entry(impact_path_key(&evidence))
+                    .or_insert(evidence);
+            }
+            for file in impact.related_files {
+                merge_related_file(&mut related_files, file);
+            }
+            likely_tests.extend(impact.tests_likely);
+        }
+    }
+
+    if symbol_map.is_empty() {
+        notes.push("no_impacted_symbols_from_change_targets".to_owned());
+    } else {
+        notes.push("impact_reused_for_intersecting_symbols".to_owned());
+    }
+
+    Ok(ExplainChangeSummary {
+        format: "symdex.explain_change.v1".to_owned(),
+        repository_id: root.id().to_owned(),
+        targets: output_targets,
+        affected_symbols: symbol_map.into_values().collect(),
+        direct_callers: direct_callers.into_values().collect(),
+        direct_callees: direct_callees.into_values().collect(),
+        transitive_callers: transitive_callers.into_values().collect(),
+        transitive_callees: transitive_callees.into_values().collect(),
+        related_files: related_files.into_values().collect(),
+        likely_tests: likely_tests.into_iter().collect(),
+        limits: ExplainChangeLimits {
+            max_targets,
+            max_symbols_per_target: 25,
+            max_depth: 4,
+        },
+        notes,
+    })
 }
 
 fn build_impact_summary(
@@ -3376,6 +3617,79 @@ fn aggregate_trust(trust: &[EvidenceTrust]) -> EvidenceTrust {
     }
 }
 
+fn normalize_change_target_path(root: &RepoRoot, path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("change target path must not be empty".to_owned());
+    }
+    let path_value = Path::new(trimmed);
+    if path_value.is_absolute() {
+        return root
+            .normalize_existing_path(path_value)
+            .map(|path| path.as_str().to_owned())
+            .map_err(|error| {
+                format!("absolute change target paths must exist inside the repository: {error}")
+            });
+    }
+    NormalizedRepoPath::new(trimmed)
+        .map(|path| path.as_str().to_owned())
+        .map_err(|error| error.to_string())
+}
+
+fn validate_change_target(target: &ChangeTarget, normalized_path: &str) -> Result<(), String> {
+    if target.start_line == 0 || target.end_line == 0 {
+        return Err(format!(
+            "change target `{normalized_path}` line ranges are 1-based"
+        ));
+    }
+    if target.end_line < target.start_line {
+        return Err(format!(
+            "change target `{normalized_path}` has end_line before start_line"
+        ));
+    }
+    if target.description.trim().is_empty() {
+        return Err(format!(
+            "change target `{normalized_path}` requires a non-empty description"
+        ));
+    }
+    Ok(())
+}
+
+fn impact_call_key(evidence: &ImpactCallEvidence) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        evidence.row.path.as_deref().unwrap_or("<unknown>"),
+        evidence.row.start_line.unwrap_or(0),
+        evidence.row.symbol_id.as_deref().unwrap_or("<unresolved>"),
+        evidence.row.callee_text,
+        evidence.row.call_line
+    )
+}
+
+fn impact_path_key(evidence: &ImpactPathEvidence) -> String {
+    evidence
+        .path
+        .edges
+        .iter()
+        .map(|edge| edge.call_id.as_str())
+        .collect::<Vec<_>>()
+        .join(">")
+}
+
+fn merge_related_file(files: &mut BTreeMap<String, ImpactRelatedFile>, file: ImpactRelatedFile) {
+    if let Some(existing) = files.get_mut(&file.path) {
+        existing.relationship_count += file.relationship_count;
+        extend_unique(&mut existing.reasons, file.reasons);
+        if file.trust.score > existing.trust.score {
+            existing.freshness = file.freshness;
+            existing.provenance = file.provenance;
+            existing.trust = file.trust;
+        }
+    } else {
+        files.insert(file.path.clone(), file);
+    }
+}
+
 fn impact_related_files(
     direct_callers: &[ImpactCallEvidence],
     direct_callees: &[ImpactCallEvidence],
@@ -3506,12 +3820,12 @@ mod tests {
     };
 
     use crate::{
-        CallDirection, ContextEvidenceSource, ContextPackMode, FreshnessScope, QueryMode,
-        SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
-        VectorVerifySemanticLayer, build_debug_context_pack, build_freshness_report,
-        build_impact_summary, build_unified_context_pack, evidence_trust, freshness_rows,
-        parse_runtime_input, resolve_semantic_search_target, run_call_graph, run_call_path,
-        run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
+        CallDirection, ChangeTarget, ContextEvidenceSource, ContextPackMode, FreshnessScope,
+        QueryMode, SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
+        VectorVerifySemanticLayer, build_debug_context_pack, build_explain_change_summary,
+        build_freshness_report, build_impact_summary, build_unified_context_pack, evidence_trust,
+        freshness_rows, parse_runtime_input, resolve_semantic_search_target, run_call_graph,
+        run_call_path, run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
         run_symbol_search, runtime_observation_records, semantic_reasons,
         semantic_result_from_point, semantic_status_from_routing, vector_verify_all_summary,
         vector_verify_summary,
@@ -4443,6 +4757,50 @@ mod tests {
                 .iter()
                 .any(|note| note == "likely_tests_from_indexed_test_targets_or_direct_calls")
         );
+    }
+
+    #[test]
+    fn explain_change_maps_line_range_to_impact_and_likely_tests() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+        let targets = vec![ChangeTarget {
+            path: "src/callee.rs".to_owned(),
+            start_line: 1,
+            end_line: 2,
+            description: "adjust callee behavior".to_owned(),
+        }];
+
+        let summary = build_explain_change_summary(&fixture.root, &fixture.store, None, &targets)
+            .expect("explain-change summary should build");
+
+        assert_eq!(summary.format, "symdex.explain_change.v1");
+        assert_eq!(summary.targets.len(), 1);
+        assert!(summary.targets[0].matched);
+        assert_eq!(summary.targets[0].symbols, vec!["crate::callee"]);
+        assert_eq!(summary.affected_symbols.len(), 1);
+        assert_eq!(
+            summary.affected_symbols[0].symbol.qualified_name,
+            "crate::callee"
+        );
+        assert_eq!(summary.likely_tests, vec!["crate::tests::covers_callee"]);
+        assert!(summary.direct_callers.iter().any(|evidence| {
+            evidence.row.symbol_qualified_name.as_deref() == Some("crate::tests::covers_callee")
+        }));
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note == "metadata_only_no_source_text")
+        );
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note == "read_only_pre_edit_analysis")
+        );
+        assert!(format!("{summary:?}").contains("adjust callee behavior"));
+        assert!(!format!("{summary:?}").contains("fn callee"));
     }
 
     #[test]

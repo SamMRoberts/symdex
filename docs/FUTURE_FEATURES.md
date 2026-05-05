@@ -65,8 +65,9 @@ Requirements:
 
 ### Pre-Edit Change Explanation
 
-Pre-edit change explanation should give agents a deterministic safety briefing
-before they modify files.
+Pre-edit change explanation is implemented as the read-only
+`symdex_explain_change` MCP tool and `explain-change` CLI command. It gives
+agents a deterministic safety briefing before they modify files.
 
 Requirements:
 

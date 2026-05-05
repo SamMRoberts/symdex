@@ -3634,6 +3634,81 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn symbols_intersecting_range(
+        &self,
+        repository_id: &str,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<Vec<SymbolSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
+                   FROM symbols
+                   JOIN files ON symbols.file_id = files.id
+                  WHERE files.repository_id = ?1
+                    AND files.path = ?2
+                    AND symbols.start_line <= ?4
+                    AND symbols.end_line >= ?3
+                  ORDER BY symbols.start_line, (symbols.end_line - symbols.start_line), symbols.qualified_name
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![repository_id, path, start_line as i64, end_line as i64],
+                symbol_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn symbols_intersecting_range_for_ref(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<Vec<SymbolSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+                        files.path, symbols.start_line, symbols.end_line,
+                        files.content_hash, symbols.index_run_id, symbols.parser_version,
+                        files.indexed_at
+                   FROM symbols
+                   JOIN files ON symbols.file_id = files.id
+                   JOIN ref_files ON ref_files.file_id = files.id
+                  WHERE files.repository_id = ?1
+                    AND ref_files.repository_ref_id = ?2
+                    AND files.path = ?3
+                    AND symbols.start_line <= ?5
+                    AND symbols.end_line >= ?4
+                  ORDER BY symbols.start_line, (symbols.end_line - symbols.start_line), symbols.qualified_name
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(
+                params![
+                    repository_id,
+                    repository_ref_id,
+                    path,
+                    start_line as i64,
+                    end_line as i64
+                ],
+                symbol_search_row,
+            )
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
     pub fn calls_at_location(
         &self,
         repository_id: &str,
@@ -7453,6 +7528,27 @@ fn test_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestSearchRow> {
     })
 }
 
+fn symbol_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolSearchRow> {
+    Ok(SymbolSearchRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        qualified_name: row.get(2)?,
+        kind: row.get(3)?,
+        path: row.get(4)?,
+        start_line: row.get::<_, i64>(5)? as usize,
+        end_line: row.get::<_, i64>(6)? as usize,
+        provenance: EvidenceProvenance {
+            content_hash: row.get(7)?,
+            index_run_id: row.get(8)?,
+            parser_version: row.get(9)?,
+            indexed_at: row.get(10)?,
+            embedding_model: None,
+            embedding_dimension: None,
+            embedded_at: None,
+        },
+    })
+}
+
 fn call_path_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallPathEdge> {
     Ok(CallPathEdge {
         call_id: row.get(0)?,
@@ -9019,6 +9115,43 @@ mod tests {
         assert_eq!(pack.direct_callers.len(), 1);
         assert_eq!(pack.files, vec!["src/main.rs".to_owned()]);
         assert!(pack.notes.contains(&"repository_ref_scoped".to_owned()));
+    }
+
+    #[test]
+    fn symbols_intersecting_range_returns_only_overlapping_symbols() {
+        let db = TestDb::new("symbols-intersecting-range");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let mut outer = sample_symbol("outer-symbol", "outer", "crate::outer");
+        outer.start_line = 1;
+        outer.end_line = 12;
+        let mut inner = sample_symbol("inner-symbol", "inner", "crate::outer::inner");
+        inner.start_line = 5;
+        inner.end_line = 7;
+        let mut later = sample_symbol("later-symbol", "later", "crate::later");
+        later.start_line = 20;
+        later.end_line = 24;
+        store
+            .replace_file_facts(&sample_file("hash-1"), &[outer, inner, later], &[], &[])
+            .expect("file facts should persist");
+
+        let symbols = store
+            .symbols_intersecting_range("repo", "src/lib.rs", 6, 10)
+            .expect("symbols should load");
+
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crate::outer", "crate::outer::inner"]
+        );
     }
 
     #[test]

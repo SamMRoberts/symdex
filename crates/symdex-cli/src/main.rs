@@ -16,12 +16,12 @@ use symdex_index::{
     run_quality_index_with_existing_writer, run_quality_index_with_existing_writer_and_progress,
 };
 use symdex_query::{
-    CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
-    ImpactSummary, SemanticStatusLayerSummary, SemanticStatusSummary, VectorVerifyOptions,
-    VectorVerifySemanticLayer, VectorVerifySummary, run_call_graph, run_call_path,
-    run_context_pack, run_debug_context_pack, run_freshness_report, run_impact,
-    run_semantic_search, run_semantic_status, run_symbol_search, run_unified_context_pack,
-    run_vector_verify_with_options,
+    CallDirection, CallGraphSummary, CallPathSummary, ChangeTarget, ContextPackMode,
+    ExplainChangeSummary, FreshnessSummary, ImpactSummary, SemanticStatusLayerSummary,
+    SemanticStatusSummary, VectorVerifyOptions, VectorVerifySemanticLayer, VectorVerifySummary,
+    run_call_graph, run_call_path, run_context_pack, run_debug_context_pack, run_explain_change,
+    run_freshness_report, run_impact, run_semantic_search, run_semantic_status, run_symbol_search,
+    run_unified_context_pack, run_vector_verify_with_options,
 };
 use symdex_store::{
     EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
@@ -149,6 +149,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let repo = args.get(1).map(String::as_str).unwrap_or(".");
             let query = args.get(2).map(String::as_str).unwrap_or("");
             impact(repo, query, output)
+        }
+        "explain-change" => {
+            let repo = args.get(1).map(String::as_str).unwrap_or(".");
+            let target_parts = if args.len() > 2 { &args[2..] } else { &[] };
+            explain_change(repo, target_parts, output)
         }
         "context-pack" => {
             let context_args = parse_context_pack_args(&args[1..])?;
@@ -1135,6 +1140,48 @@ fn impact(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {
     Ok(())
 }
 
+fn explain_change(repo: &str, target_parts: &[String], output: OutputMode) -> Result<(), String> {
+    let targets = change_targets_input(target_parts)?;
+    if output == OutputMode::Json {
+        return print_mcp_json_tool(
+            symdex_mcp::TOOL_EXPLAIN_CHANGE,
+            json!({ "repo": repo, "targets": targets }),
+        );
+    }
+    let summary = run_explain_change(repo, &targets)?;
+    print_explain_change_summary(&summary);
+    Ok(())
+}
+
+fn change_targets_input(input_parts: &[String]) -> Result<Vec<ChangeTarget>, String> {
+    let Some(first) = input_parts.first() else {
+        return Err(
+            "explain-change requires change targets JSON, a JSON file path, or `-` for stdin"
+                .to_owned(),
+        );
+    };
+    let input = if first == "-" {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("read change targets from stdin: {error}"))?;
+        input
+    } else if input_parts.len() == 1 {
+        fs::read_to_string(first).unwrap_or_else(|_| first.to_owned())
+    } else {
+        input_parts.join(" ")
+    };
+    parse_change_targets_json(&input)
+}
+
+fn parse_change_targets_json(input: &str) -> Result<Vec<ChangeTarget>, String> {
+    let value: serde_json::Value = serde_json::from_str(input)
+        .map_err(|error| format!("parse change targets JSON: {error}"))?;
+    let targets_value = value.get("targets").unwrap_or(&value);
+    serde_json::from_value(targets_value.clone())
+        .map_err(|error| format!("parse change targets array: {error}"))
+}
+
 fn print_call_path_summary(summary: &CallPathSummary) {
     println!("repository_id: {}", summary.repository_id);
     println!("source: {}", summary.source_query);
@@ -1208,6 +1255,78 @@ fn print_impact_summary(summary: &ImpactSummary) {
     }
     println!("tests_likely: {}", summary.tests_likely.len());
     for test in &summary.tests_likely {
+        println!("test: {test}");
+    }
+    for note in &summary.notes {
+        println!("note: {note}");
+    }
+}
+
+fn print_explain_change_summary(summary: &ExplainChangeSummary) {
+    println!("repository_id: {}", summary.repository_id);
+    println!("format: {}", summary.format);
+    println!("targets: {}", summary.targets.len());
+    for (index, target) in summary.targets.iter().enumerate() {
+        println!(
+            "target {index}: {}:{}-{} matched={} freshness={} trust={:.2}/{} description={}",
+            target.path,
+            target.start_line,
+            target.end_line,
+            target.matched,
+            target.freshness.label(),
+            target.trust.score,
+            target.trust.level,
+            target.description
+        );
+        for symbol in &target.symbols {
+            println!("  symbol: {symbol}");
+        }
+    }
+    println!("affected_symbols: {}", summary.affected_symbols.len());
+    for symbol in &summary.affected_symbols {
+        println!(
+            "symbol: {} {}:{}-{} freshness={} trust={:.2}/{} targets={:?} reasons={}",
+            symbol.symbol.qualified_name,
+            symbol.symbol.path,
+            symbol.symbol.start_line,
+            symbol.symbol.end_line,
+            symbol.freshness.label(),
+            symbol.trust.score,
+            symbol.trust.level,
+            symbol.target_indexes,
+            reason_list(&symbol.reasons)
+        );
+    }
+    println!("direct_callers: {}", summary.direct_callers.len());
+    for evidence in &summary.direct_callers {
+        print_impact_call_evidence(evidence);
+    }
+    println!("direct_callees: {}", summary.direct_callees.len());
+    for evidence in &summary.direct_callees {
+        print_impact_call_evidence(evidence);
+    }
+    println!("transitive_callers: {}", summary.transitive_callers.len());
+    for evidence in &summary.transitive_callers {
+        print_impact_path_evidence(evidence);
+    }
+    println!("transitive_callees: {}", summary.transitive_callees.len());
+    for evidence in &summary.transitive_callees {
+        print_impact_path_evidence(evidence);
+    }
+    println!("related_files: {}", summary.related_files.len());
+    for file in &summary.related_files {
+        println!(
+            "{} relationships={} freshness={} trust={:.2}/{} reasons={}",
+            file.path,
+            file.relationship_count,
+            file.freshness.label(),
+            file.trust.score,
+            file.trust.level,
+            reason_list(&file.reasons)
+        );
+    }
+    println!("likely_tests: {}", summary.likely_tests.len());
+    for test in &summary.likely_tests {
         println!("test: {test}");
     }
     for note in &summary.notes {
@@ -2090,7 +2209,7 @@ fn print_help() {
     println!(
         "symdex {}\n\nUSAGE:\n    symdex [--json|--output json] <command>\n\nCOMMANDS:\n    init                   Create local symdex state directories\n    doctor [repo]          Print local configuration, services, and index readiness diagnostics\n    index [--full|--incremental] [--offline] [--watch] <repo>  Index code with explicit full or incremental scope\n    index-quality <repo>  Process queued quality semantic embedding jobs\n    index-status <repo>    Show local SQLite index counts\n    semantic-status <repo>  Show active semantic layer and quality readiness\n    staleness <repo> [symbol]  Compare indexed evidence hashes with current files\n    vector-verify <repo> [--semantic-layer fast|quality|all]  Verify SQLite vector metadata against sqlite-vec rows
     qdrant-verify <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-verify\n    vector-repair <repo> [--semantic-layer fast|quality|all]  Repair sqlite-vec orphaned, missing, and stale vector metadata
-    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-repair\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    watch start|status|stop <repo>  Manage the single background watcher for a repository\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp [--watch <repo>]  Run the MCP server, optionally attaching the repository watcher\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
+    qdrant-repair <repo> [--semantic-layer fast|quality|all]  Deprecated alias for vector-repair\n    symbol <repo> <query>  Find symbols in the local index\n    callers <repo> <symbol>  Show direct callers\n    callees <repo> <symbol>  Show direct callees\n    call-path <repo> <source> <target> [depth]  Trace bounded call paths\n    impact <repo> <symbol>  Show direct, transitive, and related-file impact evidence\n    explain-change <repo> <targets-json|file|->  Explain proposed line-range changes before editing\n    context-pack <repo> <symbol> [--mode structural|unified]  Print compact JSON evidence for editing context\n    debug-context <repo> <runtime-input|file|->  Build debug context from runtime failure input\n    search <repo> <query>  Search indexed chunks by semantic similarity\n    watch start|status|stop <repo>  Manage the single background watcher for a repository\n    tui [repo]             Run the local terminal UI control panel\n    serve-mcp [--watch <repo>]  Run the MCP server, optionally attaching the repository watcher\n    help                   Print this help\n\nINDEX SCOPE:\n    --full reparses all eligible files. --incremental skips unchanged files by content hash.\n\nJSON OUTPUT:\n    --json is supported for semantic-status as plain command JSON. For index-status, search, symbol, callers, callees, call-path, impact, explain-change, context-pack, and debug-context it prints the same symdex.mcp.evidence.v1 envelope used by MCP structuredContent.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2098,9 +2217,10 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextPackMode, OutputMode, VectorVerifySemanticLayer, WatchAction, parse_cli_invocation,
-        parse_context_pack_args, parse_index_args, parse_serve_mcp_args,
-        parse_vector_maintenance_args, parse_watch_args, require_text_output, semantic_status_json,
+        ContextPackMode, OutputMode, VectorVerifySemanticLayer, WatchAction,
+        parse_change_targets_json, parse_cli_invocation, parse_context_pack_args, parse_index_args,
+        parse_serve_mcp_args, parse_vector_maintenance_args, parse_watch_args, require_text_output,
+        semantic_status_json,
     };
     use symdex_core::{SemanticLayer, SemanticLayerStatus};
     use symdex_index::IndexScope;
@@ -2275,6 +2395,41 @@ mod tests {
             .expect("context-pack args should parse");
 
         assert_eq!(args.mode, ContextPackMode::Structural);
+    }
+
+    #[test]
+    fn explain_change_targets_parse_array_and_object_wrapper() {
+        let array_targets = parse_change_targets_json(
+            r#"[
+                {
+                    "path": "src/lib.rs",
+                    "start_line": 10,
+                    "end_line": 12,
+                    "description": "adjust retry timeout"
+                }
+            ]"#,
+        )
+        .expect("array targets should parse");
+        let object_targets = parse_change_targets_json(
+            r#"{
+                "targets": [
+                    {
+                        "path": "src/main.rs",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "description": "rename entrypoint"
+                    }
+                ]
+            }"#,
+        )
+        .expect("object wrapper should parse");
+
+        assert_eq!(array_targets.len(), 1);
+        assert_eq!(array_targets[0].path, "src/lib.rs");
+        assert_eq!(array_targets[0].start_line, 10);
+        assert_eq!(array_targets[0].end_line, 12);
+        assert_eq!(object_targets.len(), 1);
+        assert_eq!(object_targets[0].path, "src/main.rs");
     }
 
     #[test]

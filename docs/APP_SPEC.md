@@ -52,6 +52,7 @@ symdex symbol <repo> <symbol>
 symdex callers <repo> <symbol>
 symdex callees <repo> <symbol>
 symdex impact <repo> <symbol>
+symdex explain-change <repo> <targets-json|file|->
 symdex context-pack <repo> <symbol>
 symdex tui [repo]
 symdex doctor [repo]
@@ -78,6 +79,9 @@ symdex serve-mcp --watch <repo>
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.
 - MCP tools return compact JSON evidence that a coding agent can use immediately.
+- Pre-edit explanation maps proposed line-range changes to indexed symbols,
+  impact evidence, likely tests, freshness, trust, and reason tags without
+  storing source text or mutating the index.
 - TUI provides a local keyboard-first control panel for indexing, storage health, diagnostics, queries, impact, and context packs.
 - TUI makes index health inspectable with local visualizations for coverage,
   fast and quality semantic readiness progress, file details, symbol outlines,
@@ -98,7 +102,5 @@ feature contracts.
   existing Rust-focused debug context behavior.
 - Future write-capable reindex requests only after an explicit design doc and
   trust/confirmation model.
-- Pre-edit change explanation that maps proposed line-range edits to impact,
-  likely tests, freshness, and trust before an agent changes files.
 - Future languages beyond Rust, C#, JavaScript, and TypeScript, added only
   through the same evidence contracts after active targets are reliable.
