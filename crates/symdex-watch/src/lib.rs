@@ -15,7 +15,7 @@ use symdex_index::{
 };
 use symdex_store::{
     RepositoryRecord, SqliteStore, StoreConfig, WatcherClientRecord, WatcherStatusRecord,
-    current_timestamp,
+    current_timestamp, debug_db_lock_log,
 };
 use symdex_writer::{WriterClient, WriterJob};
 
@@ -235,6 +235,15 @@ pub fn start_or_attach(
         std::process::id(),
         CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
     );
+    debug_db_lock_log(
+        "watch-client",
+        format_args!(
+            "start_or_attach repo={} client_kind={} client_id={}",
+            root.path().display(),
+            client_kind.as_str(),
+            client_id
+        ),
+    );
     WriterClient::from_env().submit_and_wait(&WriterJob::StartWatcher {
         repo: root.path().display().to_string(),
         client_kind: client_kind.as_str().to_owned(),
@@ -251,6 +260,14 @@ pub fn start_daemon(repo: &str) -> Result<WatcherStatus, String> {
         std::process::id(),
         CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
     );
+    debug_db_lock_log(
+        "watch-client",
+        format_args!(
+            "start_daemon repo={} client_id={}",
+            root.path().display(),
+            client_id
+        ),
+    );
     WriterClient::from_env().submit_and_wait(&WriterJob::StartWatcher {
         repo: root.path().display().to_string(),
         client_kind: WatcherClientKind::Cli.as_str().to_owned(),
@@ -262,6 +279,10 @@ pub fn start_daemon(repo: &str) -> Result<WatcherStatus, String> {
 
 pub fn stop_daemon(repo: &str) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watch-client",
+        format_args!("stop_daemon repo={}", root.path().display()),
+    );
     WriterClient::from_env().submit_and_wait(&WriterJob::StopWatcher {
         repo: root.path().display().to_string(),
     })?;
@@ -274,13 +295,26 @@ pub fn status(repo: &str) -> Result<WatcherStatus, String> {
 }
 
 pub fn spawn_writer_managed_daemon(repo: String, write_gate: Arc<Mutex<()>>) {
+    debug_db_lock_log(
+        "watcher-managed",
+        format_args!("spawn_thread repo={}", repo),
+    );
     thread::spawn(move || {
-        let _ = run_writer_managed_daemon(&repo, write_gate);
+        if let Err(error) = run_writer_managed_daemon(&repo, write_gate) {
+            debug_db_lock_log(
+                "watcher-managed",
+                format_args!("thread_error repo={} error={}", repo, error),
+            );
+        }
     });
 }
 
 pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Result<(), String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-managed",
+        format_args!("start repo={}", root.path().display()),
+    );
     let store_config = StoreConfig::from_env();
     let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
     store.migrate().map_err(|error| error.to_string())?;
@@ -331,17 +365,51 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
         },
         || clients_allow_continuing(root.id(), &mut no_clients_since),
         |job| {
+            let wait_started = Instant::now();
+            debug_db_lock_log(
+                "watcher-managed",
+                format_args!("write_gate_wait repo={}", root.path().display()),
+            );
             let _guard = write_gate
                 .lock()
                 .map_err(|_| "writer gate lock poisoned".to_owned())?;
-            job()
+            debug_db_lock_log(
+                "watcher-managed",
+                format_args!(
+                    "write_gate_acquired repo={} wait_ms={}",
+                    root.path().display(),
+                    wait_started.elapsed().as_millis()
+                ),
+            );
+            let run_started = Instant::now();
+            let result = job();
+            debug_db_lock_log(
+                "watcher-managed",
+                format_args!(
+                    "write_gate_release repo={} ok={} held_ms={}",
+                    root.path().display(),
+                    result.is_ok(),
+                    run_started.elapsed().as_millis()
+                ),
+            );
+            result
         },
     );
     match result {
-        Ok(()) => store
-            .mark_watcher_stopped(root.id())
-            .map_err(|error| error.to_string()),
+        Ok(()) => {
+            debug_db_lock_log(
+                "watcher-managed",
+                format_args!("stop repo={}", root.path().display()),
+            );
+            store
+                .mark_watcher_stopped(root.id())
+                .map_err(|error| error.to_string())
+        }
         Err(error) => {
+            debug_db_lock_log(
+                "watcher-managed",
+                format_args!("fail repo={} error={}", root.path().display(), error),
+            );
             let _ = store.mark_watcher_failed(root.id(), &error);
             Err(error)
         }
@@ -391,10 +459,20 @@ fn heartbeat_attachment(
             .recv_timeout(CLIENT_HEARTBEAT_INTERVAL)
             .is_err()
         {
-            let _ = WriterClient::from_env().submit_and_wait(&WriterJob::HeartbeatWatcherClient {
-                repo: heartbeat_repo.clone(),
-                client_id: heartbeat_client_id.clone(),
-            });
+            if let Err(error) =
+                WriterClient::from_env().submit_and_wait(&WriterJob::HeartbeatWatcherClient {
+                    repo: heartbeat_repo.clone(),
+                    client_id: heartbeat_client_id.clone(),
+                })
+            {
+                debug_db_lock_log(
+                    "watch-client",
+                    format_args!(
+                        "heartbeat_error repo={} client_id={} error={}",
+                        heartbeat_repo, heartbeat_client_id, error
+                    ),
+                );
+            }
         }
     });
 

@@ -31,6 +31,7 @@ SYMDEX_EMBED_BATCH_SIZE=16
 SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
 SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
+SYMDEX_DEBUG_DB_LOCKS=1
 ```
 
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
@@ -72,6 +73,19 @@ ticks.
 Chunks larger than the active layer limit are persisted as metadata-only
 structural evidence with `chunk_too_large_for_embedding` and are not sent to
 Ollama.
+
+`SYMDEX_DEBUG_DB_LOCKS=1` enables stderr diagnostics for SQLite lock
+troubleshooting. Logs include writer-service daemon startup and attach attempts,
+job start/finish events, writer-gate wait and hold durations, daemon-internal
+lease acquire/release events, SQLite read-write/read-only opens, migrations, and
+watcher client attach/heartbeat/detach routing. `SYMDEX_DEBUG_WRITER=1` is an
+alias. The logs include local DB and repo paths when enabled; leave it unset for
+normal CLI/TUI output. For TUI or continuous-indexing sessions, redirect stderr
+to a file so diagnostics do not interfere with terminal rendering:
+
+```bash
+SYMDEX_DEBUG_DB_LOCKS=1 cargo run -p symdex-cli -- tui . 2>symdex-db-locks.log
+```
 
 ## Expected commands
 

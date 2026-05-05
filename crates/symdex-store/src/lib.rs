@@ -8,6 +8,8 @@ use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::process;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -43,6 +45,24 @@ impl StoreConfig {
                 .unwrap_or_else(|| PathBuf::from(".symdex/symdex.sqlite")),
         }
     }
+}
+
+pub fn debug_db_locks_enabled() -> bool {
+    env_flag("SYMDEX_DEBUG_DB_LOCKS") || env_flag("SYMDEX_DEBUG_WRITER")
+}
+
+pub fn debug_db_lock_log(scope: &str, message: std::fmt::Arguments<'_>) {
+    if !debug_db_locks_enabled() {
+        return;
+    }
+    eprintln!(
+        "symdex-db-debug ts={} pid={} thread={:?} scope={} {}",
+        current_timestamp(),
+        process::id(),
+        thread::current().id(),
+        scope,
+        message
+    );
 }
 
 pub fn sqlite_parent(config: &StoreConfig) -> Option<PathBuf> {
@@ -155,6 +175,17 @@ impl WriterLease {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
         let lock_path = writer_lock_path(config);
+        debug_db_lock_log(
+            "writer-lease",
+            format_args!(
+                "acquire_attempt db={} lock={} owner_kind={} operation={} repo={}",
+                config.sqlite_path.display(),
+                lock_path.display(),
+                request.kind.as_str(),
+                request.operation,
+                request.repo_root.as_deref().unwrap_or("<none>")
+            ),
+        );
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -169,9 +200,29 @@ impl WriterLease {
                     .ok()
                     .flatten()
                     .map(Box::new);
+                debug_db_lock_log(
+                    "writer-lease",
+                    format_args!(
+                        "acquire_busy db={} lock={} owner={:?}",
+                        config.sqlite_path.display(),
+                        lock_path.display(),
+                        owner
+                    ),
+                );
                 return Err(StoreError::WriterBusy { owner });
             }
-            Err(error) => return Err(StoreError::Io(error)),
+            Err(error) => {
+                debug_db_lock_log(
+                    "writer-lease",
+                    format_args!(
+                        "acquire_error db={} lock={} error={}",
+                        config.sqlite_path.display(),
+                        lock_path.display(),
+                        error
+                    ),
+                );
+                return Err(StoreError::Io(error));
+            }
         }
 
         let info = WriterLeaseInfo::from_request(&request);
@@ -181,6 +232,17 @@ impl WriterLease {
         file.write_all(&metadata).map_err(StoreError::Io)?;
         file.write_all(b"\n").map_err(StoreError::Io)?;
         file.sync_data().map_err(StoreError::Io)?;
+        debug_db_lock_log(
+            "writer-lease",
+            format_args!(
+                "acquire_success db={} lock={} owner_kind={} operation={} repo={}",
+                config.sqlite_path.display(),
+                lock_path.display(),
+                info.owner_kind,
+                info.operation,
+                info.repo_root.as_deref().unwrap_or("<none>")
+            ),
+        );
         Ok(Self {
             file,
             lock_path,
@@ -195,6 +257,16 @@ impl WriterLease {
 
 impl Drop for WriterLease {
     fn drop(&mut self) {
+        debug_db_lock_log(
+            "writer-lease",
+            format_args!(
+                "release db_lock={} owner_kind={} operation={} repo={}",
+                self.lock_path.display(),
+                self.info.owner_kind,
+                self.info.operation,
+                self.info.repo_root.as_deref().unwrap_or("<none>")
+            ),
+        );
         let _ = self.file.unlock();
     }
 }
@@ -222,6 +294,10 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(config: &StoreConfig) -> Result<Self> {
+        debug_db_lock_log(
+            "sqlite",
+            format_args!("open_read_write_start db={}", config.sqlite_path.display()),
+        );
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         if let Some(parent) = sqlite_parent(config) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
@@ -239,10 +315,22 @@ impl SqliteStore {
                 .execute_batch("PRAGMA journal_mode = WAL;")
                 .map_err(StoreError::Sqlite)?;
         }
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "open_read_write_success db={} initialized_wal={} busy_timeout_ms=30000",
+                config.sqlite_path.display(),
+                initialize_wal
+            ),
+        );
         Ok(Self { connection })
     }
 
     pub fn open_read_only(config: &StoreConfig) -> Result<Self> {
+        debug_db_lock_log(
+            "sqlite",
+            format_args!("open_read_only_start db={}", config.sqlite_path.display()),
+        );
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         let connection =
             Connection::open_with_flags(&config.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -253,15 +341,31 @@ impl SqliteStore {
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(StoreError::Sqlite)?;
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "open_read_only_success db={} busy_timeout_ms=30000",
+                config.sqlite_path.display()
+            ),
+        );
         Ok(Self { connection })
     }
 
     pub fn migrate(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        debug_db_lock_log("sqlite", format_args!("migrate_start"));
         self.connection
             .execute_batch(SCHEMA)
             .map_err(StoreError::Sqlite)?;
         self.ensure_compatibility_columns()?;
         self.ensure_content_addressed_files()?;
+        debug_db_lock_log(
+            "sqlite",
+            format_args!(
+                "migrate_success elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        );
         Ok(())
     }
 
@@ -6052,6 +6156,17 @@ pub fn freshness_for_hash(
 
 fn env_path(upper: &str, legacy: &str) -> Option<PathBuf> {
     env_value(upper, legacy).map(PathBuf::from)
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn env_value(upper: &str, legacy: &str) -> Option<String> {

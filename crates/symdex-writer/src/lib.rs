@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use symdex_core::stable_id;
 use symdex_store::{
-    StoreConfig, WriterLease, WriterLeaseKind, WriterLeaseRequest, writer_lock_path,
+    StoreConfig, WriterLease, WriterLeaseKind, WriterLeaseRequest, debug_db_lock_log,
+    debug_db_locks_enabled, writer_lock_path,
 };
 
 const START_WAIT: Duration = Duration::from_secs(3);
@@ -74,6 +75,56 @@ impl WriterJob {
             Self::AttachWatcherClient { .. } => "watch-attach",
             Self::HeartbeatWatcherClient { .. } => "watch-heartbeat",
             Self::DetachWatcherClient { .. } => "watch-detach",
+        }
+    }
+
+    pub fn debug_details(&self) -> String {
+        match self {
+            Self::Ping => "operation=ping".to_owned(),
+            Self::Init => "operation=init".to_owned(),
+            Self::Index {
+                repo,
+                offline,
+                scope,
+            } => format!(
+                "operation=index repo={} offline={} scope={scope:?}",
+                repo, offline
+            ),
+            Self::IndexQuality { repo } => {
+                format!("operation=index-quality repo={repo}")
+            }
+            Self::VectorRepair {
+                repo,
+                semantic_layer,
+            } => {
+                format!("operation=vector-repair repo={repo} semantic_layer={semantic_layer}")
+            }
+            Self::StartWatcher {
+                repo,
+                client_kind,
+                client_id,
+                pid,
+            } => format!(
+                "operation=watch-start repo={} client_kind={} client_id={} client_pid={}",
+                repo, client_kind, client_id, pid
+            ),
+            Self::StopWatcher { repo } => format!("operation=watch-stop repo={repo}"),
+            Self::AttachWatcherClient {
+                repo,
+                client_kind,
+                client_id,
+                pid,
+            } => format!(
+                "operation=watch-attach repo={} client_kind={} client_id={} client_pid={}",
+                repo, client_kind, client_id, pid
+            ),
+            Self::HeartbeatWatcherClient { repo, client_id } => format!(
+                "operation=watch-heartbeat repo={} client_id={}",
+                repo, client_id
+            ),
+            Self::DetachWatcherClient { repo, client_id } => {
+                format!("operation=watch-detach repo={repo} client_id={client_id}")
+            }
         }
     }
 }
@@ -145,35 +196,107 @@ impl WriterClient {
     }
 
     pub fn submit_and_wait(&self, job: &WriterJob) -> Result<WriterJobResponse, String> {
+        let started = Instant::now();
+        debug_db_lock_log(
+            "writer-client",
+            format_args!(
+                "submit_start db={} endpoint={} {}",
+                self.config.sqlite_path.display(),
+                writer_endpoint_for_config(&self.config),
+                job.debug_details()
+            ),
+        );
         self.ensure_daemon()?;
         let endpoint = writer_endpoint_for_config(&self.config);
         let request = serde_json::to_string(job).map_err(|error| error.to_string())?;
         let response = ipc::send_request(&endpoint, &request)?;
-        serde_json::from_str(&response).map_err(|error| error.to_string())
+        let response: WriterJobResponse =
+            serde_json::from_str(&response).map_err(|error| error.to_string())?;
+        debug_db_lock_log(
+            "writer-client",
+            format_args!(
+                "submit_finish db={} endpoint={} operation={} ok={} elapsed_ms={} message={}",
+                self.config.sqlite_path.display(),
+                endpoint,
+                job.operation(),
+                response.ok,
+                started.elapsed().as_millis(),
+                response.message
+            ),
+        );
+        Ok(response)
     }
 
     fn ensure_daemon(&self) -> Result<(), String> {
         let endpoint = writer_endpoint_for_config(&self.config);
         let ping = serde_json::to_string(&WriterJob::Ping).unwrap_or_default();
         if ipc::send_request(&endpoint, &ping).is_ok() {
+            debug_db_lock_log(
+                "writer-client",
+                format_args!(
+                    "ensure_daemon_attach db={} endpoint={}",
+                    self.config.sqlite_path.display(),
+                    endpoint
+                ),
+            );
             return Ok(());
         }
+        debug_db_lock_log(
+            "writer-client",
+            format_args!(
+                "ensure_daemon_start db={} endpoint={}",
+                self.config.sqlite_path.display(),
+                endpoint
+            ),
+        );
         ipc::cleanup_endpoint(&endpoint);
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        Command::new(executable)
+        let stderr = if debug_db_locks_enabled() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        let child = Command::new(executable)
             .arg("writer-daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .map_err(|error| format!("start writer daemon: {error}"))?;
+        debug_db_lock_log(
+            "writer-client",
+            format_args!(
+                "ensure_daemon_spawned db={} endpoint={} daemon_pid={}",
+                self.config.sqlite_path.display(),
+                endpoint,
+                child.id()
+            ),
+        );
         let started = Instant::now();
         while started.elapsed() < START_WAIT {
             if ipc::send_request(&endpoint, &ping).is_ok() {
+                debug_db_lock_log(
+                    "writer-client",
+                    format_args!(
+                        "ensure_daemon_ready db={} endpoint={} wait_ms={}",
+                        self.config.sqlite_path.display(),
+                        endpoint,
+                        started.elapsed().as_millis()
+                    ),
+                );
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        debug_db_lock_log(
+            "writer-client",
+            format_args!(
+                "ensure_daemon_timeout db={} endpoint={} wait_ms={}",
+                self.config.sqlite_path.display(),
+                endpoint,
+                started.elapsed().as_millis()
+            ),
+        );
         Err("writer daemon did not become ready".to_owned())
     }
 }
@@ -187,6 +310,15 @@ pub fn writer_endpoint_for_config(config: &StoreConfig) -> String {
 pub fn run_daemon(mut handler: impl FnMut(WriterJob) -> WriterJobResponse) -> Result<(), String> {
     let config = StoreConfig::from_env();
     let endpoint = writer_endpoint_for_config(&config);
+    debug_db_lock_log(
+        "writer-daemon",
+        format_args!(
+            "start db={} endpoint={} lock={}",
+            config.sqlite_path.display(),
+            endpoint,
+            writer_lock_path(&config).display()
+        ),
+    );
     let _lease = WriterLease::acquire(
         &config,
         WriterLeaseRequest::new(WriterLeaseKind::Maintenance, "writer-daemon"),
@@ -194,14 +326,25 @@ pub fn run_daemon(mut handler: impl FnMut(WriterJob) -> WriterJobResponse) -> Re
     .map_err(|error| error.to_string())?;
     ipc::cleanup_endpoint(&endpoint);
     let listener = ipc::bind_listener(&endpoint)?;
+    debug_db_lock_log(
+        "writer-daemon",
+        format_args!(
+            "listening db={} endpoint={}",
+            config.sqlite_path.display(),
+            endpoint
+        ),
+    );
     let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let mut next_job_id = 1usize;
     loop {
         match ipc::accept_with_timeout(&listener, Duration::from_millis(250)) {
             Ok(Some(stream)) => {
                 if let Ok(mut last_activity) = last_activity.lock() {
                     *last_activity = Instant::now();
                 }
-                handle_stream(stream, &mut handler);
+                let job_id = next_job_id;
+                next_job_id += 1;
+                handle_stream(job_id, stream, &mut handler);
             }
             Ok(None) => {
                 let idle_for = last_activity
@@ -209,18 +352,47 @@ pub fn run_daemon(mut handler: impl FnMut(WriterJob) -> WriterJobResponse) -> Re
                     .map(|last_activity| last_activity.elapsed())
                     .unwrap_or(IDLE_EXIT_AFTER);
                 if idle_for >= IDLE_EXIT_AFTER {
+                    debug_db_lock_log(
+                        "writer-daemon",
+                        format_args!(
+                            "idle_exit db={} endpoint={} idle_ms={}",
+                            config.sqlite_path.display(),
+                            endpoint,
+                            idle_for.as_millis()
+                        ),
+                    );
                     break;
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                debug_db_lock_log(
+                    "writer-daemon",
+                    format_args!(
+                        "accept_error db={} endpoint={} error={}",
+                        config.sqlite_path.display(),
+                        endpoint,
+                        error
+                    ),
+                );
+                return Err(error);
+            }
         }
     }
     ipc::cleanup_endpoint(&endpoint);
-    let _ = writer_lock_path(&config);
+    debug_db_lock_log(
+        "writer-daemon",
+        format_args!(
+            "stop db={} endpoint={} lock={}",
+            config.sqlite_path.display(),
+            endpoint,
+            writer_lock_path(&config).display()
+        ),
+    );
     Ok(())
 }
 
 fn handle_stream(
+    job_id: usize,
     mut stream: impl Read + Write,
     handler: &mut impl FnMut(WriterJob) -> WriterJobResponse,
 ) {
@@ -230,8 +402,32 @@ fn handle_stream(
         let _ = reader.read_line(&mut request);
     }
     let response = match serde_json::from_str::<WriterJob>(request.trim()) {
-        Ok(job) => handler(job),
-        Err(error) => WriterJobResponse::error(format!("invalid writer job: {error}")),
+        Ok(job) => {
+            let started = Instant::now();
+            debug_db_lock_log(
+                "writer-daemon",
+                format_args!("job_start job_id={} {}", job_id, job.debug_details()),
+            );
+            let response = handler(job);
+            debug_db_lock_log(
+                "writer-daemon",
+                format_args!(
+                    "job_finish job_id={} ok={} elapsed_ms={} message={}",
+                    job_id,
+                    response.ok,
+                    started.elapsed().as_millis(),
+                    response.message
+                ),
+            );
+            response
+        }
+        Err(error) => {
+            debug_db_lock_log(
+                "writer-daemon",
+                format_args!("job_invalid job_id={} error={}", job_id, error),
+            );
+            WriterJobResponse::error(format!("invalid writer job: {error}"))
+        }
     };
     let encoded = serde_json::to_string(&response).unwrap_or_else(|error| {
         format!(r#"{{"ok":false,"message":"{error}","progress":[],"data":null}}"#)

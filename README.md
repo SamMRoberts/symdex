@@ -110,6 +110,7 @@ SYMDEX_QUALITY_EMBED_MODEL=mxbai-embed-large
 SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
 SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
 SYMDEX_QUALITY_INDEX=1
+SYMDEX_DEBUG_DB_LOCKS=1
 ```
 
 ## Continuous Indexing
@@ -123,6 +124,10 @@ Manual indexing, quality catch-up, repair, migrations, watcher state updates,
 and continuous indexing batches submit jobs to that service. The service owns
 SQLite/sqlite-vec writes and keeps the sidecar OS lock only as its internal
 duplicate-daemon guard. Read paths use read-only SQLite connections directly.
+Set `SYMDEX_DEBUG_DB_LOCKS=1` to print stderr diagnostics for writer daemon
+startup/attach, queued jobs, writer-gate wait and hold times, SQLite open modes,
+and daemon-internal lease acquisition. `SYMDEX_DEBUG_WRITER=1` is accepted as an
+alias.
 
 Watcher lifetime is client-scoped:
 

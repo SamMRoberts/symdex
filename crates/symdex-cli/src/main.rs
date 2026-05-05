@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use serde_json::json;
 use symdex_core::RepoRoot;
@@ -23,7 +24,7 @@ use symdex_query::{
 };
 use symdex_store::{
     EvidenceFreshness, RepositoryRecord, SqliteStore, SqliteVectorStore, StoreConfig,
-    WatcherClientRecord, WatcherStatusRecord, current_timestamp, sqlite_parent,
+    WatcherClientRecord, WatcherStatusRecord, current_timestamp, debug_db_lock_log, sqlite_parent,
 };
 use symdex_watch::{WatcherClientKind, WatcherStatus};
 use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse};
@@ -244,7 +245,14 @@ fn require_text_output(command: &str, output: OutputMode) -> Result<(), String> 
 }
 
 fn execute_writer_job(job: WriterJob) -> WriterJobResponse {
-    match job {
+    let operation = job.operation();
+    let details = job.debug_details();
+    let started = Instant::now();
+    debug_db_lock_log(
+        "writer-job",
+        format_args!("execute_start operation={} {}", operation, details),
+    );
+    let response = match job {
         WriterJob::Ping => WriterJobResponse::ok("writer daemon ready"),
         WriterJob::Init => match with_writer_gate(init_with_existing_writer) {
             Ok(message) => WriterJobResponse::ok(message),
@@ -370,7 +378,18 @@ fn execute_writer_job(job: WriterJob) -> WriterJobResponse {
                 Err(error) => WriterJobResponse::error(error),
             }
         }
-    }
+    };
+    debug_db_lock_log(
+        "writer-job",
+        format_args!(
+            "execute_finish operation={} ok={} elapsed_ms={} message={}",
+            operation,
+            response.ok,
+            started.elapsed().as_millis(),
+            response.message
+        ),
+    );
+    response
 }
 
 fn writer_start_watcher(
@@ -380,6 +399,16 @@ fn writer_start_watcher(
     pid: i32,
 ) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "start_watcher repo={} client_kind={} client_id={} client_pid={}",
+            root.path().display(),
+            client_kind,
+            client_id,
+            pid
+        ),
+    );
     let was_active = symdex_watch::status(repo)
         .map(|status| status.is_active())
         .unwrap_or(false);
@@ -419,9 +448,18 @@ fn writer_start_watcher(
         .map_err(|error| error.to_string())?;
     let status = writer_attach_watcher_client(repo, client_kind, client_id, pid)?;
     if !was_active {
+        debug_db_lock_log(
+            "watcher-writer",
+            format_args!("spawn_managed_watcher repo={}", root.path().display()),
+        );
         symdex_watch::spawn_writer_managed_daemon(
             root.path().display().to_string(),
             writer_write_gate(),
+        );
+    } else {
+        debug_db_lock_log(
+            "watcher-writer",
+            format_args!("reuse_active_watcher repo={}", root.path().display()),
         );
     }
     Ok(status)
@@ -429,6 +467,10 @@ fn writer_start_watcher(
 
 fn writer_stop_watcher(repo: &str) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!("stop_watcher repo={}", root.path().display()),
+    );
     let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
     store
         .mark_watcher_stopped(root.id())
@@ -443,6 +485,16 @@ fn writer_attach_watcher_client(
     pid: i32,
 ) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "attach_client repo={} client_kind={} client_id={} client_pid={}",
+            root.path().display(),
+            client_kind,
+            client_id,
+            pid
+        ),
+    );
     let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
     let now = current_timestamp();
     store
@@ -461,6 +513,14 @@ fn writer_attach_watcher_client(
 
 fn writer_heartbeat_watcher_client(repo: &str, client_id: &str) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "heartbeat_client repo={} client_id={}",
+            root.path().display(),
+            client_id
+        ),
+    );
     let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
     store
         .heartbeat_watcher_client(root.id(), client_id)
@@ -470,6 +530,14 @@ fn writer_heartbeat_watcher_client(repo: &str, client_id: &str) -> Result<Watche
 
 fn writer_detach_watcher_client(repo: &str, client_id: &str) -> Result<WatcherStatus, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
+    debug_db_lock_log(
+        "watcher-writer",
+        format_args!(
+            "detach_client repo={} client_id={}",
+            root.path().display(),
+            client_id
+        ),
+    );
     let store = SqliteStore::open(&StoreConfig::from_env()).map_err(|error| error.to_string())?;
     store
         .remove_watcher_client(root.id(), client_id)
@@ -499,10 +567,26 @@ fn writer_write_gate() -> Arc<Mutex<()>> {
 
 fn with_writer_gate<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let gate = writer_write_gate();
+    let wait_started = Instant::now();
+    debug_db_lock_log("writer-gate", format_args!("wait_start"));
     let _guard = gate
         .lock()
         .map_err(|_| "writer gate lock poisoned".to_owned())?;
-    job()
+    debug_db_lock_log(
+        "writer-gate",
+        format_args!("acquired wait_ms={}", wait_started.elapsed().as_millis()),
+    );
+    let run_started = Instant::now();
+    let result = job();
+    debug_db_lock_log(
+        "writer-gate",
+        format_args!(
+            "release ok={} held_ms={}",
+            result.is_ok(),
+            run_started.elapsed().as_millis()
+        ),
+    );
+    result
 }
 
 fn print_writer_response(response: &WriterJobResponse) -> Result<(), String> {
