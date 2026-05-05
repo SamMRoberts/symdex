@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -398,11 +398,25 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
             let wait_started = Instant::now();
             debug_db_lock_log(
                 "watcher-managed",
-                format_args!("write_gate_wait repo={}", root.path().display()),
+                format_args!("write_gate_try repo={}", root.path().display()),
             );
-            let _guard = write_gate
-                .lock()
-                .map_err(|_| "writer gate lock poisoned".to_owned())?;
+            let _guard = match write_gate.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    debug_db_lock_log(
+                        "watcher-managed",
+                        format_args!(
+                            "write_gate_busy repo={} wait_ms={}",
+                            root.path().display(),
+                            wait_started.elapsed().as_millis()
+                        ),
+                    );
+                    return Ok(false);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err("writer gate lock poisoned".to_owned());
+                }
+            };
             debug_db_lock_log(
                 "watcher-managed",
                 format_args!(
@@ -422,7 +436,7 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                     run_started.elapsed().as_millis()
                 ),
             );
-            result
+            result.map(|_| true)
         },
     );
     match result {

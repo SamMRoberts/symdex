@@ -474,13 +474,14 @@ catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
 tool. These paths submit jobs to the writer service and wait for the result
 instead of opening a second structural writer. Continuous indexing runs as
 writer-managed watcher work and uses the same in-process structural write gate
-as queued manual jobs for repository facts, generation metadata, and quality
-jobs. A manual index, repair, migration, or quality job still pauses
-watch-driven structural writes: the watcher can continue polling and coalescing
-filesystem changes, but incremental batches and idle quality catch-up wait for
-the structural writer gate before touching structural SQLite. Index-run and
-per-file event rows write to the events database role, while watcher
-status/client rows write to the watch database role.
+as queued manual jobs for repository facts and fast generation metadata. A
+manual index, repair, or migration still pauses watch-driven structural writes:
+the watcher continues polling and coalescing filesystem changes, but incremental
+batches yield when the structural writer gate is busy and retry on the next poll.
+Idle and post-batch quality catch-up use the `quality_semantic` writer lane, so
+they do not wait on the structural gate. Index-run and per-file event rows write
+to the events database role, while watcher status/client rows write to the watch
+database role.
 Read paths such as TUI refreshes, MCP evidence tools,
 diagnostics, semantic status, staleness checks, and query tools must not run
 migrations, stale-client pruning, repair, or quality catch-up as a side effect

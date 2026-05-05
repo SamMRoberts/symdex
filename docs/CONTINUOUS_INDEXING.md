@@ -29,17 +29,19 @@ enabled, modified or newly created eligible files are automatically reindexed.
 - Single-writer rule: only ONE process may write to each configured local
   SQLite/sqlite-vec database file at a time. Database-role-scoped writer
   services own mutations for their files. Structural indexing, manual indexing,
-  quality catch-up metadata, repair, migrations, and future write-capable tools
-  use the structural writer. Watcher status and client lease rows use the watch
-  database role. TUI, MCP, diagnostics, status, and query paths read shared
-  state without structural migrations or cleanup writes.
+  repair, migrations, and future structural write-capable tools use the
+  structural writer. Quality catch-up claims, completions, embeddings, and
+  activation metadata use the quality-semantic database role. Watcher status and
+  client lease rows use the watch database role, and index-run/event rows use the
+  events database role. TUI, MCP, diagnostics, status, and query paths read
+  shared state without structural migrations or cleanup writes.
 - Manual structural writer jobs take priority over structural watcher writes.
-  The watcher may keep polling and coalescing filesystem changes, but
-  incremental indexing batches and idle quality catch-up wait on the structural
-  writer-service gate while a manual index, repair, migration, or quality job is
-  running. Watcher status and client lease heartbeats write to the watch
-  database role so those lightweight control-plane updates do not wait on the
-  structural SQLite writer gate.
+  The watcher keeps polling and coalescing filesystem changes while a manual
+  index, repair, or migration owns the structural gate. If that gate is busy,
+  the watcher defers only the incremental structural batch and leaves the prior
+  snapshot active so the next poll folds in any additional changes. Watcher
+  status, client lease heartbeats, index events, and quality catch-up do not wait
+  on the structural SQLite writer gate.
 
 ## Event Handling
 
@@ -201,7 +203,9 @@ Current implementation status:
   automatically runs cooperative quality catch-up after fast batches and during
   idle ticks. Each catch-up tick uses the same hash-verifying quality worker
   path as `symdex index-quality <repo>` and is bounded by
-  `SYMDEX_QUALITY_BATCH_SIZE` before returning to watch polling.
+  `SYMDEX_QUALITY_BATCH_SIZE` before returning to watch polling. Quality
+  catch-up uses the `quality_semantic` writer lane, so it can continue while the
+  structural writer lane is occupied by manual structural work.
 - The TUI starts continuous indexing on launch and exposes a `c` toggle to stop
   or confirm restarting watch mode, with explicit `on` / `off` labels, pending
   debounce state, queued event count, last reindexed file, active semantic
