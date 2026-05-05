@@ -577,7 +577,7 @@ mod ipc {
     use super::*;
     use interprocess::local_socket::{
         GenericNamespaced, ListenerOptions, Stream as LocalSocketStream,
-        traits::Stream as LocalSocketStreamTrait,
+        traits::{Listener as LocalSocketListenerTrait, Stream as LocalSocketStreamTrait},
     };
     use std::io::ErrorKind;
 
