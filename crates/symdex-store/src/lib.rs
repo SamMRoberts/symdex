@@ -510,6 +510,7 @@ impl SqliteStore {
             ),
         );
         match self.role {
+            DatabaseRole::FastSemantic => self.migrate_fast_semantic_schema()?,
             DatabaseRole::QualitySemantic => self.migrate_quality_semantic_schema()?,
             DatabaseRole::Watch => self.migrate_watch_schema()?,
             DatabaseRole::Events => self.migrate_events_schema()?,
@@ -544,6 +545,13 @@ impl SqliteStore {
     fn migrate_events_schema(&self) -> Result<()> {
         self.connection
             .execute_batch(EVENTS_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn migrate_fast_semantic_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(FAST_SEMANTIC_SCHEMA)
             .map_err(StoreError::Sqlite)?;
         Ok(())
     }
@@ -9321,6 +9329,101 @@ CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_path_time ON file_in
 CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_action_status ON file_index_events(repository_id, action, status, occurred_at);
 "#;
 
+const FAST_SEMANTIC_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS semantic_generations (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    fast_model TEXT NOT NULL,
+    fast_dimension INTEGER NOT NULL,
+    fast_completed_at TEXT NOT NULL,
+    quality_model TEXT,
+    quality_dimension INTEGER,
+    quality_status TEXT NOT NULL,
+    quality_started_at TEXT,
+    quality_completed_at TEXT,
+    active_layer TEXT NOT NULL,
+    files_seen INTEGER NOT NULL,
+    embeddable_chunks INTEGER NOT NULL,
+    fast_embedded_chunks INTEGER NOT NULL,
+    quality_embedded_chunks INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(quality_status IN (
+        'missing',
+        'fast_ready',
+        'quality_pending',
+        'quality_ready',
+        'quality_stale',
+        'quality_blocked',
+        'quality_failed'
+    )),
+    CHECK(active_layer IN ('fast', 'quality'))
+);
+
+CREATE TABLE IF NOT EXISTS semantic_generation_refs (
+    repository_ref_id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    linked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    semantic_layer TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dimension INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    vector_table TEXT NOT NULL,
+    vector_point_id TEXT NOT NULL,
+    vector_store TEXT NOT NULL DEFAULT 'sqlite_vec',
+    vector_rowid INTEGER,
+    generation_id TEXT NOT NULL,
+    embedded_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'current',
+    UNIQUE(chunk_id, semantic_layer, embedding_model, embedding_dimension),
+    CHECK(semantic_layer IN ('fast', 'quality')),
+    CHECK(status IN ('current', 'stale', 'blocked', 'failed'))
+);
+
+CREATE TABLE IF NOT EXISTS vector_points (
+  vector_store TEXT NOT NULL,
+  vector_table TEXT NOT NULL,
+  vector_rowid INTEGER NOT NULL,
+  vector_point_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  symbol_id TEXT,
+  symbol_name TEXT,
+  path TEXT NOT NULL,
+  language TEXT NOT NULL,
+  chunk_kind TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  text_hash TEXT NOT NULL,
+  parser_version TEXT,
+  content_hash TEXT,
+  index_run_id TEXT,
+  embedding_model TEXT,
+  embedding_dimension INTEGER,
+  indexed_at TEXT,
+  PRIMARY KEY(vector_store, vector_table, vector_point_id),
+  UNIQUE(vector_store, vector_table, vector_rowid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_generations_repository_fast_completed ON semantic_generations(repository_id, fast_completed_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_semantic_generation_refs_generation ON semantic_generation_refs(repository_id, generation_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_layer_model ON chunk_embeddings(repository_id, semantic_layer, embedding_model);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_generation_chunk ON chunk_embeddings(generation_id, chunk_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_repository_generation_layer_status ON chunk_embeddings(repository_id, generation_id, semantic_layer, status);
+CREATE INDEX IF NOT EXISTS idx_vector_points_repository_table ON vector_points(repository_id, vector_store, vector_table);
+CREATE INDEX IF NOT EXISTS idx_vector_points_chunk ON vector_points(chunk_id);
+"#;
+
 const QUALITY_SEMANTIC_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS semantic_generations (
     id TEXT PRIMARY KEY,
@@ -12561,6 +12664,30 @@ mod tests {
         assert!(!tables.contains(&"repositories".to_owned()));
         assert!(!tables.contains(&"files".to_owned()));
         assert!(!tables.contains(&"chunks".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_fast_semantic_role_uses_fast_database() {
+        let db = TestDb::new("fast-semantic-role-database");
+        let config = db.config();
+        let store = SqliteStore::open_for_role(&config, DatabaseRole::FastSemantic)
+            .expect("fast semantic store should open");
+        store
+            .migrate()
+            .expect("fast semantic schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::FastSemantic).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"semantic_generations".to_owned()));
+        assert!(tables.contains(&"semantic_generation_refs".to_owned()));
+        assert!(tables.contains(&"chunk_embeddings".to_owned()));
+        assert!(tables.contains(&"vector_points".to_owned()));
+        assert!(!tables.contains(&"repositories".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
+        assert!(!tables.contains(&"chunks".to_owned()));
+        assert!(!tables.contains(&"quality_embedding_jobs".to_owned()));
     }
 
     #[test]
