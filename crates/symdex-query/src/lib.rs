@@ -1081,6 +1081,48 @@ pub fn parse_runtime_input(input: &str) -> RuntimeFailureInput {
         if let Some(test) = parse_failing_test(trimmed, in_failures) {
             failing_tests.insert(test);
         }
+        if let Some((symbol, path, line_number, column)) = parse_csharp_stack_frame(trimmed) {
+            if let Some((_, raw, pending)) = pending_symbol.take() {
+                frames.push(RuntimeFrame {
+                    ordinal: frames.len(),
+                    raw,
+                    symbol: Some(pending),
+                    path: None,
+                    line: None,
+                    column: None,
+                });
+            }
+            frames.push(RuntimeFrame {
+                ordinal: frames.len(),
+                raw: trimmed.to_owned(),
+                symbol: Some(symbol),
+                path: Some(path),
+                line: Some(line_number),
+                column,
+            });
+            continue;
+        }
+        if let Some((symbol, path, line_number, column)) = parse_node_v8_stack_frame(trimmed) {
+            if let Some((_, raw, pending)) = pending_symbol.take() {
+                frames.push(RuntimeFrame {
+                    ordinal: frames.len(),
+                    raw,
+                    symbol: Some(pending),
+                    path: None,
+                    line: None,
+                    column: None,
+                });
+            }
+            frames.push(RuntimeFrame {
+                ordinal: frames.len(),
+                raw: trimmed.to_owned(),
+                symbol: Some(symbol),
+                path: Some(path),
+                line: Some(line_number),
+                column,
+            });
+            continue;
+        }
         if let Some((symbol, path, line_number, column)) = parse_inline_symbol_location(trimmed) {
             if let Some((_, raw, pending)) = pending_symbol.take() {
                 frames.push(RuntimeFrame {
@@ -3110,6 +3152,45 @@ fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
     Some((path, line_number, column))
 }
 
+fn parse_csharp_stack_frame(line: &str) -> Option<(String, String, usize, Option<usize>)> {
+    let rest = line.strip_prefix("at ")?;
+    let (symbol, location) = rest.rsplit_once(" in ")?;
+    let symbol = symbol.split_once('(').map_or(symbol, |(symbol, _)| symbol);
+    let symbol = normalize_stack_symbol(symbol)?;
+    let (path, line_number, column) = parse_csharp_line_location(location)?;
+    Some((symbol, path, line_number, column))
+}
+
+fn parse_csharp_line_location(location: &str) -> Option<(String, usize, Option<usize>)> {
+    let (path, rest) = location.rsplit_once(":line ")?;
+    if !path.ends_with(".cs") {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let (line_number, rest) = parse_usize_prefix(rest)?;
+    let column = rest
+        .strip_prefix(':')
+        .and_then(|rest| parse_usize_prefix(rest).map(|(column, _)| column));
+    Some((path.trim().to_owned(), line_number, column))
+}
+
+fn parse_node_v8_stack_frame(line: &str) -> Option<(String, String, usize, Option<usize>)> {
+    let rest = line.strip_prefix("at ")?;
+    let open = rest.rfind('(')?;
+    let close = rest.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let symbol = rest[..open].trim().trim_start_matches("async ").trim();
+    if symbol.is_empty() {
+        return None;
+    }
+    let symbol = normalize_stack_symbol(symbol)?;
+    let location = rest[open + 1..close].trim();
+    let (path, line_number, column) = parse_file_location(location)?;
+    Some((symbol, path, line_number, column))
+}
+
 fn runtime_path_start(line: &str, marker_start: usize) -> usize {
     line[..marker_start]
         .rfind(|character: char| {
@@ -4644,6 +4725,60 @@ mod tests {
     }
 
     #[test]
+    fn runtime_parser_extracts_csharp_and_node_v8_frames() {
+        let parsed = parse_runtime_input(
+            "System.ApplicationException: failed\n\
+             at Example.Service.Run(System.String value) in src/Program.cs:line 42\n\
+             at Example.Service.Helper() in C:\\repo\\src\\Service.cs:line 7\n\
+             at handleRequest (/repo/web/app.js:12:3)\n\
+             at async Object.load (/repo/web/app.ts:22:9)\n\
+             at Module._compile (node:internal/modules/cjs/loader:1254:14)\n\
+             at broken (web/app.js:nope)\n",
+        );
+
+        assert_eq!(parsed.frames.len(), 4);
+        assert_eq!(
+            parsed
+                .frames
+                .iter()
+                .map(|frame| (
+                    frame.symbol.as_deref(),
+                    frame.path.as_deref(),
+                    frame.line,
+                    frame.column,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some("Example.Service.Run"),
+                    Some("src/Program.cs"),
+                    Some(42),
+                    None,
+                ),
+                (
+                    Some("Example.Service.Helper"),
+                    Some("C:\\repo\\src\\Service.cs"),
+                    Some(7),
+                    None,
+                ),
+                (
+                    Some("handleRequest"),
+                    Some("/repo/web/app.js"),
+                    Some(12),
+                    Some(3),
+                ),
+                (
+                    Some("Object.load"),
+                    Some("/repo/web/app.ts"),
+                    Some(22),
+                    Some(9),
+                ),
+            ]
+        );
+        assert_eq!(parsed.malformed_lines, vec!["at broken (web/app.js:nope)"]);
+    }
+
+    #[test]
     fn debug_context_maps_fresh_stale_deleted_and_unmapped_frames() {
         let fixture = DebugFixture::new();
         let current_hashes = BTreeMap::from([
@@ -4702,6 +4837,91 @@ mod tests {
                 .iter()
                 .any(|note| note == "malformed_runtime_lines_ignored")
         );
+    }
+
+    #[test]
+    fn debug_context_maps_csharp_and_node_frames_through_existing_pipeline() {
+        let mut fixture = DebugFixture::new();
+        fs::write(
+            fixture._root_path.join("src/Program.cs"),
+            "class Program {}\n",
+        )
+        .expect("csharp file should be written");
+        fs::create_dir_all(fixture._root_path.join("web")).expect("web dir should be created");
+        fs::write(
+            fixture._root_path.join("web/app.ts"),
+            "export function handler() {}\n",
+        )
+        .expect("typescript file should be written");
+        let repository_id = fixture.root.id().to_owned();
+        persist_file(
+            &mut fixture.store,
+            &repository_id,
+            FileFixture {
+                file_id: "file-csharp-program",
+                path: "src/Program.cs",
+                content_hash: "hash-csharp-program",
+                symbol_id: "sym-csharp-run",
+                symbol_name: "Run",
+                qualified_name: "Example.Service.Run",
+            },
+        );
+        persist_file(
+            &mut fixture.store,
+            &repository_id,
+            FileFixture {
+                file_id: "file-node-app",
+                path: "web/app.ts",
+                content_hash: "hash-node-app",
+                symbol_id: "sym-node-handler",
+                symbol_name: "handler",
+                qualified_name: "handler",
+            },
+        );
+        let input = format!(
+            "at Example.Service.Run(System.String value) in {}/src/Program.cs:line 2\n\
+             at async handler (web/app.ts:2:1)\n\
+             at Missing.Frame() in outside/Other.cs:line 9\n",
+            fixture.root.path().display()
+        );
+
+        let pack = build_debug_context_pack(
+            &fixture.root,
+            &fixture.store,
+            &input,
+            8,
+            &BTreeMap::from([
+                (
+                    "src/Program.cs".to_owned(),
+                    "hash-csharp-program".to_owned(),
+                ),
+                ("web/app.ts".to_owned(), "hash-node-app".to_owned()),
+            ]),
+        )
+        .expect("debug context should build");
+
+        assert_eq!(pack.frames.len(), 3);
+        assert_eq!(
+            pack.frames
+                .iter()
+                .map(|frame| (
+                    frame.normalized_path.as_deref(),
+                    frame
+                        .matched_symbols
+                        .first()
+                        .map(|symbol| symbol.qualified_name.as_str()),
+                    frame.matched,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("src/Program.cs"), Some("Example.Service.Run"), true,),
+                (Some("web/app.ts"), Some("handler"), true),
+                (Some("outside/Other.cs"), None, false),
+            ]
+        );
+        assert!(pack.frames[2].reasons.iter().any(|reason| {
+            reason == "runtime_path_outside_or_unindexed" || reason == "unmatched_runtime_frame"
+        }));
     }
 
     #[test]
