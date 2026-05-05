@@ -34,6 +34,13 @@ SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 SYMDEX_DEBUG_DB_LOCKS=1
 ```
 
+`SYMDEX_DB_PATH` remains the structural SQLite path. Semantic vector storage now
+derives per-layer SQLite files from that path: `.symdex/symdex-fast.sqlite` for
+the fast sqlite-vec projection and `.symdex/symdex-quality.sqlite` for the
+quality sqlite-vec projection. Existing legacy vector collections in the
+structural database remain readable as a compatibility fallback until the split
+storage migration is complete.
+
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
 default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command
 can be launched, `symdex doctor` checks readiness with `rust-analyzer --version`

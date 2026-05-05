@@ -75,7 +75,7 @@ file changes
   -> debounce/coalesce
   -> structural SQLite update
   -> fast nomic-embed-text embedding
-  -> fast sqlite-vec upsert
+  -> fast sqlite-vec upsert in the fast semantic database role
   -> mark quality stale when needed
   -> enqueue quality jobs
   -> return to watching
@@ -88,7 +88,7 @@ quality queue
   -> background worker
   -> verify hashes
   -> embed with mxbai-embed-large
-  -> quality sqlite-vec upsert
+  -> quality sqlite-vec upsert in the quality semantic database role
   -> activate quality only after complete/current
 ```
 

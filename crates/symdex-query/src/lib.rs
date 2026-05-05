@@ -1412,9 +1412,13 @@ pub fn run_vector_verify_with_options(
     let sqlite = sqlite_for_read()?;
     let targets = vector_verify_targets(&root, &sqlite, options.semantic_layer)?;
     let store_config = StoreConfig::from_env();
-    let vector = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
     let mut summaries = Vec::new();
     for target in targets {
+        let vector = vector_store_for_semantic_layer(
+            &store_config,
+            target.semantic_layer,
+            &target.collection_name,
+        )?;
         let table_exists = vector
             .table_exists(&target.collection_name)
             .map_err(|error| error.to_string())?;
@@ -1997,12 +2001,19 @@ fn semantic_search_for_root(
         return Err("embedding query returned no vector".to_owned());
     };
 
-    let vector_store = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
+    let vector_store = vector_store_for_semantic_layer(
+        &store_config,
+        target.semantic_layer,
+        &target.vector_table,
+    )?;
     let points = if let Some(repository_ref_id) = repository_ref_id.as_deref() {
-        vector_store.query_points_for_ref(
+        let file_ids = sqlite
+            .ref_file_ids(root.id(), repository_ref_id)
+            .map_err(|error| error.to_string())?;
+        vector_store.query_points_for_file_ids(
             &target.vector_table,
             root.id(),
-            repository_ref_id,
+            &file_ids,
             query_vector,
             limit,
         )
@@ -2024,6 +2035,32 @@ fn semantic_search_for_root(
         query: query.to_owned(),
         results,
     })
+}
+
+fn vector_store_for_semantic_layer(
+    store_config: &StoreConfig,
+    semantic_layer: SemanticLayer,
+    vector_table: &str,
+) -> Result<SqliteVectorStore, String> {
+    let layer_store = SqliteVectorStore::new_for_semantic_layer(store_config, semantic_layer)
+        .map_err(|error| error.to_string())?;
+    if layer_store
+        .table_exists(vector_table)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(layer_store);
+    }
+
+    let legacy_store = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    if legacy_store.database_path() != layer_store.database_path()
+        && legacy_store
+            .table_exists(vector_table)
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(legacy_store);
+    }
+
+    Ok(layer_store)
 }
 
 fn semantic_routing_summary_for_scope(

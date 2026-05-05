@@ -71,6 +71,13 @@ impl DatabaseRole {
         }
     }
 
+    pub fn for_semantic_layer(layer: SemanticLayer) -> Self {
+        match layer {
+            SemanticLayer::Fast => Self::FastSemantic,
+            SemanticLayer::Quality => Self::QualitySemantic,
+        }
+    }
+
     fn file_suffix(self) -> Option<&'static str> {
         match self {
             Self::Structural => None,
@@ -774,6 +781,27 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         let rows = statement
             .query_map(params![repository_ref_id], file_state_record)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
+    }
+
+    pub fn ref_file_ids(
+        &self,
+        repository_id: &str,
+        repository_ref_id: &str,
+    ) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT file_id
+                   FROM ref_files
+                  WHERE repository_id = ?1
+                    AND repository_ref_id = ?2
+                  ORDER BY path",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, repository_ref_id], |row| row.get(0))
             .map_err(StoreError::Sqlite)?;
         collect_rows(rows)
     }
@@ -1787,12 +1815,11 @@ impl SqliteStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT DISTINCT vector_points.vector_point_id
-                   FROM vector_points
-                   JOIN ref_files ON ref_files.file_id = vector_points.file_id
-                  WHERE vector_points.vector_store = 'sqlite_vec'
-                    AND vector_points.repository_id = ?1
-                    AND vector_points.vector_table = ?2",
+                "SELECT DISTINCT chunk_embeddings.vector_point_id
+                                     FROM chunk_embeddings
+                                     JOIN ref_files ON ref_files.file_id = chunk_embeddings.file_id
+                                    WHERE chunk_embeddings.repository_id = ?1
+                                        AND chunk_embeddings.vector_table = ?2",
             )
             .map_err(StoreError::Sqlite)?;
         let rows = statement
@@ -9121,6 +9148,14 @@ mod tests {
             config.database_path(DatabaseRole::Runtime),
             PathBuf::from(".symdex/symdex-runtime.sqlite")
         );
+        assert_eq!(
+            DatabaseRole::for_semantic_layer(SemanticLayer::Fast),
+            DatabaseRole::FastSemantic
+        );
+        assert_eq!(
+            DatabaseRole::for_semantic_layer(SemanticLayer::Quality),
+            DatabaseRole::QualitySemantic
+        );
     }
 
     #[test]
@@ -9924,6 +9959,18 @@ mod tests {
                 &[],
             )
             .expect("feature file should persist");
+        assert_eq!(
+            store
+                .ref_file_ids("repo", &main.id)
+                .expect("main file ids should load"),
+            vec!["main-file".to_owned()]
+        );
+        assert_eq!(
+            store
+                .ref_file_ids("repo", &feature.id)
+                .expect("feature file ids should load"),
+            vec!["feature-file".to_owned()]
+        );
         drop(store);
 
         let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
@@ -9966,6 +10013,13 @@ mod tests {
         assert_eq!(main_results.len(), 1);
         assert_eq!(main_results[0].id, main_point);
         assert_eq!(main_results[0].payload.path, "src/main.rs");
+
+        let file_id_results = vector_store
+            .query_points_for_file_ids(&table, "repo", &["main-file".to_owned()], vec![0.0, 1.0], 5)
+            .expect("file-id scoped query should run");
+        assert_eq!(file_id_results.len(), 1);
+        assert_eq!(file_id_results[0].id, main_point);
+        assert_eq!(file_id_results[0].payload.path, "src/main.rs");
 
         let feature_results = vector_store
             .query_points_for_ref(&table, "repo", &feature.id, vec![1.0, 0.0], 5)

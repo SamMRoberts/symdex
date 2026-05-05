@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use serde_json::json;
-use symdex_core::RepoRoot;
+use symdex_core::{RepoRoot, SemanticLayer};
 use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
@@ -1024,11 +1024,50 @@ fn delete_orphaned_vector_points(summary: &VectorVerifySummary) -> Result<usize,
         return Ok(0);
     }
     let store_config = StoreConfig::from_env();
-    let vector = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
+    let semantic_layer = semantic_layer_for_vector_summary(summary)?;
+    let vector = vector_store_for_repair(&store_config, semantic_layer, &summary.collection_name)?;
     vector
         .delete_points(&summary.collection_name, &summary.orphaned_point_ids)
         .map_err(|error| error.to_string())?;
     Ok(summary.orphaned_point_ids.len())
+}
+
+fn semantic_layer_for_vector_summary(
+    summary: &VectorVerifySummary,
+) -> Result<SemanticLayer, String> {
+    match summary.semantic_layer.as_str() {
+        "fast" => Ok(SemanticLayer::Fast),
+        "quality" => Ok(SemanticLayer::Quality),
+        other => Err(format!(
+            "cannot repair vector summary for semantic layer `{other}`"
+        )),
+    }
+}
+
+fn vector_store_for_repair(
+    store_config: &StoreConfig,
+    semantic_layer: SemanticLayer,
+    vector_table: &str,
+) -> Result<SqliteVectorStore, String> {
+    let layer_store = SqliteVectorStore::new_for_semantic_layer(store_config, semantic_layer)
+        .map_err(|error| error.to_string())?;
+    if layer_store
+        .table_exists(vector_table)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(layer_store);
+    }
+
+    let legacy_store = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    if legacy_store.database_path() != layer_store.database_path()
+        && legacy_store
+            .table_exists(vector_table)
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(legacy_store);
+    }
+
+    Ok(layer_store)
 }
 
 fn symbol(repo: &str, query: &str, output: OutputMode) -> Result<(), String> {

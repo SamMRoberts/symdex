@@ -435,6 +435,14 @@ starts or attaches to one local writer daemon keyed by `StoreConfig.sqlite_path`
 The daemon owns the advisory sidecar lock internally as a duplicate-start guard,
 then serializes write jobs in process. Clients do not acquire the lock directly.
 
+The first multi-database split moves sqlite-vec projections out of the
+structural database: fast vectors use a derived `fast_semantic` SQLite file, and
+quality vectors use a derived `quality_semantic` SQLite file. Structural SQLite
+continues to own the authoritative manifests, quality jobs, generation state,
+watcher state, and index events until later slices move those tables into their
+own role databases. The current writer service still serializes high-level jobs
+while this transition is in progress.
+
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
 tool. These paths submit jobs to the writer service and wait for the result

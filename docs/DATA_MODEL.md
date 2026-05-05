@@ -262,13 +262,13 @@ manifests. New indexing leaves them unset and records vector provenance in
 Before semantic indexing replaces changed-file chunk rows or removes deleted
 files, it reads current fast `chunk_embeddings` point IDs for those paths from
 the latest semantic generation. New fast embeddings are staged and upserted to
-sqlite-vec before SQLite mutation; after structural facts and the new semantic
-generation are persisted, the previously collected stale point IDs are deleted
-unless the new manifest reused the same deterministic point ID. This keeps
-SQLite as the source of truth for vector lifecycle cleanup while avoiding source
-text in sqlite-vec payloads or cleanup reports, and it preserves the previous
-complete manifest if local embedding or vector upsert fails before SQLite
-replacement.
+the fast semantic sqlite-vec database before SQLite mutation; after structural
+facts and the new semantic generation are persisted, the previously collected
+stale point IDs are deleted from the fast semantic sqlite-vec database unless
+the new manifest reused the same deterministic point ID. This keeps SQLite as
+the source of truth for vector lifecycle cleanup while avoiding source text in
+sqlite-vec payloads or cleanup reports, and it preserves the previous complete
+manifest if local embedding or vector upsert fails before SQLite replacement.
 
 When an active `ref_files` manifest is available, fast semantic generation
 recording carries forward only fast `chunk_embeddings` whose file snapshot is
@@ -628,6 +628,17 @@ symdex_<repository_id>_<embedding_model_slug>
 
 The current slugger lowercases ASCII alphanumerics and converts other
 characters to underscores so generated collection names are safe for REST paths.
+
+Fast and quality sqlite-vec projections are stored in separate local SQLite
+files derived from `SYMDEX_DB_PATH`: the fast layer uses the `fast_semantic`
+database role, and the quality layer uses the `quality_semantic` database role.
+For a legacy structural path such as `.symdex/symdex.sqlite`, the derived vector
+files are `.symdex/symdex-fast.sqlite` and `.symdex/symdex-quality.sqlite`.
+Structural SQLite still stores the authoritative `chunk_embeddings` manifests,
+semantic generation metadata, and active-ref file manifests during this
+transition. Query-time ref filtering reads active `ref_files` file IDs from
+structural SQLite and applies those IDs to sqlite-vec payload metadata instead
+of requiring `ref_files` to live in the vector database.
 
 Payload fields:
 

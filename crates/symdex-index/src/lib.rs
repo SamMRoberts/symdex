@@ -439,7 +439,8 @@ fn run_quality_index_limited_with_progress(
         ));
     }
 
-    let vector = SqliteVectorStore::new(&store_config).map_err(|error| error.to_string())?;
+    let vector = SqliteVectorStore::new_for_semantic_layer(&store_config, SemanticLayer::Quality)
+        .map_err(|error| error.to_string())?;
     let mut stats = QualityWorkerStats::default();
     let mut quality_dimension = generation.quality_dimension;
     let batch_size = layered_embed_config.quality_batch_size.max(1);
@@ -2142,7 +2143,8 @@ fn prepare_semantic_index(
         .ensure_embedding_compatible(root.id(), &embed_config.model, dimension)
         .map_err(|error| error.to_string())?;
 
-    let vector = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    let vector = SqliteVectorStore::new_for_semantic_layer(store_config, SemanticLayer::Fast)
+        .map_err(|error| error.to_string())?;
     let vector_table = vector_table_name(root.id(), &embed_config.model);
     vector
         .ensure_table(&vector_table, dimension)
@@ -2874,7 +2876,8 @@ fn delete_stale_vector_points(
         return Ok(0);
     }
 
-    let vector = SqliteVectorStore::new(store_config).map_err(|error| error.to_string())?;
+    let vector = SqliteVectorStore::new_for_semantic_layer(store_config, SemanticLayer::Fast)
+        .map_err(|error| error.to_string())?;
     let vector_table = vector_table_name(root.id(), embedding_model);
     if !vector
         .table_exists(&vector_table)
