@@ -6,169 +6,45 @@ MVP contracts.
 
 ## Goals
 
-- Make graph-derived evidence explicit and repeatable instead of hidden in chat
-  retrieval.
-- Reuse the same local index across CLIs, TUIs, MCP tools, and multiple coding
-  agents.
+- Improve precision for active non-Rust targets without weakening conservative
+  evidence contracts.
+- Add new agent workflows only after their local-only, metadata-first contracts
+  are explicit.
 - Preserve local-first privacy guarantees while adding richer debugging and
   provenance workflows.
 
 ## Feature Set
 
-### Unified Context Packs
+### Impact Analysis Follow-Ups
 
-Unified context packs should combine structural and semantic evidence for an
-editing target in one compact response.
-
-Requirements:
-
-- Start from the existing symbol-focused context pack.
-- Add a `unified` mode that also runs semantic search for the target.
-- Merge and deduplicate evidence from focus symbols, callers, callees, involved
-  files, and semantic matches.
-- Label each row's evidence source as structural, semantic, or both.
-- Preserve source-text omission, freshness, trust, reason tags, provenance, and
-  deterministic ordering.
-
-### Call Path Tracing
-
-Call path tracing should find explicit paths through the call graph between a
-source symbol and a target symbol.
+Future impact work should deepen precision without replacing the current
+metadata-only report.
 
 Requirements:
 
-- Traverse persisted call edges rather than relying on ad hoc chat retrieval.
-- Return bounded paths with path length, edge resolution status, confidence, and
-  file/line evidence.
-- Preserve unresolved or ambiguous edges as labeled graph facts.
-- Support CLI, TUI, and MCP surfaces after the core traversal API is stable.
-
-### Impact Analysis
-
-Impact analysis has grown from direct callers/callees into a repeatable change
-impact report with bounded transitive paths, related files, and persisted
-conservative test-target evidence. Future work is focused on richer same-file
-symbol grouping, broader non-Rust call resolution, and deeper explanation
-metadata.
-
-Requirements:
-
-- Keep direct callers, direct callees, bounded transitive call paths, related
-  files, and likely tests when test mapping exists.
+- Add richer same-file symbol grouping where indexed relationships support it.
+- Improve broader C#, JavaScript, and TypeScript call resolution without turning
+  weak hints into certain edges.
+- Add deeper explanation metadata and ranking for why impact rows are returned.
+- Extend likely-test evidence for C#, JavaScript, and TypeScript as non-Rust
+  call resolution and runtime parsing become more precise.
 - Keep the output deterministic for the same index version and query.
-- Explain evidence with paths, line ranges, relationship type, confidence, and
-  staleness status.
-- Avoid claiming affected tests beyond indexed test evidence and documented
-  mapping limits.
-- Extend likely-test evidence further for C#, JavaScript, and TypeScript as
-  non-Rust call resolution and runtime parsing become more precise.
 
-### Pre-Edit Change Explanation
+### Runtime-To-Source Mapping Follow-Ups
 
-Pre-edit change explanation is implemented as the read-only
-`symdex_explain_change` MCP tool and `explain-change` CLI command. It gives
-agents a deterministic safety briefing before they modify files.
+Future runtime work should expand parser precision for non-Rust stacks.
 
 Requirements:
 
-- Accept proposed change targets as path plus line range plus short
-  description.
-- Enforce repository root boundaries for every path.
-- Map line ranges to indexed symbols and related files.
-- Reuse impact analysis, call path traversal, likely-test mapping, freshness,
-  trust, and provenance.
-- Return compact evidence without source text.
-- Remain read-only unless a future design explicitly adds write behavior.
-
-### Debug Context Packs
-
-Debug context packs should package reusable evidence for debugging tasks.
-
-Requirements:
-
-- Accept a failure signal such as a stack trace, failing test name, panic
-  location, symbol, or file path.
-- Include matched frames, related symbols, call paths, likely tests, relevant
-  context-pack sections, and index provenance.
-- Be reusable across agents and sessions as a structured artifact rather than a
-  one-off chat summary.
-- Exclude source text by default unless a future source-preview design explicitly
-  allows it.
-
-### Index Provenance
-
-Index provenance should make it clear exactly what evidence was indexed and
-when.
-
-Requirements:
-
-- Track index run ID, timestamp, repository ID, normalized root, file path,
-  content hash, parser version, embedding model, vector dimension, and status.
-- Expose provenance for files, chunks, symbols, calls, vectors, context packs,
-  and future debug packs.
-- Allow TUI and MCP outputs to cite the index run or freshness state behind
-  returned evidence.
-- Support audits without logging or returning source text.
-
-### Local And Private Indexing
-
-Local/private indexing should remain a hard product boundary as richer features
-are added.
-
-Requirements:
-
-- Keep user control over embedding model, vector database, SQLite storage, and
-  repository roots.
-- Do not add hosted indexing, cloud embeddings, telemetry, or remote metadata
-  sync without a future explicit design doc.
-- Make local service choices visible in diagnostics and provenance.
-- Keep offline structural workflows usable without sqlite-vec or Ollama.
-
-### Cross-Agent Reuse
-
-Cross-agent reuse should let many local agents consume the same index safely.
-
-Requirements:
-
-- Keep evidence contracts stable and versioned across CLI, TUI, and MCP.
-- Prefer read-only agent access until write-capable tools have a design doc.
-- Include compact response shapes suitable for agent context windows.
-- Guard repository boundaries and fail closed for ambiguous roots or stale
-  indexes.
-
-### Runtime-To-Source Mapping
-
-Runtime-to-source mapping should connect runtime failures to indexed source
-evidence.
-
-Requirements:
-
-- Parse stack traces, panic locations, failing test names, and runtime frame
-  symbols into normalized source references.
-- Join those references to indexed files, symbols, call graph edges, and likely
-  tests.
-- Produce focused debugging evidence through CLI, TUI, MCP, and debug context
-  packs.
-- Cache short-lived metadata-only runtime observations for repeated-failure
-  comparison, keyed by input hash and normalized match metadata, without storing
-  raw logs or source text.
-- Preserve unmapped frames with explicit status instead of dropping them.
-- Expand beyond Rust with conservative C# and Node/V8 stack frame parsing before
-  adding lower-priority runtimes.
-
-### Staleness Detection
-
-Staleness detection should warn when evidence may no longer match the working
-tree.
-
-Requirements:
-
-- Compare indexed content hashes and timestamps against current eligible files.
-- Label evidence as fresh, stale, missing, deleted, or unknown where relevant.
-- Surface staleness in CLI outputs, TUI status panels, MCP responses, context
-  packs, debug packs, and the direct read-only MCP staleness check.
-- Avoid automatic destructive cleanup; stale evidence warnings should guide
-  reindexing or continuous indexing.
+- Parse C# frames shaped like `at Namespace.Type.Method(...) in path.cs:line N`.
+- Parse Node/V8 frames shaped like `at name (path.js:line:column)` and common
+  async TypeScript/JavaScript variants.
+- Preserve unmapped C# and Node/V8 frames with explicit status instead of
+  dropping them.
+- Join parsed C# and Node/V8 frames through the existing file, symbol, call,
+  likely-test, freshness, trust, and provenance pipeline.
+- Add parser tests for mapped frames, unmapped frames, relative paths, absolute
+  paths inside the repo, and malformed lines.
 
 ### Scoped Reindex Requests
 
@@ -178,8 +54,8 @@ must have a design doc before implementation.
 Requirements:
 
 - Scope every request to one configured repository root.
-- Allow optional path-scoped reindexing; CLI and TUI already expose explicit
-  full and incremental manual index scopes.
+- Align optional path-scoped reindexing with the existing explicit full and
+  incremental manual index scopes.
 - Default to offline structural reindexing.
 - Require explicit `semantic: true` before using Ollama or sqlite-vec.
 - Do not execute indexed repository code.
@@ -187,15 +63,17 @@ Requirements:
 - Define caller trust, confirmation, concurrency, and failure semantics before
   code is written.
 
-### Semantic Neighborhoods
+### Targeted Semantic Neighborhoods
 
-Semantic neighborhoods should expose "code similar to this indexed chunk or
-symbol" as reusable metadata-only evidence.
+Targeted semantic neighborhoods should add an evidence workflow for code similar
+to one indexed chunk or symbol.
 
 Requirements:
 
 - Start from an existing indexed chunk or symbol, not from arbitrary source text.
 - Query local sqlite-vec for nearest vector neighbors.
+- Expose the workflow through a read-only MCP tool after the query contract is
+  stable.
 - Return path, line range, symbol, chunk kind, score, freshness, trust, reason
   tags, and provenance.
 - Do not return vectors or source text.
