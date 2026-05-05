@@ -69,9 +69,9 @@ impl WriterJob {
             Self::AttachWatcherClient { .. }
             | Self::HeartbeatWatcherClient { .. }
             | Self::DetachWatcherClient { .. } => Some(DatabaseRole::Watch),
+            Self::IndexQuality { .. } => Some(DatabaseRole::QualitySemantic),
             Self::Init
             | Self::Index { .. }
-            | Self::IndexQuality { .. }
             | Self::VectorRepair { .. }
             | Self::StartWatcher { .. }
             | Self::StopWatcher { .. } => Some(DatabaseRole::Structural),
@@ -789,6 +789,13 @@ mod tests {
             })
             .database_role(),
             Some(DatabaseRole::Watch)
+        );
+        assert_eq!(
+            (WriterJob::IndexQuality {
+                repo: ".".to_owned(),
+            })
+            .database_role(),
+            Some(DatabaseRole::QualitySemantic)
         );
         assert_eq!(DatabaseRole::parse("watch"), Some(DatabaseRole::Watch));
         assert_eq!(DatabaseRole::parse("unknown"), None);

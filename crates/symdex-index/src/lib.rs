@@ -393,8 +393,9 @@ fn run_quality_index_limited_with_progress(
     let store_config = StoreConfig::from_env();
     let _writer_lease = if acquire_writer {
         Some(
-            WriterLease::acquire(
+            WriterLease::acquire_for_role(
                 &store_config,
+                DatabaseRole::QualitySemantic,
                 WriterLeaseRequest::new(WriterLeaseKind::QualityIndex, "index-quality")
                     .for_repo(root.id(), root.path().display().to_string()),
             )
@@ -403,15 +404,7 @@ fn run_quality_index_limited_with_progress(
     } else {
         None
     };
-    let mut sqlite = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    sqlite.migrate().map_err(|error| error.to_string())?;
-    let repository = RepositoryRecord {
-        id: root.id().to_owned(),
-        root_path: root.path().display().to_string(),
-    };
-    sqlite
-        .upsert_repository(&repository)
-        .map_err(|error| error.to_string())?;
+    let sqlite = SqliteStore::open_read_only(&store_config).map_err(|error| error.to_string())?;
     let generation = sqlite
         .latest_semantic_generation(root.id())
         .map_err(|error| error.to_string())?
@@ -433,7 +426,6 @@ fn run_quality_index_limited_with_progress(
         .map_err(|error| error.to_string())?
     {
         let now = current_timestamp();
-        let _ = sqlite.mark_quality_generation_blocked(&generation, &quality_model, &now);
         let _ = mirror_quality_generation_blocked(&store_config, &generation, &quality_model, &now);
         return Err(format!(
             "quality embedding model `{quality_model}` is not available"
@@ -446,13 +438,30 @@ fn run_quality_index_limited_with_progress(
     let mut quality_dimension = generation.quality_dimension;
     let batch_size = layered_embed_config.quality_batch_size.max(1);
     let requeued_at = current_timestamp();
-    let requeued_stale_jobs = sqlite
-        .requeue_current_terminal_quality_embedding_jobs(root.id(), &generation.id, &requeued_at)
-        .map_err(|error| error.to_string())?;
     let fast_embeddings = sqlite
         .chunk_embeddings_for_generation(root.id(), &generation.id, SemanticLayer::Fast.as_str())
         .map_err(|error| error.to_string())?;
-    let queued_jobs = sqlite
+    let mut quality_store =
+        SqliteStore::open_for_role(&store_config, DatabaseRole::QualitySemantic)
+            .map_err(|error| error.to_string())?;
+    quality_store.migrate().map_err(|error| error.to_string())?;
+    ensure_quality_role_fast_manifest(
+        &mut quality_store,
+        &generation,
+        &fast_embeddings,
+        &requeued_at,
+    )?;
+    if let Some(role_generation) = quality_store
+        .latest_semantic_generation(root.id())
+        .map_err(|error| error.to_string())?
+        .filter(|record| record.id == generation.id)
+    {
+        quality_dimension = role_generation.quality_dimension;
+    }
+    let requeued_stale_jobs = quality_store
+        .requeue_current_terminal_quality_embedding_jobs(root.id(), &generation.id, &requeued_at)
+        .map_err(|error| error.to_string())?;
+    let candidate_jobs = sqlite
         .quality_embedding_jobs_for_fast_generation(
             root.id(),
             &generation.id,
@@ -460,19 +469,14 @@ fn run_quality_index_limited_with_progress(
             &requeued_at,
         )
         .map_err(|error| error.to_string())?;
+    let queued_jobs = quality_store
+        .missing_quality_embedding_jobs_from_candidates(&candidate_jobs, &quality_model)
+        .map_err(|error| error.to_string())?;
     let queued_missing_jobs = queued_jobs.len();
     if queued_missing_jobs > 0 {
-        sqlite
+        quality_store
             .queue_quality_embedding_jobs(&generation, &quality_model, &queued_jobs, &requeued_at)
             .map_err(|error| error.to_string())?;
-        mirror_quality_embedding_jobs(
-            &store_config,
-            &generation,
-            &fast_embeddings,
-            &quality_model,
-            &queued_jobs,
-            &requeued_at,
-        )?;
     }
     if requeued_stale_jobs > 0 {
         on_progress(IndexProgress::new(
@@ -501,7 +505,7 @@ fn run_quality_index_limited_with_progress(
             .unwrap_or(batch_size)
             .max(1);
         let claimed_at = current_timestamp();
-        let claimed = sqlite
+        let claimed = quality_store
             .claim_quality_embedding_jobs(root.id(), &generation.id, claim_limit, &claimed_at)
             .map_err(|error| error.to_string())?;
         if claimed.is_empty() {
@@ -525,7 +529,7 @@ fn run_quality_index_limited_with_progress(
         for job in claimed {
             let Some(row) = source_rows.remove(&job.id) else {
                 let completed_at = current_timestamp();
-                sqlite
+                quality_store
                     .complete_quality_embedding_job(
                         &job.id,
                         QualityJobCompletion::SkippedStale,
@@ -545,7 +549,8 @@ fn run_quality_index_limited_with_progress(
                     quality_max_chunk_bytes,
                     vector_table: &vector_table,
                 },
-                &mut sqlite,
+                &sqlite,
+                &mut quality_store,
                 &mut quality_dimension,
                 &mut stats,
                 row,
@@ -554,7 +559,7 @@ fn run_quality_index_limited_with_progress(
     }
 
     let refreshed_at = current_timestamp();
-    let activation = sqlite
+    let activation = quality_store
         .refresh_quality_activation(root.id(), &generation.id, quality_dimension, &refreshed_at)
         .map_err(|error| error.to_string())?;
 
@@ -2555,13 +2560,35 @@ fn mirror_quality_embedding_jobs(
     let mut quality_store = SqliteStore::open_for_role(store_config, DatabaseRole::QualitySemantic)
         .map_err(|error| error.to_string())?;
     quality_store.migrate().map_err(|error| error.to_string())?;
-    quality_store
-        .record_semantic_generation_manifest(generation, fast_embeddings, None, queued_at)
-        .map_err(|error| error.to_string())?;
+    ensure_quality_role_fast_manifest(&mut quality_store, generation, fast_embeddings, queued_at)?;
     quality_store
         .queue_quality_embedding_jobs(generation, quality_model, jobs, queued_at)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+fn ensure_quality_role_fast_manifest(
+    quality_store: &mut SqliteStore,
+    generation: &symdex_store::SemanticGenerationRecord,
+    fast_embeddings: &[ChunkEmbeddingRecord],
+    recorded_at: &str,
+) -> Result<(), String> {
+    match quality_store
+        .latest_semantic_generation(&generation.repository_id)
+        .map_err(|error| error.to_string())?
+    {
+        Some(existing) if existing.id == generation.id => {
+            for embedding in fast_embeddings {
+                quality_store
+                    .upsert_chunk_embedding(embedding)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        _ => quality_store
+            .record_semantic_generation_manifest(generation, fast_embeddings, None, recorded_at)
+            .map_err(|error| error.to_string()),
+    }
 }
 
 fn mirror_quality_semantic_generation_manifest(
@@ -2626,7 +2653,8 @@ struct QualityWorkerContext<'a> {
 
 fn process_quality_job(
     context: &QualityWorkerContext<'_>,
-    sqlite: &mut SqliteStore,
+    source_sqlite: &SqliteStore,
+    quality_sqlite: &mut SqliteStore,
     quality_dimension: &mut Option<usize>,
     stats: &mut QualityWorkerStats,
     row: QualityJobSourceRow,
@@ -2640,7 +2668,7 @@ fn process_quality_job(
     ) {
         Ok(QualityJobPreparation::Ready(prepared)) => *prepared,
         Ok(QualityJobPreparation::Stale) => {
-            sqlite
+            quality_sqlite
                 .complete_quality_embedding_job(
                     &row.job.id,
                     QualityJobCompletion::SkippedStale,
@@ -2651,7 +2679,7 @@ fn process_quality_job(
             return Ok(());
         }
         Ok(QualityJobPreparation::Excluded { reason }) => {
-            sqlite
+            quality_sqlite
                 .complete_quality_embedding_job(
                     &row.job.id,
                     QualityJobCompletion::SkippedExcluded { reason },
@@ -2662,7 +2690,7 @@ fn process_quality_job(
             return Ok(());
         }
         Err(error) => {
-            sqlite
+            quality_sqlite
                 .complete_quality_embedding_job(
                     &row.job.id,
                     QualityJobCompletion::Failed {
@@ -2679,7 +2707,7 @@ fn process_quality_job(
     let embeddings = match context.embed_client.embed_batch(&prepared.text_segments) {
         Ok(embeddings) => embeddings,
         Err(error) => {
-            sqlite
+            quality_sqlite
                 .complete_quality_embedding_job(
                     &prepared.row.job.id,
                     QualityJobCompletion::Failed {
@@ -2695,7 +2723,7 @@ fn process_quality_job(
     let dimension = embeddings.dimension().unwrap_or(0);
     if dimension == 0 {
         complete_failed_quality_job(
-            sqlite,
+            quality_sqlite,
             &prepared.row.job.id,
             "quality embedding returned an empty vector",
             &completed_at,
@@ -2707,7 +2735,7 @@ fn process_quality_job(
         && previous_dimension != dimension
     {
         complete_failed_quality_job(
-            sqlite,
+            quality_sqlite,
             &prepared.row.job.id,
             &format!(
                 "quality embedding dimension changed: previous={previous_dimension} current={dimension}"
@@ -2717,11 +2745,13 @@ fn process_quality_job(
         )?;
         return Ok(());
     }
-    if let Err(error) =
-        sqlite.ensure_embedding_compatible(context.root.id(), context.quality_model, dimension)
-    {
+    if let Err(error) = source_sqlite.ensure_embedding_compatible(
+        context.root.id(),
+        context.quality_model,
+        dimension,
+    ) {
         complete_failed_quality_job(
-            sqlite,
+            quality_sqlite,
             &prepared.row.job.id,
             &error.to_string(),
             &completed_at,
@@ -2731,7 +2761,7 @@ fn process_quality_job(
     }
     if let Err(error) = context.vector.ensure_table(context.vector_table, dimension) {
         complete_failed_quality_job(
-            sqlite,
+            quality_sqlite,
             &prepared.row.job.id,
             &error.to_string(),
             &completed_at,
@@ -2744,7 +2774,7 @@ fn process_quality_job(
         Ok(vector) => vector,
         Err(error) => {
             complete_failed_quality_job(
-                sqlite,
+                quality_sqlite,
                 &prepared.row.job.id,
                 &error,
                 &completed_at,
@@ -2764,7 +2794,7 @@ fn process_quality_job(
         Ok(point) => point,
         Err(error) => {
             complete_failed_quality_job(
-                sqlite,
+                quality_sqlite,
                 &prepared.row.job.id,
                 &error,
                 &completed_at,
@@ -2778,7 +2808,7 @@ fn process_quality_job(
         .upsert_points(context.vector_table, std::slice::from_ref(&point))
     {
         complete_failed_quality_job(
-            sqlite,
+            quality_sqlite,
             &prepared.row.job.id,
             &error.to_string(),
             &completed_at,
@@ -2796,7 +2826,7 @@ fn process_quality_job(
         &point.id,
         &completed_at,
     );
-    sqlite
+    quality_sqlite
         .complete_quality_embedding_job(
             &prepared.row.job.id,
             QualityJobCompletion::Succeeded {
@@ -2811,13 +2841,13 @@ fn process_quality_job(
 }
 
 fn complete_failed_quality_job(
-    sqlite: &mut SqliteStore,
+    quality_sqlite: &mut SqliteStore,
     job_id: &str,
     error: &str,
     completed_at: &str,
     stats: &mut QualityWorkerStats,
 ) -> Result<(), String> {
-    sqlite
+    quality_sqlite
         .complete_quality_embedding_job(
             job_id,
             QualityJobCompletion::Failed {

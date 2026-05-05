@@ -660,13 +660,14 @@ without requiring cross-database foreign keys or source text.
 `semantic_generations.quality_dimension` remains null until the quality worker
 records actual quality embeddings.
 
-The manual quality worker claims oldest `pending` jobs in bounded batches,
-marks them `running`, increments `attempts`, and then revalidates current file
-and chunk metadata before embedding. Source revalidation accepts claimed job
-records and reads structural file/chunk/symbol metadata separately, so quality
-queue state can move to the `quality_semantic` role without copying source facts
-or adding cross-database foreign keys. Successful jobs transactionally write a
-quality-layer `chunk_embeddings` row and move to `succeeded`. Service or vector
+The manual quality worker claims oldest `pending` jobs from the
+`quality_semantic` role in bounded batches, marks them `running`, increments
+`attempts`, and then revalidates current file and chunk metadata before
+embedding. Source revalidation accepts claimed job records and reads structural
+file/chunk/symbol metadata separately, so quality queue state stays in the
+`quality_semantic` role without copying source facts or adding cross-database
+foreign keys. Successful jobs transactionally write a quality-layer
+`chunk_embeddings` row and move to `succeeded` in `quality_semantic`. Service or vector
 write failures move to `failed` with a compact metadata-only error summary.
 Stale jobs move to `skipped_stale` and are not embedded. Chunks that are current
 but not eligible for the quality layer, such as chunks over the quality model's
@@ -717,10 +718,10 @@ for `semantic_generations`, `chunk_embeddings`, `quality_embedding_jobs`, and
 keys. New fast indexing mirrors completed fast `semantic_generations`,
 `semantic_generation_refs`, and fast `chunk_embeddings` into the `fast_semantic`
 role after structural finalization. Structural SQLite still stores the
-authoritative semantic manifests, quality job read path, and active-ref file
-manifests until query and quality-worker callers are routed to the semantic
-roles; the `quality_semantic` role receives mirrored queued and blocked quality
-metadata for fresh databases. Query-time ref
+authoritative semantic read path and active-ref file manifests until query
+callers are routed to the semantic roles. The manual quality worker claims,
+completes, and refreshes quality progress in `quality_semantic` while reading
+structural source facts read-only. Query-time ref
 filtering reads active `ref_files` file IDs from structural SQLite and applies
 those IDs to sqlite-vec payload metadata instead of requiring `ref_files` to live
 in the vector database.

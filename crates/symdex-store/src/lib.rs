@@ -3178,6 +3178,66 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn missing_quality_embedding_jobs_from_candidates(
+        &self,
+        candidates: &[QualityEmbeddingJobRecord],
+        quality_model: &str,
+    ) -> Result<Vec<QualityEmbeddingJobRecord>> {
+        let mut missing = Vec::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT 1
+                 WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM chunk_embeddings AS quality
+                   WHERE quality.repository_id = ?1
+                     AND quality.generation_id = ?2
+                     AND quality.chunk_id = ?3
+                     AND quality.semantic_layer = 'quality'
+                     AND quality.embedding_model = ?7
+                     AND quality.content_hash = ?5
+                     AND quality.text_hash = ?6
+                     AND quality.status = 'current'
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM quality_embedding_jobs AS existing
+                   WHERE existing.repository_id = ?1
+                     AND existing.generation_id = ?2
+                     AND existing.file_id = ?4
+                     AND existing.chunk_id = ?3
+                     AND existing.content_hash = ?5
+                     AND existing.text_hash = ?6
+                 )",
+            )
+            .map_err(StoreError::Sqlite)?;
+
+        for candidate in candidates {
+            let should_queue = statement
+                .query_row(
+                    params![
+                        candidate.repository_id,
+                        candidate.generation_id,
+                        candidate.chunk_id,
+                        candidate.file_id,
+                        candidate.content_hash,
+                        candidate.text_hash,
+                        quality_model,
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?
+                .is_some();
+            if should_queue {
+                missing.push(candidate.clone());
+            }
+        }
+
+        Ok(missing)
+    }
+
     pub fn mark_quality_generation_blocked(
         &mut self,
         generation: &SemanticGenerationRecord,
@@ -12867,6 +12927,66 @@ mod tests {
             .expect("quality progress should read");
         assert_eq!(progress.pending_jobs, 1);
         assert_eq!(progress.quality_eligible_chunks, 1);
+    }
+
+    #[test]
+    fn sqlite_quality_semantic_role_filters_existing_quality_candidates() {
+        let db = TestDb::new("quality-semantic-role-candidate-filter");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality semantic store should open");
+        store
+            .migrate()
+            .expect("quality semantic schema should migrate");
+
+        let generation = sample_semantic_generation();
+        let job = sample_quality_embedding_job();
+        assert_eq!(
+            store
+                .missing_quality_embedding_jobs_from_candidates(
+                    std::slice::from_ref(&job),
+                    "mxbai-embed-large",
+                )
+                .expect("missing candidates should read"),
+            vec![job.clone()]
+        );
+
+        store
+            .queue_quality_embedding_jobs(
+                &generation,
+                "mxbai-embed-large",
+                std::slice::from_ref(&job),
+                "103",
+            )
+            .expect("quality queue metadata should persist");
+        assert!(
+            store
+                .missing_quality_embedding_jobs_from_candidates(
+                    std::slice::from_ref(&job),
+                    "mxbai-embed-large",
+                )
+                .expect("missing candidates should read")
+                .is_empty()
+        );
+
+        let embedded_job = sample_quality_embedding_job_for("generation-1", "chunk-2", "pending");
+        let quality_embedding = ChunkEmbeddingRecord {
+            chunk_id: "chunk-2".to_owned(),
+            text_hash: "text-chunk-2".to_owned(),
+            ..sample_quality_chunk_embedding("current")
+        };
+        store
+            .upsert_chunk_embedding(&quality_embedding)
+            .expect("quality embedding should persist");
+        assert!(
+            store
+                .missing_quality_embedding_jobs_from_candidates(
+                    std::slice::from_ref(&embedded_job),
+                    "mxbai-embed-large",
+                )
+                .expect("missing candidates should read")
+                .is_empty()
+        );
     }
 
     #[test]

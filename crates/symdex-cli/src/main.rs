@@ -318,12 +318,10 @@ fn execute_writer_job_with_progress(
             Err(error) => WriterJobResponse::error(error),
         },
         WriterJob::IndexQuality { repo } => {
-            match with_writer_gate(|| {
-                run_quality_index_with_existing_writer_and_progress(
-                    &QualityIndexOptions { repo },
-                    |progress| on_progress(writer_progress(progress)),
-                )
-            }) {
+            match run_quality_index_with_existing_writer_and_progress(
+                &QualityIndexOptions { repo },
+                |progress| on_progress(writer_progress(progress)),
+            ) {
                 Ok(summary) => WriterJobResponse::ok_with_data(
                     "quality index completed",
                     json!({
