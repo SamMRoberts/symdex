@@ -179,6 +179,13 @@ impl WriterJobResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WriterStreamMessage {
+    Progress { progress: WriterProgress },
+    Result { response: WriterJobResponse },
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterClient {
     config: StoreConfig,
@@ -196,6 +203,14 @@ impl WriterClient {
     }
 
     pub fn submit_and_wait(&self, job: &WriterJob) -> Result<WriterJobResponse, String> {
+        self.submit_and_wait_with_progress(job, |_| {})
+    }
+
+    pub fn submit_and_wait_with_progress(
+        &self,
+        job: &WriterJob,
+        mut on_progress: impl FnMut(WriterProgress),
+    ) -> Result<WriterJobResponse, String> {
         let started = Instant::now();
         debug_db_lock_log(
             "writer-client",
@@ -209,9 +224,32 @@ impl WriterClient {
         self.ensure_daemon()?;
         let endpoint = writer_endpoint_for_config(&self.config);
         let request = serde_json::to_string(job).map_err(|error| error.to_string())?;
-        let response = ipc::send_request(&endpoint, &request)?;
-        let response: WriterJobResponse =
-            serde_json::from_str(&response).map_err(|error| error.to_string())?;
+        let mut streamed_progress = Vec::new();
+        let mut final_response = None;
+        ipc::send_request_stream(&endpoint, &request, |line| {
+            match serde_json::from_str::<WriterStreamMessage>(line) {
+                Ok(WriterStreamMessage::Progress { progress }) => {
+                    on_progress(progress.clone());
+                    streamed_progress.push(progress);
+                    Ok(())
+                }
+                Ok(WriterStreamMessage::Result { response }) => {
+                    final_response = Some(response);
+                    Ok(())
+                }
+                Err(_) => {
+                    let response = serde_json::from_str::<WriterJobResponse>(line)
+                        .map_err(|error| error.to_string())?;
+                    final_response = Some(response);
+                    Ok(())
+                }
+            }
+        })?;
+        let mut response =
+            final_response.ok_or_else(|| "writer daemon closed without response".to_owned())?;
+        if response.progress.is_empty() {
+            response.progress = streamed_progress;
+        }
         debug_db_lock_log(
             "writer-client",
             format_args!(
@@ -307,7 +345,9 @@ pub fn writer_endpoint_for_config(config: &StoreConfig) -> String {
     ipc::endpoint_for_id(&id)
 }
 
-pub fn run_daemon(mut handler: impl FnMut(WriterJob) -> WriterJobResponse) -> Result<(), String> {
+pub fn run_daemon(
+    mut handler: impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
+) -> Result<(), String> {
     let config = StoreConfig::from_env();
     let endpoint = writer_endpoint_for_config(&config);
     debug_db_lock_log(
@@ -394,7 +434,7 @@ pub fn run_daemon(mut handler: impl FnMut(WriterJob) -> WriterJobResponse) -> Re
 fn handle_stream(
     job_id: usize,
     mut stream: impl Read + Write,
-    handler: &mut impl FnMut(WriterJob) -> WriterJobResponse,
+    handler: &mut impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
 ) {
     let mut request = String::new();
     {
@@ -408,7 +448,17 @@ fn handle_stream(
                 "writer-daemon",
                 format_args!("job_start job_id={} {}", job_id, job.debug_details()),
             );
-            let response = handler(job);
+            let response = {
+                let mut on_progress = |progress: WriterProgress| {
+                    let message = WriterStreamMessage::Progress { progress };
+                    if let Ok(encoded) = serde_json::to_string(&message) {
+                        let _ = stream.write_all(encoded.as_bytes());
+                        let _ = stream.write_all(b"\n");
+                        let _ = stream.flush();
+                    }
+                };
+                handler(job, &mut on_progress)
+            };
             debug_db_lock_log(
                 "writer-daemon",
                 format_args!(
@@ -429,9 +479,12 @@ fn handle_stream(
             WriterJobResponse::error(format!("invalid writer job: {error}"))
         }
     };
-    let encoded = serde_json::to_string(&response).unwrap_or_else(|error| {
-        format!(r#"{{"ok":false,"message":"{error}","progress":[],"data":null}}"#)
-    });
+    let encoded = serde_json::to_string(&WriterStreamMessage::Result { response })
+        .unwrap_or_else(|error| {
+            format!(
+                r#"{{"kind":"result","response":{{"ok":false,"message":"{error}","progress":[],"data":null}}}}"#
+            )
+        });
     let _ = stream.write_all(encoded.as_bytes());
     let _ = stream.write_all(b"\n");
 }
@@ -491,17 +544,31 @@ mod ipc {
     }
 
     pub fn send_request(endpoint: &str, request: &str) -> Result<String, String> {
+        let mut response = None;
+        send_request_stream(endpoint, request, |line| {
+            response = Some(line.to_owned());
+            Ok(())
+        })?;
+        response.ok_or_else(|| "writer daemon closed without response".to_owned())
+    }
+
+    pub fn send_request_stream(
+        endpoint: &str,
+        request: &str,
+        mut on_line: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut stream = UnixStream::connect(endpoint).map_err(|error| error.to_string())?;
         stream
             .write_all(request.as_bytes())
             .map_err(|error| error.to_string())?;
         stream.write_all(b"\n").map_err(|error| error.to_string())?;
         let _ = stream.shutdown(std::net::Shutdown::Write);
-        let mut response = String::new();
-        BufReader::new(stream)
-            .read_line(&mut response)
-            .map_err(|error| error.to_string())?;
-        Ok(response)
+        let reader = BufReader::new(stream);
+        for line in reader.lines() {
+            let line = line.map_err(|error| error.to_string())?;
+            on_line(&line)?;
+        }
+        Ok(())
     }
 }
 
@@ -552,6 +619,19 @@ mod ipc {
     }
 
     pub fn send_request(endpoint: &str, request: &str) -> Result<String, String> {
+        let mut response = None;
+        send_request_stream(endpoint, request, |line| {
+            response = Some(line.to_owned());
+            Ok(())
+        })?;
+        response.ok_or_else(|| "writer daemon closed without response".to_owned())
+    }
+
+    pub fn send_request_stream(
+        endpoint: &str,
+        request: &str,
+        mut on_line: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut stream = LocalSocketStream::connect(
             endpoint
                 .to_ns_name::<GenericNamespaced>()
@@ -563,11 +643,12 @@ mod ipc {
             .map_err(|error| error.to_string())?;
         stream.write_all(b"\n").map_err(|error| error.to_string())?;
         stream.flush().map_err(|error| error.to_string())?;
-        let mut response = String::new();
-        BufReader::new(stream)
-            .read_line(&mut response)
-            .map_err(|error| error.to_string())?;
-        Ok(response)
+        let reader = BufReader::new(stream);
+        for line in reader.lines() {
+            let line = line.map_err(|error| error.to_string())?;
+            on_line(&line)?;
+        }
+        Ok(())
     }
 }
 

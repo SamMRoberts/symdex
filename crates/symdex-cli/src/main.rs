@@ -10,9 +10,10 @@ use symdex_diagnostics::{
     DiagnosticCheck, DiagnosticReport, DiagnosticState, run_diagnostics_for_repo,
 };
 use symdex_index::{
-    ContinuousIndexEvent, EmbeddingSummary, IndexOptions, IndexScope, IndexSummary,
+    ContinuousIndexEvent, EmbeddingSummary, IndexOptions, IndexProgress, IndexScope, IndexSummary,
     QualityIndexOptions, QualityIndexSummary, RustAnalyzerEnrichmentSummary, WatchChangeSet,
-    run_index_with_existing_writer, run_quality_index_with_existing_writer,
+    run_index_with_existing_writer, run_index_with_existing_writer_and_progress,
+    run_quality_index_with_existing_writer, run_quality_index_with_existing_writer_and_progress,
 };
 use symdex_query::{
     CallDirection, CallGraphSummary, CallPathSummary, ContextPackMode, FreshnessSummary,
@@ -27,7 +28,7 @@ use symdex_store::{
     WatcherClientRecord, WatcherStatusRecord, current_timestamp, debug_db_lock_log, sqlite_parent,
 };
 use symdex_watch::{WatcherClientKind, WatcherStatus};
-use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse};
+use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse, WriterProgress};
 
 static WRITER_WRITE_GATE: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
@@ -68,11 +69,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "watch-daemon" => {
             require_text_output(command, output)?;
-            symdex_writer::run_daemon(execute_writer_job)
+            symdex_writer::run_daemon(|job, on_progress| {
+                execute_writer_job_with_progress(job, on_progress)
+            })
         }
         "writer-daemon" => {
             require_text_output(command, output)?;
-            symdex_writer::run_daemon(execute_writer_job)
+            symdex_writer::run_daemon(|job, on_progress| {
+                execute_writer_job_with_progress(job, on_progress)
+            })
         }
         "index-quality" => {
             require_text_output(command, output)?;
@@ -244,7 +249,10 @@ fn require_text_output(command: &str, output: OutputMode) -> Result<(), String> 
     Ok(())
 }
 
-fn execute_writer_job(job: WriterJob) -> WriterJobResponse {
+fn execute_writer_job_with_progress(
+    job: WriterJob,
+    mut on_progress: impl FnMut(WriterProgress),
+) -> WriterJobResponse {
     let operation = job.operation();
     let details = job.debug_details();
     let started = Instant::now();
@@ -263,11 +271,14 @@ fn execute_writer_job(job: WriterJob) -> WriterJobResponse {
             offline,
             scope,
         } => match with_writer_gate(|| {
-            run_index_with_existing_writer(&IndexOptions {
-                repo,
-                offline,
-                scope: index_scope(scope),
-            })
+            run_index_with_existing_writer_and_progress(
+                &IndexOptions {
+                    repo,
+                    offline,
+                    scope: index_scope(scope),
+                },
+                |progress| on_progress(writer_progress(progress)),
+            )
         }) {
             Ok(summary) => WriterJobResponse::ok_with_data(
                 "index completed",
@@ -290,7 +301,10 @@ fn execute_writer_job(job: WriterJob) -> WriterJobResponse {
         },
         WriterJob::IndexQuality { repo } => {
             match with_writer_gate(|| {
-                run_quality_index_with_existing_writer(&QualityIndexOptions { repo })
+                run_quality_index_with_existing_writer_and_progress(
+                    &QualityIndexOptions { repo },
+                    |progress| on_progress(writer_progress(progress)),
+                )
             }) {
                 Ok(summary) => WriterJobResponse::ok_with_data(
                     "quality index completed",
@@ -390,6 +404,15 @@ fn execute_writer_job(job: WriterJob) -> WriterJobResponse {
         ),
     );
     response
+}
+
+fn writer_progress(progress: IndexProgress) -> WriterProgress {
+    WriterProgress {
+        phase: progress.phase.to_owned(),
+        completed: progress.completed,
+        total: progress.total,
+        message: progress.message,
+    }
 }
 
 fn writer_start_watcher(

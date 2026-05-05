@@ -49,7 +49,7 @@ use symdex_store::{
     VectorStorageProjection, vector_table_name,
 };
 use symdex_watch::{WatcherAttachment, WatcherClientKind, WatcherStatus};
-use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse};
+use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse, WriterProgress};
 pub use terminal::help_text;
 use terminal::{enter_terminal, leave_terminal};
 
@@ -1126,11 +1126,17 @@ impl App {
                 total: 1,
                 message: "Submitting index job to writer service".to_owned(),
             }));
+            let job = WriterJob::Index {
+                repo,
+                offline: matches!(request.mode, IndexMode::Offline),
+                scope: writer_scope(request.scope),
+            };
+            let progress_sender = sender.clone();
             let result = WriterClient::from_env()
-                .submit_and_wait(&WriterJob::Index {
-                    repo,
-                    offline: matches!(request.mode, IndexMode::Offline),
-                    scope: writer_scope(request.scope),
+                .submit_and_wait_with_progress(&job, move |progress| {
+                    let _ = progress_sender.send(IndexJobMessage::Progress(
+                        index_progress_from_writer(progress),
+                    ));
                 })
                 .and_then(index_summary_from_writer_response)
                 .map(Box::new);
@@ -6101,6 +6107,33 @@ fn writer_scope(scope: IndexScope) -> WriterIndexScope {
     match scope {
         IndexScope::Full => WriterIndexScope::Full,
         IndexScope::Incremental => WriterIndexScope::Incremental,
+    }
+}
+
+fn index_progress_from_writer(progress: WriterProgress) -> IndexProgress {
+    IndexProgress {
+        phase: writer_progress_phase(&progress.phase),
+        completed: progress.completed,
+        total: progress.total,
+        message: progress.message,
+    }
+}
+
+fn writer_progress_phase(phase: &str) -> &'static str {
+    match phase {
+        "open" => "open",
+        "discover" => "discover",
+        "parse" => "parse",
+        "resolve" => "resolve",
+        "rust_analyzer" => "rust_analyzer",
+        "sqlite" => "sqlite",
+        "semantic" => "semantic",
+        "quality_queue" => "quality_queue",
+        "quality_index" => "quality_index",
+        "vector_repair" => "vector_repair",
+        "queue" => "queue",
+        "start" => "start",
+        _ => "writer",
     }
 }
 

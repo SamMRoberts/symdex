@@ -337,12 +337,19 @@ pub fn run_index(options: &IndexOptions) -> Result<IndexSummary, String> {
 }
 
 pub fn run_index_with_existing_writer(options: &IndexOptions) -> Result<IndexSummary, String> {
+    run_index_with_existing_writer_and_progress(options, |_| {})
+}
+
+pub fn run_index_with_existing_writer_and_progress(
+    options: &IndexOptions,
+    mut on_progress: impl FnMut(IndexProgress),
+) -> Result<IndexSummary, String> {
     run_index_internal(
         options,
         options.scope.skips_unchanged(),
         None,
         false,
-        |_| {},
+        &mut on_progress,
     )
 }
 
@@ -353,7 +360,14 @@ pub fn run_quality_index(options: &QualityIndexOptions) -> Result<QualityIndexSu
 pub fn run_quality_index_with_existing_writer(
     options: &QualityIndexOptions,
 ) -> Result<QualityIndexSummary, String> {
-    run_quality_index_limited_with_progress(options, None, false, |_| {})
+    run_quality_index_with_existing_writer_and_progress(options, |_| {})
+}
+
+pub fn run_quality_index_with_existing_writer_and_progress(
+    options: &QualityIndexOptions,
+    on_progress: impl FnMut(IndexProgress),
+) -> Result<QualityIndexSummary, String> {
+    run_quality_index_limited_with_progress(options, None, false, on_progress)
 }
 
 pub fn run_quality_index_with_progress(
