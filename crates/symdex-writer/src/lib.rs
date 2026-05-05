@@ -576,7 +576,7 @@ mod ipc {
 mod ipc {
     use super::*;
     use interprocess::local_socket::{
-        GenericNamespaced, ListenerOptions, Stream as LocalSocketStream,
+        GenericNamespaced, ListenerOptions, Stream as LocalSocketStream, ToNsName as _,
         traits::Stream as LocalSocketStreamTrait,
     };
     use std::io::ErrorKind;
@@ -591,12 +591,12 @@ mod ipc {
     pub fn cleanup_endpoint(_endpoint: &str) {}
 
     pub fn bind_listener(endpoint: &str) -> Result<Listener, String> {
+        let name = endpoint
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|error| error.to_string())?;
+
         ListenerOptions::new()
-            .name(
-                endpoint
-                    .to_ns_name::<GenericNamespaced>()
-                    .map_err(|error| error.to_string())?,
-            )
+            .name(name)
             .create_sync()
             .map_err(|error| error.to_string())
     }
@@ -632,12 +632,11 @@ mod ipc {
         request: &str,
         mut on_line: impl FnMut(&str) -> Result<(), String>,
     ) -> Result<(), String> {
-        let mut stream = LocalSocketStream::connect(
-            endpoint
-                .to_ns_name::<GenericNamespaced>()
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let name = endpoint
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|error| error.to_string())?;
+
+        let mut stream = LocalSocketStream::connect(name).map_err(|error| error.to_string())?;
         stream
             .write_all(request.as_bytes())
             .map_err(|error| error.to_string())?;
