@@ -661,7 +661,10 @@ records actual quality embeddings.
 
 The manual quality worker claims oldest `pending` jobs in bounded batches,
 marks them `running`, increments `attempts`, and then revalidates current file
-and chunk metadata before embedding. Successful jobs transactionally write a
+and chunk metadata before embedding. Source revalidation accepts claimed job
+records and reads structural file/chunk/symbol metadata separately, so quality
+queue state can move to the `quality_semantic` role without copying source facts
+or adding cross-database foreign keys. Successful jobs transactionally write a
 quality-layer `chunk_embeddings` row and move to `succeeded`. Service or vector
 write failures move to `failed` with a compact metadata-only error summary.
 Stale jobs move to `skipped_stale` and are not embedded. Chunks that are current

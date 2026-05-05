@@ -511,9 +511,8 @@ fn run_quality_index_limited_with_progress(
             format!("Claimed {} quality jobs", claimed.len()),
         ));
 
-        let job_ids = claimed.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
         let source_rows = sqlite
-            .quality_job_source_rows(&job_ids)
+            .quality_job_source_rows_for_jobs(&claimed)
             .map_err(|error| error.to_string())?;
         let mut source_rows = source_rows
             .into_iter()

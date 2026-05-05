@@ -3391,6 +3391,63 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    pub fn quality_job_source_rows_for_jobs(
+        &self,
+        jobs: &[QualityEmbeddingJobRecord],
+    ) -> Result<Vec<QualityJobSourceRow>> {
+        let mut rows = Vec::with_capacity(jobs.len());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT files.id, files.content_hash, files.language,
+                        chunks.kind, chunks.text_hash, chunks.start_line, chunks.end_line,
+                        chunks.start_byte, chunks.end_byte, chunks.excluded_reason,
+                        chunks.symbol_id, symbols.name, chunks.index_run_id,
+                        chunks.parser_version
+                 FROM (SELECT 1) AS source
+                 LEFT JOIN files
+                   ON files.id = ?1
+                  AND files.repository_id = ?2
+                  AND files.path = ?3
+                 LEFT JOIN chunks
+                   ON chunks.id = ?4
+                  AND chunks.file_id = files.id
+                 LEFT JOIN symbols
+                   ON symbols.id = chunks.symbol_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+
+        for job in jobs {
+            let row = statement
+                .query_row(
+                    params![job.file_id, job.repository_id, job.path, job.chunk_id],
+                    |row| {
+                        Ok(QualityJobSourceRow {
+                            job: job.clone(),
+                            current_file_id: row.get(0)?,
+                            current_content_hash: row.get(1)?,
+                            language: row.get(2)?,
+                            chunk_kind: row.get(3)?,
+                            current_text_hash: row.get(4)?,
+                            start_line: row.get::<_, Option<i64>>(5)?.map(|line| line as usize),
+                            end_line: row.get::<_, Option<i64>>(6)?.map(|line| line as usize),
+                            start_byte: row.get::<_, Option<i64>>(7)?.map(|byte| byte as usize),
+                            end_byte: row.get::<_, Option<i64>>(8)?.map(|byte| byte as usize),
+                            excluded_reason: row.get(9)?,
+                            symbol_id: row.get(10)?,
+                            symbol_name: row.get(11)?,
+                            index_run_id: row.get(12)?,
+                            parser_version: row.get(13)?,
+                        })
+                    },
+                )
+                .map_err(StoreError::Sqlite)?;
+            rows.push(row);
+        }
+
+        Ok(rows)
+    }
+
     pub fn complete_quality_embedding_job(
         &mut self,
         job_id: &str,
@@ -11178,6 +11235,54 @@ mod tests {
                 .expect("pending jobs should load")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn quality_worker_loads_sources_from_external_job_records() {
+        let db = TestDb::new("quality-worker-external-job-sources");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[sample_symbol("symbol", "hello", "hello")],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("file facts should persist");
+
+        let job = QualityEmbeddingJobRecord {
+            status: "running".to_owned(),
+            attempts: 1,
+            updated_at: "500".to_owned(),
+            ..sample_quality_embedding_job()
+        };
+        let source_rows = store
+            .quality_job_source_rows_for_jobs(std::slice::from_ref(&job))
+            .expect("source row should load from job record");
+
+        assert_eq!(source_rows.len(), 1);
+        assert_eq!(source_rows[0].job, job);
+        assert_eq!(source_rows[0].current_file_id.as_deref(), Some("file"));
+        assert_eq!(
+            source_rows[0].current_text_hash.as_deref(),
+            Some("text-chunk-1")
+        );
+        assert_eq!(source_rows[0].start_byte, Some(0));
+        assert_eq!(source_rows[0].end_byte, Some(32));
+        assert_eq!(source_rows[0].symbol_name.as_deref(), Some("hello"));
+        assert!(
+            store
+                .quality_jobs_by_status("repo", "generation-1", "running")
+                .expect("running jobs should load")
+                .is_empty()
         );
     }
 
