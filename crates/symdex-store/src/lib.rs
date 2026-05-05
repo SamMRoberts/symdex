@@ -2545,6 +2545,52 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn record_semantic_generation_manifest(
+        &mut self,
+        generation: &SemanticGenerationRecord,
+        embeddings: &[ChunkEmbeddingRecord],
+        repository_ref_id: Option<&str>,
+        linked_at: &str,
+    ) -> Result<()> {
+        for embedding in embeddings {
+            if embedding.repository_id != generation.repository_id
+                || embedding.generation_id != generation.id
+            {
+                return Err(StoreError::UnexpectedResponse(
+                    "semantic embedding does not belong to generation".to_owned(),
+                ));
+            }
+        }
+
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        upsert_semantic_generation_in_transaction(&transaction, generation)?;
+        for embedding in embeddings {
+            upsert_chunk_embedding_in_transaction(&transaction, embedding)?;
+        }
+        if let Some(repository_ref_id) = repository_ref_id {
+            transaction
+                .execute(
+                    "INSERT INTO semantic_generation_refs (
+                       repository_ref_id, repository_id, generation_id, linked_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(repository_ref_id) DO UPDATE SET
+                       repository_id = excluded.repository_id,
+                       generation_id = excluded.generation_id,
+                       linked_at = excluded.linked_at",
+                    params![
+                        repository_ref_id,
+                        generation.repository_id,
+                        generation.id,
+                        linked_at
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
     pub fn latest_semantic_generation(
         &self,
         repository_id: &str,
@@ -12688,6 +12734,47 @@ mod tests {
         assert!(!tables.contains(&"files".to_owned()));
         assert!(!tables.contains(&"chunks".to_owned()));
         assert!(!tables.contains(&"quality_embedding_jobs".to_owned()));
+    }
+
+    #[test]
+    fn sqlite_fast_semantic_role_records_generation_manifest() {
+        let db = TestDb::new("fast-semantic-role-generation-manifest");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::FastSemantic)
+            .expect("fast semantic store should open");
+        store
+            .migrate()
+            .expect("fast semantic schema should migrate");
+
+        let generation = sample_semantic_generation();
+        let embedding = sample_chunk_embedding();
+        store
+            .record_semantic_generation_manifest(
+                &generation,
+                std::slice::from_ref(&embedding),
+                Some("ref-main"),
+                "102",
+            )
+            .expect("generation manifest should persist");
+
+        assert_eq!(
+            store
+                .latest_semantic_generation("repo")
+                .expect("latest generation should read"),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            store
+                .latest_semantic_generation_for_ref("repo", "ref-main")
+                .expect("ref generation should read"),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            store
+                .chunk_embeddings_for_generation("repo", "generation-1", "fast")
+                .expect("embeddings should read"),
+            vec![embedding]
+        );
     }
 
     #[test]

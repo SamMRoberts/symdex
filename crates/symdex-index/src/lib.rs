@@ -2274,6 +2274,9 @@ fn finalize_semantic_index(
             completed_at: &recorded_at,
         })
         .map_err(|error| error.to_string())?;
+    let fast_embeddings = sqlite
+        .chunk_embeddings_for_generation(root.id(), &generation.id, SemanticLayer::Fast.as_str())
+        .map_err(|error| error.to_string())?;
     if let Some(repository_ref_id) = context.repository_ref_id {
         sqlite
             .link_semantic_generation_to_ref(
@@ -2284,6 +2287,13 @@ fn finalize_semantic_index(
             )
             .map_err(|error| error.to_string())?;
     }
+    mirror_fast_semantic_generation_manifest(
+        context.store_config,
+        &generation,
+        &fast_embeddings,
+        context.repository_ref_id,
+        &recorded_at,
+    )?;
     queue_quality_jobs_after_fast_indexing(
         sqlite,
         root.id(),
@@ -2311,6 +2321,21 @@ fn finalize_semantic_index(
         vector_table: prepared.vector_table,
         chunks_embedded: prepared.fast_embeddings.len(),
     })
+}
+
+fn mirror_fast_semantic_generation_manifest(
+    store_config: &StoreConfig,
+    generation: &symdex_store::SemanticGenerationRecord,
+    embeddings: &[ChunkEmbeddingRecord],
+    repository_ref_id: Option<&str>,
+    linked_at: &str,
+) -> Result<(), String> {
+    let mut fast_store = SqliteStore::open_for_role(store_config, DatabaseRole::FastSemantic)
+        .map_err(|error| error.to_string())?;
+    fast_store.migrate().map_err(|error| error.to_string())?;
+    fast_store
+        .record_semantic_generation_manifest(generation, embeddings, repository_ref_id, linked_at)
+        .map_err(|error| error.to_string())
 }
 
 fn queue_quality_jobs_after_fast_indexing(

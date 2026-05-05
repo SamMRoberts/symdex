@@ -329,10 +329,12 @@ Before semantic indexing replaces changed-file chunk rows or removes deleted
 files, it reads current fast `chunk_embeddings` point IDs for those paths from
 the latest semantic generation. New fast embeddings are staged and upserted to
 the fast semantic sqlite-vec database before SQLite mutation; after structural
-facts and the new semantic generation are persisted, the previously collected
-stale point IDs are deleted from the fast semantic sqlite-vec database unless
-the new manifest reused the same deterministic point ID. This keeps SQLite as
-the source of truth for vector lifecycle cleanup while avoiding source text in
+facts and the new semantic generation are persisted, the finished fast
+generation and chunk embedding manifest are mirrored into the `fast_semantic`
+role database by stable IDs. The previously collected stale point IDs are then
+deleted from the fast semantic sqlite-vec database unless the new manifest reused
+the same deterministic point ID. This keeps structural SQLite as the current
+source of truth for vector lifecycle cleanup while avoiding source text in
 sqlite-vec payloads or cleanup reports, and it preserves the previous complete
 manifest if local embedding or vector upsert fails before SQLite replacement.
 
@@ -705,9 +707,12 @@ The `fast_semantic` role also initializes staged metadata tables for
 `vector_points`; the `quality_semantic` role initializes staged metadata tables
 for `semantic_generations`, `chunk_embeddings`, `quality_embedding_jobs`, and
 `vector_points`. These role schemas intentionally avoid cross-database foreign
-keys. Structural SQLite still stores the authoritative `chunk_embeddings`
-manifests, semantic generation metadata, and active-ref file manifests until the
-semantic metadata write paths are routed to their semantic roles. Query-time ref
+keys. New fast indexing mirrors completed fast `semantic_generations`,
+`semantic_generation_refs`, and fast `chunk_embeddings` into the `fast_semantic`
+role after structural finalization. Structural SQLite still stores the
+authoritative semantic manifests, quality job metadata, and active-ref file
+manifests until query and quality-worker callers are routed to the semantic
+roles. Query-time ref
 filtering reads active `ref_files` file IDs from structural SQLite and applies
 those IDs to sqlite-vec payload metadata instead of requiring `ref_files` to live
 in the vector database.
