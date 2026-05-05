@@ -1065,20 +1065,7 @@ fn tool_definitions() -> Vec<Value> {
                 ("depth", "integer", "Maximum traversal depth, capped at 8"),
             ],
         ),
-        tool_definition(
-            TOOL_EXPLAIN_CHANGE,
-            "Explain Change",
-            "Return a compact metadata-only pre-edit safety report for proposed line-range changes.",
-            &["repo", "targets"],
-            vec![
-                ("repo", "string", "Repository root path"),
-                (
-                    "targets",
-                    "array",
-                    "Proposed changes with path, start_line, end_line, and description",
-                ),
-            ],
-        ),
+        explain_change_tool_definition(),
         tool_definition(
             TOOL_CONTEXT_PACK,
             "Context Pack",
@@ -1189,6 +1176,56 @@ fn watch_start_tool_definition() -> Value {
         },
         "annotations": {
             "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
+}
+
+fn explain_change_tool_definition() -> Value {
+    json!({
+        "name": TOOL_EXPLAIN_CHANGE,
+        "title": "Explain Change",
+        "description": "Return a compact metadata-only pre-edit safety report for proposed line-range changes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository root path"
+                },
+                "targets": {
+                    "type": "array",
+                    "description": "Proposed changes with path, start_line, end_line, and description",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository-relative path, or absolute path inside the repository root"
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "1-based inclusive start line"
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "1-based inclusive end line"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Short metadata-only description of the proposed change"
+                            }
+                        },
+                        "required": ["path", "start_line", "end_line", "description"]
+                    }
+                }
+            },
+            "required": ["repo", "targets"]
+        },
+        "annotations": {
+            "readOnlyHint": true,
             "destructiveHint": false,
             "idempotentHint": true,
             "openWorldHint": false
@@ -1369,6 +1406,33 @@ mod tests {
         assert_eq!(
             explain_change["inputSchema"]["properties"]["targets"]["type"],
             "array"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["type"],
+            "object"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["required"],
+            json!(["path", "start_line", "end_line", "description"])
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["path"]["type"],
+            "string"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["start_line"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["end_line"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            explain_change["inputSchema"]["properties"]["targets"]["items"]["properties"]["description"]
+                ["type"],
+            "string"
         );
         assert_eq!(
             explain_change["inputSchema"]["required"],
