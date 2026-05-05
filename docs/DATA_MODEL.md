@@ -727,6 +727,13 @@ Query-time ref filtering reads active `ref_files` file IDs from structural SQLit
 and applies those IDs to sqlite-vec payload metadata instead of requiring
 `ref_files` to live in the vector database.
 
+Vector verification reads the selected layer's `chunk_embeddings` manifest from
+that layer's semantic role database when the role database contains the same
+current generation. It then uses structural SQLite only to resolve file paths and
+chunk line ranges for expected payload comparison. If a role database is missing
+or has a different generation, verification falls back to structural metadata for
+legacy and clean-rebuild compatibility.
+
 Payload fields:
 
 - `repository_id`

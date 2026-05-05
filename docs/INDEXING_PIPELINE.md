@@ -464,6 +464,10 @@ quality-role generations. Manual quality catch-up now uses the `quality_semantic
 writer endpoint and uses structural SQLite only for read-only source validation
 and compatibility checks; quality job claims, completions, quality embeddings,
 and activation progress write to `quality_semantic`.
+Vector verification also reads expected fast/quality manifest rows from the
+matching semantic role database when that role contains the same generation, then
+uses structural SQLite for file paths and chunk line ranges needed to compare
+sqlite-vec payload metadata.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP

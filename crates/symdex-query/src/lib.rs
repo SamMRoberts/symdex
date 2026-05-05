@@ -1410,9 +1410,17 @@ pub fn run_vector_verify_with_options(
     options: VectorVerifyOptions,
 ) -> Result<VectorVerifySummary, String> {
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
-    let targets = vector_verify_targets(&root, &sqlite, options.semantic_layer)?;
     let store_config = StoreConfig::from_env();
+    let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let fast_store = semantic_role_store_for_read(&store_config, DatabaseRole::FastSemantic)?;
+    let quality_store = semantic_role_store_for_read(&store_config, DatabaseRole::QualitySemantic)?;
+    let targets = vector_verify_targets(
+        &root,
+        &sqlite,
+        fast_store.as_ref(),
+        quality_store.as_ref(),
+        options.semantic_layer,
+    )?;
     let mut summaries = Vec::new();
     for target in targets {
         let vector = vector_store_for_semantic_layer(
@@ -1462,33 +1470,47 @@ struct VectorVerifyTarget {
 fn vector_verify_targets(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    fast_store: Option<&SqliteStore>,
+    quality_store: Option<&SqliteStore>,
     selection: VectorVerifySemanticLayer,
 ) -> Result<Vec<VectorVerifyTarget>, String> {
-    let routing = sqlite
-        .semantic_routing_summary(root.id())
-        .map_err(|error| error.to_string())?;
+    let routing = semantic_routing_summary_for_scope(sqlite, root.id(), None, quality_store)?;
     selection
         .layers()
         .into_iter()
-        .map(|layer| vector_verify_target(root, sqlite, routing.as_ref(), layer))
+        .map(|layer| {
+            vector_verify_target(
+                root,
+                sqlite,
+                fast_store,
+                quality_store,
+                routing.as_ref(),
+                layer,
+            )
+        })
         .collect()
 }
 
 fn vector_verify_target(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    fast_store: Option<&SqliteStore>,
+    quality_store: Option<&SqliteStore>,
     routing: Option<&SemanticRoutingSummary>,
     semantic_layer: SemanticLayer,
 ) -> Result<VectorVerifyTarget, String> {
     match semantic_layer {
-        SemanticLayer::Fast => vector_verify_fast_target(root, sqlite, routing),
-        SemanticLayer::Quality => vector_verify_quality_target(root, sqlite, routing),
+        SemanticLayer::Fast => vector_verify_fast_target(root, sqlite, fast_store, routing),
+        SemanticLayer::Quality => {
+            vector_verify_quality_target(root, sqlite, quality_store, routing)
+        }
     }
 }
 
 fn vector_verify_fast_target(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    fast_store: Option<&SqliteStore>,
     routing: Option<&SemanticRoutingSummary>,
 ) -> Result<VectorVerifyTarget, String> {
     let Some(routing) = routing else {
@@ -1497,13 +1519,16 @@ fn vector_verify_fast_target(
             root.id()
         ));
     };
-    let expected = sqlite
-        .expected_vector_points_for_generation_layer(
-            root.id(),
-            &routing.generation_id,
-            SemanticLayer::Fast,
-        )
-        .map_err(|error| error.to_string())?;
+    let metadata_store =
+        semantic_layer_store_for_generation(fast_store, root.id(), &routing.generation_id)?
+            .unwrap_or(sqlite);
+    let expected = expected_vector_points_from_layer_metadata(
+        sqlite,
+        metadata_store,
+        root.id(),
+        &routing.generation_id,
+        SemanticLayer::Fast,
+    )?;
     if !routing.fast.is_complete {
         return Err(format!(
             "layered fast semantic metadata is incomplete for {}; run `symdex index <repo>` to refresh chunk_embeddings before vector-verify",
@@ -1516,16 +1541,20 @@ fn vector_verify_fast_target(
 fn vector_verify_quality_target(
     root: &RepoRoot,
     sqlite: &SqliteStore,
+    quality_store: Option<&SqliteStore>,
     routing: Option<&SemanticRoutingSummary>,
 ) -> Result<VectorVerifyTarget, String> {
     if let Some(routing) = routing {
-        let expected = sqlite
-            .expected_vector_points_for_generation_layer(
-                root.id(),
-                &routing.generation_id,
-                SemanticLayer::Quality,
-            )
-            .map_err(|error| error.to_string())?;
+        let metadata_store =
+            semantic_layer_store_for_generation(quality_store, root.id(), &routing.generation_id)?
+                .unwrap_or(sqlite);
+        let expected = expected_vector_points_from_layer_metadata(
+            sqlite,
+            metadata_store,
+            root.id(),
+            &routing.generation_id,
+            SemanticLayer::Quality,
+        )?;
         if let Some(manifest) = &routing.quality {
             return Ok(vector_target_from_manifest(manifest, expected));
         }
@@ -1538,6 +1567,36 @@ fn vector_verify_quality_target(
         embedding_model: quality_config.model,
         expected: Vec::new(),
     })
+}
+
+fn semantic_layer_store_for_generation<'a>(
+    store: Option<&'a SqliteStore>,
+    repository_id: &str,
+    generation_id: &str,
+) -> Result<Option<&'a SqliteStore>, String> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let is_current_generation = store
+        .latest_semantic_generation(repository_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|generation| generation.id == generation_id);
+    Ok(is_current_generation.then_some(store))
+}
+
+fn expected_vector_points_from_layer_metadata(
+    structural_store: &SqliteStore,
+    metadata_store: &SqliteStore,
+    repository_id: &str,
+    generation_id: &str,
+    semantic_layer: SemanticLayer,
+) -> Result<Vec<ExpectedVectorPoint>, String> {
+    let embeddings = metadata_store
+        .chunk_embeddings_for_generation(repository_id, generation_id, semantic_layer.as_str())
+        .map_err(|error| error.to_string())?;
+    structural_store
+        .expected_vector_points_for_chunk_embeddings(&embeddings)
+        .map_err(|error| error.to_string())
 }
 
 fn vector_target_from_manifest(

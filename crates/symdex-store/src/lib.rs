@@ -1968,6 +1968,62 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn expected_vector_points_for_chunk_embeddings(
+        &self,
+        embeddings: &[ChunkEmbeddingRecord],
+    ) -> Result<Vec<ExpectedVectorPoint>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT files.path, chunks.start_line, chunks.end_line
+                 FROM chunks
+                 JOIN files ON files.id = chunks.file_id
+                 WHERE files.repository_id = ?1
+                   AND files.id = ?2
+                   AND chunks.id = ?3
+                   AND chunks.file_id = ?2",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let mut expected = Vec::new();
+        for embedding in embeddings
+            .iter()
+            .filter(|embedding| embedding.status == "current")
+        {
+            let point = statement
+                .query_row(
+                    params![
+                        embedding.repository_id,
+                        embedding.file_id,
+                        embedding.chunk_id,
+                    ],
+                    |row| {
+                        Ok(ExpectedVectorPoint {
+                            vector_point_id: embedding.vector_point_id.clone(),
+                            chunk_id: embedding.chunk_id.clone(),
+                            path: row.get(0)?,
+                            start_line: row.get::<_, i64>(1)? as usize,
+                            end_line: row.get::<_, i64>(2)? as usize,
+                            text_hash: embedding.text_hash.clone(),
+                            embedding_model: Some(embedding.embedding_model.clone()),
+                            embedding_dimension: Some(embedding.embedding_dimension),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?;
+            if let Some(point) = point {
+                expected.push(point);
+            }
+        }
+        expected.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.chunk_id.cmp(&right.chunk_id))
+        });
+        Ok(expected)
+    }
+
     pub fn repository_status(&self, repository_id: &str) -> Result<RepositoryStatus> {
         let files_indexed: usize = self
             .connection
@@ -13254,6 +13310,51 @@ mod tests {
             .expect("quality manifest should load");
 
         assert!(quality.is_empty());
+    }
+
+    #[test]
+    fn sqlite_expected_vector_points_can_use_external_embedding_manifest() {
+        let db = TestDb::new("external-vector-manifest");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        store
+            .replace_file_facts(
+                &sample_file("content-hash"),
+                &[],
+                &[sample_chunk("chunk-1")],
+                &[],
+            )
+            .expect("facts should persist");
+
+        let mut stale = sample_quality_chunk_embedding("stale");
+        stale.vector_point_id = "01234567-89ab-cdef-fedc-ba9876543212".to_owned();
+        let missing_chunk = ChunkEmbeddingRecord {
+            chunk_id: "missing-chunk".to_owned(),
+            vector_point_id: "01234567-89ab-cdef-fedc-ba9876543213".to_owned(),
+            ..sample_quality_chunk_embedding("current")
+        };
+        let expected = store
+            .expected_vector_points_for_chunk_embeddings(&[
+                sample_quality_chunk_embedding("current"),
+                stale,
+                missing_chunk,
+            ])
+            .expect("expected points should load from structural facts");
+
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].chunk_id, "chunk-1");
+        assert_eq!(expected[0].path, "src/lib.rs");
+        assert_eq!(
+            expected[0].embedding_model.as_deref(),
+            Some("mxbai-embed-large")
+        );
+        assert_eq!(expected[0].embedding_dimension, Some(768));
     }
 
     #[test]
