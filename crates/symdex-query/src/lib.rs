@@ -3153,22 +3153,24 @@ fn parse_file_location(line: &str) -> Option<(String, usize, Option<usize>)> {
 }
 
 fn parse_csharp_stack_frame(line: &str) -> Option<(String, String, usize, Option<usize>)> {
-    let rest = line.strip_prefix("at ")?;
-    let (symbol, location) = rest.rsplit_once(" in ")?;
-    let symbol = symbol.split_once('(').map_or(symbol, |(symbol, _)| symbol);
-    let symbol = normalize_stack_symbol(symbol)?;
+    let prefix_stripped = line.strip_prefix("at ")?;
+    let (raw_symbol, location) = prefix_stripped.rsplit_once(" in ")?;
+    let trimmed_symbol = raw_symbol
+        .split_once('(')
+        .map_or(raw_symbol, |(symbol, _)| symbol);
+    let normalized_symbol = normalize_stack_symbol(trimmed_symbol)?;
     let (path, line_number, column) = parse_csharp_line_location(location)?;
-    Some((symbol, path, line_number, column))
+    Some((normalized_symbol, path, line_number, column))
 }
 
 fn parse_csharp_line_location(location: &str) -> Option<(String, usize, Option<usize>)> {
-    let (path, rest) = location.rsplit_once(":line ")?;
+    let (path, line_suffix) = location.rsplit_once(":line ")?;
     if !path.ends_with(".cs") {
         return None;
     }
-    let rest = rest.trim_start();
-    let (line_number, rest) = parse_usize_prefix(rest)?;
-    let column = rest
+    let line_suffix = line_suffix.trim_start();
+    let (line_number, column_suffix) = parse_usize_prefix(line_suffix)?;
+    let column = column_suffix
         .strip_prefix(':')
         .and_then(|rest| parse_usize_prefix(rest).map(|(column, _)| column));
     Some((path.trim().to_owned(), line_number, column))
@@ -3176,17 +3178,20 @@ fn parse_csharp_line_location(location: &str) -> Option<(String, usize, Option<u
 
 fn parse_node_v8_stack_frame(line: &str) -> Option<(String, String, usize, Option<usize>)> {
     let rest = line.strip_prefix("at ")?;
-    let open = rest.rfind('(')?;
-    let close = rest.rfind(')')?;
-    if close <= open {
+    let open_paren_pos = rest.rfind('(')?;
+    let close_paren_pos = rest.rfind(')')?;
+    if close_paren_pos <= open_paren_pos {
         return None;
     }
-    let symbol = rest[..open].trim().trim_start_matches("async ").trim();
+    let symbol = rest[..open_paren_pos]
+        .trim()
+        .trim_start_matches("async ")
+        .trim();
     if symbol.is_empty() {
         return None;
     }
     let symbol = normalize_stack_symbol(symbol)?;
-    let location = rest[open + 1..close].trim();
+    let location = rest[open_paren_pos + 1..close_paren_pos].trim();
     let (path, line_number, column) = parse_file_location(location)?;
     Some((symbol, path, line_number, column))
 }
