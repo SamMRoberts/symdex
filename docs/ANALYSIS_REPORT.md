@@ -82,7 +82,9 @@ common Rust runtime output shapes: `cargo test`, `RUST_BACKTRACE=1`,
 treating them as stack frames), `tracing` metadata lines, and async stack-like
 output. The frame-to-SQLite join (files → symbols covering the line → calls
 recorded at that line) is the right join, and the test-name mapping for indexed
-Rust tests adds immediate value for CI failures.
+Rust tests adds immediate value for CI failures. Debug context now also records
+short-lived `runtime_observations` metadata keyed by input hash so repeated
+failures can be compared without storing pasted logs or source text.
 
 ### 6. Security and Privacy Model
 

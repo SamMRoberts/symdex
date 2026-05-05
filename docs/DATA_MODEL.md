@@ -7,7 +7,8 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, symbol references, tests, conservative test targets, fast semantic generations, and fast/quality
+symbols, calls, symbol references, tests, conservative test targets, short-lived
+runtime observations, fast semantic generations, and fast/quality
 `chunk_embeddings` manifests. The older chunk-level vector columns remain
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
@@ -837,11 +838,11 @@ explanatory note instead of guessing.
 
 ## Debug context packs
 
-Debug context packs are query-time metadata bundles and do not add new tables.
-Runtime input is parsed into frames containing optional frame symbols, file
-paths, line numbers, and columns. Relative paths are normalized with repository
-path rules; absolute paths are accepted only when they are under the selected
-repository root.
+Debug context packs are metadata bundles built from runtime input. Runtime
+input is parsed into frames containing optional frame symbols, file paths, line
+numbers, and columns. Relative paths are normalized with repository path rules;
+absolute paths are accepted only when they are under the selected repository
+root.
 
 The Rust-oriented parser recognizes common `cargo test` output, panic-hook
 locations, `RUST_BACKTRACE=1` and `RUST_BACKTRACE=full` frame lines, `anyhow`
@@ -860,5 +861,43 @@ agents can distinguish fresh, fully provenanced runtime evidence from stale,
 deleted, or weakly provenanced matches. They also include reason tags that
 identify path normalization, file provenance matches, symbol-at-location
 matches, symbol-name fallback matches, calls at the runtime line, and unmatched
-frames. Debug context packs do not include source text and do not mutate index
-state.
+frames. Debug context packs do not include source text.
+
+### `runtime_observations`
+
+```sql
+CREATE TABLE runtime_observations (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  observation_id TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  observation_kind TEXT NOT NULL,
+  ordinal INTEGER,
+  runtime_symbol TEXT,
+  runtime_path TEXT,
+  normalized_path TEXT,
+  line INTEGER,
+  column INTEGER,
+  failing_test_name TEXT,
+  mapped_test_name TEXT,
+  matched INTEGER NOT NULL,
+  match_kind TEXT NOT NULL,
+  match_summary TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+```
+
+`runtime_observations` is a short-lived metadata cache for repeated debugging
+workflows. `symdex_debug_context` appends one row per parsed frame and failing
+test name after it builds the normal debug context pack. Rows store a hash of
+the full runtime input, not the pasted log. Frame rows can include the parsed
+runtime symbol, parsed path, normalized repo-relative path, line, column,
+match kind, freshness/trust summary, reason tags, matched symbol names, and
+call-at-line counts. Failing-test rows store the parsed failing test name and
+the indexed test name when mapping succeeds.
+
+The cache currently uses a 24-hour expiry window and prunes expired rows during
+new debug-context writes. It is intended for comparing repeated failures by
+metadata shape and `input_hash`; it is not an audit log. Do not store raw
+runtime output, source snippets, stack logs, or full files in this table.

@@ -14,7 +14,8 @@ use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
     EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance, ExpectedVectorPoint,
     FileFreshnessSnapshot, IndexCoverageSummary, IndexRunsTimelineSummary,
-    QualityGenerationProgress, RetrievedPoint, ScoredPoint, SemanticLayerManifestSummary,
+    QualityGenerationProgress, RetrievedPoint, RuntimeObservationCacheSummary,
+    RuntimeObservationRecord, ScoredPoint, SemanticLayerManifestSummary,
     SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore, SqliteVectorStore,
     StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
     SymbolOutlineSummary, SymbolSearchRow, TestSearchRow, clamp_call_path_depth,
@@ -519,6 +520,7 @@ pub struct RuntimeFrame {
 pub struct DebugContextPack {
     pub format: String,
     pub repository_id: String,
+    pub runtime_observation: Option<Box<RuntimeObservationCacheSummary>>,
     pub frames: Vec<DebugFrameMatch>,
     pub call_paths_between_frames: Vec<DebugFrameCallPath>,
     pub likely_tests: Vec<String>,
@@ -896,9 +898,16 @@ pub fn run_debug_context_pack(
         return Err("debug-context requires runtime failure input".to_owned());
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let sqlite = sqlite_for_read()?;
+    let mut sqlite = sqlite_for_write()?;
     let current_hashes = current_hashes(&root)?;
-    build_debug_context_pack(&root, &sqlite, runtime_input, limit, &current_hashes)
+    let mut pack = build_debug_context_pack(&root, &sqlite, runtime_input, limit, &current_hashes)?;
+    let observations = runtime_observation_records(&sqlite, root.id(), runtime_input, &pack)?;
+    let cache_summary = sqlite
+        .record_runtime_observations(root.id(), runtime_input, &observations)
+        .map_err(|error| error.to_string())?;
+    pack.runtime_observation = Some(Box::new(cache_summary));
+    pack.notes.push("runtime_observation_cached".to_owned());
+    Ok(pack)
 }
 
 pub fn run_freshness_report(
@@ -2581,6 +2590,7 @@ fn build_debug_context_pack(
     Ok(DebugContextPack {
         format: "symdex.debug_context.v1".to_owned(),
         repository_id: root.id().to_owned(),
+        runtime_observation: None,
         frames,
         call_paths_between_frames,
         likely_tests: mapped_tests.tests,
@@ -2592,6 +2602,103 @@ fn build_debug_context_pack(
         },
         notes,
     })
+}
+
+fn runtime_observation_records(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    runtime_input: &str,
+    pack: &DebugContextPack,
+) -> Result<Vec<RuntimeObservationRecord>, String> {
+    let parsed = parse_runtime_input(runtime_input);
+    let mut rows = Vec::new();
+    for frame in &pack.frames {
+        let match_summary = serde_json::json!({
+            "metadata_only": true,
+            "reasons": &frame.reasons,
+            "file_freshness": frame.file_freshness.label(),
+            "trust_level": &frame.trust.level,
+            "trust_score": frame.trust.score,
+            "matched_symbol_count": frame.matched_symbols.len(),
+            "calls_at_line_count": frame.calls_at_line.len(),
+            "matched_symbol_qualified_names": frame
+                .matched_symbols
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        rows.push(RuntimeObservationRecord {
+            observation_kind: "frame".to_owned(),
+            ordinal: Some(frame.frame.ordinal),
+            runtime_symbol: frame.frame.symbol.clone(),
+            runtime_path: frame.frame.path.clone(),
+            normalized_path: frame.normalized_path.clone(),
+            line: frame.frame.line,
+            column: frame.frame.column,
+            failing_test_name: None,
+            mapped_test_name: None,
+            matched: frame.matched,
+            match_kind: debug_frame_match_kind(frame).to_owned(),
+            match_summary,
+        });
+    }
+
+    for failing_test in parsed.failing_tests {
+        let mapped_test = map_single_failing_test(sqlite, repository_id, &failing_test)?;
+        let matched = mapped_test.is_some();
+        let match_kind = if matched {
+            "indexed_test_match"
+        } else {
+            "runtime_name_fallback"
+        };
+        let match_summary = serde_json::json!({
+            "metadata_only": true,
+            "runtime_failing_test": failing_test.clone(),
+            "mapped_test_name": mapped_test.clone(),
+            "match_kind": match_kind,
+        })
+        .to_string();
+        rows.push(RuntimeObservationRecord {
+            observation_kind: "failing_test".to_owned(),
+            ordinal: None,
+            runtime_symbol: None,
+            runtime_path: None,
+            normalized_path: None,
+            line: None,
+            column: None,
+            failing_test_name: Some(failing_test),
+            mapped_test_name: mapped_test,
+            matched,
+            match_kind: match_kind.to_owned(),
+            match_summary,
+        });
+    }
+    Ok(rows)
+}
+
+fn debug_frame_match_kind(frame: &DebugFrameMatch) -> &'static str {
+    if !frame.matched {
+        "unmatched_runtime_frame"
+    } else if frame
+        .reasons
+        .iter()
+        .any(|reason| reason == "symbols_at_runtime_location")
+    {
+        "symbols_at_runtime_location"
+    } else if frame
+        .reasons
+        .iter()
+        .any(|reason| reason == "symbol_name_fallback_match")
+    {
+        "symbol_name_fallback_match"
+    } else if !frame.calls_at_line.is_empty() {
+        "calls_at_runtime_line"
+    } else if frame.file_provenance.is_some() {
+        "file_provenance_match"
+    } else {
+        "metadata_match"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2610,25 +2717,13 @@ fn map_failing_tests(
     let mut used_indexed_tests = false;
     let mut used_runtime_fallbacks = false;
     for failing_test in failing_tests {
-        let mut matches = Vec::new();
-        for candidate in runtime_test_name_candidates(failing_test) {
-            matches.extend(
-                sqlite
-                    .tests_matching_name(repository_id, &candidate)
-                    .map_err(|error| error.to_string())?,
-            );
-            if !matches.is_empty() {
-                break;
-            }
-        }
+        let matches = map_failing_test_matches(sqlite, repository_id, failing_test)?;
         if matches.is_empty() {
             used_runtime_fallbacks = true;
             tests.insert(failing_test.clone());
         } else {
             used_indexed_tests = true;
-            for test in matches {
-                tests.insert(test.qualified_name);
-            }
+            tests.extend(matches);
         }
     }
     Ok(MappedTests {
@@ -2636,6 +2731,37 @@ fn map_failing_tests(
         used_indexed_tests,
         used_runtime_fallbacks,
     })
+}
+
+fn map_single_failing_test(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    failing_test: &str,
+) -> Result<Option<String>, String> {
+    Ok(
+        map_failing_test_matches(sqlite, repository_id, failing_test)?
+            .into_iter()
+            .next(),
+    )
+}
+
+fn map_failing_test_matches(
+    sqlite: &SqliteStore,
+    repository_id: &str,
+    failing_test: &str,
+) -> Result<Vec<String>, String> {
+    for candidate in runtime_test_name_candidates(failing_test) {
+        let matches = sqlite
+            .tests_matching_name(repository_id, &candidate)
+            .map_err(|error| error.to_string())?;
+        if !matches.is_empty() {
+            return Ok(matches
+                .into_iter()
+                .map(|test| test.qualified_name)
+                .collect());
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn runtime_test_name_candidates(name: &str) -> Vec<String> {
@@ -2924,6 +3050,13 @@ fn sqlite_for_read() -> Result<SqliteStore, String> {
 
 fn sqlite_for_read_with_config(store_config: &StoreConfig) -> Result<SqliteStore, String> {
     SqliteStore::open_read_only(store_config).map_err(|error| error.to_string())
+}
+
+fn sqlite_for_write() -> Result<SqliteStore, String> {
+    let store_config = StoreConfig::from_env();
+    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    store.migrate().map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 fn active_ref_scope(root: &RepoRoot, sqlite: &SqliteStore) -> Result<Option<String>, String> {
@@ -3379,8 +3512,9 @@ mod tests {
         build_impact_summary, build_unified_context_pack, evidence_trust, freshness_rows,
         parse_runtime_input, resolve_semantic_search_target, run_call_graph, run_call_path,
         run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
-        run_symbol_search, semantic_reasons, semantic_result_from_point,
-        semantic_status_from_routing, vector_verify_all_summary, vector_verify_summary,
+        run_symbol_search, runtime_observation_records, semantic_reasons,
+        semantic_result_from_point, semantic_status_from_routing, vector_verify_all_summary,
+        vector_verify_summary,
     };
     use symdex_store::QualityGenerationProgress;
 
@@ -4223,6 +4357,41 @@ mod tests {
                 .iter()
                 .any(|note| { note == "likely_tests_include_unmatched_runtime_failure_names" })
         );
+    }
+
+    #[test]
+    fn debug_context_builds_metadata_only_runtime_observation_rows() {
+        let mut fixture = DebugFixture::new();
+        let repository_id = fixture.root.id().to_owned();
+        persist_test_calling_callee(&mut fixture.store, &repository_id);
+        let input = "test tests::covers_callee ... FAILED\n\
+                     thread 'tests::covers_callee' panicked at src/fresh.rs:1:1:\n\
+                     stack backtrace:\n\
+                     0: crate::fresh\n\
+                        at src/fresh.rs:1:1\n";
+        let pack =
+            build_debug_context_pack(&fixture.root, &fixture.store, input, 8, &BTreeMap::new())
+                .expect("debug context should build");
+
+        let rows = runtime_observation_records(&fixture.store, &repository_id, input, &pack)
+            .expect("runtime observation rows should build");
+
+        assert!(rows.iter().any(|row| {
+            row.observation_kind == "frame"
+                && row.normalized_path.as_deref() == Some("src/fresh.rs")
+                && row.match_kind == "symbols_at_runtime_location"
+                && row.matched
+        }));
+        assert!(rows.iter().any(|row| {
+            row.observation_kind == "failing_test"
+                && row.failing_test_name.as_deref() == Some("tests::covers_callee")
+                && row.mapped_test_name.as_deref() == Some("crate::tests::covers_callee")
+                && row.match_kind == "indexed_test_match"
+        }));
+        assert!(rows.iter().all(|row| {
+            !row.match_summary.contains("stack backtrace")
+                && !row.match_summary.contains("thread 'tests::covers_callee'")
+        }));
     }
 
     #[test]

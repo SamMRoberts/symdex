@@ -148,6 +148,9 @@ Requirements:
   tests.
 - Produce focused debugging evidence through CLI, TUI, MCP, and debug context
   packs.
+- Cache short-lived metadata-only runtime observations for repeated-failure
+  comparison, keyed by input hash and normalized match metadata, without storing
+  raw logs or source text.
 - Preserve unmapped frames with explicit status instead of dropping them.
 - Expand beyond Rust with conservative C# and Node/V8 stack frame parsing before
   adding lower-priority runtimes.

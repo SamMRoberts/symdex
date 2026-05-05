@@ -258,7 +258,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   available. Passing `-` reads from stdin; a single existing path reads that
   file; otherwise remaining arguments are treated as inline runtime text. Frame
   matches include trust scores and reason tags, and the pack does not include
-  source text.
+  source text. Each run also appends short-lived metadata-only
+  `runtime_observations` rows with an input hash, normalized paths, failing test
+  names, match summaries, and expiry metadata for repeated-failure comparison.
 - `search <repo> <query>`: embeds the query locally through the active semantic
   routing path and returns ranked sqlite-vec matches with scores, paths, line
   ranges, symbol names, active layer metadata, fallback reason, and provenance

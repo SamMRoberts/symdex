@@ -9843,6 +9843,7 @@ mod tests {
         DebugContextPack {
             format: "symdex.debug_context.v1".to_owned(),
             repository_id: "repo".to_owned(),
+            runtime_observation: None,
             frames: vec![
                 DebugFrameMatch {
                     frame: RuntimeFrame {

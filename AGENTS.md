@@ -26,7 +26,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
 - SQLite stores repositories, files, symbols, chunks, calls, tests,
-  conservative test targets, and index metadata.
+  conservative test targets, short-lived runtime observations, and index
+  metadata.
 - Only ONE process may write to the configured local SQLite/sqlite-vec database
   at a time. The guard is database-file scoped, not repository scoped. TUI, MCP,
   diagnostics, query, and status paths must be read-only unless they are
@@ -151,6 +152,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   Watchers, manual index jobs, quality jobs, repair, migrations, and future
   write-capable tools must submit write jobs to that service. Read paths use
   read-only SQLite connections and do not depend on the writer service.
+- Runtime/debug evidence caching is a narrow metadata-write exception for
+  `symdex_debug_context`: store only parsed stack-frame metadata, failing test
+  names, normalized paths, match summaries, hashes, and expiry timestamps in
+  `runtime_observations`; never store pasted logs or source text.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 - Branch-aware indexing must read only local Git metadata. Do not execute hooks,
   fetch remotes, contact hosted services, or treat branch names as trusted input.
@@ -159,9 +164,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   from any retained local ref.
 
 ## MCP Rules
-- MCP evidence tools are read-only for the MVP. `symdex_watch_start` is the
+- MCP evidence tools are read-only by default. `symdex_watch_start` is the
   explicit local-only exception for starting or attaching the scoped background
-  watcher.
+  watcher, and `symdex_debug_context` may append metadata-only
+  `runtime_observations` rows for short-lived repeated-failure comparison.
 - Write-capable tools require a future design doc before implementation.
 - Tool names must be stable, descriptive, and versionable.
 - Tool outputs must fit agent context windows.

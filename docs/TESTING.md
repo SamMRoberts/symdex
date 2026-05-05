@@ -73,7 +73,9 @@ Fixtures should be tiny and purpose-built.
   failing test names, mapped frames, unmapped frames, stale frames, deleted
   files, malformed runtime input, common Rust `cargo test`, `anyhow`, `tracing`,
   full backtrace, panic-hook, and async stack-like output, and TUI debug context
-  pack rendering.
+  pack rendering. Runtime observation cache tests should assert that only
+  metadata is stored: input hashes, normalized paths, failing test names, match
+  kinds, summaries, and expiry metadata, never raw logs or source text.
 - Test discovery coverage for Rust recognized test attributes, C# NUnit/xUnit/
   MSTest attributes, JavaScript and TypeScript Jest/Vitest/Mocha `test` / `it` /
   `describe` shapes, module- or suite-qualified test names, SQLite test

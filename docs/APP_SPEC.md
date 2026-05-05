@@ -70,9 +70,10 @@ symdex serve-mcp --watch <repo>
   off, and reindex modified or newly created eligible files without source
   execution.
 - Only one local process writes to a repository's SQLite/sqlite-vec database at
-  a time. All write-capable indexing, quality, repair, cleanup, and future MCP
-  operations coordinate through that writer or refuse instead of racing a second
-  writer.
+  a time. Write-capable indexing, quality, repair, cleanup, and future mutating
+  MCP operations coordinate through that writer or refuse instead of racing a
+  second writer. The debug-context runtime observation cache is a narrow
+  metadata-only append exception and must never store pasted logs or source text.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.

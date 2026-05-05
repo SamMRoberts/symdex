@@ -159,6 +159,8 @@
 - [x] CLI command for building debug context packs from runtime failure input.
 - [x] TUI debug context-pack viewer with matched frames, call paths, likely tests, provenance, and staleness.
 - [x] MCP tool for debug context packs with compact context-window-safe output.
+- [x] Short-lived metadata-only `runtime_observations` cache for repeated
+  debug-context comparisons without storing logs or source text.
 - [x] Tests for mapped frames, unmapped frames, stale frames, deleted files, and malformed stack traces.
 
 ## Phase 14 — Cross-agent local reuse

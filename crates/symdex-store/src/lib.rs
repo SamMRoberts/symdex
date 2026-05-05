@@ -16,7 +16,8 @@ use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use symdex_core::{
-    RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
+    RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, content_hash,
+    stable_id,
 };
 
 pub use vector::{
@@ -28,6 +29,7 @@ pub use vector::{
 pub(crate) use vector::validate_vector_table_name;
 
 pub const MAX_CALL_PATH_DEPTH: usize = 8;
+pub const RUNTIME_OBSERVATION_TTL_SECONDS: u64 = 60 * 60 * 24;
 
 pub fn clamp_call_path_depth(depth: usize) -> usize {
     depth.clamp(1, MAX_CALL_PATH_DEPTH)
@@ -3798,6 +3800,98 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn record_runtime_observations(
+        &mut self,
+        repository_id: &str,
+        runtime_input: &str,
+        rows: &[RuntimeObservationRecord],
+    ) -> Result<RuntimeObservationCacheSummary> {
+        let input_hash = content_hash(runtime_input.as_bytes());
+        let observed_at = timestamp();
+        let expires_at = timestamp_after_secs(RUNTIME_OBSERVATION_TTL_SECONDS);
+        let observation_id = stable_id(&[
+            "runtime-observation",
+            repository_id,
+            &input_hash,
+            &timestamp_nanos().to_string(),
+        ]);
+        let transaction = self.connection.transaction().map_err(StoreError::Sqlite)?;
+        let pruned_expired = transaction
+            .execute(
+                "DELETE FROM runtime_observations
+                  WHERE CAST(expires_at AS INTEGER) <= CAST(?1 AS INTEGER)",
+                params![observed_at],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let previous_observations = transaction
+            .query_row(
+                "SELECT COUNT(DISTINCT observation_id)
+                   FROM runtime_observations
+                  WHERE repository_id = ?1
+                    AND input_hash = ?2",
+                params![repository_id, input_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::Sqlite)? as usize;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO runtime_observations (
+                        id, repository_id, observation_id, input_hash, observation_kind,
+                        ordinal, runtime_symbol, runtime_path, normalized_path, line, column,
+                        failing_test_name, mapped_test_name, matched, match_kind, match_summary,
+                        observed_at, expires_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                )
+                .map_err(StoreError::Sqlite)?;
+            for (index, row) in rows.iter().enumerate() {
+                let id = stable_id(&[
+                    "runtime-observation-row",
+                    &observation_id,
+                    &index.to_string(),
+                    &row.observation_kind,
+                    row.ordinal
+                        .map(|ordinal| ordinal.to_string())
+                        .as_deref()
+                        .unwrap_or("none"),
+                ]);
+                statement
+                    .execute(params![
+                        id,
+                        repository_id,
+                        observation_id,
+                        input_hash,
+                        row.observation_kind,
+                        row.ordinal.map(|ordinal| ordinal as i64),
+                        row.runtime_symbol,
+                        row.runtime_path,
+                        row.normalized_path,
+                        row.line.map(|line| line as i64),
+                        row.column.map(|column| column as i64),
+                        row.failing_test_name,
+                        row.mapped_test_name,
+                        row.matched,
+                        row.match_kind,
+                        row.match_summary,
+                        observed_at,
+                        expires_at,
+                    ])
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(RuntimeObservationCacheSummary {
+            observation_id,
+            input_hash,
+            stored_rows: rows.len(),
+            previous_observations,
+            pruned_expired,
+            observed_at,
+            expires_at,
+        })
+    }
+
     pub fn callees(&self, repository_id: &str, symbol_query: &str) -> Result<Vec<CallSearchRow>> {
         let mut statement = self
             .connection
@@ -5461,6 +5555,33 @@ pub struct TestSearchRow {
     pub start_line: usize,
     pub end_line: usize,
     pub provenance: EvidenceProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeObservationRecord {
+    pub observation_kind: String,
+    pub ordinal: Option<usize>,
+    pub runtime_symbol: Option<String>,
+    pub runtime_path: Option<String>,
+    pub normalized_path: Option<String>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub failing_test_name: Option<String>,
+    pub mapped_test_name: Option<String>,
+    pub matched: bool,
+    pub match_kind: String,
+    pub match_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeObservationCacheSummary {
+    pub observation_id: String,
+    pub input_hash: String,
+    pub stored_rows: usize,
+    pub previous_observations: usize,
+    pub pruned_expired: usize,
+    pub observed_at: String,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8175,6 +8296,30 @@ CREATE TABLE IF NOT EXISTS test_targets (
     FOREIGN KEY(target_file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS runtime_observations (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    observation_kind TEXT NOT NULL,
+    ordinal INTEGER,
+    runtime_symbol TEXT,
+    runtime_path TEXT,
+    normalized_path TEXT,
+    line INTEGER,
+    column INTEGER,
+    failing_test_name TEXT,
+    mapped_test_name TEXT,
+    matched INTEGER NOT NULL,
+    match_kind TEXT NOT NULL,
+    match_summary TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    CHECK(observation_kind IN ('frame', 'failing_test')),
+    CHECK(matched IN (0, 1)),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS semantic_generations (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -8312,6 +8457,9 @@ CREATE INDEX IF NOT EXISTS idx_test_targets_repository_kind ON test_targets(repo
 CREATE INDEX IF NOT EXISTS idx_test_targets_test_id ON test_targets(test_id);
 CREATE INDEX IF NOT EXISTS idx_test_targets_target_symbol ON test_targets(target_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_test_targets_target_file ON test_targets(target_file_id);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_repository_hash ON runtime_observations(repository_id, input_hash, observed_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_observation ON runtime_observations(observation_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_expires ON runtime_observations(expires_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_file_index_events_run_path ON file_index_events(index_run_id, path);
@@ -8341,6 +8489,14 @@ fn timestamp() -> String {
     current_timestamp()
 }
 
+fn timestamp_after_secs(seconds: u64) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() + seconds)
+        .unwrap_or(seconds);
+    seconds.to_string()
+}
+
 fn timestamp_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8356,7 +8512,8 @@ mod tests {
 
     use rusqlite::{Connection, params};
     use symdex_core::{
-        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, stable_id,
+        RepositoryRefKind, RepositoryRefSnapshot, SemanticLayer, SemanticLayerStatus, content_hash,
+        stable_id,
     };
 
     use crate::{
@@ -8364,11 +8521,11 @@ mod tests {
         FastEmbeddingManifestRecord, FastSemanticGenerationInput, FileCoverageStatus,
         FileIndexEventRecord, FileRecord, PointPayload, QualityActivationReason,
         QualityEmbeddingJobRecord, QualityJobCompletion, RepositoryRecord,
-        SemanticGenerationRecord, SqliteStore, SqliteVectorStore, StorageHealthStatus, StoreConfig,
-        StoreError, SymbolRecord, SymbolReferenceRecord, TestRecord, VectorPoint,
-        WatcherClientRecord, WatcherStatusRecord, WriterLease, WriterLeaseInfo, WriterLeaseKind,
-        WriterLeaseRequest, validate_vector_table_name, vector_point_id, vector_rowid,
-        vector_table_name,
+        RuntimeObservationRecord, SemanticGenerationRecord, SqliteStore, SqliteVectorStore,
+        StorageHealthStatus, StoreConfig, StoreError, SymbolRecord, SymbolReferenceRecord,
+        TestRecord, VectorPoint, WatcherClientRecord, WatcherStatusRecord, WriterLease,
+        WriterLeaseInfo, WriterLeaseKind, WriterLeaseRequest, validate_vector_table_name,
+        vector_point_id, vector_rowid, vector_table_name,
     };
 
     #[test]
@@ -9245,6 +9402,9 @@ mod tests {
             "idx_test_targets_test_id",
             "idx_test_targets_target_symbol",
             "idx_test_targets_target_file",
+            "idx_runtime_observations_repository_hash",
+            "idx_runtime_observations_observation",
+            "idx_runtime_observations_expires",
             "idx_index_runs_repository_status",
             "idx_index_runs_repository_model_status",
             "idx_file_index_events_run_path",
@@ -10868,6 +11028,16 @@ mod tests {
             ("test_targets", "relationship_kind"),
             ("test_targets", "confidence"),
             ("test_targets", "reason"),
+            ("runtime_observations", "observation_id"),
+            ("runtime_observations", "input_hash"),
+            ("runtime_observations", "observation_kind"),
+            ("runtime_observations", "runtime_symbol"),
+            ("runtime_observations", "normalized_path"),
+            ("runtime_observations", "failing_test_name"),
+            ("runtime_observations", "mapped_test_name"),
+            ("runtime_observations", "match_kind"),
+            ("runtime_observations", "match_summary"),
+            ("runtime_observations", "expires_at"),
         ] {
             assert!(
                 store
@@ -11123,6 +11293,77 @@ mod tests {
                 .expect("likely tests should load")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn sqlite_records_runtime_observations_without_runtime_text() {
+        let db = TestDb::new("runtime-observations");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let runtime_input = "thread 'tests::fails' panicked at src/lib.rs:42:5";
+        let summary = store
+            .record_runtime_observations(
+                "repo",
+                runtime_input,
+                &[
+                    RuntimeObservationRecord {
+                        observation_kind: "frame".to_owned(),
+                        ordinal: Some(0),
+                        runtime_symbol: Some("crate::fails".to_owned()),
+                        runtime_path: Some("src/lib.rs".to_owned()),
+                        normalized_path: Some("src/lib.rs".to_owned()),
+                        line: Some(42),
+                        column: Some(5),
+                        failing_test_name: None,
+                        mapped_test_name: None,
+                        matched: true,
+                        match_kind: "symbols_at_runtime_location".to_owned(),
+                        match_summary: "{\"reasons\":[\"metadata_only\"]}".to_owned(),
+                    },
+                    RuntimeObservationRecord {
+                        observation_kind: "failing_test".to_owned(),
+                        ordinal: None,
+                        runtime_symbol: None,
+                        runtime_path: None,
+                        normalized_path: None,
+                        line: None,
+                        column: None,
+                        failing_test_name: Some("tests::fails".to_owned()),
+                        mapped_test_name: Some("crate::tests::fails".to_owned()),
+                        matched: true,
+                        match_kind: "indexed_test_match".to_owned(),
+                        match_summary: "{\"metadata_only\":true}".to_owned(),
+                    },
+                ],
+            )
+            .expect("runtime observations should persist");
+
+        assert_eq!(summary.stored_rows, 2);
+        assert_eq!(summary.previous_observations, 0);
+        assert_eq!(summary.input_hash, content_hash(runtime_input.as_bytes()));
+        let second = store
+            .record_runtime_observations("repo", runtime_input, &[])
+            .expect("second observation should persist");
+        assert_eq!(second.previous_observations, 1);
+
+        let rows = runtime_observation_rows(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, _, summary)| {
+            !summary.contains("panicked") && !summary.contains("thread 'tests::fails'")
+        }));
+        assert!(rows.iter().any(|(kind, match_kind, _)| {
+            kind == "frame" && match_kind == "symbols_at_runtime_location"
+        }));
+        assert!(rows.iter().any(|(kind, match_kind, _)| {
+            kind == "failing_test" && match_kind == "indexed_test_match"
+        }));
     }
 
     #[test]
@@ -13028,6 +13269,27 @@ mod tests {
             .expect("statement should prepare");
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
+            .expect("query should run");
+        rows.map(|row| row.expect("row should load")).collect()
+    }
+
+    fn runtime_observation_rows(store: &SqliteStore) -> Vec<(String, String, String)> {
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT observation_kind, match_kind, match_summary
+                   FROM runtime_observations
+                  ORDER BY observation_kind, match_kind",
+            )
+            .expect("statement should prepare");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
             .expect("query should run");
         rows.map(|row| row.expect("row should load")).collect()
     }

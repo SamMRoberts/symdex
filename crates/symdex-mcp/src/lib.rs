@@ -218,7 +218,11 @@ fn dispatch_tool(
 }
 
 fn tool_is_read_only(name: &str) -> bool {
-    name != TOOL_WATCH_START
+    !matches!(name, TOOL_WATCH_START | TOOL_DEBUG_CONTEXT)
+}
+
+fn tool_is_idempotent(name: &str) -> bool {
+    name != TOOL_DEBUG_CONTEXT
 }
 
 fn tool_search(arguments: &Value) -> Result<Value, String> {
@@ -1193,9 +1197,9 @@ fn tool_definition(
             "required": required
         },
         "annotations": {
-            "readOnlyHint": true,
+            "readOnlyHint": tool_is_read_only(name),
             "destructiveHint": false,
-            "idempotentHint": true,
+            "idempotentHint": tool_is_idempotent(name),
             "openWorldHint": false
         }
     })
@@ -1287,7 +1291,8 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_WATCH_STATUS));
         assert!(tools.iter().any(|tool| tool["name"] == TOOL_WATCH_START));
         assert!(tools.iter().all(|tool| {
-            let expected_read_only = tool["name"] != TOOL_WATCH_START;
+            let expected_read_only =
+                tool["name"] != TOOL_WATCH_START && tool["name"] != TOOL_DEBUG_CONTEXT;
             tool["annotations"]["readOnlyHint"]
                 .as_bool()
                 .expect("readOnlyHint should be bool")

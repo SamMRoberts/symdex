@@ -451,6 +451,15 @@ Output:
 {
   "format": "symdex.debug_context.v1",
   "repository_id": "stable-repo-id",
+  "runtime_observation": {
+    "observation_id": "stable-observation-id",
+    "input_hash": "sha256:...",
+    "stored_rows": 2,
+    "previous_observations": 0,
+    "pruned_expired": 0,
+    "observed_at": "1770000000",
+    "expires_at": "1770086400"
+  },
   "frames": [
     {
       "frame": {
@@ -486,7 +495,8 @@ Output:
   },
   "notes": [
     "metadata_only_no_source_text",
-    "likely_tests_mapped_to_indexed_tests"
+    "likely_tests_mapped_to_indexed_tests",
+    "runtime_observation_cached"
   ]
 }
 ```
@@ -495,7 +505,11 @@ The tool parses panic/file locations, stack-frame symbols, indexed-language file
 paths, and failing test names. It maps frames to indexed SQLite file/symbol/call
 evidence, maps failing test names to indexed tests when available, keeps
 unmatched runtime test names as fallbacks, adds freshness, trust, and
-provenance, and returns source-free metadata only. C# and Node/V8 stack-frame
+provenance, and returns source-free metadata only. It also appends short-lived
+metadata rows to `runtime_observations` so repeated failures can be compared by
+input hash, normalized paths, failing test names, and match results without
+storing logs or source text. Because of that cache write, this MCP tool is
+local-only, non-destructive, and not read-only or idempotent. C# and Node/V8 stack-frame
 parsing remains planned separately; this mapping only uses test names that the
 runtime parser already extracts.
 
