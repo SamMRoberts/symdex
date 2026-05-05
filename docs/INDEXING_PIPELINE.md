@@ -211,6 +211,11 @@ with `run_kind = watch` in index-run metadata.
 
 The SQLite schema also includes additive layered semantic tables for
 `semantic_generations`, `chunk_embeddings`, and `quality_embedding_jobs`.
+The same quality metadata table shapes are now initialized in the
+`quality_semantic` role database so quality job routing can move off structural
+SQLite without a later schema bootstrap. During the transition, structural rows
+remain the authoritative semantic manifests and job queue until callers are
+routed to the quality role.
 After a successful fast sqlite-vec upsert, semantic indexing records a deterministic
 fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
 The older chunk-level vector columns remain nullable compatibility schema, but

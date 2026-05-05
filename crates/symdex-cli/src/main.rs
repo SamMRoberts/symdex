@@ -733,6 +733,7 @@ fn init_with_existing_writer() -> Result<String, String> {
     let sqlite = SqliteStore::open(&store).map_err(|error| error.to_string())?;
     sqlite.migrate().map_err(|error| error.to_string())?;
     for role in [
+        DatabaseRole::QualitySemantic,
         DatabaseRole::Events,
         DatabaseRole::Runtime,
         DatabaseRole::Watch,

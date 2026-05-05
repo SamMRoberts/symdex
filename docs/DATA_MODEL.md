@@ -700,11 +700,14 @@ files derived from `SYMDEX_DB_PATH`: the fast layer uses the `fast_semantic`
 database role, and the quality layer uses the `quality_semantic` database role.
 For a legacy structural path such as `.symdex/symdex.sqlite`, the derived vector
 files are `.symdex/symdex-fast.sqlite` and `.symdex/symdex-quality.sqlite`.
-Structural SQLite still stores the authoritative `chunk_embeddings` manifests,
-semantic generation metadata, and active-ref file manifests during this
-transition. Query-time ref filtering reads active `ref_files` file IDs from
-structural SQLite and applies those IDs to sqlite-vec payload metadata instead
-of requiring `ref_files` to live in the vector database.
+The `quality_semantic` role also initializes quality metadata tables for
+`semantic_generations`, `chunk_embeddings`, `quality_embedding_jobs`, and
+`vector_points` without cross-database foreign keys. Structural SQLite still
+stores the authoritative `chunk_embeddings` manifests, semantic generation
+metadata, and active-ref file manifests until the quality metadata write path is
+routed to the quality role. Query-time ref filtering reads active `ref_files`
+file IDs from structural SQLite and applies those IDs to sqlite-vec payload
+metadata instead of requiring `ref_files` to live in the vector database.
 
 Payload fields:
 
