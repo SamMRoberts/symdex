@@ -1824,21 +1824,42 @@ pub fn run_semantic_status(repo: &str) -> Result<SemanticStatusSummary, String> 
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let quality_store = semantic_role_store_for_read(&store_config, DatabaseRole::QualitySemantic)?;
     let repository_ref_id = active_ref_scope(&root, &sqlite)?;
-    let routing =
-        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
+    let routing = semantic_routing_summary_for_scope(
+        &sqlite,
+        root.id(),
+        repository_ref_id.as_deref(),
+        quality_store.as_ref(),
+    )?;
     let quality_progress = match routing.as_ref() {
-        Some(summary) => Some(
-            sqlite
-                .quality_generation_progress(root.id(), &summary.generation_id)
-                .map_err(|error| error.to_string())?,
-        ),
+        Some(summary) => {
+            let read_store = semantic_quality_store_for_generation(
+                quality_store.as_ref(),
+                root.id(),
+                &summary.generation_id,
+            )?
+            .unwrap_or(&sqlite);
+            Some(
+                read_store
+                    .quality_generation_progress(root.id(), &summary.generation_id)
+                    .map_err(|error| error.to_string())?,
+            )
+        }
         None => None,
     };
     let latest_quality_error = match routing.as_ref() {
-        Some(summary) => sqlite
-            .latest_quality_generation_error(root.id(), &summary.generation_id)
-            .map_err(|error| error.to_string())?,
+        Some(summary) => {
+            let read_store = semantic_quality_store_for_generation(
+                quality_store.as_ref(),
+                root.id(),
+                &summary.generation_id,
+            )?
+            .unwrap_or(&sqlite);
+            read_store
+                .latest_quality_generation_error(root.id(), &summary.generation_id)
+                .map_err(|error| error.to_string())?
+        }
         None => None,
     };
     Ok(semantic_status_from_routing(
@@ -1987,9 +2008,14 @@ fn semantic_search_for_root(
     let layered_config = LayeredEmbedConfig::from_env();
     let store_config = StoreConfig::from_env();
     let sqlite = sqlite_for_read_with_config(&store_config)?;
+    let quality_store = semantic_role_store_for_read(&store_config, DatabaseRole::QualitySemantic)?;
     let repository_ref_id = active_ref_scope(root, &sqlite)?;
-    let routing =
-        semantic_routing_summary_for_scope(&sqlite, root.id(), repository_ref_id.as_deref())?;
+    let routing = semantic_routing_summary_for_scope(
+        &sqlite,
+        root.id(),
+        repository_ref_id.as_deref(),
+        quality_store.as_ref(),
+    )?;
     let target =
         resolve_semantic_search_target(root.id(), options, routing.as_ref(), &layered_config)?;
     let embed_config = embed_config_for_semantic_target(&layered_config, &target);
@@ -2068,18 +2094,84 @@ fn semantic_routing_summary_for_scope(
     sqlite: &SqliteStore,
     repository_id: &str,
     repository_ref_id: Option<&str>,
+    quality_store: Option<&SqliteStore>,
 ) -> Result<Option<SemanticRoutingSummary>, String> {
-    if let Some(repository_ref_id) = repository_ref_id {
+    let structural_routing = if let Some(repository_ref_id) = repository_ref_id {
         let routing = sqlite
             .semantic_routing_summary_for_ref(repository_id, repository_ref_id)
             .map_err(|error| error.to_string())?;
         if routing.is_some() {
-            return Ok(routing);
+            routing
+        } else {
+            sqlite
+                .semantic_routing_summary(repository_id)
+                .map_err(|error| error.to_string())?
         }
+    } else {
+        sqlite
+            .semantic_routing_summary(repository_id)
+            .map_err(|error| error.to_string())?
+    };
+
+    let Some(structural_routing) = structural_routing else {
+        return Ok(None);
+    };
+
+    let quality_routing = match quality_store {
+        Some(store) => store
+            .semantic_routing_summary(repository_id)
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    Ok(Some(merge_quality_semantic_routing(
+        structural_routing,
+        quality_routing,
+    )))
+}
+
+fn semantic_role_store_for_read(
+    store_config: &StoreConfig,
+    role: DatabaseRole,
+) -> Result<Option<SqliteStore>, String> {
+    if !store_config.database_path(role).exists() {
+        return Ok(None);
     }
-    sqlite
-        .semantic_routing_summary(repository_id)
+    SqliteStore::open_read_only_for_role(store_config, role)
+        .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn semantic_quality_store_for_generation<'a>(
+    quality_store: Option<&'a SqliteStore>,
+    repository_id: &str,
+    generation_id: &str,
+) -> Result<Option<&'a SqliteStore>, String> {
+    let Some(store) = quality_store else {
+        return Ok(None);
+    };
+    let is_current_generation = store
+        .latest_semantic_generation(repository_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|generation| generation.id == generation_id);
+    Ok(is_current_generation.then_some(store))
+}
+
+fn merge_quality_semantic_routing(
+    mut structural: SemanticRoutingSummary,
+    quality: Option<SemanticRoutingSummary>,
+) -> SemanticRoutingSummary {
+    let Some(quality) = quality else {
+        return structural;
+    };
+    if quality.generation_id != structural.generation_id {
+        return structural;
+    }
+
+    structural.active_layer = quality.active_layer;
+    structural.quality_status = quality.quality_status;
+    structural.quality_embedded_chunks = quality.quality_embedded_chunks;
+    structural.quality = quality.quality;
+    structural
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4007,11 +4099,11 @@ mod tests {
         QueryMode, SemanticSearchOptions, SemanticSearchResult, SemanticSearchSummary,
         VectorVerifySemanticLayer, build_debug_context_pack, build_explain_change_summary,
         build_freshness_report, build_impact_summary, build_unified_context_pack, evidence_trust,
-        freshness_rows, parse_runtime_input, resolve_semantic_search_target, run_call_graph,
-        run_call_path, run_context_pack, run_debug_context_pack, run_impact, run_semantic_search,
-        run_symbol_search, runtime_observation_records, semantic_reasons,
-        semantic_result_from_point, semantic_status_from_routing, vector_verify_all_summary,
-        vector_verify_summary,
+        freshness_rows, merge_quality_semantic_routing, parse_runtime_input,
+        resolve_semantic_search_target, run_call_graph, run_call_path, run_context_pack,
+        run_debug_context_pack, run_impact, run_semantic_search, run_symbol_search,
+        runtime_observation_records, semantic_reasons, semantic_result_from_point,
+        semantic_status_from_routing, vector_verify_all_summary, vector_verify_summary,
     };
     use symdex_store::QualityGenerationProgress;
 
@@ -4082,6 +4174,46 @@ mod tests {
         assert_eq!(target.vector_table, "symdex_repo_quality_model");
         assert_eq!(target.quality_status, SemanticLayerStatus::QualityReady);
         assert_eq!(target.fallback_reason, None);
+    }
+
+    #[test]
+    fn semantic_routing_merges_same_generation_quality_role_state() {
+        let structural =
+            sample_routing_summary(SemanticLayer::Fast, SemanticLayerStatus::FastReady, None);
+        let quality = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+
+        let merged = merge_quality_semantic_routing(structural, Some(quality));
+
+        assert_eq!(merged.active_layer, SemanticLayer::Quality);
+        assert_eq!(merged.quality_status, SemanticLayerStatus::QualityReady);
+        assert!(
+            merged
+                .quality
+                .as_ref()
+                .is_some_and(|manifest| manifest.is_complete)
+        );
+    }
+
+    #[test]
+    fn semantic_routing_ignores_stale_quality_role_generation() {
+        let structural =
+            sample_routing_summary(SemanticLayer::Fast, SemanticLayerStatus::FastReady, None);
+        let mut quality = sample_routing_summary(
+            SemanticLayer::Quality,
+            SemanticLayerStatus::QualityReady,
+            Some(sample_manifest(SemanticLayer::Quality, true)),
+        );
+        quality.generation_id = "generation-old".to_owned();
+
+        let merged = merge_quality_semantic_routing(structural, Some(quality));
+
+        assert_eq!(merged.active_layer, SemanticLayer::Fast);
+        assert_eq!(merged.quality_status, SemanticLayerStatus::FastReady);
+        assert_eq!(merged.quality, None);
     }
 
     #[test]

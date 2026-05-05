@@ -717,14 +717,15 @@ for `semantic_generations`, `chunk_embeddings`, `quality_embedding_jobs`, and
 `vector_points`. These role schemas intentionally avoid cross-database foreign
 keys. New fast indexing mirrors completed fast `semantic_generations`,
 `semantic_generation_refs`, and fast `chunk_embeddings` into the `fast_semantic`
-role after structural finalization. Structural SQLite still stores the
-authoritative semantic read path and active-ref file manifests until query
-callers are routed to the semantic roles. The manual quality worker claims,
-completes, and refreshes quality progress in `quality_semantic` while reading
-structural source facts read-only. Query-time ref
-filtering reads active `ref_files` file IDs from structural SQLite and applies
-those IDs to sqlite-vec payload metadata instead of requiring `ref_files` to live
-in the vector database.
+role after structural finalization. Structural SQLite still stores the active-ref
+file manifests and the fast semantic generation selected for the live ref. Query
+routing then merges same-generation quality status, quality manifests, progress,
+and latest quality errors from `quality_semantic`; stale quality-role generations
+are ignored. The manual quality worker claims, completes, and refreshes quality
+progress in `quality_semantic` while reading structural source facts read-only.
+Query-time ref filtering reads active `ref_files` file IDs from structural SQLite
+and applies those IDs to sqlite-vec payload metadata instead of requiring
+`ref_files` to live in the vector database.
 
 Payload fields:
 

@@ -219,9 +219,9 @@ transition, completed fast semantic generations and their current fast
 structural finalization, and quality queued/blocked metadata is mirrored into
 the `quality_semantic` role from structural job selection with the current fast
 manifest. Manual quality catch-up is routed to the `quality_semantic` writer
-lane and claims/completes quality jobs in that role, while structural rows remain
-the authoritative query read path until semantic callers are routed to the
-semantic roles.
+lane and claims/completes quality jobs in that role. Semantic status and search
+routing use structural SQLite for live-ref fast generation selection, then merge
+same-generation quality readiness and progress from `quality_semantic`.
 After a successful fast sqlite-vec upsert, semantic indexing records a deterministic
 fast semantic generation and current fast `chunk_embeddings` manifest in SQLite.
 The older chunk-level vector columns remain nullable compatibility schema, but
@@ -457,12 +457,13 @@ moved watcher control-plane state into the derived `watch` SQLite file. Watcher 
 heartbeat and detach jobs use the watch-role writer endpoint so they do not wait
 for structural indexing jobs. Index-run summaries and per-file index events now
 write to the derived `events` SQLite file. Structural SQLite continues to own the
-authoritative repository/ref manifests, file facts, symbols, calls, and
-generation query read path until later slices move the remaining semantic callers
-into their own role databases. Manual quality catch-up now uses the
-`quality_semantic` writer endpoint and uses structural SQLite only for read-only
-source validation and compatibility checks; quality job claims, completions,
-quality embeddings, and activation progress write to `quality_semantic`.
+authoritative repository/ref manifests, file facts, symbols, calls, and live-ref
+fast generation selection. Semantic status and search routing merge
+same-generation quality readiness from `quality_semantic`, and ignore stale
+quality-role generations. Manual quality catch-up now uses the `quality_semantic`
+writer endpoint and uses structural SQLite only for read-only source validation
+and compatibility checks; quality job claims, completions, quality embeddings,
+and activation progress write to `quality_semantic`.
 
 Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
