@@ -1140,17 +1140,17 @@ impl App {
                 })
                 .and_then(index_summary_from_writer_response)
                 .map(Box::new)
-                .and_then(|summary| {
+                .map(|summary| {
                     let (quality, quality_error) =
                         match run_manual_quality_after_index(&repo, request, &sender) {
                             Ok(quality) => (quality.map(Box::new), None),
                             Err(error) => (None, Some(error)),
                         };
-                    Ok(Box::new(ManualIndexJobSummary {
+                    Box::new(ManualIndexJobSummary {
                         index: summary,
                         quality,
                         quality_error,
-                    }))
+                    })
                 });
             let _ = sender.send(IndexJobMessage::Finished(result));
         });

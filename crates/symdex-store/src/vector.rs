@@ -387,8 +387,7 @@ impl SqliteVectorStore {
         if !self.table_exists(table_name)? {
             return Ok(Vec::new());
         }
-        let file_placeholders = std::iter::repeat("?")
-            .take(file_ids.len())
+        let file_placeholders = std::iter::repeat_n("?", file_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
