@@ -12,12 +12,12 @@ use symdex_core::{
 use symdex_embed::{EmbedConfig, LayeredEmbedConfig, OllamaClient};
 use symdex_store::{
     CallPath, CallResolutionSummary, CallSearchRow, ContextPack, CrossStoreHealthSummary,
-    DependencyUsageSearchRow, EmbeddingCoverageSummary, EvidenceFreshness, EvidenceProvenance,
-    ExpectedVectorPoint, FileFreshnessSnapshot, IndexCoverageSummary, IndexRunsTimelineSummary,
-    QualityGenerationProgress, RetrievedPoint, RuntimeObservationCacheSummary,
-    RuntimeObservationRecord, ScoredPoint, SemanticLayerManifestSummary,
-    SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore, SqliteVectorStore,
-    StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
+    DatabaseRole, DependencyUsageSearchRow, EmbeddingCoverageSummary, EvidenceFreshness,
+    EvidenceProvenance, ExpectedVectorPoint, FileFreshnessSnapshot, IndexCoverageSummary,
+    IndexRunsTimelineSummary, QualityGenerationProgress, RetrievedPoint,
+    RuntimeObservationCacheSummary, RuntimeObservationRecord, ScoredPoint,
+    SemanticLayerManifestSummary, SemanticNeighborhoodSummary, SemanticRoutingSummary, SqliteStore,
+    SqliteVectorStore, StorageExplorerSummary, StorageHealthRow, StorageHealthStatus, StoreConfig,
     SymbolOutlineSummary, SymbolSearchRow, TestSearchRow, clamp_call_path_depth,
     freshness_for_hash, vector_table_name,
 };
@@ -1203,11 +1203,12 @@ pub fn run_debug_context_pack(
         return Err("debug-context requires runtime failure input".to_owned());
     }
     let root = RepoRoot::open(repo).map_err(|error| error.to_string())?;
-    let mut sqlite = sqlite_for_write()?;
+    let sqlite = sqlite_for_read()?;
+    let mut runtime = sqlite_for_runtime_write()?;
     let current_hashes = current_hashes(&root)?;
     let mut pack = build_debug_context_pack(&root, &sqlite, runtime_input, limit, &current_hashes)?;
     let observations = runtime_observation_records(&sqlite, root.id(), runtime_input, &pack)?;
-    let cache_summary = sqlite
+    let cache_summary = runtime
         .record_runtime_observations(root.id(), runtime_input, &observations)
         .map_err(|error| error.to_string())?;
     pack.runtime_observation = Some(Box::new(cache_summary));
@@ -3438,9 +3439,10 @@ fn sqlite_for_read_with_config(store_config: &StoreConfig) -> Result<SqliteStore
     SqliteStore::open_read_only(store_config).map_err(|error| error.to_string())
 }
 
-fn sqlite_for_write() -> Result<SqliteStore, String> {
+fn sqlite_for_runtime_write() -> Result<SqliteStore, String> {
     let store_config = StoreConfig::from_env();
-    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+    let store = SqliteStore::open_for_role(&store_config, DatabaseRole::Runtime)
+        .map_err(|error| error.to_string())?;
     store.migrate().map_err(|error| error.to_string())?;
     Ok(store)
 }

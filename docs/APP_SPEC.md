@@ -70,11 +70,12 @@ symdex serve-mcp --watch <repo>
   run only while TUI, MCP, or CLI clients hold leases, can be toggled on and
   off, and reindex modified or newly created eligible files without source
   execution.
-- Only one local process writes to a repository's SQLite/sqlite-vec database at
-  a time. Write-capable indexing, quality, repair, cleanup, and future mutating
-  MCP operations coordinate through that writer or refuse instead of racing a
-  second writer. The debug-context runtime observation cache is a narrow
-  metadata-only append exception and must never store pasted logs or source text.
+- Only one local process writes to each role-scoped SQLite/sqlite-vec database
+  file at a time. Write-capable indexing, quality, repair, cleanup, and future
+  mutating MCP operations coordinate through the matching writer lane or refuse
+  instead of racing a second writer for the same role. The debug-context runtime
+  observation cache is a narrow metadata-only append to the runtime database role
+  and must never store pasted logs or source text.
 - Semantic search returns relevant function-level chunks.
 - Symbol search returns exact path and line ranges.
 - Call graph records direct calls where syntax makes them obvious.

@@ -163,7 +163,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Runtime/debug evidence caching is a narrow metadata-write exception for
   `symdex_debug_context`: store only parsed stack-frame metadata, failing test
   names, normalized paths, match summaries, hashes, and expiry timestamps in
-  `runtime_observations`; never store pasted logs or source text.
+  runtime-role `runtime_observations`; never store pasted logs or source text.
 - Never execute indexed repository code or follow symlinks outside the configured root.
 - Branch-aware indexing must read only local Git metadata. Do not execute hooks,
   fetch remotes, contact hosted services, or treat branch names as trusted input.
@@ -175,7 +175,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - MCP evidence tools are read-only by default. `symdex_watch_start` is the
   explicit local-only exception for starting or attaching the scoped background
   watcher, and `symdex_debug_context` may append metadata-only
-  `runtime_observations` rows for short-lived repeated-failure comparison.
+  runtime-role `runtime_observations` rows for short-lived repeated-failure
+  comparison.
 - Write-capable tools require a future design doc before implementation.
 - Tool names must be stable, descriptive, and versionable.
 - Tool outputs must fit agent context windows.

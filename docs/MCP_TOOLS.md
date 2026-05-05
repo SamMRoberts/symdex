@@ -553,10 +553,10 @@ and failing test names. It maps frames to indexed SQLite file/symbol/call
 evidence, maps failing test names to indexed tests when available, keeps
 unmatched runtime test names as fallbacks, adds freshness, trust, and
 provenance, and returns source-free metadata only. It also appends short-lived
-metadata rows to `runtime_observations` so repeated failures can be compared by
-input hash, normalized paths, failing test names, and match results without
-storing logs or source text. Because of that cache write, this MCP tool is
-local-only, non-destructive, and not read-only or idempotent. Unmapped frames
+metadata rows to runtime-role `runtime_observations` so repeated failures can be
+compared by input hash, normalized paths, failing test names, and match results
+without storing logs or source text. Because of that cache write, this MCP tool
+is local-only, non-destructive, and not read-only or idempotent. Unmapped frames
 remain visible with explicit status instead of being dropped.
 
 ### `symdex_staleness_check`

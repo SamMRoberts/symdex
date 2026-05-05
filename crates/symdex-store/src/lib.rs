@@ -512,6 +512,7 @@ impl SqliteStore {
         match self.role {
             DatabaseRole::Watch => self.migrate_watch_schema()?,
             DatabaseRole::Events => self.migrate_events_schema()?,
+            DatabaseRole::Runtime => self.migrate_runtime_schema()?,
             _ => {
                 self.connection
                     .execute_batch(SCHEMA)
@@ -542,6 +543,13 @@ impl SqliteStore {
     fn migrate_events_schema(&self) -> Result<()> {
         self.connection
             .execute_batch(EVENTS_SCHEMA)
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn migrate_runtime_schema(&self) -> Result<()> {
+        self.connection
+            .execute_batch(RUNTIME_SCHEMA)
             .map_err(StoreError::Sqlite)?;
         Ok(())
     }
@@ -9305,6 +9313,35 @@ CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_path_time ON file_in
 CREATE INDEX IF NOT EXISTS idx_file_index_events_repository_action_status ON file_index_events(repository_id, action, status, occurred_at);
 "#;
 
+const RUNTIME_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS runtime_observations (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    observation_kind TEXT NOT NULL,
+    ordinal INTEGER,
+    runtime_symbol TEXT,
+    runtime_path TEXT,
+    normalized_path TEXT,
+    line INTEGER,
+    column INTEGER,
+    failing_test_name TEXT,
+    mapped_test_name TEXT,
+    matched INTEGER NOT NULL,
+    match_kind TEXT NOT NULL,
+    match_summary TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    CHECK(observation_kind IN ('frame', 'failing_test')),
+    CHECK(matched IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_repository_hash ON runtime_observations(repository_id, input_hash, observed_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_observation ON runtime_observations(observation_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_expires ON runtime_observations(expires_at);
+"#;
+
 pub fn current_timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -12348,6 +12385,44 @@ mod tests {
         assert!(rows.iter().any(|(kind, match_kind, _)| {
             kind == "failing_test" && match_kind == "indexed_test_match"
         }));
+    }
+
+    #[test]
+    fn sqlite_runtime_role_uses_runtime_database() {
+        let db = TestDb::new("runtime-role-database");
+        let config = db.config();
+        let mut store = SqliteStore::open_for_role(&config, DatabaseRole::Runtime)
+            .expect("runtime store should open");
+        store.migrate().expect("runtime schema should migrate");
+
+        assert!(config.database_path(DatabaseRole::Runtime).exists());
+        assert!(!config.database_path(DatabaseRole::Structural).exists());
+
+        store
+            .record_runtime_observations(
+                "repo",
+                "thread 'tests::fails' panicked at src/lib.rs:42:5",
+                &[RuntimeObservationRecord {
+                    observation_kind: "frame".to_owned(),
+                    ordinal: Some(0),
+                    runtime_symbol: Some("crate::fails".to_owned()),
+                    runtime_path: Some("src/lib.rs".to_owned()),
+                    normalized_path: Some("src/lib.rs".to_owned()),
+                    line: Some(42),
+                    column: Some(5),
+                    failing_test_name: None,
+                    mapped_test_name: None,
+                    matched: true,
+                    match_kind: "symbols_at_runtime_location".to_owned(),
+                    match_summary: "{\"metadata_only\":true}".to_owned(),
+                }],
+            )
+            .expect("runtime observations should persist");
+
+        let tables = sqlite_table_names(&store);
+        assert!(tables.contains(&"runtime_observations".to_owned()));
+        assert!(!tables.contains(&"repositories".to_owned()));
+        assert!(!tables.contains(&"files".to_owned()));
     }
 
     #[test]

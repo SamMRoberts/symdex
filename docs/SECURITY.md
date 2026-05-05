@@ -78,7 +78,7 @@ Tool outputs should not contain hidden directives, markdown tricks, or unnecessa
 Successful MCP evidence tool outputs include a stable local/read-only contract
 envelope so multiple agents can safely reuse the same local index. The envelope
 is metadata only and must not include source text. `symdex_debug_context` is
-local-only but not read-only because it appends short-lived
+local-only but not read-only because it appends short-lived runtime-role
 `runtime_observations`; those rows may contain parsed frame metadata, failing
 test names, normalized paths, hashes, and match summaries, but never raw pasted
 logs or source text.

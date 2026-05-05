@@ -18,10 +18,11 @@ semantic projection.
 derive from that path as the storage split progresses. The fast and quality
 sqlite-vec projections live in `fast_semantic` and `quality_semantic` database
 roles, watcher control-plane state lives in the `watch` database role, and
-index-run telemetry lives in the `events` database role. With the default path
+index-run telemetry lives in the `events` database role, and debug-context
+runtime observations live in the `runtime` database role. With the default path
 this means `.symdex/symdex.sqlite`, `.symdex/symdex-fast.sqlite`,
-`.symdex/symdex-quality.sqlite`, `.symdex/symdex-watch.sqlite`, and
-`.symdex/symdex-events.sqlite`.
+`.symdex/symdex-quality.sqlite`, `.symdex/symdex-watch.sqlite`,
+`.symdex/symdex-events.sqlite`, and `.symdex/symdex-runtime.sqlite`.
 
 Migrations also create indexes for large-repo query paths: repository file
 lookups, chunk-by-file cleanup, symbol name and qualified-name lookup,
@@ -1027,14 +1028,18 @@ CREATE TABLE runtime_observations (
 );
 ```
 
-`runtime_observations` is a short-lived metadata cache for repeated debugging
-workflows. `symdex_debug_context` appends one row per parsed frame and failing
-test name after it builds the normal debug context pack. Rows store a hash of
-the full runtime input, not the pasted log. Frame rows can include the parsed
-runtime symbol, parsed path, normalized repo-relative path, line, column,
-match kind, freshness/trust summary, reason tags, matched symbol names, and
-call-at-line counts. Failing-test rows store the parsed failing test name and
-the indexed test name when mapping succeeds.
+`runtime_observations` is stored in the `runtime` database role as a
+short-lived metadata cache for repeated debugging workflows. `symdex_debug_context`
+appends one row per parsed frame and failing test name after it builds the normal
+debug context pack. Rows store a hash of the full runtime input, not the pasted
+log. Frame rows can include the parsed runtime symbol, parsed path, normalized
+repo-relative path, line, column, match kind, freshness/trust summary, reason
+tags, matched symbol names, and call-at-line counts. Failing-test rows store the
+parsed failing test name and the indexed test name when mapping succeeds.
+
+References to structural repository/file/symbol/test facts are stable IDs,
+paths, and metadata summaries; cross-database foreign keys are intentionally not
+used.
 
 The cache currently uses a 24-hour expiry window and prunes expired rows during
 new debug-context writes. It is intended for comparing repeated failures by

@@ -39,9 +39,10 @@ derive sibling SQLite files from that path: `.symdex/symdex-fast.sqlite` for the
 fast sqlite-vec projection, `.symdex/symdex-quality.sqlite` for the quality
 sqlite-vec projection, `.symdex/symdex-watch.sqlite` for watcher status and
 client leases, and `.symdex/symdex-events.sqlite` for index-run summaries and
-per-file index events. Existing legacy vector collections in the structural
-database remain readable as a compatibility fallback until the split storage
-migration is complete.
+per-file index events, and `.symdex/symdex-runtime.sqlite` for short-lived
+debug-context runtime observation metadata. Existing legacy vector collections
+in the structural database remain readable as a compatibility fallback until the
+split storage migration is complete.
 
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
 default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command
@@ -279,8 +280,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   file; otherwise remaining arguments are treated as inline runtime text. Frame
   matches include trust scores and reason tags, and the pack does not include
   source text. Each run also appends short-lived metadata-only
-  `runtime_observations` rows with an input hash, normalized paths, failing test
-  names, match summaries, and expiry metadata for repeated-failure comparison.
+  `runtime_observations` rows in the runtime database role with an input hash,
+  normalized paths, failing test names, match summaries, and expiry metadata for
+  repeated-failure comparison.
 - `search <repo> <query>`: embeds the query locally through the active semantic
   routing path and returns ranked sqlite-vec matches with scores, paths, line
   ranges, symbol names, active layer metadata, fallback reason, and provenance
