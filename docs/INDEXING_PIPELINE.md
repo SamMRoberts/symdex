@@ -154,15 +154,18 @@ Use Ollama with `nomic-embed-text`.
 
 Current implementation uses Ollama `POST /api/embed` for batch embeddings and
 `GET /api/tags` for local model availability. `SYMDEX_EMBED_TRUNCATE` defaults
-to `true`, but Symdex also excludes large chunks before embedding because some
-Ollama/model combinations return context-length errors instead of truncating.
+to `true`, but Symdex also bounds each embedding input because some Ollama/model
+combinations return context-length errors instead of truncating. 
 `SYMDEX_EMBED_BATCH_SIZE` defaults to `16`, so full-repository semantic indexing
 is split into smaller Ollama requests while preserving embedding order.
 `SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `2048` for fast indexing, while
 `SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` defaults to `512` for quality indexing.
-Larger chunks are kept as metadata-only structural evidence with
-`chunk_too_large_for_embedding` and are omitted from Ollama/sqlite-vec. Vector
-dimension probing embeds a tiny diagnostic string through the same local model.
+Chunks larger than the active layer limit are split into overlapping, UTF-8-safe
+embedding segments. Segment vectors are averaged back into one vector point for
+the original structural chunk, preserving chunk-level SQLite and sqlite-vec
+metadata. Secret-blocked chunks are still kept as metadata-only structural
+evidence and are omitted from Ollama/sqlite-vec. Vector dimension probing embeds
+a tiny diagnostic string through the same local model.
 
 Store:
 
