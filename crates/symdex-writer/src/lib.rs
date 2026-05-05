@@ -1,4 +1,4 @@
-//! Database-file-scoped single writer service.
+//! Database-role-scoped writer service foundation.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use symdex_core::stable_id;
 use symdex_store::{
-    StoreConfig, WriterLease, WriterLeaseKind, WriterLeaseRequest, debug_db_lock_log,
+    DatabaseRole, StoreConfig, WriterLease, WriterLeaseKind, WriterLeaseRequest, debug_db_lock_log,
     debug_db_locks_enabled, writer_lock_path,
 };
 
@@ -345,6 +345,15 @@ pub fn writer_endpoint_for_config(config: &StoreConfig) -> String {
     ipc::endpoint_for_id(&id)
 }
 
+pub fn writer_endpoint_for_role(config: &StoreConfig, role: DatabaseRole) -> String {
+    if role == DatabaseRole::Structural {
+        return writer_endpoint_for_config(config);
+    }
+    let database_path = config.database_path(role).display().to_string();
+    let id = stable_id(&["writer", role.as_str(), &database_path]);
+    ipc::endpoint_for_id(&id)
+}
+
 pub fn run_daemon(
     mut handler: impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
 ) -> Result<(), String> {
@@ -653,8 +662,11 @@ mod ipc {
 
 #[cfg(test)]
 mod tests {
-    use super::{WriterIndexScope, WriterJob, WriterJobResponse, writer_endpoint_for_config};
-    use symdex_store::StoreConfig;
+    use super::{
+        WriterIndexScope, WriterJob, WriterJobResponse, writer_endpoint_for_config,
+        writer_endpoint_for_role,
+    };
+    use symdex_store::{DatabaseRole, StoreConfig};
 
     #[test]
     fn writer_endpoint_is_stable_for_database_path() {
@@ -680,6 +692,26 @@ mod tests {
         assert_ne!(
             writer_endpoint_for_config(&first),
             writer_endpoint_for_config(&second)
+        );
+    }
+
+    #[test]
+    fn writer_endpoint_is_database_role_scoped() {
+        let config = StoreConfig {
+            sqlite_path: std::env::temp_dir().join("symdex-writer-a.sqlite"),
+        };
+
+        assert_eq!(
+            writer_endpoint_for_role(&config, DatabaseRole::Structural),
+            writer_endpoint_for_config(&config)
+        );
+        assert_ne!(
+            writer_endpoint_for_role(&config, DatabaseRole::FastSemantic),
+            writer_endpoint_for_role(&config, DatabaseRole::QualitySemantic)
+        );
+        assert_ne!(
+            writer_endpoint_for_config(&config),
+            writer_endpoint_for_role(&config, DatabaseRole::Events)
         );
     }
 

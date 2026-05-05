@@ -40,6 +40,49 @@ pub struct StoreConfig {
     pub sqlite_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DatabaseRole {
+    Structural,
+    FastSemantic,
+    QualitySemantic,
+    Watch,
+    Events,
+    Runtime,
+}
+
+pub const DATABASE_ROLES: [DatabaseRole; 6] = [
+    DatabaseRole::Structural,
+    DatabaseRole::FastSemantic,
+    DatabaseRole::QualitySemantic,
+    DatabaseRole::Watch,
+    DatabaseRole::Events,
+    DatabaseRole::Runtime,
+];
+
+impl DatabaseRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Structural => "structural",
+            Self::FastSemantic => "fast_semantic",
+            Self::QualitySemantic => "quality_semantic",
+            Self::Watch => "watch",
+            Self::Events => "events",
+            Self::Runtime => "runtime",
+        }
+    }
+
+    fn file_suffix(self) -> Option<&'static str> {
+        match self {
+            Self::Structural => None,
+            Self::FastSemantic => Some("fast"),
+            Self::QualitySemantic => Some("quality"),
+            Self::Watch => Some("watch"),
+            Self::Events => Some("events"),
+            Self::Runtime => Some("runtime"),
+        }
+    }
+}
+
 impl StoreConfig {
     pub fn from_env() -> Self {
         Self {
@@ -47,6 +90,36 @@ impl StoreConfig {
                 .unwrap_or_else(|| PathBuf::from(".symdex/symdex.sqlite")),
         }
     }
+
+    pub fn database_path(&self, role: DatabaseRole) -> PathBuf {
+        match role.file_suffix() {
+            None => self.sqlite_path.clone(),
+            Some(suffix) => sibling_role_path(&self.sqlite_path, suffix),
+        }
+    }
+
+    pub fn structural_path(&self) -> &Path {
+        &self.sqlite_path
+    }
+}
+
+fn sibling_role_path(base_path: &Path, suffix: &str) -> PathBuf {
+    let stem = base_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("symdex");
+    let file_name = match base_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension) if !extension.is_empty() => format!("{stem}-{suffix}.{extension}"),
+        _ => format!("{stem}-{suffix}"),
+    };
+    base_path
+        .parent()
+        .map(|parent| parent.join(&file_name))
+        .unwrap_or_else(|| PathBuf::from(file_name))
 }
 
 pub fn debug_db_locks_enabled() -> bool {
@@ -68,18 +141,25 @@ pub fn debug_db_lock_log(scope: &str, message: std::fmt::Arguments<'_>) {
 }
 
 pub fn sqlite_parent(config: &StoreConfig) -> Option<PathBuf> {
-    config.sqlite_path.parent().map(PathBuf::from)
+    database_parent(config, DatabaseRole::Structural)
+}
+
+pub fn database_parent(config: &StoreConfig, role: DatabaseRole) -> Option<PathBuf> {
+    config.database_path(role).parent().map(PathBuf::from)
 }
 
 pub fn writer_lock_path(config: &StoreConfig) -> PathBuf {
-    let lock_name = config
-        .sqlite_path
+    writer_lock_path_for_role(config, DatabaseRole::Structural)
+}
+
+pub fn writer_lock_path_for_role(config: &StoreConfig, role: DatabaseRole) -> PathBuf {
+    let database_path = config.database_path(role);
+    let lock_name = database_path
         .file_name()
         .and_then(|name| name.to_str())
         .map(|name| format!("{name}.writer.lock"))
         .unwrap_or_else(|| "symdex.sqlite.writer.lock".to_owned());
-    config
-        .sqlite_path
+    database_path
         .parent()
         .map(|parent| parent.join(&lock_name))
         .unwrap_or_else(|| PathBuf::from(lock_name))
@@ -160,7 +240,11 @@ impl WriterLeaseInfo {
     }
 
     pub fn read_for(config: &StoreConfig) -> Result<Option<Self>> {
-        read_writer_lease_info(&writer_lock_path(config))
+        Self::read_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn read_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Option<Self>> {
+        read_writer_lease_info(&writer_lock_path_for_role(config, role))
     }
 }
 
@@ -173,15 +257,25 @@ pub struct WriterLease {
 
 impl WriterLease {
     pub fn acquire(config: &StoreConfig, request: WriterLeaseRequest) -> Result<Self> {
-        if let Some(parent) = sqlite_parent(config) {
+        Self::acquire_for_role(config, DatabaseRole::Structural, request)
+    }
+
+    pub fn acquire_for_role(
+        config: &StoreConfig,
+        role: DatabaseRole,
+        request: WriterLeaseRequest,
+    ) -> Result<Self> {
+        let database_path = config.database_path(role);
+        if let Some(parent) = database_parent(config, role) {
             std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
         }
-        let lock_path = writer_lock_path(config);
+        let lock_path = writer_lock_path_for_role(config, role);
         debug_db_lock_log(
             "writer-lease",
             format_args!(
-                "acquire_attempt db={} lock={} owner_kind={} operation={} repo={}",
-                config.sqlite_path.display(),
+                "acquire_attempt role={} db={} lock={} owner_kind={} operation={} repo={}",
+                role.as_str(),
+                database_path.display(),
                 lock_path.display(),
                 request.kind.as_str(),
                 request.operation,
@@ -205,8 +299,9 @@ impl WriterLease {
                 debug_db_lock_log(
                     "writer-lease",
                     format_args!(
-                        "acquire_busy db={} lock={} owner={:?}",
-                        config.sqlite_path.display(),
+                        "acquire_busy role={} db={} lock={} owner={:?}",
+                        role.as_str(),
+                        database_path.display(),
                         lock_path.display(),
                         owner
                     ),
@@ -217,8 +312,9 @@ impl WriterLease {
                 debug_db_lock_log(
                     "writer-lease",
                     format_args!(
-                        "acquire_error db={} lock={} error={}",
-                        config.sqlite_path.display(),
+                        "acquire_error role={} db={} lock={} error={}",
+                        role.as_str(),
+                        database_path.display(),
                         lock_path.display(),
                         error
                     ),
@@ -237,8 +333,9 @@ impl WriterLease {
         debug_db_lock_log(
             "writer-lease",
             format_args!(
-                "acquire_success db={} lock={} owner_kind={} operation={} repo={}",
-                config.sqlite_path.display(),
+                "acquire_success role={} db={} lock={} owner_kind={} operation={} repo={}",
+                role.as_str(),
+                database_path.display(),
                 lock_path.display(),
                 info.owner_kind,
                 info.operation,
@@ -8968,7 +9065,7 @@ mod tests {
 
     use crate::{
         CallRecord, ChunkEmbeddingRecord, ChunkRecord, ChunkVectorStatus, ConfidenceBucket,
-        DependencyRecord, DependencyUsageRecord, FastEmbeddingManifestRecord,
+        DatabaseRole, DependencyRecord, DependencyUsageRecord, FastEmbeddingManifestRecord,
         FastSemanticGenerationInput, FileCoverageStatus, FileIndexEventRecord, FileRecord,
         PointPayload, QualityActivationReason, QualityEmbeddingJobRecord, QualityJobCompletion,
         RepositoryRecord, RuntimeObservationRecord, SemanticGenerationRecord, SqliteStore,
@@ -8976,6 +9073,7 @@ mod tests {
         SymbolReferenceRecord, TestRecord, VectorPoint, WatcherClientRecord, WatcherStatusRecord,
         WriterLease, WriterLeaseInfo, WriterLeaseKind, WriterLeaseRequest,
         validate_vector_table_name, vector_point_id, vector_rowid, vector_table_name,
+        writer_lock_path_for_role,
     };
 
     #[test]
@@ -8991,6 +9089,79 @@ mod tests {
         assert!(validate_vector_table_name("symdex_repo_model").is_ok());
         assert!(validate_vector_table_name("").is_err());
         assert!(validate_vector_table_name("../bad").is_err());
+    }
+
+    #[test]
+    fn database_role_paths_are_derived_from_structural_path() {
+        let config = StoreConfig {
+            sqlite_path: PathBuf::from(".symdex/symdex.sqlite"),
+        };
+
+        assert_eq!(
+            config.database_path(DatabaseRole::Structural),
+            PathBuf::from(".symdex/symdex.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::FastSemantic),
+            PathBuf::from(".symdex/symdex-fast.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::QualitySemantic),
+            PathBuf::from(".symdex/symdex-quality.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::Watch),
+            PathBuf::from(".symdex/symdex-watch.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::Events),
+            PathBuf::from(".symdex/symdex-events.sqlite")
+        );
+        assert_eq!(
+            config.database_path(DatabaseRole::Runtime),
+            PathBuf::from(".symdex/symdex-runtime.sqlite")
+        );
+    }
+
+    #[test]
+    fn writer_lock_paths_are_database_role_scoped() {
+        let config = StoreConfig {
+            sqlite_path: PathBuf::from(".symdex/symdex.sqlite"),
+        };
+
+        assert_eq!(
+            writer_lock_path_for_role(&config, DatabaseRole::Structural),
+            PathBuf::from(".symdex/symdex.sqlite.writer.lock")
+        );
+        assert_eq!(
+            writer_lock_path_for_role(&config, DatabaseRole::QualitySemantic),
+            PathBuf::from(".symdex/symdex-quality.sqlite.writer.lock")
+        );
+        assert_ne!(
+            writer_lock_path_for_role(&config, DatabaseRole::FastSemantic),
+            writer_lock_path_for_role(&config, DatabaseRole::QualitySemantic)
+        );
+    }
+
+    #[test]
+    fn vector_store_uses_database_role_path() {
+        let config = StoreConfig {
+            sqlite_path: PathBuf::from(".symdex/symdex.sqlite"),
+        };
+
+        let fast = SqliteVectorStore::new_for_role(&config, DatabaseRole::FastSemantic)
+            .expect("fast vector store should build");
+        let quality = SqliteVectorStore::new_for_role(&config, DatabaseRole::QualitySemantic)
+            .expect("quality vector store should build");
+
+        assert_eq!(
+            fast.database_path(),
+            Path::new(".symdex/symdex-fast.sqlite")
+        );
+        assert_eq!(
+            quality.database_path(),
+            Path::new(".symdex/symdex-quality.sqlite")
+        );
     }
 
     #[test]

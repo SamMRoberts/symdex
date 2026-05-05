@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zerocopy::IntoBytes;
 
-use crate::{Result, StoreConfig, StoreError, collect_rows};
+use crate::{DatabaseRole, Result, StoreConfig, StoreError, collect_rows};
 
 #[derive(Debug, Clone)]
 pub struct SqliteVectorStore {
@@ -11,10 +11,18 @@ pub struct SqliteVectorStore {
 
 impl SqliteVectorStore {
     pub fn new(config: &StoreConfig) -> Result<Self> {
+        Self::new_for_role(config, DatabaseRole::Structural)
+    }
+
+    pub fn new_for_role(config: &StoreConfig, role: DatabaseRole) -> Result<Self> {
         symdex_sqlite_vec::register_sqlite_vec().map_err(StoreError::SqliteVecRegistration)?;
         Ok(Self {
-            sqlite_path: config.sqlite_path.clone(),
+            sqlite_path: config.database_path(role),
         })
+    }
+
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.sqlite_path
     }
 
     pub fn health_check(&self) -> Result<String> {
