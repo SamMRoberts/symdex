@@ -654,7 +654,8 @@ supersedes queued work, only old `pending` and `running` jobs are marked
 is unavailable, the semantic generation is marked `quality_blocked` and no
 pending quality jobs are created. New queue and blocked-generation writes are
 also mirrored into the `quality_semantic` role database from the already-built
-structural job list, so clean role databases receive quality catch-up metadata
+structural job list and current fast manifest, so clean role databases receive
+quality catch-up metadata that can be checked against the fast generation
 without requiring cross-database foreign keys or source text.
 `semantic_generations.quality_dimension` remains null until the quality worker
 records actual quality embeddings.

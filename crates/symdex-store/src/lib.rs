@@ -12829,6 +12829,15 @@ mod tests {
 
         let generation = sample_semantic_generation();
         let job = sample_quality_embedding_job();
+        let fast_embedding = sample_chunk_embedding();
+        store
+            .record_semantic_generation_manifest(
+                &generation,
+                std::slice::from_ref(&fast_embedding),
+                None,
+                "102",
+            )
+            .expect("fast manifest should persist");
         let summary = store
             .queue_quality_embedding_jobs(
                 &generation,
@@ -12853,6 +12862,11 @@ mod tests {
                 .expect("pending quality jobs should read"),
             vec![job]
         );
+        let progress = store
+            .quality_generation_progress("repo", "generation-1")
+            .expect("quality progress should read");
+        assert_eq!(progress.pending_jobs, 1);
+        assert_eq!(progress.quality_eligible_chunks, 1);
     }
 
     #[test]
@@ -12872,11 +12886,12 @@ mod tests {
             updated_at: "104".to_owned(),
             ..sample_semantic_generation()
         };
-        let embedding = sample_quality_chunk_embedding("current");
+        let fast_embedding = sample_chunk_embedding();
+        let quality_embedding = sample_quality_chunk_embedding("current");
         store
             .record_semantic_generation_manifest(
                 &generation,
-                std::slice::from_ref(&embedding),
+                &[fast_embedding, quality_embedding.clone()],
                 None,
                 "104",
             )
@@ -12892,8 +12907,12 @@ mod tests {
             store
                 .chunk_embeddings_for_generation("repo", "generation-1", "quality")
                 .expect("quality embeddings should read"),
-            vec![embedding]
+            vec![quality_embedding]
         );
+        let progress = store
+            .quality_generation_progress("repo", "generation-1")
+            .expect("quality progress should read");
+        assert_eq!(progress.quality_embedded_chunks, 1);
     }
 
     #[test]

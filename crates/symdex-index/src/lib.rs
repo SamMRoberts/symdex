@@ -449,6 +449,9 @@ fn run_quality_index_limited_with_progress(
     let requeued_stale_jobs = sqlite
         .requeue_current_terminal_quality_embedding_jobs(root.id(), &generation.id, &requeued_at)
         .map_err(|error| error.to_string())?;
+    let fast_embeddings = sqlite
+        .chunk_embeddings_for_generation(root.id(), &generation.id, SemanticLayer::Fast.as_str())
+        .map_err(|error| error.to_string())?;
     let queued_jobs = sqlite
         .quality_embedding_jobs_for_fast_generation(
             root.id(),
@@ -465,6 +468,7 @@ fn run_quality_index_limited_with_progress(
         mirror_quality_embedding_jobs(
             &store_config,
             &generation,
+            &fast_embeddings,
             &quality_model,
             &queued_jobs,
             &requeued_at,
@@ -2392,6 +2396,13 @@ fn queue_quality_jobs_after_fast_indexing(
                     &quality_config.model,
                 )
                 .map_err(|error| error.to_string())?;
+            let fast_embeddings = sqlite
+                .chunk_embeddings_for_generation(
+                    repository_id,
+                    &generation.id,
+                    SemanticLayer::Fast.as_str(),
+                )
+                .map_err(|error| error.to_string())?;
             let jobs = sqlite
                 .quality_embedding_jobs_for_fast_generation(
                     repository_id,
@@ -2430,10 +2441,12 @@ fn queue_quality_jobs_after_fast_indexing(
                             SemanticLayer::Quality.as_str(),
                         )
                         .map_err(|error| error.to_string())?;
+                    let mut semantic_embeddings = fast_embeddings.clone();
+                    semantic_embeddings.extend(quality_embeddings);
                     mirror_quality_semantic_generation_manifest(
                         store_config,
                         &updated_generation,
-                        &quality_embeddings,
+                        &semantic_embeddings,
                     )?;
                     on_progress(IndexProgress::new(
                         "quality_queue",
@@ -2465,6 +2478,7 @@ fn queue_quality_jobs_after_fast_indexing(
             mirror_quality_embedding_jobs(
                 store_config,
                 generation,
+                &fast_embeddings,
                 &quality_config.model,
                 &jobs,
                 &queued_at,
@@ -2533,6 +2547,7 @@ fn mirror_quality_generation_blocked(
 fn mirror_quality_embedding_jobs(
     store_config: &StoreConfig,
     generation: &symdex_store::SemanticGenerationRecord,
+    fast_embeddings: &[ChunkEmbeddingRecord],
     quality_model: &str,
     jobs: &[QualityEmbeddingJobRecord],
     queued_at: &str,
@@ -2540,6 +2555,9 @@ fn mirror_quality_embedding_jobs(
     let mut quality_store = SqliteStore::open_for_role(store_config, DatabaseRole::QualitySemantic)
         .map_err(|error| error.to_string())?;
     quality_store.migrate().map_err(|error| error.to_string())?;
+    quality_store
+        .record_semantic_generation_manifest(generation, fast_embeddings, None, queued_at)
+        .map_err(|error| error.to_string())?;
     quality_store
         .queue_quality_embedding_jobs(generation, quality_model, jobs, queued_at)
         .map(|_| ())
