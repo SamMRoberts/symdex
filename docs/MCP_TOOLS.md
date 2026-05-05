@@ -287,10 +287,12 @@ Direct and transitive evidence rows include provenance, freshness labels, and
 trust scores. Related-file rows include path, relationship count, freshness,
 trust, and provenance.
 `tests_likely` contains indexed test qualified names when a discovered test
-directly calls the queried symbol through resolved call evidence. Metadata-only
-tests without symbol linkage are not used for likely-test claims. When no direct
-indexed test evidence is available, the list stays empty and a note explains
-that no likely-test evidence was found.
+has a moderate-confidence `test_targets` relationship to the queried symbol or
+its file. Direct call evidence is still supported as a compatibility fallback
+for older indexes. Metadata-only tests can contribute through conservative
+fixture-path relationships, but low-confidence same-module hints are not enough
+for likely-test claims. When no indexed test-target evidence is available, the
+list stays empty and a note explains that no likely-test evidence was found.
 
 ### `symdex_context_pack`
 

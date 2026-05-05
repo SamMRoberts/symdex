@@ -161,15 +161,17 @@ closure captures.
 
 ### 4. Impact Analysis Test Discovery Is Conservative Across Languages
 
-`tests_likely` in the impact output lists indexed tests that directly call the
-queried symbol through resolved call edges. Rust test attributes, C# NUnit,
-xUnit, and MSTest attributes, and JavaScript/TypeScript Jest, Vitest, and Mocha
-test calls are now persisted as test facts. JS/TS inline callback tests remain
+`tests_likely` in the impact output now reads conservative test-to-code
+relationships from `test_targets`, with direct call evidence retained as a
+compatibility fallback for older indexes. Rust test attributes, C# NUnit, xUnit,
+and MSTest attributes, and JavaScript/TypeScript Jest, Vitest, and Mocha test
+calls are persisted as test facts. JS/TS inline callback tests remain
 metadata-only unless a named callback can be linked unambiguously to an indexed
-symbol, so they are searchable but do not overclaim likely-test call coverage.
-For a tool designed to help debug failing tests across languages, the remaining
-gap is richer runtime parsing and stronger non-Rust call resolution rather than
-the table write path itself.
+symbol, but fixture-path relationships can still connect metadata-only tests to
+matching source files without claiming exact symbol coverage. For a tool
+designed to help debug failing tests across languages, the remaining gap is
+richer runtime parsing and stronger non-Rust call resolution rather than the
+table write path itself.
 
 ### 5. The `staleness` Command Is Underexposed in MCP
 
@@ -284,7 +286,8 @@ when the agent can guarantee the index is fresh.
 Store discovered tests in the `tests` table with the same schema (language slug,
 framework, qualified name, optional symbol linkage, byte/line ranges,
 provenance). `symdex_impact` surfaces `tests_likely` for any language when a
-stored test has direct resolved call evidence.
+stored test has persisted `test_targets` evidence, with direct resolved call
+evidence retained as the strongest relationship kind.
 
 **Why:** A large fraction of real debugging workflows start with "this test is
 failing." If the agent cannot map the failing test name to indexed symbols and

@@ -77,9 +77,10 @@ Fixtures should be tiny and purpose-built.
 - Test discovery coverage for Rust recognized test attributes, C# NUnit/xUnit/
   MSTest attributes, JavaScript and TypeScript Jest/Vitest/Mocha `test` / `it` /
   `describe` shapes, module- or suite-qualified test names, SQLite test
-  persistence/replacement, failing-test name mapping, metadata-only anonymous
-  callback rows, and impact likely-test evidence only from direct indexed test
-  calls.
+  persistence/replacement, conservative `test_targets` inference for direct
+  calls, naming conventions, and fixture paths, failing-test name mapping,
+  metadata-only anonymous callback rows, and impact likely-test evidence only
+  from indexed test-target evidence or compatibility direct-call joins.
 - Rust call-resolution coverage for exact local calls, unresolved calls,
   normalized `crate::` prefixes, explicit `use ... as ...` function aliases,
   module aliases used in scoped calls, simple grouped `use` aliases,
@@ -228,7 +229,7 @@ Current debug context tests cover runtime input parsing, mapped frame evidence,
 unmapped frames, fresh/stale/deleted freshness labels, calls at failing lines,
 malformed runtime lines, indexed failing-test mapping, unmatched failing-test
 fallbacks, common Rust runtime output shapes, and impact likely-test evidence
-from direct indexed test calls.
+from indexed test-target evidence.
 
 TUI storage visualizations should use SQLite fixtures for deterministic
 structural data and mocked or adapter-level sqlite-vec metadata for semantic

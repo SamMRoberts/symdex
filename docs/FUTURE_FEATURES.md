@@ -46,9 +46,10 @@ Requirements:
 ### Impact Analysis
 
 Impact analysis has grown from direct callers/callees into a repeatable change
-impact report with bounded transitive paths, related files, and direct indexed
-test evidence. Future work is focused on richer same-file symbol grouping,
-broader non-Rust call resolution, and deeper explanation metadata.
+impact report with bounded transitive paths, related files, and persisted
+conservative test-target evidence. Future work is focused on richer same-file
+symbol grouping, broader non-Rust call resolution, and deeper explanation
+metadata.
 
 Requirements:
 

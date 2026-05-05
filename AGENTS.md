@@ -25,7 +25,8 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Support a local continuous indexing mode that can be toggled on or off.
 - In continuous indexing mode, modified or newly created eligible files are automatically reindexed.
 - The MCP server exposes safe, narrow tools for coding agents.
-- SQLite stores repositories, files, symbols, chunks, calls, and index metadata.
+- SQLite stores repositories, files, symbols, chunks, calls, tests,
+  conservative test targets, and index metadata.
 - Only ONE process may write to the configured local SQLite/sqlite-vec database
   at a time. The guard is database-file scoped, not repository scoped. TUI, MCP,
   diagnostics, query, and status paths must be read-only unless they are
@@ -123,6 +124,10 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
 - Store symbol identity separately from display names.
 - Preserve unresolved call edges instead of dropping them.
 - Keep call resolution conservative; false certainty is worse than an unresolved edge.
+- Persist conservative test-to-code relationships in `test_targets` when
+  evidence supports direct calls, naming conventions, fixture paths, or
+  same-module file relationships. Store relationship kind, confidence, and
+  reason; do not turn weak hints into exact coverage claims.
 - Record embedding model name and vector dimension with every semantic layer.
 - A model or dimension change requires collection migration or full reindex for
   the affected layer.

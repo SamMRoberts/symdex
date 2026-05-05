@@ -242,7 +242,8 @@ architecture, and compatibility with the local-first evidence contract.
 - [x] Link discovered tests to symbols when syntax evidence is clear; otherwise
   preserve metadata without overclaiming call coverage.
 - [x] Surface non-Rust `tests_likely` in impact and debug-context outputs only
-  when indexed test facts and call evidence justify it.
+  when indexed test facts, persisted `test_targets`, or compatibility
+  direct-call evidence justify it.
 - [x] Add fixture-backed tests for each framework family.
 
 ### A5 — C# and Node stack trace parsing

@@ -7,7 +7,7 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -912,6 +912,14 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         transaction
+            .execute(
+                "DELETE FROM test_targets
+                 WHERE test_id IN (SELECT id FROM tests WHERE file_id = ?1)
+                    OR target_file_id = ?1",
+                params![file.id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
             .execute("DELETE FROM tests WHERE file_id = ?1", params![file.id])
             .map_err(StoreError::Sqlite)?;
         transaction
@@ -947,6 +955,14 @@ impl SqliteStore {
                 .execute(
                     "DELETE FROM symbol_references
                      WHERE file_id = ?1",
+                    params![&stale_file_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            transaction
+                .execute(
+                    "DELETE FROM test_targets
+                     WHERE test_id IN (SELECT id FROM tests WHERE file_id = ?1)
+                        OR target_file_id = ?1",
                     params![&stale_file_id],
                 )
                 .map_err(StoreError::Sqlite)?;
@@ -1151,8 +1167,49 @@ impl SqliteStore {
             }
         }
 
+        insert_inferred_test_targets(&transaction, file, tests, &indexed_at)?;
+
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(())
+    }
+
+    pub fn test_targets_for_symbol(
+        &self,
+        repository_id: &str,
+        symbol_query: &str,
+    ) -> Result<Vec<TestSearchRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT tests.id, tests.name, tests.qualified_name, tests.framework,
+                        tests.language, tests.path, tests.start_line, tests.end_line,
+                        files.content_hash, tests.index_run_id, tests.parser_version, tests.indexed_at
+                   FROM tests
+                   JOIN files ON tests.file_id = files.id
+                   JOIN test_targets ON test_targets.test_id = tests.id
+                   LEFT JOIN symbols target_symbol ON test_targets.target_symbol_id = target_symbol.id
+                   JOIN files target_file ON test_targets.target_file_id = target_file.id
+                   LEFT JOIN symbols file_symbol ON file_symbol.file_id = target_file.id
+                  WHERE tests.repository_id = ?1
+                    AND test_targets.confidence >= 0.5
+                    AND (
+                      target_symbol.id = ?2
+                      OR target_symbol.name = ?2
+                      OR target_symbol.qualified_name = ?2
+                      OR target_file.path = ?2
+                      OR file_symbol.id = ?2
+                      OR file_symbol.name = ?2
+                      OR file_symbol.qualified_name = ?2
+                    )
+                  GROUP BY tests.id
+                  ORDER BY MAX(test_targets.confidence) DESC, tests.path, tests.start_line, tests.qualified_name
+                  LIMIT 25",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![repository_id, symbol_query], test_search_row)
+            .map_err(StoreError::Sqlite)?;
+        collect_rows(rows)
     }
 
     pub fn ref_file_paths(&self, repository_ref_id: &str) -> Result<Vec<String>> {
@@ -3711,6 +3768,11 @@ impl SqliteStore {
         repository_id: &str,
         symbol_query: &str,
     ) -> Result<Vec<TestSearchRow>> {
+        let inferred = self.test_targets_for_symbol(repository_id, symbol_query)?;
+        if !inferred.is_empty() {
+            return Ok(inferred);
+        }
+
         let mut statement = self
             .connection
             .prepare(
@@ -6268,6 +6330,366 @@ fn collect_rows<T>(
     Ok(values)
 }
 
+fn insert_inferred_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    tests: &[TestRecord],
+    indexed_at: &str,
+) -> Result<()> {
+    for test in tests {
+        if let Some(symbol_id) = test.symbol_id.as_deref() {
+            insert_direct_call_test_targets(transaction, file, test, symbol_id, indexed_at)?;
+        }
+        insert_same_module_test_target(transaction, file, test, indexed_at)?;
+        insert_naming_convention_test_targets(transaction, file, test, indexed_at)?;
+        insert_fixture_path_test_targets(transaction, file, test, indexed_at)?;
+    }
+    Ok(())
+}
+
+fn insert_direct_call_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    test_symbol_id: &str,
+    indexed_at: &str,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO test_targets (
+                id, repository_id, test_id, target_symbol_id, target_file_id,
+                relationship_kind, confidence, reason, index_run_id, parser_version, indexed_at
+             )
+             SELECT ?1 || ':' || calls.id,
+                    ?2,
+                    ?3,
+                    calls.callee_symbol_id,
+                    callee.file_id,
+                    'direct_call',
+                    CASE WHEN calls.confidence > 0.95 THEN 0.95 ELSE calls.confidence END,
+                    'resolved call from test symbol to target symbol',
+                    COALESCE(calls.index_run_id, ?4),
+                    COALESCE(calls.parser_version, ?5),
+                    ?6
+               FROM calls
+               JOIN symbols callee ON calls.callee_symbol_id = callee.id
+              WHERE calls.caller_symbol_id = ?7
+                AND calls.callee_symbol_id IS NOT NULL
+                AND calls.resolution_status IN ('resolved_exact', 'resolved_local_candidate')
+             ON CONFLICT(id) DO UPDATE SET
+                repository_id = excluded.repository_id,
+                test_id = excluded.test_id,
+                target_symbol_id = excluded.target_symbol_id,
+                target_file_id = excluded.target_file_id,
+                relationship_kind = excluded.relationship_kind,
+                confidence = excluded.confidence,
+                reason = excluded.reason,
+                index_run_id = excluded.index_run_id,
+                parser_version = excluded.parser_version,
+                indexed_at = excluded.indexed_at",
+            params![
+                stable_id(&["test-target", &test.id, "direct_call"]),
+                file.repository_id,
+                test.id,
+                test.index_run_id,
+                test.parser_version,
+                indexed_at,
+                test_symbol_id,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn insert_same_module_test_target(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    indexed_at: &str,
+) -> Result<()> {
+    if is_likely_test_file_path(&test.path) {
+        return Ok(());
+    }
+    let has_non_test_symbol: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                  FROM symbols
+                 WHERE file_id = ?1
+                   AND (?2 IS NULL OR id <> ?2)
+                 LIMIT 1
+             )",
+            params![test.file_id, test.symbol_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    if !has_non_test_symbol {
+        return Ok(());
+    }
+    insert_test_target(
+        transaction,
+        TestTargetInsert {
+            id: stable_id(&["test-target", &test.id, "same_module", &test.file_id]),
+            repository_id: &file.repository_id,
+            test_id: &test.id,
+            target_symbol_id: None,
+            target_file_id: &test.file_id,
+            relationship_kind: "same_module",
+            confidence: 0.45,
+            reason: "test shares a source file with indexed code symbols",
+            index_run_id: &test.index_run_id,
+            parser_version: &test.parser_version,
+            indexed_at,
+        },
+    )
+}
+
+fn insert_naming_convention_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    indexed_at: &str,
+) -> Result<()> {
+    let normalized_test_name = normalized_identifier(&test.name);
+    if normalized_test_name.is_empty() {
+        return Ok(());
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, name, file_id
+               FROM symbols
+              WHERE file_id = ?1
+                AND (?2 IS NULL OR id <> ?2)
+              ORDER BY start_line, id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let rows = statement
+        .query_map(params![test.file_id, test.symbol_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(StoreError::Sqlite)?;
+    let candidates = collect_rows(rows)?;
+    drop(statement);
+
+    for (symbol_id, symbol_name, target_file_id) in candidates {
+        if !test_name_matches_symbol(&normalized_test_name, &symbol_name) {
+            continue;
+        }
+        insert_test_target(
+            transaction,
+            TestTargetInsert {
+                id: stable_id(&["test-target", &test.id, "naming_convention", &symbol_id]),
+                repository_id: &file.repository_id,
+                test_id: &test.id,
+                target_symbol_id: Some(&symbol_id),
+                target_file_id: &target_file_id,
+                relationship_kind: "naming_convention",
+                confidence: 0.7,
+                reason: "test name matches an indexed symbol in the same file",
+                index_run_id: &test.index_run_id,
+                parser_version: &test.parser_version,
+                indexed_at,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_fixture_path_test_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    file: &FileRecord,
+    test: &TestRecord,
+    indexed_at: &str,
+) -> Result<()> {
+    let fixture_stems = fixture_target_stems(&test.path);
+    if fixture_stems.is_empty() {
+        return Ok(());
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, path
+               FROM files
+              WHERE repository_id = ?1
+                AND id <> ?2
+              ORDER BY path, id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let rows = statement
+        .query_map(params![file.repository_id, test.file_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(StoreError::Sqlite)?;
+    let candidate_files = collect_rows(rows)?;
+    drop(statement);
+
+    for (target_file_id, target_path) in candidate_files {
+        if is_likely_test_file_path(&target_path) {
+            continue;
+        }
+        let Some(target_stem) = normalized_file_stem(&target_path) else {
+            continue;
+        };
+        if !fixture_stems.contains(&target_stem) {
+            continue;
+        }
+        insert_test_target(
+            transaction,
+            TestTargetInsert {
+                id: stable_id(&["test-target", &test.id, "fixture_path", &target_file_id]),
+                repository_id: &file.repository_id,
+                test_id: &test.id,
+                target_symbol_id: None,
+                target_file_id: &target_file_id,
+                relationship_kind: "fixture_path",
+                confidence: 0.55,
+                reason: "test file path matches an indexed source file stem",
+                index_run_id: &test.index_run_id,
+                parser_version: &test.parser_version,
+                indexed_at,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+struct TestTargetInsert<'a> {
+    id: String,
+    repository_id: &'a str,
+    test_id: &'a str,
+    target_symbol_id: Option<&'a str>,
+    target_file_id: &'a str,
+    relationship_kind: &'a str,
+    confidence: f32,
+    reason: &'a str,
+    index_run_id: &'a str,
+    parser_version: &'a str,
+    indexed_at: &'a str,
+}
+
+fn insert_test_target(
+    transaction: &rusqlite::Transaction<'_>,
+    target: TestTargetInsert<'_>,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO test_targets (
+                id, repository_id, test_id, target_symbol_id, target_file_id,
+                relationship_kind, confidence, reason, index_run_id, parser_version, indexed_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                repository_id = excluded.repository_id,
+                test_id = excluded.test_id,
+                target_symbol_id = excluded.target_symbol_id,
+                target_file_id = excluded.target_file_id,
+                relationship_kind = excluded.relationship_kind,
+                confidence = excluded.confidence,
+                reason = excluded.reason,
+                index_run_id = excluded.index_run_id,
+                parser_version = excluded.parser_version,
+                indexed_at = excluded.indexed_at",
+            params![
+                target.id,
+                target.repository_id,
+                target.test_id,
+                target.target_symbol_id,
+                target.target_file_id,
+                target.relationship_kind,
+                target.confidence,
+                target.reason,
+                target.index_run_id,
+                target.parser_version,
+                target.indexed_at,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn fixture_target_stems(path: &str) -> BTreeSet<String> {
+    let mut stems = BTreeSet::new();
+    let Some(stem) = normalized_file_stem(path) else {
+        return stems;
+    };
+    if is_likely_test_file_path(path) {
+        stems.insert(strip_test_affixes(&stem));
+    }
+    stems.remove("");
+    stems
+}
+
+fn normalized_file_stem(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(normalized_identifier)
+}
+
+fn normalized_identifier(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn strip_test_affixes(stem: &str) -> String {
+    let mut stripped = stem;
+    for prefix in ["test_", "tests_"] {
+        if let Some(rest) = stripped.strip_prefix(prefix) {
+            stripped = rest;
+        }
+    }
+    for suffix in ["_test", "_tests", "_spec", "_specs"] {
+        if let Some(rest) = stripped.strip_suffix(suffix) {
+            stripped = rest;
+        }
+    }
+    stripped.to_owned()
+}
+
+fn is_likely_test_file_path(path: &str) -> bool {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized_path.as_str());
+    normalized_path.starts_with("tests/")
+        || normalized_path.contains("/tests/")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_tests.rs")
+        || file_name.ends_with("_spec.rs")
+        || file_name.ends_with("_specs.rs")
+}
+
+fn test_name_matches_symbol(normalized_test_name: &str, symbol_name: &str) -> bool {
+    let normalized_symbol = normalized_identifier(symbol_name);
+    if normalized_symbol.is_empty() {
+        return false;
+    }
+    normalized_test_name == normalized_symbol
+        || normalized_test_name == format!("test_{normalized_symbol}")
+        || normalized_test_name == format!("{normalized_symbol}_test")
+        || normalized_test_name == format!("tests_{normalized_symbol}")
+        || normalized_test_name == format!("{normalized_symbol}_tests")
+}
+
 fn ref_identity(kind: RepositoryRefKind, ref_name: Option<&str>, head_oid: Option<&str>) -> String {
     match kind {
         RepositoryRefKind::Branch | RepositoryRefKind::Other => ref_name.unwrap_or("unknown"),
@@ -7728,6 +8150,31 @@ CREATE TABLE IF NOT EXISTS tests (
     FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS test_targets (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    test_id TEXT NOT NULL,
+    target_symbol_id TEXT,
+    target_file_id TEXT NOT NULL,
+    relationship_kind TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    index_run_id TEXT,
+    parser_version TEXT,
+    indexed_at TEXT NOT NULL,
+    CHECK(relationship_kind IN (
+        'direct_call',
+        'same_module',
+        'naming_convention',
+        'fixture_path'
+    )),
+    CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+    FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE,
+    FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL,
+    FOREIGN KEY(target_file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS semantic_generations (
     id TEXT PRIMARY KEY,
     repository_id TEXT NOT NULL,
@@ -7861,6 +8308,10 @@ CREATE INDEX IF NOT EXISTS idx_tests_repository_name ON tests(repository_id, nam
 CREATE INDEX IF NOT EXISTS idx_tests_repository_qualified_name ON tests(repository_id, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_tests_file_id ON tests(file_id);
 CREATE INDEX IF NOT EXISTS idx_tests_symbol_id ON tests(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_test_targets_repository_kind ON test_targets(repository_id, relationship_kind);
+CREATE INDEX IF NOT EXISTS idx_test_targets_test_id ON test_targets(test_id);
+CREATE INDEX IF NOT EXISTS idx_test_targets_target_symbol ON test_targets(target_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_test_targets_target_file ON test_targets(target_file_id);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_status ON index_runs(repository_id, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_index_runs_repository_model_status ON index_runs(repository_id, embedding_model, status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_file_index_events_run_path ON file_index_events(index_run_id, path);
@@ -8790,6 +9241,10 @@ mod tests {
             "idx_tests_repository_qualified_name",
             "idx_tests_file_id",
             "idx_tests_symbol_id",
+            "idx_test_targets_repository_kind",
+            "idx_test_targets_test_id",
+            "idx_test_targets_target_symbol",
+            "idx_test_targets_target_file",
             "idx_index_runs_repository_status",
             "idx_index_runs_repository_model_status",
             "idx_file_index_events_run_path",
@@ -10407,6 +10862,12 @@ mod tests {
             ("tests", "qualified_name"),
             ("tests", "framework"),
             ("tests", "parser_version"),
+            ("test_targets", "test_id"),
+            ("test_targets", "target_symbol_id"),
+            ("test_targets", "target_file_id"),
+            ("test_targets", "relationship_kind"),
+            ("test_targets", "confidence"),
+            ("test_targets", "reason"),
         ] {
             assert!(
                 store
@@ -10495,6 +10956,15 @@ mod tests {
             .expect("likely tests should load");
         assert_eq!(likely.len(), 1);
         assert_eq!(likely[0].qualified_name, "tests::covers_target");
+        let target_kind = store
+            .connection
+            .query_row(
+                "SELECT relationship_kind FROM test_targets WHERE test_id = 'test-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("test target should persist");
+        assert_eq!(target_kind, "direct_call");
 
         store
             .replace_file_facts_with_tests(&sample_file("hash-2"), &symbols[..1], &[], &[], &[])
@@ -10505,6 +10975,119 @@ mod tests {
                 .expect("likely tests should load")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn sqlite_uses_fixture_path_test_targets_for_likely_tests() {
+        let db = TestDb::new("fixture-test-targets");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+
+        let source_file = sample_file_at("source-file", "src/calculator.rs", "hash-source");
+        let source_symbols = vec![sample_symbol_in_file(
+            "target-symbol",
+            "source-file",
+            "add",
+            "crate::calculator::add",
+        )];
+        store
+            .replace_file_facts(&source_file, &source_symbols, &[], &[])
+            .expect("source file should persist");
+
+        let test_file = sample_file_at("test-file", "tests/calculator_tests.rs", "hash-test");
+        let test = TestRecord {
+            id: "test-calculator".to_owned(),
+            repository_id: "repo".to_owned(),
+            file_id: "test-file".to_owned(),
+            symbol_id: None,
+            name: "adds numbers".to_owned(),
+            qualified_name: "tests::calculator_tests::adds numbers".to_owned(),
+            framework: "rust_test".to_owned(),
+            language: "rust".to_owned(),
+            path: "tests/calculator_tests.rs".to_owned(),
+            start_line: 4,
+            end_line: 8,
+            start_byte: 32,
+            end_byte: 96,
+            index_run_id: "run".to_owned(),
+            parser_version: "parser".to_owned(),
+        };
+        store
+            .replace_file_facts_with_tests(&test_file, &[], &[], &[], &[test])
+            .expect("fixture test should persist");
+
+        let likely = store
+            .likely_tests_for_symbol("repo", "add")
+            .expect("likely tests should load from test targets");
+        assert_eq!(
+            likely
+                .iter()
+                .map(|test| test.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tests::calculator_tests::adds numbers"]
+        );
+        let relationship = store
+            .connection
+            .query_row(
+                "SELECT relationship_kind, confidence, reason
+                   FROM test_targets
+                  WHERE test_id = 'test-calculator'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("fixture relationship should persist");
+        assert_eq!(relationship.0, "fixture_path");
+        assert!((relationship.1 - 0.55).abs() < 0.001);
+        assert_eq!(
+            relationship.2,
+            "test file path matches an indexed source file stem"
+        );
+    }
+
+    #[test]
+    fn sqlite_uses_naming_convention_test_targets_for_likely_tests() {
+        let db = TestDb::new("naming-test-targets");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: "repo".to_owned(),
+                root_path: "/tmp/repo".to_owned(),
+            })
+            .expect("repository should persist");
+        let symbols = vec![
+            sample_symbol("target-symbol", "target", "crate::target"),
+            sample_symbol("test-symbol", "test_target", "crate::tests::test_target"),
+        ];
+        let tests = vec![sample_test(
+            "test-naming",
+            "test-symbol",
+            "crate::tests::test_target",
+        )];
+        store
+            .replace_file_facts_with_tests(&sample_file("hash-1"), &symbols, &[], &[], &tests)
+            .expect("test facts should persist");
+
+        let likely = store
+            .likely_tests_for_symbol("repo", "target")
+            .expect("likely tests should load from naming target");
+        assert_eq!(likely.len(), 1);
+        assert_eq!(likely[0].qualified_name, "crate::tests::test_target");
+        let kinds = test_target_kinds(&store);
+        assert!(kinds.iter().any(|kind| kind == "naming_convention"));
+        assert!(kinds.iter().any(|kind| kind == "same_module"));
     }
 
     #[test]
@@ -12436,6 +13019,17 @@ mod tests {
             index_run_id: "run".to_owned(),
             parser_version: "parser".to_owned(),
         }
+    }
+
+    fn test_target_kinds(store: &SqliteStore) -> Vec<String> {
+        let mut statement = store
+            .connection
+            .prepare("SELECT relationship_kind FROM test_targets ORDER BY relationship_kind")
+            .expect("statement should prepare");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query should run");
+        rows.map(|row| row.expect("row should load")).collect()
     }
 
     fn unresolved_call(

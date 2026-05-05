@@ -142,6 +142,14 @@ symbol only when the callback reference is unambiguous; anonymous callback tests
 are persisted as metadata-only rows with no symbol link so they cannot overclaim
 call coverage.
 
+After test facts, symbols, files, and calls are persisted, the store derives
+conservative `test_targets` rows. Direct resolved calls from symbol-linked tests
+produce symbol targets. Exact normalized test-name matches, fixture-path stems
+such as `tests/calculator_tests.rs` to `src/calculator.rs`, and low-confidence
+same-module file relationships produce additional metadata-only target evidence.
+Each row stores `relationship_kind`, `confidence`, and `reason`; weak hints are
+kept below the likely-test threshold instead of being promoted to exact coverage.
+
 Current implementation also scans each chunk for likely sensitive material
 before embedding. Private key markers, credential-looking assignments, token
 prefixes, and credentialed database connection strings set `excluded_reason` on

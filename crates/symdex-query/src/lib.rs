@@ -728,9 +728,9 @@ fn build_impact_summary(
         .map_err(|error| error.to_string())?;
     let mut notes = vec!["metadata_only_no_source_text".to_owned()];
     if tests_likely.is_empty() {
-        notes.push("likely_tests_unavailable_without_indexed_direct_test_evidence".to_owned());
+        notes.push("likely_tests_unavailable_without_indexed_test_target_evidence".to_owned());
     } else {
-        notes.push("likely_tests_from_indexed_direct_test_calls".to_owned());
+        notes.push("likely_tests_from_indexed_test_targets_or_direct_calls".to_owned());
     }
 
     Ok(ImpactSummary {
@@ -4272,7 +4272,7 @@ mod tests {
             summary
                 .notes
                 .iter()
-                .any(|note| note == "likely_tests_from_indexed_direct_test_calls")
+                .any(|note| note == "likely_tests_from_indexed_test_targets_or_direct_calls")
         );
     }
 
@@ -4293,7 +4293,7 @@ mod tests {
             summary
                 .notes
                 .iter()
-                .any(|note| note == "likely_tests_from_indexed_direct_test_calls")
+                .any(|note| note == "likely_tests_from_indexed_test_targets_or_direct_calls")
         );
     }
 

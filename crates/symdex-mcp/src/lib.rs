@@ -406,9 +406,9 @@ fn tool_impact(arguments: &Value) -> Result<Value, String> {
         .into_iter()
         .collect::<Vec<_>>();
     let test_note = if tests_likely.is_empty() {
-        "likely_tests_unavailable_without_indexed_direct_test_evidence"
+        "likely_tests_unavailable_without_indexed_test_target_evidence"
     } else {
-        "likely_tests_from_indexed_direct_test_calls"
+        "likely_tests_from_indexed_test_targets_or_direct_calls"
     };
     Ok(json!({
         "repository_id": root.id(),

@@ -237,8 +237,9 @@ commands to print the same `symdex.mcp.evidence.v1` envelope used by MCP
   labels. Evidence rows include trust scores derived from freshness,
   provenance completeness, confidence, and index metadata completeness, plus
   compact reason tags explaining why each evidence row was returned. Likely tests
-  list indexed tests that directly call the queried symbol when discovered test
-  metadata and resolved call evidence are present.
+  list indexed tests with moderate-confidence `test_targets` evidence for the
+  queried symbol or its file, with direct-call joins retained as a compatibility
+  fallback for older indexes.
 - `context-pack <repo> <symbol> [--mode structural|unified]`: prints compact
   JSON evidence for editing context. The default structural mode preserves
   `symdex.context_pack.v1` and includes focus symbols, direct callers, direct

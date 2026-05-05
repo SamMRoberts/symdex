@@ -7,7 +7,7 @@ Initial schema names are stable enough for early implementation but may change b
 Current implementation runs idempotent SQLite migrations at `symdex init`,
 `symdex index`, and `symdex index-status`. It creates all tables listed below,
 while the current indexing write path persists repositories, files, chunks,
-symbols, calls, symbol references, tests, fast semantic generations, and fast/quality
+symbols, calls, symbol references, tests, conservative test targets, fast semantic generations, and fast/quality
 `chunk_embeddings` manifests. The older chunk-level vector columns remain
 nullable compatibility schema, but layered manifests are the authoritative
 semantic projection.
@@ -356,6 +356,40 @@ such as inline Jest, Vitest, or Mocha callbacks. The `tests` table supports
 exact/suffix failing-test name lookup for debug context packs and direct
 test-to-symbol call lookup for impact summaries.
 
+### `test_targets`
+
+```sql
+CREATE TABLE test_targets (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,
+  test_id TEXT NOT NULL,
+  target_symbol_id TEXT,
+  target_file_id TEXT NOT NULL,
+  relationship_kind TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  reason TEXT NOT NULL,
+  index_run_id TEXT,
+  parser_version TEXT,
+  indexed_at TEXT NOT NULL
+);
+```
+
+`test_targets` records conservative relationships between indexed tests and
+the symbols or files they likely cover. It exists so impact analysis does not
+depend only on direct call-edge joins at query time. Current relationship kinds
+are `direct_call`, `same_module`, `naming_convention`, and `fixture_path`.
+Rows include a numeric confidence and compact reason string so downstream
+surfaces can explain why a test was considered relevant without reading source
+text.
+
+Direct-call rows require a resolved call from a symbol-linked test to a target
+symbol. Naming rows require an exact normalized test-name-to-symbol-name match
+in the same file, such as `test_target` for `target`. Fixture-path rows link
+test files such as `tests/calculator_tests.rs` to indexed source files with a
+matching stem such as `src/calculator.rs`. Same-module rows are low-confidence
+file-level evidence for colocated source-file tests and are not strong enough
+by themselves to drive `tests_likely`.
+
 ### `semantic_generations`
 
 ```sql
@@ -631,6 +665,8 @@ Use SQLite tables to show repository structure:
 - `calls`: caller/callee links, call lines, confidence, and resolution status.
 - `symbol_references`: imports, type references, implementations, inheritance,
   attributes/decorators, confidence, and resolution status.
+- `tests` and `test_targets`: discovered test metadata plus conservative
+  test-to-code relationship kind, confidence, and reason.
 
 Use sqlite-vec metadata to show semantic storage:
 
@@ -790,11 +826,14 @@ freshness label, trust score, and the first available provenance record for that
 file. Direct call rows, transitive paths, path edges, and related-file rows also
 carry reason tags that distinguish direct caller/callee evidence, bounded
 transitive paths, and file relationships derived from call evidence. The impact
-report also includes indexed tests that directly call the queried symbol through
-resolved call edges. Metadata-only tests without symbol linkage remain
-searchable as test facts but do not appear in `tests_likely`. When no direct
-indexed test evidence is available, `tests_likely` remains empty and the output
-includes an explanatory note instead of guessing.
+report also includes indexed tests that target the queried symbol or its file
+through persisted `test_targets` rows with at least moderate confidence.
+Existing direct-call joins remain a compatibility fallback for databases that
+were indexed before `test_targets` existed. Metadata-only tests can contribute
+when fixture-path evidence links them to a target file, but weak same-module
+hints stay below the likely-test threshold. When no indexed test-target
+evidence is available, `tests_likely` remains empty and the output includes an
+explanatory note instead of guessing.
 
 ## Debug context packs
 
