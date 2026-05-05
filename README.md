@@ -124,6 +124,10 @@ Manual indexing, quality catch-up, repair, migrations, watcher state updates,
 and continuous indexing batches submit jobs to that service. The service owns
 SQLite/sqlite-vec writes and keeps the sidecar OS lock only as its internal
 duplicate-daemon guard. Read paths use read-only SQLite connections directly.
+When a manual writer job is running, watcher database writes pause at the
+writer gate; the watcher may continue polling and coalescing filesystem changes
+but does not write watcher status, incremental batches, or idle quality
+catch-up until the manual job releases the gate.
 Set `SYMDEX_DEBUG_DB_LOCKS=1` to print stderr diagnostics for writer daemon
 startup/attach, queued jobs, writer-gate wait and hold times, SQLite open modes,
 and daemon-internal lease acquisition. `SYMDEX_DEBUG_WRITER=1` is accepted as an

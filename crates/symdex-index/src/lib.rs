@@ -588,10 +588,14 @@ pub fn run_continuous_index_until_with_write_gate(
 ) -> Result<(), String> {
     let root = RepoRoot::open(&options.repo).map_err(|error| error.to_string())?;
     let mut snapshot = watch_snapshot(&root)?;
-    on_event(ContinuousIndexEvent::Started {
-        repository_id: root.id().to_owned(),
-        files_seen: snapshot.len(),
-    });
+    emit_continuous_event_with_writer(
+        ContinuousIndexEvent::Started {
+            repository_id: root.id().to_owned(),
+            files_seen: snapshot.len(),
+        },
+        &mut on_event,
+        &mut with_writer,
+    )?;
 
     while should_continue() {
         thread::sleep(options.poll_interval);
@@ -601,16 +605,23 @@ pub fn run_continuous_index_until_with_write_gate(
         let (next_snapshot, first_changes) = detect_watch_changes(&root, &snapshot)?;
         if first_changes.is_empty() {
             snapshot = next_snapshot;
-            on_event(ContinuousIndexEvent::Idle {
-                files_seen: snapshot.len(),
-            });
-            run_continuous_quality_catch_up(options, &mut on_event, false);
+            with_writer(&mut || {
+                on_event(ContinuousIndexEvent::Idle {
+                    files_seen: snapshot.len(),
+                });
+                run_continuous_quality_catch_up(options, &mut on_event, false);
+                Ok(())
+            })?;
             continue;
         }
 
-        on_event(ContinuousIndexEvent::ChangesPending {
-            changes: first_changes.clone(),
-        });
+        emit_continuous_event_with_writer(
+            ContinuousIndexEvent::ChangesPending {
+                changes: first_changes.clone(),
+            },
+            &mut on_event,
+            &mut with_writer,
+        )?;
         thread::sleep(options.debounce);
         if !should_continue() {
             break;
@@ -621,9 +632,13 @@ pub fn run_continuous_index_until_with_write_gate(
         } else {
             changes
         };
-        on_event(ContinuousIndexEvent::ChangesDetected {
-            changes: changes.clone(),
-        });
+        emit_continuous_event_with_writer(
+            ContinuousIndexEvent::ChangesDetected {
+                changes: changes.clone(),
+            },
+            &mut on_event,
+            &mut with_writer,
+        )?;
 
         let batch_job = || {
             run_watch_incremental_index(&IndexOptions {
@@ -642,18 +657,36 @@ pub fn run_continuous_index_until_with_write_gate(
             })
         }) {
             Ok(()) => {
-                let _ = with_writer(&mut || {
+                with_writer(&mut || {
                     run_continuous_quality_catch_up(options, &mut on_event, true);
                     Ok(())
-                });
+                })?;
             }
             Err(error) => {
                 snapshot = debounced_snapshot;
-                on_event(ContinuousIndexEvent::BatchFailed { changes, error });
+                emit_continuous_event_with_writer(
+                    ContinuousIndexEvent::BatchFailed { changes, error },
+                    &mut on_event,
+                    &mut with_writer,
+                )?;
             }
         }
     }
     Ok(())
+}
+
+fn emit_continuous_event_with_writer(
+    event: ContinuousIndexEvent,
+    on_event: &mut impl FnMut(ContinuousIndexEvent),
+    with_writer: &mut impl FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut event = Some(event);
+    with_writer(&mut || {
+        if let Some(event) = event.take() {
+            on_event(event);
+        }
+        Ok(())
+    })
 }
 
 fn run_continuous_quality_catch_up(
@@ -3145,7 +3178,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use symdex_core::{
         ByteRange, CallEdge, ChunkKind, CodeChunk, DiscoveryOptions, FileFacts, Language,
@@ -3158,14 +3191,15 @@ mod tests {
     };
 
     use crate::{
-        ContinuousIndexOptions, ContinuousQualityState, IndexCollection, IndexReport, IndexScope,
-        QualityJobPreparation, RustAnalyzerEnrichmentConfig, RustAnalyzerEnrichmentSummary,
-        RustAnalyzerReadiness, WatchSnapshot, apply_embedding_size_limits, chunk_record,
-        chunk_texts, collect_index_reports, collect_index_reports_with_options,
-        detect_watch_changes, diff_watch_snapshots, index_run_kind, plan_rust_analyzer_enrichment,
-        prepare_quality_job, quality_chunk_embedding_record, quality_vector_point,
-        resolve_cross_file_rust_calls, should_run_continuous_quality_catch_up, watch_snapshot,
-        watch_snapshot_with_options,
+        ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, IndexCollection,
+        IndexReport, IndexScope, QualityJobPreparation, RustAnalyzerEnrichmentConfig,
+        RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness, WatchSnapshot,
+        apply_embedding_size_limits, chunk_record, chunk_texts, collect_index_reports,
+        collect_index_reports_with_options, detect_watch_changes, diff_watch_snapshots,
+        index_run_kind, plan_rust_analyzer_enrichment, prepare_quality_job,
+        quality_chunk_embedding_record, quality_vector_point, resolve_cross_file_rust_calls,
+        run_continuous_index_until_with_write_gate, should_run_continuous_quality_catch_up,
+        watch_snapshot, watch_snapshot_with_options,
     };
 
     #[test]
@@ -3421,6 +3455,46 @@ mod tests {
             &no_catch_up,
             &enabled
         ));
+    }
+
+    #[test]
+    fn continuous_indexing_idle_status_runs_through_writer_gate() {
+        let repo = TestRepo::new("continuous-idle-writer-gate");
+        repo.write("src/lib.rs", "fn main() {}\n");
+        let mut options = ContinuousIndexOptions::new(repo.path().display().to_string(), true);
+        options.poll_interval = Duration::from_millis(1);
+        options.debounce = Duration::from_millis(1);
+
+        let mut should_continue_calls = 0usize;
+        let mut gate_calls = 0usize;
+        let mut events = Vec::new();
+        run_continuous_index_until_with_write_gate(
+            &options,
+            |event| events.push(event),
+            || {
+                should_continue_calls += 1;
+                should_continue_calls <= 2
+            },
+            |job| {
+                gate_calls += 1;
+                job()
+            },
+        )
+        .expect("continuous loop should stop cleanly");
+
+        assert!(matches!(
+            events.first(),
+            Some(ContinuousIndexEvent::Started { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ContinuousIndexEvent::Idle { .. }))
+        );
+        assert!(
+            gate_calls >= events.len(),
+            "watcher status events should be serialized through the writer gate"
+        );
     }
 
     #[test]

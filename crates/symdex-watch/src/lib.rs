@@ -316,15 +316,6 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
         format_args!("start repo={}", root.path().display()),
     );
     let store_config = StoreConfig::from_env();
-    let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
-    store.migrate().map_err(|error| error.to_string())?;
-    store
-        .upsert_repository(&RepositoryRecord {
-            id: root.id().to_owned(),
-            root_path: root.path().display().to_string(),
-        })
-        .map_err(|error| error.to_string())?;
-
     let initial = WatcherStatus {
         repository_id: root.id().to_owned(),
         root_path: root.path().display().to_string(),
@@ -351,9 +342,45 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
         clients: Vec::new(),
         shutdown_after_seconds: None,
     };
-    store
-        .upsert_watcher_status(&initial.record())
-        .map_err(|error| error.to_string())?;
+    let store = {
+        let wait_started = Instant::now();
+        debug_db_lock_log(
+            "watcher-managed",
+            format_args!("setup_gate_wait repo={}", root.path().display()),
+        );
+        let _guard = write_gate
+            .lock()
+            .map_err(|_| "writer gate lock poisoned".to_owned())?;
+        debug_db_lock_log(
+            "watcher-managed",
+            format_args!(
+                "setup_gate_acquired repo={} wait_ms={}",
+                root.path().display(),
+                wait_started.elapsed().as_millis()
+            ),
+        );
+        let setup_started = Instant::now();
+        let store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
+        store.migrate().map_err(|error| error.to_string())?;
+        store
+            .upsert_repository(&RepositoryRecord {
+                id: root.id().to_owned(),
+                root_path: root.path().display().to_string(),
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .upsert_watcher_status(&initial.record())
+            .map_err(|error| error.to_string())?;
+        debug_db_lock_log(
+            "watcher-managed",
+            format_args!(
+                "setup_gate_release repo={} held_ms={}",
+                root.path().display(),
+                setup_started.elapsed().as_millis()
+            ),
+        );
+        store
+    };
 
     let mut current = initial;
     let mut no_clients_since: Option<Instant> = None;
@@ -401,6 +428,9 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 "watcher-managed",
                 format_args!("stop repo={}", root.path().display()),
             );
+            let _guard = write_gate
+                .lock()
+                .map_err(|_| "writer gate lock poisoned".to_owned())?;
             store
                 .mark_watcher_stopped(root.id())
                 .map_err(|error| error.to_string())
@@ -410,6 +440,9 @@ pub fn run_writer_managed_daemon(repo: &str, write_gate: Arc<Mutex<()>>) -> Resu
                 "watcher-managed",
                 format_args!("fail repo={} error={}", root.path().display(), error),
             );
+            let _guard = write_gate
+                .lock()
+                .map_err(|_| "writer gate lock poisoned".to_owned())?;
             let _ = store.mark_watcher_failed(root.id(), &error);
             Err(error)
         }

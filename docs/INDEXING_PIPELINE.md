@@ -421,7 +421,11 @@ Write-capable work includes manual indexing, continuous indexing, quality
 catch-up, vector repair, cleanup, migrations, and any future write-capable MCP
 tool. These paths submit jobs to the writer service and wait for the result
 instead of opening a second writer. Continuous indexing runs as writer-managed
-watcher work and uses the same in-process write gate as queued manual jobs.
+watcher work and uses the same in-process write gate as queued manual jobs. A
+manual index, repair, migration, or quality job pauses watcher database writes:
+the watcher can continue polling and coalescing filesystem changes, but watcher
+status writes, incremental batches, idle quality catch-up, and terminal
+stop/failure state writes wait for the writer gate before touching SQLite.
 Read paths such as TUI refreshes, MCP evidence tools,
 diagnostics, semantic status, staleness checks, and query tools must not run
 migrations, stale-client pruning, repair, or quality catch-up as a side effect

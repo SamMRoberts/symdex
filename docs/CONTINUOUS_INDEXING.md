@@ -32,6 +32,11 @@ enabled, modified or newly created eligible files are automatically reindexed.
   repair, migrations, and future write-capable tools submit jobs to that
   service. TUI, MCP, diagnostics, status, and query paths read shared state
   without migrations or cleanup writes.
+- Manual writer jobs take priority over watcher writes. The watcher may keep
+  polling and coalescing filesystem changes, but watcher status updates,
+  incremental indexing batches, idle quality catch-up, and stop/failure state
+  writes wait on the writer-service gate while a manual index, repair,
+  migration, or quality job is running.
 
 ## Event Handling
 
