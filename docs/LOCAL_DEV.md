@@ -44,9 +44,10 @@ readiness check for the configured command. Current indexing does not run
 rust-analyzer project analysis or apply rust-analyzer facts.
 
 `SYMDEX_EMBED_TRUNCATE` defaults to `true`, matching Ollama's embedding API
-behavior for oversized local inputs. Symdex still excludes large chunks before
-embedding because some Ollama/model combinations return context-length errors
-instead of truncating.
+behavior for oversized local inputs. Symdex also splits large chunks into
+overlapping, right-sized embedding segments because some Ollama/model
+combinations return context-length errors instead of truncating. Segment vectors
+are averaged into one vector for the original structural chunk.
 
 `SYMDEX_EMBED_BATCH_SIZE` defaults to `16`. Symdex splits semantic indexing
 requests into batches before calling Ollama `/api/embed`, which avoids oversized
@@ -70,9 +71,11 @@ ticks.
 
 `SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `2048` for fast indexing.
 `SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` defaults to `512` for quality indexing.
-Chunks larger than the active layer limit are persisted as metadata-only
-structural evidence with `chunk_too_large_for_embedding` and are not sent to
-Ollama.
+Chunks larger than the active layer limit are sent to Ollama as multiple
+overlapping segments no larger than the configured byte limit, except that a
+single UTF-8 scalar may exceed a very small limit to avoid invalid text splits.
+Secret-blocked chunks remain metadata-only structural evidence and are not sent
+to Ollama.
 
 `SYMDEX_DEBUG_DB_LOCKS=1` enables stderr diagnostics for SQLite lock
 troubleshooting. Logs include writer-service daemon startup and attach attempts,

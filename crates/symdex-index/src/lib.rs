@@ -23,6 +23,10 @@ use symdex_store::{
     WriterLeaseRequest, current_timestamp, vector_point_id, vector_table_name,
 };
 
+const EMBEDDING_SEGMENT_OVERLAP_DIVISOR: usize = 5;
+const MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES: usize = 256;
+const MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOptions {
     pub repo: String,
@@ -961,7 +965,6 @@ fn run_index_internal(
         }
     };
     resolve_cross_file_rust_calls(&mut collection, &persisted_rust_symbols);
-    apply_embedding_size_limits(&mut collection.reports, embed_config.max_chunk_bytes);
     let files = file_summaries(&collection.reports);
     let rust_analyzer =
         rust_analyzer_enrichment_summary(&collection, &RustAnalyzerEnrichmentConfig::from_env());
@@ -2053,7 +2056,7 @@ fn prepare_semantic_index(
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<PreparedSemanticIndex, String> {
     let embed_config = layered_embed_config.fast_embed_config();
-    let chunk_texts = chunk_texts(&collection.reports);
+    let chunk_texts = chunk_texts(&collection.reports, embed_config.max_chunk_bytes);
     if chunk_texts.is_empty() {
         on_progress(IndexProgress::new(
             "embedding",
@@ -2088,15 +2091,18 @@ fn prepare_semantic_index(
         format!("Embedding {} chunks", chunk_texts.len()),
     ));
 
+    let embedding_segments = chunk_texts
+        .iter()
+        .flat_map(|chunk| chunk.text_segments.iter().cloned())
+        .collect::<Vec<_>>();
     let embeddings = embed_client
-        .embed_batch(
-            &chunk_texts
-                .iter()
-                .map(|chunk| chunk.text.clone())
-                .collect::<Vec<_>>(),
-        )
+        .embed_batch(&embedding_segments)
         .map_err(|error| error.to_string())?;
-    let dimension = embeddings.dimension().unwrap_or(0);
+    let chunk_vectors = aggregate_segment_embeddings(&chunk_texts, embeddings.embeddings)?;
+    let dimension = chunk_vectors
+        .first()
+        .map(|vector| vector.len())
+        .unwrap_or(0);
     on_progress(IndexProgress::new(
         "embedding",
         3,
@@ -2116,12 +2122,16 @@ fn prepare_semantic_index(
         "vector",
         4,
         5,
-        format!("Upserting {} vector points", chunk_texts.len()),
+        format!(
+            "Upserting {} vector points from {} embedding segments",
+            chunk_texts.len(),
+            embedding_segments.len()
+        ),
     ));
 
     let points = chunk_texts
         .iter()
-        .zip(embeddings.embeddings)
+        .zip(chunk_vectors)
         .map(|(chunk, vector)| {
             vector_point(
                 root.id(),
@@ -2492,10 +2502,7 @@ fn process_quality_job(
         }
     };
 
-    let embeddings = match context
-        .embed_client
-        .embed_batch(std::slice::from_ref(&prepared.text))
-    {
+    let embeddings = match context.embed_client.embed_batch(&prepared.text_segments) {
         Ok(embeddings) => embeddings,
         Err(error) => {
             sqlite
@@ -2559,15 +2566,18 @@ fn process_quality_job(
         return Ok(());
     }
 
-    let Some(vector) = embeddings.embeddings.into_iter().next() else {
-        complete_failed_quality_job(
-            sqlite,
-            &prepared.row.job.id,
-            "quality embedding response did not include a vector",
-            &completed_at,
-            stats,
-        )?;
-        return Ok(());
+    let vector = match average_embedding(&embeddings.embeddings) {
+        Ok(vector) => vector,
+        Err(error) => {
+            complete_failed_quality_job(
+                sqlite,
+                &prepared.row.job.id,
+                &error,
+                &completed_at,
+                stats,
+            )?;
+            return Ok(());
+        }
     };
     let point = match quality_vector_point(
         context.root.id(),
@@ -2649,7 +2659,7 @@ fn complete_failed_quality_job(
 #[derive(Debug)]
 struct PreparedQualityJob {
     row: QualityJobSourceRow,
-    text: String,
+    text_segments: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2685,11 +2695,6 @@ fn prepare_quality_job(
     if start_byte >= end_byte {
         return Ok(QualityJobPreparation::Stale);
     }
-    if end_byte.saturating_sub(start_byte) > max_chunk_bytes {
-        return Ok(QualityJobPreparation::Excluded {
-            reason: "quality_chunk_too_large_for_embedding".to_owned(),
-        });
-    }
     let normalized = NormalizedRepoPath::new(&row.job.path).map_err(|error| error.to_string())?;
     let path = root.path().join(normalized.as_str());
     let source =
@@ -2709,9 +2714,13 @@ fn prepare_quality_job(
     if content_hash(text.as_bytes()) != row.job.text_hash {
         return Ok(QualityJobPreparation::Stale);
     }
+    let text_segments = embedding_text_segments(&text, max_chunk_bytes);
+    if text_segments.is_empty() {
+        return Ok(QualityJobPreparation::Stale);
+    }
     Ok(QualityJobPreparation::Ready(Box::new(PreparedQualityJob {
         row: row.clone(),
-        text,
+        text_segments,
     })))
 }
 
@@ -2879,7 +2888,7 @@ fn stale_vector_point_ids_to_delete(
         .collect()
 }
 
-fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
+fn chunk_texts(reports: &[IndexReport], max_chunk_bytes: usize) -> Vec<ChunkText<'_>> {
     reports
         .iter()
         .flat_map(|report| {
@@ -2887,27 +2896,157 @@ fn chunk_texts(reports: &[IndexReport]) -> Vec<ChunkText<'_>> {
                 .chunks
                 .iter()
                 .filter(|chunk| chunk.excluded_reason.is_none())
-                .map(|chunk| ChunkText {
-                    file: &report.file,
-                    chunk,
-                    text: report.source[chunk.byte_range.start..chunk.byte_range.end].to_owned(),
+                .filter_map(|chunk| {
+                    let text = &report.source[chunk.byte_range.start..chunk.byte_range.end];
+                    let text_segments = embedding_text_segments(text, max_chunk_bytes);
+                    (!text_segments.is_empty()).then_some(ChunkText {
+                        file: &report.file,
+                        chunk,
+                        text_segments,
+                    })
                 })
         })
         .collect()
 }
 
-fn apply_embedding_size_limits(reports: &mut [IndexReport], max_chunk_bytes: usize) -> usize {
-    let mut excluded = 0;
-    for report in reports {
-        for chunk in &mut report.chunks {
-            let chunk_bytes = chunk.byte_range.end.saturating_sub(chunk.byte_range.start);
-            if chunk.excluded_reason.is_none() && chunk_bytes > max_chunk_bytes {
-                chunk.excluded_reason = Some("chunk_too_large_for_embedding".to_owned());
-                excluded += 1;
-            }
+fn embedding_text_segments(text: &str, max_chunk_bytes: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if max_chunk_bytes == 0 || text.len() <= max_chunk_bytes {
+        return vec![text.to_owned()];
+    }
+
+    let overlap = embedding_overlap_bytes(max_chunk_bytes);
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let hard_end =
+            floor_char_boundary(text, start.saturating_add(max_chunk_bytes).min(text.len()));
+        let mut end = preferred_embedding_segment_end(text, start, hard_end, max_chunk_bytes);
+        if end <= start {
+            end = next_char_boundary(text, start);
+        }
+        segments.push(text[start..end].to_owned());
+        if end >= text.len() {
+            break;
+        }
+
+        let next_start = if overlap == 0 {
+            end
+        } else {
+            floor_char_boundary(text, end.saturating_sub(overlap))
+        };
+        start = if next_start <= start { end } else { next_start };
+    }
+    segments
+}
+
+fn embedding_overlap_bytes(max_chunk_bytes: usize) -> usize {
+    if max_chunk_bytes < 32 {
+        0
+    } else {
+        (max_chunk_bytes / EMBEDDING_SEGMENT_OVERLAP_DIVISOR)
+            .min(MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES)
+            .min(max_chunk_bytes - 1)
+    }
+}
+
+fn preferred_embedding_segment_end(
+    text: &str,
+    start: usize,
+    hard_end: usize,
+    max_chunk_bytes: usize,
+) -> usize {
+    if hard_end >= text.len() {
+        return text.len();
+    }
+    let min_end = start + (max_chunk_bytes / MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR).max(1);
+    if let Some(relative_newline) = text[start..hard_end].rfind('\n') {
+        let newline_end = start + relative_newline + 1;
+        if newline_end >= min_end {
+            return newline_end;
         }
     }
-    excluded
+    hard_end
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(text: &str, start: usize) -> usize {
+    text[start..]
+        .chars()
+        .next()
+        .map(|character| start + character.len_utf8())
+        .unwrap_or(text.len())
+}
+
+fn aggregate_segment_embeddings(
+    chunks: &[ChunkText<'_>],
+    segment_embeddings: Vec<Vec<f32>>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let expected_segments = chunks
+        .iter()
+        .map(|chunk| chunk.text_segments.len())
+        .sum::<usize>();
+    if expected_segments != segment_embeddings.len() {
+        return Err(format!(
+            "embedding response count mismatch: expected {expected_segments}, got {}",
+            segment_embeddings.len()
+        ));
+    }
+
+    let mut offset = 0usize;
+    let mut vectors = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let end = offset + chunk.text_segments.len();
+        vectors.push(average_embedding(&segment_embeddings[offset..end])?);
+        offset = end;
+    }
+    Ok(vectors)
+}
+
+fn average_embedding(embeddings: &[Vec<f32>]) -> Result<Vec<f32>, String> {
+    let Some(first) = embeddings.first() else {
+        return Err("cannot average an empty embedding set".to_owned());
+    };
+    let dimension = first.len();
+    if embeddings
+        .iter()
+        .any(|embedding| embedding.len() != dimension)
+    {
+        return Err("embedding response included inconsistent vector dimensions".to_owned());
+    }
+    if embeddings.len() == 1 {
+        return Ok(first.clone());
+    }
+
+    let mut averaged = vec![0.0f32; dimension];
+    for embedding in embeddings {
+        for (index, value) in embedding.iter().enumerate() {
+            averaged[index] += *value;
+        }
+    }
+    let count = embeddings.len() as f32;
+    for value in &mut averaged {
+        *value /= count;
+    }
+    let norm = averaged
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut averaged {
+            *value /= norm;
+        }
+    }
+    Ok(averaged)
 }
 
 fn vector_point(
@@ -3183,7 +3322,7 @@ struct IndexReport {
 struct ChunkText<'a> {
     file: &'a FileFacts,
     chunk: &'a CodeChunk,
-    text: String,
+    text_segments: Vec<String>,
 }
 
 #[cfg(test)]
@@ -3208,12 +3347,12 @@ mod tests {
         ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, IndexCollection,
         IndexReport, IndexScope, QualityJobPreparation, RustAnalyzerEnrichmentConfig,
         RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness, WatchSnapshot,
-        apply_embedding_size_limits, chunk_record, chunk_texts, collect_index_reports,
+        aggregate_segment_embeddings, chunk_record, chunk_texts, collect_index_reports,
         collect_index_reports_with_options, detect_watch_changes, diff_watch_snapshots,
-        index_run_kind, plan_rust_analyzer_enrichment, prepare_quality_job,
-        quality_chunk_embedding_record, quality_vector_point, resolve_cross_file_rust_calls,
-        run_continuous_index_until_with_write_gate, should_run_continuous_quality_catch_up,
-        watch_snapshot, watch_snapshot_with_options,
+        embedding_text_segments, index_run_kind, plan_rust_analyzer_enrichment,
+        prepare_quality_job, quality_chunk_embedding_record, quality_vector_point,
+        resolve_cross_file_rust_calls, run_continuous_index_until_with_write_gate,
+        should_run_continuous_quality_catch_up, watch_snapshot, watch_snapshot_with_options,
     };
 
     #[test]
@@ -3260,7 +3399,7 @@ mod tests {
         };
 
         let reports = [report];
-        let chunks = chunk_texts(&reports);
+        let chunks = chunk_texts(&reports, 2 * 1024);
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk.id, public.id);
@@ -3291,7 +3430,7 @@ mod tests {
             other => panic!("job should be current, got {other:?}"),
         };
 
-        assert_eq!(prepared.text, source);
+        assert_eq!(prepared.text_segments, vec![source.to_owned()]);
         assert_eq!(prepared.row.job.id, "quality-job-1");
     }
 
@@ -3318,19 +3457,27 @@ mod tests {
     }
 
     #[test]
-    fn prepare_quality_job_skips_chunks_over_quality_size_limit() {
-        let repo = TestRepo::new("quality-prepare-too-large");
-        let source = "pub fn public() {}\n";
+    fn prepare_quality_job_splits_chunks_over_quality_size_limit() {
+        let repo = TestRepo::new("quality-prepare-split-large");
+        let source = "pub fn public() {\n    println!(\"first\");\n    println!(\"second\");\n}\n";
         repo.write("src/lib.rs", source);
         let root = RepoRoot::open(repo.path()).expect("repo root should open");
         let row = sample_quality_source_row(source, 0, source.len(), None);
 
-        assert!(matches!(
-            prepare_quality_job(&root, "generation-1", 8, &row)
-                .expect("oversized quality job should not fail"),
-            QualityJobPreparation::Excluded { reason }
-                if reason == "quality_chunk_too_large_for_embedding"
-        ));
+        let prepared = match prepare_quality_job(&root, "generation-1", 8, &row)
+            .expect("oversized quality job should not fail")
+        {
+            QualityJobPreparation::Ready(prepared) => prepared,
+            other => panic!("oversized job should be split, got {other:?}"),
+        };
+
+        assert!(prepared.text_segments.len() > 1);
+        assert!(
+            prepared
+                .text_segments
+                .iter()
+                .all(|segment| segment.len() <= 8)
+        );
     }
 
     #[test]
@@ -3373,12 +3520,12 @@ mod tests {
     }
 
     #[test]
-    fn embedding_size_limits_exclude_oversized_chunks_before_embedding() {
+    fn chunk_texts_split_oversized_chunks_before_embedding() {
         let file = sample_file();
         let source = "a".repeat(128);
         let small = sample_chunk("small", 0, 16, None);
         let large = sample_chunk("large", 16, 128, None);
-        let mut reports = vec![IndexReport {
+        let reports = vec![IndexReport {
             file,
             chunks: vec![small.clone(), large.clone()],
             symbols: Vec::new(),
@@ -3391,17 +3538,63 @@ mod tests {
             old_content_hash: None,
         }];
 
-        let excluded = apply_embedding_size_limits(&mut reports, 64);
-        let chunks = chunk_texts(&reports);
+        let chunks = chunk_texts(&reports, 64);
 
-        assert_eq!(excluded, 1);
         assert_eq!(reports[0].chunks[0].excluded_reason, None);
-        assert_eq!(
-            reports[0].chunks[1].excluded_reason.as_deref(),
-            Some("chunk_too_large_for_embedding")
-        );
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(reports[0].chunks[1].excluded_reason, None);
+        assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chunk.id, small.id);
+        assert_eq!(chunks[0].text_segments, vec!["a".repeat(16)]);
+        assert_eq!(chunks[1].chunk.id, large.id);
+        assert!(chunks[1].text_segments.len() > 1);
+        assert!(
+            chunks[1]
+                .text_segments
+                .iter()
+                .all(|segment| segment.len() <= 64)
+        );
+    }
+
+    #[test]
+    fn embedding_text_segments_overlap_and_aggregate_to_one_vector_per_chunk() {
+        let file = sample_file();
+        let chunk = sample_chunk("large", 0, 96, None);
+        let report = IndexReport {
+            file,
+            chunks: vec![chunk],
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            symbol_references: Vec::new(),
+            tests: Vec::new(),
+            parse_diagnostics: Vec::new(),
+            source: "x".repeat(96),
+            skipped_unchanged: false,
+            old_content_hash: None,
+        };
+        let reports = [report];
+
+        let chunks = chunk_texts(&reports, 64);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text_segments.len(), 2);
+        assert_eq!(chunks[0].text_segments[0].len(), 64);
+        assert_eq!(chunks[0].text_segments[1].len(), 44);
+
+        let vectors = aggregate_segment_embeddings(&chunks, vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("segments should aggregate");
+
+        assert_eq!(vectors.len(), 1);
+        assert!((vectors[0][0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+        assert!((vectors[0][1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn embedding_text_segments_preserve_utf8_boundaries() {
+        let segments = embedding_text_segments("ééé", 3);
+
+        assert_eq!(
+            segments,
+            vec!["é".to_owned(), "é".to_owned(), "é".to_owned()]
+        );
     }
 
     #[test]

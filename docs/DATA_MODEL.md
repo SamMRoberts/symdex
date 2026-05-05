@@ -485,11 +485,14 @@ embedding, but never include source text. Current status values are `pending`,
 `running`, `succeeded`, `failed`, `skipped_stale`, and `skipped_excluded`.
 Fast semantic indexing creates `pending` jobs only for current embeddable chunks
 when quality indexing is enabled and the configured quality model is available.
-Chunks with `excluded_reason`, including secret-blocked and too-large chunks,
-do not get quality jobs. If a new fast generation supersedes queued work, only
-old `pending` and `running` jobs are marked `skipped_stale`; terminal history is
-preserved. If the quality model or service is unavailable, the semantic
-generation is marked `quality_blocked` and no pending quality jobs are created.
+Chunks with `excluded_reason`, including secret-blocked chunks, do not get
+quality jobs. Oversized chunks that are otherwise embeddable keep their quality
+jobs; the worker splits their source text into overlapping model-sized segments
+and records one averaged vector for the original chunk. If a new fast generation
+supersedes queued work, only old `pending` and `running` jobs are marked
+`skipped_stale`; terminal history is preserved. If the quality model or service
+is unavailable, the semantic generation is marked `quality_blocked` and no
+pending quality jobs are created.
 `semantic_generations.quality_dimension` remains null until the quality worker
 records actual quality embeddings.
 
