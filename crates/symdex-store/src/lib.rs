@@ -2582,11 +2582,19 @@ impl SqliteStore {
                   AND quality.content_hash = embeddings.content_hash
                   AND quality.text_hash = embeddings.text_hash
                   AND quality.status = 'current'
+                 LEFT JOIN quality_embedding_jobs AS existing
+                   ON existing.repository_id = embeddings.repository_id
+                  AND existing.generation_id = embeddings.generation_id
+                  AND existing.file_id = embeddings.file_id
+                  AND existing.chunk_id = embeddings.chunk_id
+                  AND existing.content_hash = embeddings.content_hash
+                  AND existing.text_hash = embeddings.text_hash
                  WHERE embeddings.repository_id = ?1
                    AND embeddings.generation_id = ?2
                    AND embeddings.semantic_layer = 'fast'
                    AND embeddings.status = 'current'
                    AND quality.chunk_id IS NULL
+                   AND existing.chunk_id IS NULL
                  ORDER BY files.path, embeddings.chunk_id",
             )
             .map_err(StoreError::Sqlite)?;
@@ -3000,6 +3008,7 @@ impl SqliteStore {
                  FROM quality_embedding_jobs
                  WHERE repository_id = ?1
                    AND generation_id = ?2
+                   AND status = 'failed'
                    AND error_summary IS NOT NULL
                  ORDER BY updated_at DESC, id DESC
                  LIMIT 1",
@@ -9407,6 +9416,48 @@ mod tests {
     }
 
     #[test]
+    fn latest_quality_generation_error_ignores_excluded_jobs() {
+        let db = TestDb::new("quality-latest-error-ignores-excluded");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        store
+            .upsert_semantic_generation(&sample_semantic_generation())
+            .expect("generation should persist");
+        let mut excluded =
+            sample_quality_embedding_job_for("generation-1", "chunk-1", "skipped_excluded");
+        excluded.error_summary = Some("quality_chunk_too_large_for_embedding".to_owned());
+        excluded.updated_at = "500".to_owned();
+        store
+            .upsert_quality_embedding_job(&excluded)
+            .expect("excluded job should persist");
+
+        assert_eq!(
+            store
+                .latest_quality_generation_error("repo", "generation-1")
+                .expect("latest quality error should load"),
+            None
+        );
+
+        let mut failed = sample_quality_embedding_job_for("generation-1", "chunk-2", "failed");
+        failed.error_summary = Some("quality embedding service unavailable".to_owned());
+        failed.updated_at = "400".to_owned();
+        store
+            .upsert_quality_embedding_job(&failed)
+            .expect("failed job should persist");
+
+        assert_eq!(
+            store
+                .latest_quality_generation_error("repo", "generation-1")
+                .expect("latest quality error should load"),
+            Some("quality embedding service unavailable".to_owned())
+        );
+    }
+
+    #[test]
     fn quality_jobs_for_fast_generation_cover_full_fast_manifest() {
         let db = TestDb::new("quality-jobs-full-fast-manifest");
         let mut store = SqliteStore::open(&db.config()).expect("store should open");
@@ -9451,6 +9502,66 @@ mod tests {
         assert_eq!(jobs[1].chunk_id, "chunk-2");
         assert!(jobs.iter().all(|job| job.status == "pending"));
         assert!(jobs.iter().all(|job| job.created_at == "500"));
+    }
+
+    #[test]
+    fn quality_jobs_for_fast_generation_do_not_requeue_current_terminal_jobs() {
+        let db = TestDb::new("quality-jobs-skip-terminal-current");
+        let mut store = SqliteStore::open(&db.config()).expect("store should open");
+        store.migrate().expect("migration should run");
+        persist_repo_with_chunks(
+            &mut store,
+            &[sample_chunk("chunk-1"), sample_chunk("chunk-2")],
+        );
+        let mut generation = sample_semantic_generation();
+        generation.embeddable_chunks = 2;
+        generation.fast_embedded_chunks = 2;
+        store
+            .upsert_semantic_generation(&generation)
+            .expect("generation should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-embedding-1".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("first fast embedding should persist");
+        store
+            .upsert_chunk_embedding(&ChunkEmbeddingRecord {
+                id: "fast-embedding-2".to_owned(),
+                chunk_id: "chunk-2".to_owned(),
+                text_hash: "text-chunk-2".to_owned(),
+                vector_point_id: "01234567-89ab-cdef-fedc-ba9876543212".to_owned(),
+                ..sample_chunk_embedding()
+            })
+            .expect("second fast embedding should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-1",
+                "skipped_excluded",
+            ))
+            .expect("excluded job should persist");
+        store
+            .upsert_quality_embedding_job(&sample_quality_embedding_job_for(
+                "generation-1",
+                "chunk-2",
+                "failed",
+            ))
+            .expect("failed job should persist");
+
+        let jobs = store
+            .quality_embedding_jobs_for_fast_generation(
+                "repo",
+                "generation-1",
+                "mxbai-embed-large",
+                "500",
+            )
+            .expect("quality jobs should load");
+
+        assert!(
+            jobs.is_empty(),
+            "current terminal quality jobs should not be re-queued as missing coverage"
+        );
     }
 
     #[test]

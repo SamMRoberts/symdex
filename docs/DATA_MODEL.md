@@ -501,7 +501,10 @@ write failures move to `failed` with a compact metadata-only error summary.
 Stale jobs move to `skipped_stale` and are not embedded. Chunks that are current
 but not eligible for the quality layer, such as chunks over the quality model's
 size limit or chunks that now have an `excluded_reason`, move to
-`skipped_excluded`.
+`skipped_excluded`. Queue repair treats current terminal jobs, including
+`skipped_excluded`, as accounted-for work rather than re-queueing them as
+missing quality coverage. User-facing latest quality errors are reported from
+`failed` jobs only, so intentional exclusions do not appear as worker failures.
 
 After worker progress, `semantic_generations.quality_embedded_chunks` is
 refreshed from current quality manifest rows. The first successful quality
