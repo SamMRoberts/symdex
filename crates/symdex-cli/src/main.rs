@@ -1,7 +1,9 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::Instant;
 
 use serde_json::json;
@@ -31,6 +33,7 @@ use symdex_watch::{WatcherClientKind, WatcherStatus};
 use symdex_writer::{WriterClient, WriterIndexScope, WriterJob, WriterJobResponse, WriterProgress};
 
 static WRITER_WRITE_GATE: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+static ACTIVE_MANAGED_WATCHERS: AtomicUsize = AtomicUsize::new(0);
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -70,16 +73,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "watch-daemon" => {
             require_text_output(command, output)?;
             let role = parse_writer_daemon_role(&args[1..])?;
-            symdex_writer::run_daemon_for_role(role, |job, on_progress| {
-                execute_writer_job_with_progress(job, on_progress)
-            })
+            run_writer_daemon(role)
         }
         "writer-daemon" => {
             require_text_output(command, output)?;
             let role = parse_writer_daemon_role(&args[1..])?;
-            symdex_writer::run_daemon_for_role(role, |job, on_progress| {
-                execute_writer_job_with_progress(job, on_progress)
-            })
+            run_writer_daemon(role)
         }
         "index-quality" => {
             require_text_output(command, output)?;
@@ -267,6 +266,14 @@ fn require_text_output(command: &str, output: OutputMode) -> Result<(), String> 
     Ok(())
 }
 
+fn run_writer_daemon(role: DatabaseRole) -> Result<(), String> {
+    symdex_writer::run_daemon_for_role_with_idle_guard(
+        role,
+        |job, on_progress| execute_writer_job_with_progress(job, on_progress),
+        || role != DatabaseRole::Structural || ACTIVE_MANAGED_WATCHERS.load(Ordering::SeqCst) == 0,
+    )
+}
+
 fn execute_writer_job_with_progress(
     job: WriterJob,
     mut on_progress: impl FnMut(WriterProgress),
@@ -449,7 +456,7 @@ fn writer_start_watcher(
         ),
     );
     let was_active = symdex_watch::status(repo)
-        .map(|status| status.is_active())
+        .map(|status| watcher_daemon_appears_active(&status))
         .unwrap_or(false);
     let store_config = StoreConfig::from_env();
     let structural_store = SqliteStore::open(&store_config).map_err(|error| error.to_string())?;
@@ -494,10 +501,7 @@ fn writer_start_watcher(
             "watcher-writer",
             format_args!("spawn_managed_watcher repo={}", root.path().display()),
         );
-        symdex_watch::spawn_writer_managed_daemon(
-            root.path().display().to_string(),
-            writer_write_gate(),
-        );
+        spawn_managed_watcher(root.path().display().to_string());
     } else {
         debug_db_lock_log(
             "watcher-writer",
@@ -505,6 +509,42 @@ fn writer_start_watcher(
         );
     }
     Ok(status)
+}
+
+fn spawn_managed_watcher(repo: String) {
+    let write_gate = writer_write_gate();
+    thread::spawn(move || {
+        let _active = ActiveManagedWatcher::new();
+        debug_db_lock_log(
+            "watcher-managed",
+            format_args!("spawn_thread repo={}", repo),
+        );
+        if let Err(error) = symdex_watch::run_writer_managed_daemon(&repo, write_gate) {
+            debug_db_lock_log(
+                "watcher-managed",
+                format_args!("thread_error repo={} error={}", repo, error),
+            );
+        }
+    });
+}
+
+fn watcher_daemon_appears_active(status: &WatcherStatus) -> bool {
+    status.is_active() && !symdex_watch::watcher_heartbeat_is_stale(status.heartbeat_at.as_deref())
+}
+
+struct ActiveManagedWatcher;
+
+impl ActiveManagedWatcher {
+    fn new() -> Self {
+        ACTIVE_MANAGED_WATCHERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ActiveManagedWatcher {
+    fn drop(&mut self) {
+        ACTIVE_MANAGED_WATCHERS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn writer_stop_watcher(repo: &str) -> Result<WatcherStatus, String> {
@@ -2316,12 +2356,13 @@ mod tests {
         ContextPackMode, OutputMode, VectorVerifySemanticLayer, WatchAction,
         parse_change_targets_json, parse_cli_invocation, parse_context_pack_args, parse_index_args,
         parse_serve_mcp_args, parse_vector_maintenance_args, parse_watch_args, require_text_output,
-        semantic_status_json,
+        semantic_status_json, watcher_daemon_appears_active,
     };
     use symdex_core::{SemanticLayer, SemanticLayerStatus};
     use symdex_index::IndexScope;
     use symdex_query::{SemanticStatusLayerSummary, SemanticStatusSummary};
     use symdex_store::QualityGenerationProgress;
+    use symdex_watch::WatcherStatus;
 
     #[test]
     fn cli_invocation_parses_leading_json_flag() {
@@ -2468,6 +2509,18 @@ mod tests {
             parse_watch_args(&["restart".to_owned(), "repo".to_owned()]).expect_err("bad action");
 
         assert!(error.contains("unsupported watch action"));
+    }
+
+    #[test]
+    fn watcher_start_respawns_when_daemon_heartbeat_is_stale() {
+        let mut status = sample_watcher_status("running");
+        status.attached_clients = 1;
+        status.heartbeat_at = Some("1".to_owned());
+
+        assert!(!watcher_daemon_appears_active(&status));
+
+        status.heartbeat_at = Some(symdex_store::current_timestamp());
+        assert!(watcher_daemon_appears_active(&status));
     }
 
     #[test]
@@ -2630,6 +2683,35 @@ mod tests {
             total_chunks: 1,
             expected_chunks: 1,
             is_complete,
+        }
+    }
+
+    fn sample_watcher_status(state: &str) -> WatcherStatus {
+        WatcherStatus {
+            repository_id: "repo".to_owned(),
+            root_path: ".".to_owned(),
+            mode: "semantic".to_owned(),
+            owner_kind: "writer-daemon".to_owned(),
+            owner_pid: Some(1),
+            socket_path: None,
+            state: state.to_owned(),
+            started_at: Some("1".to_owned()),
+            updated_at: Some("1".to_owned()),
+            heartbeat_at: Some(symdex_store::current_timestamp()),
+            files_seen: 0,
+            queued_events: 0,
+            last_indexed_path: None,
+            last_error: None,
+            active_layer: None,
+            quality_status: None,
+            quality_pending_jobs: 0,
+            quality_running_jobs: 0,
+            quality_failed_jobs: 0,
+            quality_stale_jobs: 0,
+            attached_clients: 0,
+            client_kinds: Vec::new(),
+            clients: Vec::new(),
+            shutdown_after_seconds: None,
         }
     }
 }

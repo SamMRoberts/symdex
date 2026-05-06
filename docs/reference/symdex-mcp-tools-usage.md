@@ -1,5 +1,5 @@
 ---
-description: "Use when: developing in the symdex repository and using symdex MCP tools for code search, freshness checks, call graph evidence, watcher status, or runtime debugging."
+description: "Use when: working in any repository and using Symdex MCP tools to gather metadata-first evidence (search, freshness, call graph, impact, watcher state, and runtime debug context) before broad file reads."
 ---
 
 # Symdex MCP Tool Usage
@@ -7,6 +7,9 @@ description: "Use when: developing in the symdex repository and using symdex MCP
 Use symdex MCP tools as the first evidence pass when they can answer a question
 from the local index. They are designed to provide compact, metadata-first
 context for agents without reading whole files or exposing source text.
+
+This guide is not limited to the Symdex codebase. Use it when Symdex MCP tools
+are available and indexing the repository you are currently editing.
 
 ## Default Workflow
 
