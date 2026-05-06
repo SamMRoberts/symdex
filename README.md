@@ -202,6 +202,15 @@ relationship evidence. They do not return full source files, vectors, or
 embeddings. `symdex_watch_start` is the explicit local write-capable exception
 for starting or attaching the scoped background watcher.
 
+Use MCP as an evidence oracle before broad source exploration: check freshness,
+search or find the relevant symbol, request a unified context pack before
+nontrivial edits, inspect the returned files and ranges directly, then run impact
+or explain-change before risky changes. For debugging, feed panics, stack traces,
+or failing test names to `symdex_debug_context` and inspect the highlighted
+files/ranges first. See
+[`docs/reference/symdex-mcp-tools-usage.md`](docs/reference/symdex-mcp-tools-usage.md)
+for the recommended coding-agent workflow and standing instruction.
+
 ## Privacy And Safety
 
 - All storage is local.
