@@ -161,7 +161,7 @@ to Ollama and do not get sqlite-vec point IDs.
 
 ## Embeddings
 
-Use Ollama with `embeddinggemma`.
+Use Ollama with `nomic-embed-text`.
 
 Current implementation uses Ollama `POST /api/embed` for batch embeddings and
 `GET /api/tags` for local model availability. `SYMDEX_EMBED_TRUNCATE` defaults

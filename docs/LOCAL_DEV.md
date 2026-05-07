@@ -6,13 +6,13 @@
 - SQLite available through Rust crate bindings
 - `cargo-audit` installed for local dependency audits
 - Ollama running locally
-- `embeddinggemma` pulled into Ollama
+- `nomic-embed-text` pulled into Ollama
 
 ## Local setup commands
 
 ```bash
 cargo install cargo-audit --locked
-ollama pull embeddinggemma
+ollama pull nomic-embed-text
 ```
 
 ## Environment variables
@@ -20,8 +20,8 @@ ollama pull embeddinggemma
 ```bash
 SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_OLLAMA_URL=http://localhost:11434
-SYMDEX_EMBED_MODEL=embeddinggemma
-SYMDEX_FAST_EMBED_MODEL=embeddinggemma
+SYMDEX_EMBED_MODEL=nomic-embed-text
+SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
 SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
 SYMDEX_QUALITY_INDEX=1
 SYMDEX_QUALITY_BATCH_SIZE=16
@@ -70,7 +70,7 @@ Layered semantic indexing helpers also recognize `SYMDEX_FAST_EMBED_MODEL`,
 `SYMDEX_QUALITY_BATCH_SIZE`, `SYMDEX_QUALITY_WORKERS`, and
 `SYMDEX_EMBED_MAX_CHUNK_TOKENS` /
 `SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS`. The fast model defaults to
-`embeddinggemma`; the quality model defaults to `nomic-embed-text-v2-moe`.
+`nomic-embed-text`; the quality model defaults to `nomic-embed-text-v2-moe`.
 `SYMDEX_EMBED_MODEL` remains the compatibility setting for the current
 single-model path and is used as the fast-model fallback when
 `SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality jobs

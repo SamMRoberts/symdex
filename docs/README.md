@@ -42,7 +42,7 @@ recommended implementation sequence is captured in `BACKLOG.md` under
 "Analysis-driven next steps"; use that section when choosing new work.
 
 For the `quality-index` branch, the semantic indexing direction is defined in
-`LAYERED_SEMANTIC_INDEXING.md`: fast `embeddinggemma` indexing remains the
+`LAYERED_SEMANTIC_INDEXING.md`: fast `nomic-embed-text` indexing remains the
 availability path, while deferred `nomic-embed-text-v2-moe` quality indexing
 becomes active for default search only after it is complete and current. Use
 `LAYERED_SEMANTIC_INDEXING_TASKS.md` for the implementation slice order and

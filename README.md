@@ -16,7 +16,7 @@ Implemented today:
 - SQLite storage for repositories, files, chunks, symbols, calls, tests,
   provenance, semantic generations, and index runs.
 - sqlite-vec vector storage for semantic search.
-- Fast semantic indexing with `embeddinggemma`.
+- Fast semantic indexing with `nomic-embed-text`.
 - Deferred quality indexing with `nomic-embed-text-v2-moe`.
 - Structural queries: symbols, callers, callees, call paths, impact, staleness,
   context packs, and debug context packs.
@@ -44,7 +44,7 @@ Offline indexing builds the SQLite structural index without Ollama. For semantic
 indexing and search, start Ollama and install the embedding models:
 
 ```bash
-ollama pull embeddinggemma
+ollama pull nomic-embed-text
 ollama pull nomic-embed-text-v2-moe
 cargo run -p symdex-cli -- index .
 cargo run -p symdex-cli -- index-quality .
@@ -94,7 +94,7 @@ Index scope is explicit:
 
 Semantic indexing is layered:
 
-- The fast layer uses `embeddinggemma`, default max chunk size `2048` bytes.
+- The fast layer uses `nomic-embed-text`, default max chunk size `2048` bytes.
 - The quality layer uses `nomic-embed-text-v2-moe`, default max chunk size `512` bytes.
 - Default semantic search uses fast until quality is complete and current.
 - If quality is missing, stale, partial, failed, or blocked, search falls back
@@ -105,7 +105,7 @@ Useful environment variables:
 ```bash
 SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_OLLAMA_URL=http://localhost:11434
-SYMDEX_FAST_EMBED_MODEL=embeddinggemma
+SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
 SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
 SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
 SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512

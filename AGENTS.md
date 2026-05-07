@@ -3,7 +3,7 @@
 ## Mission
 Build symdex: a local-first codebase intelligence system for AI coding agents.
 It indexes repositories semantically and structurally so agents can reason from evidence.
-Primary stack: Rust, tree-sitter, SQLite, sqlite-vec, Ollama, embeddinggemma, MCP server, TUI.
+Primary stack: Rust, tree-sitter, SQLite, sqlite-vec, Ollama, nomic-embed-text, MCP server, TUI.
 Optimize for privacy, correctness, deterministic behavior, and compact agent context.
 
 ## First Reads
@@ -43,7 +43,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   non-Git repository behavior.
 - sqlite-vec stores dense vectors plus filterable payload fields.
 - Ollama generates local embeddings. The default fast semantic layer uses
-  `embeddinggemma`; the deferred quality semantic layer uses
+  `nomic-embed-text`; the deferred quality semantic layer uses
   `nomic-embed-text-v2-moe` when configured and available.
 - Semantic search must use the fast layer until the quality layer is complete
   and current for the latest fast semantic generation, then route to quality.
@@ -144,7 +144,7 @@ Optimize for privacy, correctness, deterministic behavior, and compact agent con
   the affected layer.
 - Treat SQLite as the source of truth for structural facts and semantic-layer
   readiness. Treat sqlite-vec collections as projections of embeddable chunks.
-- Fast indexing with `embeddinggemma` must remain the availability path for
+- Fast indexing with `nomic-embed-text` must remain the availability path for
   manual and continuous indexing.
 - Quality indexing with `nomic-embed-text-v2-moe` must run as deferred work and
   must not block continuous indexing or normal edit loops.

@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
-pub const DEFAULT_FAST_EMBED_MODEL: &str = "embeddinggemma";
+pub const DEFAULT_FAST_EMBED_MODEL: &str = "nomic-embed-text";
 pub const DEFAULT_QUALITY_EMBED_MODEL: &str = "nomic-embed-text-v2-moe";
 pub const DEFAULT_EMBED_TRUNCATE: bool = true;
 pub const DEFAULT_EMBED_BATCH_SIZE: usize = 16;
@@ -852,25 +852,25 @@ mod tests {
     #[test]
     fn model_available_matches_plain_and_latest_names() {
         let models = vec![ModelInfo {
-            name: "embeddinggemma:latest".to_owned(),
-            model: "embeddinggemma:latest".to_owned(),
+            name: "nomic-embed-text:latest".to_owned(),
+            model: "nomic-embed-text:latest".to_owned(),
         }];
 
-        assert!(model_available_in(&models, "embeddinggemma"));
+        assert!(model_available_in(&models, "nomic-embed-text"));
     }
 
     #[test]
     fn embed_request_uses_current_api_shape_with_truncation_enabled() {
         let inputs = vec!["first".to_owned(), "second".to_owned()];
         let request = EmbedRequest {
-            model: "embeddinggemma".to_owned(),
+            model: "nomic-embed-text".to_owned(),
             input: &inputs,
             truncate: true,
         };
 
         let json = serde_json::to_value(request).expect("request should serialize");
 
-        assert_eq!(json["model"], "embeddinggemma");
+        assert_eq!(json["model"], "nomic-embed-text");
         assert_eq!(json["input"][0], "first");
         assert_eq!(json["truncate"], true);
     }
@@ -934,13 +934,13 @@ mod tests {
     #[test]
     fn embed_response_reports_dimension() {
         let response = EmbedResponse {
-            model: "embeddinggemma".to_owned(),
+            model: "nomic-embed-text".to_owned(),
             embeddings: vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]],
             prompt_eval_count: Some(12),
         };
 
         let batch = embedding_batch_from_response(response, 2).expect("response should validate");
-        assert_eq!(batch.model, "embeddinggemma");
+        assert_eq!(batch.model, "nomic-embed-text");
         assert_eq!(batch.dimension(), Some(3));
         assert_eq!(batch.embeddings.len(), 2);
         assert_eq!(batch.prompt_eval_count, Some(12));
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn embed_batch_parts_preserve_count_order_and_prompt_total() {
         let batch = embedding_batch_from_parts(
-            "embeddinggemma".to_owned(),
+            "nomic-embed-text".to_owned(),
             vec![vec![0.1, 0.2], vec![0.3, 0.4], vec![0.5, 0.6]],
             Some(9),
             3,
@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn embed_batch_rejects_mismatched_counts() {
         let response = EmbedResponse {
-            model: "embeddinggemma".to_owned(),
+            model: "nomic-embed-text".to_owned(),
             embeddings: vec![vec![0.1, 0.2, 0.3]],
             prompt_eval_count: None,
         };

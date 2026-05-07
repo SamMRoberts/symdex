@@ -21,7 +21,7 @@ Verified sources for the chosen stack.
 
 - Ollama API docs: https://docs.ollama.com/api
 - Ollama embeddings docs: https://docs.ollama.com/capabilities/embeddings
-- embeddinggemma model: https://ollama.com/library/embeddinggemma
+- nomic-embed-text model: https://ollama.com/library/nomic-embed-text
 
 ## MCP
 

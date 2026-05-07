@@ -4718,7 +4718,7 @@ mod tests {
             "repo",
             "fast",
             "symdex_repo_model".to_owned(),
-            "embeddinggemma".to_owned(),
+            "nomic-embed-text".to_owned(),
             true,
             vec![aligned.clone(), stale.clone(), missing],
             vec![
@@ -4756,7 +4756,7 @@ mod tests {
             "repo",
             "fast",
             "symdex_repo_model".to_owned(),
-            "embeddinggemma".to_owned(),
+            "nomic-embed-text".to_owned(),
             true,
             vec![expected.clone()],
             vec![retrieved_point(
@@ -4783,7 +4783,7 @@ mod tests {
             "repo",
             "quality",
             "symdex_repo_model".to_owned(),
-            "embeddinggemma".to_owned(),
+            "nomic-embed-text".to_owned(),
             false,
             vec![expected],
             Vec::new(),
@@ -4820,7 +4820,7 @@ mod tests {
             "repo",
             "fast",
             "symdex_repo_nomic_embed_text".to_owned(),
-            "embeddinggemma".to_owned(),
+            "nomic-embed-text".to_owned(),
             true,
             vec![fast_expected.clone()],
             vec![retrieved_point(
@@ -5906,7 +5906,7 @@ mod tests {
             start_line: 1,
             end_line: 3,
             text_hash: text_hash.to_owned(),
-            embedding_model: Some("embeddinggemma".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
             embedding_dimension: Some(768),
         }
     }
@@ -5927,7 +5927,7 @@ mod tests {
             parser_version: Some("parser".to_owned()),
             content_hash: Some("content-hash".to_owned()),
             index_run_id: Some("run".to_owned()),
-            embedding_model: Some("embeddinggemma".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
             embedding_dimension: Some(768),
             indexed_at: Some("123".to_owned()),
         }
@@ -6078,7 +6078,7 @@ mod tests {
 
     fn complete_semantic_provenance(content_hash: &str) -> EvidenceProvenance {
         EvidenceProvenance {
-            embedding_model: Some("embeddinggemma".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
             embedding_dimension: Some(768),
             ..complete_provenance_with_hash(content_hash)
         }

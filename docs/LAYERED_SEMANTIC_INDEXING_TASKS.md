@@ -15,7 +15,7 @@ Tasks:
   `quality_pending`, `quality_ready`, `quality_stale`, `quality_blocked`, and
   `quality_failed`.
 - Add config helpers for:
-  - fast model default: `embeddinggemma`
+  - fast model default: `nomic-embed-text`
   - quality model default: `nomic-embed-text-v2-moe`
   - quality enabled flag
   - quality batch size
@@ -60,7 +60,7 @@ Goal: keep current fast indexing behavior but record semantic generation state.
 
 Tasks:
 
-- Treat current `embeddinggemma` semantic indexing as the `fast` layer.
+- Treat current `nomic-embed-text` semantic indexing as the `fast` layer.
 - After a successful fast sqlite-vec upsert, create/update the latest
   `semantic_generations` row.
 - Record fast model, dimension, chunk count, and active layer.

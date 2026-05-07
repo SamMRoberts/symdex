@@ -9834,7 +9834,7 @@ mod tests {
     #[test]
     fn collection_name_is_deterministic_and_safe() {
         assert_eq!(
-            vector_table_name("Repo-ID_123", "embeddinggemma:latest"),
+            vector_table_name("Repo-ID_123", "nomic-embed-text:latest"),
             "symdex_repo_id_123_nomic_embed_text_latest"
         );
     }
@@ -10582,7 +10582,7 @@ mod tests {
     fn sqlite_vec_upserts_queries_scrolls_and_deletes_points() {
         let db = TestDb::new("sqlite-vec-roundtrip");
         let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
-        let table = vector_table_name("repo", "embeddinggemma");
+        let table = vector_table_name("repo", "nomic-embed-text");
         vector_store
             .ensure_table(&table, 2)
             .expect("vector table should be created");
@@ -10702,7 +10702,7 @@ mod tests {
         drop(store);
 
         let vector_store = SqliteVectorStore::new(&db.config()).expect("vector store should open");
-        let table = vector_table_name("repo", "embeddinggemma");
+        let table = vector_table_name("repo", "nomic-embed-text");
         let main_point = vector_point_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect("main point id should format");
         let feature_point = vector_point_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -12046,7 +12046,7 @@ mod tests {
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
                 repository_ref_id: None,
-                fast_model: "embeddinggemma",
+                fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "nomic-embed-text-v2-moe",
                 upserted_embeddings: &fast_manifest,
@@ -12075,7 +12075,7 @@ mod tests {
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
                 repository_ref_id: None,
-                fast_model: "embeddinggemma",
+                fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "nomic-embed-text-v2-moe",
                 upserted_embeddings: &fast_manifest,
@@ -12142,7 +12142,7 @@ mod tests {
 
         assert_eq!(summary.active_layer, SemanticLayer::Fast);
         assert_eq!(summary.quality_status, SemanticLayerStatus::FastReady);
-        assert_eq!(summary.fast.embedding_model, "embeddinggemma");
+        assert_eq!(summary.fast.embedding_model, "nomic-embed-text");
         assert_eq!(summary.fast.current_chunks, 1);
         assert_eq!(summary.fast.expected_chunks, 1);
         assert!(summary.fast.is_complete);
@@ -12265,7 +12265,7 @@ mod tests {
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
                 repository_ref_id: None,
-                fast_model: "embeddinggemma",
+                fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &fast_manifest,
@@ -12276,7 +12276,7 @@ mod tests {
 
         assert_eq!(generation.quality_status, "fast_ready");
         assert_eq!(generation.active_layer, "fast");
-        assert_eq!(generation.fast_model, "embeddinggemma");
+        assert_eq!(generation.fast_model, "nomic-embed-text");
         assert_eq!(generation.fast_dimension, 768);
         assert_eq!(generation.embeddable_chunks, 2);
         assert_eq!(generation.fast_embedded_chunks, 2);
@@ -12300,7 +12300,7 @@ mod tests {
         );
         assert!(embeddings.iter().all(|embedding| {
             embedding.semantic_layer == "fast"
-                && embedding.embedding_model == "embeddinggemma"
+                && embedding.embedding_model == "nomic-embed-text"
                 && embedding.embedding_dimension == 768
                 && embedding.content_hash == "content-hash"
                 && embedding.status == "current"
@@ -12390,7 +12390,7 @@ mod tests {
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
                 repository_ref_id: Some(&repository_ref.id),
-                fast_model: "embeddinggemma",
+                fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &[],
@@ -12433,7 +12433,7 @@ mod tests {
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
                 repository_ref_id: None,
-                fast_model: "embeddinggemma",
+                fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &first_manifest,
@@ -12445,7 +12445,7 @@ mod tests {
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
                 repository_ref_id: None,
-                fast_model: "embeddinggemma",
+                fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &first_manifest,
@@ -12475,7 +12475,7 @@ mod tests {
             .record_fast_semantic_generation(FastSemanticGenerationInput {
                 repository_id: "repo",
                 repository_ref_id: None,
-                fast_model: "embeddinggemma",
+                fast_model: "nomic-embed-text",
                 fast_dimension: 768,
                 vector_table: "symdex_repo_nomic_embed_text",
                 upserted_embeddings: &changed_manifest,
@@ -13268,7 +13268,7 @@ mod tests {
             .expect("quality manifest should load");
 
         assert_eq!(fast.len(), 1);
-        assert_eq!(fast[0].embedding_model.as_deref(), Some("embeddinggemma"));
+        assert_eq!(fast[0].embedding_model.as_deref(), Some("nomic-embed-text"));
         assert_eq!(quality.len(), 1);
         assert_eq!(
             quality[0].embedding_model.as_deref(),
@@ -13395,7 +13395,7 @@ mod tests {
             )
             .expect("facts should persist");
         store
-            .record_index_run(&sample_index_run("embeddinggemma", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
             .expect("index run should persist");
 
         let file_provenance: (String, String) = store
@@ -13994,17 +13994,17 @@ mod tests {
             .expect("repository should persist");
 
         store
-            .record_index_run(&sample_index_run("embeddinggemma", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
             .expect("index run should persist");
 
         let status = store.repository_status("repo").expect("status should load");
-        assert_eq!(status.embedding_model.as_deref(), Some("embeddinggemma"));
+        assert_eq!(status.embedding_model.as_deref(), Some("nomic-embed-text"));
         assert_eq!(status.embedding_dimension, Some(768));
         store
-            .ensure_embedding_compatible("repo", "embeddinggemma", 768)
+            .ensure_embedding_compatible("repo", "nomic-embed-text", 768)
             .expect("same dimension should be compatible");
         let error = store
-            .ensure_embedding_compatible("repo", "embeddinggemma", 1024)
+            .ensure_embedding_compatible("repo", "nomic-embed-text", 1024)
             .expect_err("changed dimension should be rejected");
         assert!(matches!(
             error,
@@ -14046,11 +14046,11 @@ mod tests {
             .expect("facts should persist");
         upsert_fast_embedding_for_chunk(&store, "chunk-vector", "hash-1", "text-chunk-vector");
         store
-            .record_index_run(&sample_index_run("embeddinggemma", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
             .expect("index run should persist");
 
         let summary = store
-            .storage_explorer_summary("repo", "embeddinggemma")
+            .storage_explorer_summary("repo", "nomic-embed-text")
             .expect("storage summary should build");
 
         assert_eq!(summary.sqlite.repositories, 1);
@@ -14058,7 +14058,7 @@ mod tests {
         assert_eq!(summary.sqlite.chunks, 3);
         assert_eq!(summary.sqlite.symbols, 1);
         assert_eq!(summary.sqlite.index_runs, 1);
-        assert_eq!(summary.vector.embedding_model, "embeddinggemma");
+        assert_eq!(summary.vector.embedding_model, "nomic-embed-text");
         assert_eq!(summary.vector.embedding_dimension, Some(768));
         assert_eq!(summary.vector.embeddable_chunks, 2);
         assert_eq!(summary.vector.vector_backed_chunks, 1);
@@ -14098,16 +14098,16 @@ mod tests {
             .expect("facts should persist");
         upsert_fast_embedding_for_chunk(&store, "chunk-vector", "hash-1", "text-chunk-vector");
         store
-            .record_index_run(&sample_index_run("embeddinggemma", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
             .expect("index run should persist");
 
         let summary = store
-            .embedding_coverage_summary("repo", "embeddinggemma")
+            .embedding_coverage_summary("repo", "nomic-embed-text")
             .expect("embedding coverage should load");
 
         assert_eq!(summary.repository_id, "repo");
-        assert_eq!(summary.configured_embedding_model, "embeddinggemma");
-        assert_eq!(summary.embedding_model, "embeddinggemma");
+        assert_eq!(summary.configured_embedding_model, "nomic-embed-text");
+        assert_eq!(summary.embedding_model, "nomic-embed-text");
         assert_eq!(summary.embedding_dimension, Some(768));
         assert_eq!(summary.total_chunks, 3);
         assert_eq!(summary.embeddable_chunks, 2);
@@ -14144,7 +14144,7 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z",
                 finished_at: Some("2026-01-01T00:00:10Z"),
                 status: "success",
-                model: "embeddinggemma",
+                model: "nomic-embed-text",
                 dimension: Some(768),
                 files_seen: 4,
                 files_indexed: 3,
@@ -14160,7 +14160,7 @@ mod tests {
                 started_at: "2026-01-02T00:00:00Z",
                 finished_at: Some("2026-01-02T00:00:04Z"),
                 status: "failed",
-                model: "embeddinggemma",
+                model: "nomic-embed-text",
                 dimension: Some(768),
                 files_seen: 5,
                 files_indexed: 2,
@@ -14204,7 +14204,7 @@ mod tests {
             })
             .expect("repository should persist");
 
-        let mut run = sample_index_run("embeddinggemma", 768);
+        let mut run = sample_index_run("nomic-embed-text", 768);
         run.id = "run-lifecycle".to_owned();
         run.status = "running".to_owned();
         run.files_seen = 0;
@@ -14430,7 +14430,7 @@ mod tests {
         assert!(config.database_path(DatabaseRole::Events).exists());
         assert!(!config.database_path(DatabaseRole::Structural).exists());
 
-        let run = sample_index_run("embeddinggemma", 768);
+        let run = sample_index_run("nomic-embed-text", 768);
         store.start_index_run(&run).expect("run should start");
         store
             .record_file_index_events(&[FileIndexEventRecord {
@@ -14743,15 +14743,15 @@ mod tests {
             .expect("facts should persist");
         upsert_fast_embedding_for_chunk(&store, "chunk-vector", "hash-1", "hash-vector");
         store
-            .record_index_run(&sample_index_run("embeddinggemma", 768))
+            .record_index_run(&sample_index_run("nomic-embed-text", 768))
             .expect("index run should persist");
 
         let summary = store
-            .semantic_neighborhood_summary("repo", "embeddinggemma")
+            .semantic_neighborhood_summary("repo", "nomic-embed-text")
             .expect("semantic neighborhood should load");
 
         assert_eq!(summary.repository_id, "repo");
-        assert_eq!(summary.embedding_model, "embeddinggemma");
+        assert_eq!(summary.embedding_model, "nomic-embed-text");
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].path, "src/lib.rs");
         assert_eq!(summary.rows[0].symbol_name.as_deref(), Some("crate::add"));
@@ -14827,7 +14827,7 @@ mod tests {
         );
 
         let summary = store
-            .cross_store_health_summary("repo", "embeddinggemma")
+            .cross_store_health_summary("repo", "nomic-embed-text")
             .expect("health summary should load");
 
         assert_eq!(summary.repository_id, "repo");
@@ -14875,7 +14875,7 @@ mod tests {
             .expect("facts should persist");
 
         let summary = store
-            .cross_store_health_summary("repo", "embeddinggemma")
+            .cross_store_health_summary("repo", "nomic-embed-text")
             .expect("health summary should load");
 
         assert!(summary.rows.iter().any(
@@ -15152,7 +15152,7 @@ mod tests {
             parser_version: Some("parser".to_owned()),
             content_hash: Some("content-hash".to_owned()),
             index_run_id: Some("run".to_owned()),
-            embedding_model: Some("embeddinggemma".to_owned()),
+            embedding_model: Some("nomic-embed-text".to_owned()),
             embedding_dimension: Some(768),
             indexed_at: Some("123".to_owned()),
         }
@@ -15379,7 +15379,7 @@ mod tests {
         SemanticGenerationRecord {
             id: "generation-1".to_owned(),
             repository_id: "repo".to_owned(),
-            fast_model: "embeddinggemma".to_owned(),
+            fast_model: "nomic-embed-text".to_owned(),
             fast_dimension: 768,
             fast_completed_at: "100".to_owned(),
             quality_model: Some("nomic-embed-text-v2-moe".to_owned()),
@@ -15416,7 +15416,7 @@ mod tests {
             file_id: "file".to_owned(),
             chunk_id: "chunk-1".to_owned(),
             semantic_layer: "fast".to_owned(),
-            embedding_model: "embeddinggemma".to_owned(),
+            embedding_model: "nomic-embed-text".to_owned(),
             embedding_dimension: 768,
             content_hash: "content-hash".to_owned(),
             text_hash: "text-chunk-1".to_owned(),
