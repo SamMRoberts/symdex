@@ -7,7 +7,7 @@ supporting a higher-quality semantic layer that can take longer to build. The
 fast layer is the availability path. The quality layer is the eventual precision
 path.
 
-This design keeps continuous indexing responsive by using `nomic-embed-text` for
+This design keeps continuous indexing responsive by using `embeddinggemma` for
 synchronous fast indexing and `nomic-embed-text-v2-moe` for deferred quality
 indexing.
 
@@ -39,7 +39,7 @@ indexing.
 
 | Layer | Model | Timing | Role |
 |---|---|---|---|
-| `fast` | `nomic-embed-text` | synchronous | availability, broad recall, continuous indexing |
+| `fast` | `embeddinggemma` | synchronous | availability, broad recall, continuous indexing |
 | `quality` | `nomic-embed-text-v2-moe` | deferred/background | higher precision semantic search |
 
 The fast layer must be updated during normal semantic indexing. The quality
@@ -501,7 +501,7 @@ centralized.
 Recommended defaults:
 
 ```text
-fast model: nomic-embed-text
+fast model: embeddinggemma
 quality model: nomic-embed-text-v2-moe
 quality indexing: enabled when model is available, otherwise blocked/degraded
 quality workers: 1
@@ -513,7 +513,7 @@ pause quality while fast indexing: true
 Suggested environment variables:
 
 ```text
-SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
+SYMDEX_FAST_EMBED_MODEL=embeddinggemma
 SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
 SYMDEX_QUALITY_INDEX=1
 SYMDEX_QUALITY_BATCH_SIZE=16

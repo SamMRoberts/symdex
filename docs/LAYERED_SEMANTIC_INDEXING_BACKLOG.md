@@ -21,7 +21,7 @@ This backlog is specific to the `quality-index` branch. It supplements
   `quality_pending`, `quality_ready`, `quality_stale`, `quality_blocked`, and
   `quality_failed` states.
 - [x] Add layer-specific model configuration with defaults:
-  - fast: `nomic-embed-text`
+  - fast: `embeddinggemma`
   - quality: `nomic-embed-text-v2-moe`
 - [x] Preserve current `SYMDEX_EMBED_MODEL` behavior for compatibility.
 - [x] Add tests for config defaults, env overrides, and status transitions.

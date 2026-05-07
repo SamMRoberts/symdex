@@ -22,7 +22,7 @@ enabled, modified or newly created eligible files are automatically reindexed.
 - Semantic continuous indexing requires local Ollama and sqlite-vec, just like
   manual semantic indexing.
 - When layered semantic indexing is enabled, continuous indexing must update the
-  fast `nomic-embed-text` layer synchronously and queue the quality
+  fast `embeddinggemma` layer synchronously and queue the quality
   `nomic-embed-text-v2-moe` layer as deferred work.
 - Continuous indexing must not wait for quality indexing before returning to
   watch mode.
@@ -79,7 +79,7 @@ availability requirement:
 file changes
   -> debounce/coalesce
   -> structural SQLite update
-  -> fast nomic-embed-text embedding
+  -> fast embeddinggemma embedding
   -> fast sqlite-vec upsert in the fast semantic database role
   -> mark quality stale when needed
   -> enqueue quality jobs

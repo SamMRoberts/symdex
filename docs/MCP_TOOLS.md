@@ -87,7 +87,7 @@ Output:
   "query": "where is retry logic handled?",
   "semantic_layer": "fast",
   "requested_layer": "auto",
-  "embedding_model": "nomic-embed-text",
+  "embedding_model": "embeddinggemma",
   "vector_table": "symdex_repo_nomic_embed_text",
   "generation_id": "repo-semantic-...",
   "quality_status": "quality_pending",
@@ -119,7 +119,7 @@ Output:
         "index_run_id": "repo-semantic-...",
         "parser_version": "tree-sitter-rust-...",
         "indexed_at": "2026-04-30T12:00:00Z",
-        "embedding_model": "nomic-embed-text",
+        "embedding_model": "embeddinggemma",
         "embedding_dimension": 768,
         "embedded_at": null
       }
@@ -437,7 +437,7 @@ Unified output:
         "index_run_id": "repo-semantic-...",
         "parser_version": "tree-sitter-rust-...",
         "indexed_at": "2026-04-30T12:00:00Z",
-        "embedding_model": "nomic-embed-text",
+        "embedding_model": "embeddinggemma",
         "embedding_dimension": 768,
         "embedded_at": null
       }
@@ -665,7 +665,7 @@ Output:
   "chunks_indexed": 120,
   "symbols_indexed": 80,
   "calls_indexed": 240,
-  "embedding_model": "nomic-embed-text",
+  "embedding_model": "embeddinggemma",
   "embedding_dimension": 768,
   "last_indexed_at": "2026-04-30T12:00:00Z"
 }

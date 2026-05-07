@@ -92,7 +92,7 @@ Indexing orchestration:
 - structural SQLite persistence
 - optional semantic embedding and sqlite-vec upserts
 - compact indexing summaries without source text
-- fast semantic generation creation using `nomic-embed-text`
+- fast semantic generation creation using `embeddinggemma`
 - quality semantic job queueing and worker orchestration using
   `nomic-embed-text-v2-moe`
 
@@ -128,7 +128,7 @@ a future explicit diagnostic mode is designed.
 Local embedding adapter:
 
 - Ollama HTTP client
-- `nomic-embed-text` model checks
+- `embeddinggemma` model checks
 - `nomic-embed-text-v2-moe` quality model checks when layered indexing is enabled
 - batch embedding requests
 - vector dimension discovery
