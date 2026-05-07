@@ -26,8 +26,9 @@ use symdex_store::{
 };
 
 const EMBEDDING_SEGMENT_OVERLAP_DIVISOR: usize = 5;
-const MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES: usize = 256;
+const MAX_EMBEDDING_SEGMENT_OVERLAP_TOKENS: usize = 64;
 const MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR: usize = 2;
+const APPROX_TOKEN_TEXT_BYTES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOptions {
@@ -418,7 +419,7 @@ fn run_quality_index_limited_with_progress(
 
     let quality_config = layered_embed_config.quality_embed_config();
     let quality_model = quality_config.model.clone();
-    let quality_max_chunk_bytes = quality_config.max_chunk_bytes;
+    let quality_max_chunk_tokens = quality_config.max_chunk_tokens;
     let vector_table = vector_table_name(root.id(), &quality_model);
     let embed_client = OllamaClient::new(quality_config).map_err(|error| error.to_string())?;
     if !embed_client
@@ -546,7 +547,7 @@ fn run_quality_index_limited_with_progress(
                     embed_client: &embed_client,
                     latest_generation_id: &generation.id,
                     quality_model: &quality_model,
-                    quality_max_chunk_bytes,
+                    quality_max_chunk_tokens,
                     vector_table: &vector_table,
                 },
                 &sqlite,
@@ -2073,7 +2074,7 @@ fn prepare_semantic_index(
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<PreparedSemanticIndex, String> {
     let embed_config = layered_embed_config.fast_embed_config();
-    let chunk_texts = chunk_texts(&collection.reports, embed_config.max_chunk_bytes);
+    let chunk_texts = chunk_texts(&collection.reports, embed_config.max_chunk_tokens);
     if chunk_texts.is_empty() {
         on_progress(IndexProgress::new(
             "embedding",
@@ -2613,7 +2614,7 @@ struct QualityWorkerContext<'a> {
     embed_client: &'a OllamaClient,
     latest_generation_id: &'a str,
     quality_model: &'a str,
-    quality_max_chunk_bytes: usize,
+    quality_max_chunk_tokens: usize,
     vector_table: &'a str,
 }
 
@@ -2629,7 +2630,7 @@ fn process_quality_job(
     let prepared = match prepare_quality_job(
         context.root,
         context.latest_generation_id,
-        context.quality_max_chunk_bytes,
+        context.quality_max_chunk_tokens,
         &row,
     ) {
         Ok(QualityJobPreparation::Ready(prepared)) => *prepared,
@@ -2842,7 +2843,7 @@ enum QualityJobPreparation {
 fn prepare_quality_job(
     root: &RepoRoot,
     latest_generation_id: &str,
-    max_chunk_bytes: usize,
+    max_chunk_tokens: usize,
     row: &QualityJobSourceRow,
 ) -> Result<QualityJobPreparation, String> {
     if row.job.generation_id != latest_generation_id {
@@ -2884,7 +2885,7 @@ fn prepare_quality_job(
     if content_hash(text.as_bytes()) != row.job.text_hash {
         return Ok(QualityJobPreparation::Stale);
     }
-    let text_segments = embedding_text_segments(&text, max_chunk_bytes);
+    let text_segments = embedding_text_segments(&text, max_chunk_tokens);
     if text_segments.is_empty() {
         return Ok(QualityJobPreparation::Stale);
     }
@@ -3059,7 +3060,7 @@ fn stale_vector_point_ids_to_delete(
         .collect()
 }
 
-fn chunk_texts(reports: &[IndexReport], max_chunk_bytes: usize) -> Vec<ChunkText<'_>> {
+fn chunk_texts(reports: &[IndexReport], max_chunk_tokens: usize) -> Vec<ChunkText<'_>> {
     reports
         .iter()
         .flat_map(|report| {
@@ -3069,7 +3070,7 @@ fn chunk_texts(reports: &[IndexReport], max_chunk_bytes: usize) -> Vec<ChunkText
                 .filter(|chunk| chunk.excluded_reason.is_none())
                 .filter_map(|chunk| {
                     let text = &report.source[chunk.byte_range.start..chunk.byte_range.end];
-                    let text_segments = embedding_text_segments(text, max_chunk_bytes);
+                    let text_segments = embedding_text_segments(text, max_chunk_tokens);
                     (!text_segments.is_empty()).then_some(ChunkText {
                         file: &report.file,
                         chunk,
@@ -3080,81 +3081,156 @@ fn chunk_texts(reports: &[IndexReport], max_chunk_bytes: usize) -> Vec<ChunkText
         .collect()
 }
 
-fn embedding_text_segments(text: &str, max_chunk_bytes: usize) -> Vec<String> {
+fn embedding_text_segments(text: &str, max_chunk_tokens: usize) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
     }
-    if max_chunk_bytes == 0 || text.len() <= max_chunk_bytes {
+    let tokens = approximate_token_spans(text);
+    if max_chunk_tokens == 0 || tokens.len() <= max_chunk_tokens {
         return vec![text.to_owned()];
     }
 
-    let overlap = embedding_overlap_bytes(max_chunk_bytes);
+    let overlap = embedding_overlap_tokens(max_chunk_tokens);
     let mut segments = Vec::new();
-    let mut start = 0usize;
-    while start < text.len() {
-        let hard_end =
-            floor_char_boundary(text, start.saturating_add(max_chunk_bytes).min(text.len()));
-        let mut end = preferred_embedding_segment_end(text, start, hard_end, max_chunk_bytes);
-        if end <= start {
-            end = next_char_boundary(text, start);
-        }
-        segments.push(text[start..end].to_owned());
-        if end >= text.len() {
+    let mut start_token_index = 0usize;
+    while start_token_index < tokens.len() {
+        let hard_end_token_index = start_token_index
+            .saturating_add(max_chunk_tokens)
+            .min(tokens.len());
+        let end_token_index = preferred_embedding_segment_end(
+            text,
+            &tokens,
+            start_token_index,
+            hard_end_token_index,
+            max_chunk_tokens,
+        );
+        let segment_start = tokens[start_token_index].start;
+        let segment_end = tokens[end_token_index - 1].end;
+        segments.push(text[segment_start..segment_end].to_owned());
+        if end_token_index >= tokens.len() {
             break;
         }
 
-        let next_start = if overlap == 0 {
-            end
+        let next_start_token_index = if overlap == 0 {
+            end_token_index
         } else {
-            floor_char_boundary(text, end.saturating_sub(overlap))
+            end_token_index.saturating_sub(overlap)
         };
-        start = if next_start <= start { end } else { next_start };
+        start_token_index = if next_start_token_index <= start_token_index {
+            end_token_index
+        } else {
+            next_start_token_index
+        };
     }
     segments
 }
 
-fn embedding_overlap_bytes(max_chunk_bytes: usize) -> usize {
-    if max_chunk_bytes < 32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenSpan {
+    start: usize,
+    end: usize,
+}
+
+fn approximate_token_spans(text: &str) -> Vec<TokenSpan> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    let mut category = None;
+    let mut current_bytes = 0usize;
+
+    for (index, character) in text.char_indices() {
+        let next_category = token_category(character);
+        let character_bytes = character.len_utf8();
+        let should_split = match (category, start) {
+            (Some(current_category), Some(_)) if current_category != next_category => true,
+            (Some(TokenCategory::Word), Some(_)) => {
+                current_bytes + character_bytes > APPROX_TOKEN_TEXT_BYTES
+            }
+            (Some(TokenCategory::Punctuation), Some(_)) => true,
+            (Some(TokenCategory::NonAscii), Some(_)) => true,
+            _ => false,
+        };
+
+        if should_split {
+            if let Some(token_start) = start {
+                tokens.push(TokenSpan {
+                    start: token_start,
+                    end: index,
+                });
+            }
+            start = Some(index);
+            current_bytes = character_bytes;
+        } else {
+            start.get_or_insert(index);
+            current_bytes += character_bytes;
+        }
+        category = Some(next_category);
+    }
+
+    if let Some(token_start) = start {
+        tokens.push(TokenSpan {
+            start: token_start,
+            end: text.len(),
+        });
+    }
+
+    tokens
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenCategory {
+    Word,
+    Whitespace,
+    Punctuation,
+    NonAscii,
+}
+
+fn token_category(character: char) -> TokenCategory {
+    if character.is_ascii_alphanumeric() || character == '_' {
+        TokenCategory::Word
+    } else if character.is_whitespace() {
+        TokenCategory::Whitespace
+    } else if character.is_ascii() {
+        TokenCategory::Punctuation
+    } else {
+        TokenCategory::NonAscii
+    }
+}
+
+#[cfg(test)]
+fn approximate_token_count(text: &str) -> usize {
+    approximate_token_spans(text).len()
+}
+
+fn embedding_overlap_tokens(max_chunk_tokens: usize) -> usize {
+    if max_chunk_tokens < 8 {
         0
     } else {
-        (max_chunk_bytes / EMBEDDING_SEGMENT_OVERLAP_DIVISOR)
-            .min(MAX_EMBEDDING_SEGMENT_OVERLAP_BYTES)
-            .min(max_chunk_bytes - 1)
+        (max_chunk_tokens / EMBEDDING_SEGMENT_OVERLAP_DIVISOR)
+            .min(MAX_EMBEDDING_SEGMENT_OVERLAP_TOKENS)
+            .min(max_chunk_tokens - 1)
     }
 }
 
 fn preferred_embedding_segment_end(
     text: &str,
-    start: usize,
-    hard_end: usize,
-    max_chunk_bytes: usize,
+    tokens: &[TokenSpan],
+    start_token_index: usize,
+    hard_end_token_index: usize,
+    max_chunk_tokens: usize,
 ) -> usize {
-    if hard_end >= text.len() {
-        return text.len();
+    if hard_end_token_index >= tokens.len() {
+        return tokens.len();
     }
-    let min_end = start + (max_chunk_bytes / MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR).max(1);
-    if let Some(relative_newline) = text[start..hard_end].rfind('\n') {
-        let newline_end = start + relative_newline + 1;
-        if newline_end >= min_end {
-            return newline_end;
+    let min_token_count = (max_chunk_tokens / MIN_PREFERRED_EMBEDDING_SEGMENT_DIVISOR).max(1);
+    for token_index in (start_token_index..hard_end_token_index).rev() {
+        let token = tokens[token_index];
+        if text[token.start..token.end].contains('\n')
+            && token_index + 1 - start_token_index >= min_token_count
+        {
+            return token_index + 1;
         }
     }
-    hard_end
-}
-
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn next_char_boundary(text: &str, start: usize) -> usize {
-    text[start..]
-        .chars()
-        .next()
-        .map(|character| start + character.len_utf8())
-        .unwrap_or(text.len())
+    hard_end_token_index
 }
 
 fn aggregate_segment_embeddings(
@@ -3869,12 +3945,13 @@ mod tests {
         ContinuousIndexEvent, ContinuousIndexOptions, ContinuousQualityState, IndexCollection,
         IndexReport, IndexScope, QualityJobPreparation, RustAnalyzerEnrichmentConfig,
         RustAnalyzerEnrichmentSummary, RustAnalyzerReadiness, WatchSnapshot,
-        aggregate_segment_embeddings, chunk_record, chunk_texts, collect_index_reports,
-        collect_index_reports_with_options, detect_watch_changes, diff_watch_snapshots,
-        embedding_text_segments, index_run_kind, plan_rust_analyzer_enrichment,
-        prepare_quality_job, quality_chunk_embedding_record, quality_vector_point,
-        resolve_cross_file_rust_calls, run_continuous_index_until_with_write_gate,
-        should_run_continuous_quality_catch_up, watch_snapshot, watch_snapshot_with_options,
+        aggregate_segment_embeddings, approximate_token_count, approximate_token_spans,
+        chunk_record, chunk_texts, collect_index_reports, collect_index_reports_with_options,
+        detect_watch_changes, diff_watch_snapshots, embedding_text_segments, index_run_kind,
+        plan_rust_analyzer_enrichment, prepare_quality_job, quality_chunk_embedding_record,
+        quality_vector_point, resolve_cross_file_rust_calls,
+        run_continuous_index_until_with_write_gate, should_run_continuous_quality_catch_up,
+        watch_snapshot, watch_snapshot_with_options,
     };
 
     #[test]
@@ -3981,7 +4058,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_quality_job_splits_chunks_over_quality_size_limit() {
+    fn prepare_quality_job_splits_chunks_over_quality_token_limit() {
         let repo = TestRepo::new("quality-prepare-split-large");
         let source = "pub fn public() {\n    println!(\"first\");\n    println!(\"second\");\n}\n";
         repo.write("src/lib.rs", source);
@@ -4000,7 +4077,7 @@ mod tests {
             prepared
                 .text_segments
                 .iter()
-                .all(|segment| segment.len() <= 8)
+                .all(|segment| approximate_token_count(segment) <= 8)
         );
     }
 
@@ -4044,7 +4121,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_texts_split_oversized_chunks_before_embedding() {
+    fn chunk_texts_split_oversized_chunks_by_token_budget_before_embedding() {
         let file = sample_file();
         let source = "a".repeat(128);
         let small = sample_chunk("small", 0, 16, None);
@@ -4064,7 +4141,7 @@ mod tests {
             old_content_hash: None,
         }];
 
-        let chunks = chunk_texts(&reports, 64);
+        let chunks = chunk_texts(&reports, 16);
 
         assert_eq!(reports[0].chunks[0].excluded_reason, None);
         assert_eq!(reports[0].chunks[1].excluded_reason, None);
@@ -4077,12 +4154,12 @@ mod tests {
             chunks[1]
                 .text_segments
                 .iter()
-                .all(|segment| segment.len() <= 64)
+                .all(|segment| approximate_token_count(segment) <= 16)
         );
     }
 
     #[test]
-    fn embedding_text_segments_overlap_and_aggregate_to_one_vector_per_chunk() {
+    fn embedding_text_segments_overlap_by_tokens_and_aggregate_to_one_vector_per_chunk() {
         let file = sample_file();
         let chunk = sample_chunk("large", 0, 96, None);
         let report = IndexReport {
@@ -4101,7 +4178,7 @@ mod tests {
         };
         let reports = [report];
 
-        let chunks = chunk_texts(&reports, 64);
+        let chunks = chunk_texts(&reports, 16);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text_segments.len(), 2);
         assert_eq!(chunks[0].text_segments[0].len(), 64);
@@ -4117,11 +4194,40 @@ mod tests {
 
     #[test]
     fn embedding_text_segments_preserve_utf8_boundaries() {
-        let segments = embedding_text_segments("ééé", 3);
+        let segments = embedding_text_segments("ééé", 1);
 
         assert_eq!(
             segments,
             vec!["é".to_owned(), "é".to_owned(), "é".to_owned()]
+        );
+    }
+
+    #[test]
+    fn approximate_token_spans_are_deterministic_for_code_like_text() {
+        let text = "alpha += 42\nβ";
+        let tokens = approximate_token_spans(text)
+            .iter()
+            .map(|span| &text[span.start..span.end])
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tokens,
+            vec!["alph", "a", " ", "+", "=", " ", "42", "\n", "β"]
+        );
+    }
+
+    #[test]
+    fn embedding_text_segments_prefer_newline_boundaries_within_token_budget() {
+        let text = "one two\nthree four\nfive six";
+        let segments = embedding_text_segments(text, 6);
+
+        assert_eq!(
+            segments,
+            vec![
+                "one two\n".to_owned(),
+                "three four\n".to_owned(),
+                "five six".to_owned()
+            ]
         );
     }
 

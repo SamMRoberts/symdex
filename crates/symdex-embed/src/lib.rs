@@ -15,6 +15,8 @@ pub const DEFAULT_QUALITY_EMBED_BATCH_SIZE: usize = 16;
 pub const DEFAULT_QUALITY_EMBED_WORKERS: usize = 1;
 pub const DEFAULT_EMBED_MAX_CHUNK_BYTES: usize = 2 * 1024;
 pub const DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES: usize = 512;
+pub const DEFAULT_EMBED_MAX_CHUNK_TOKENS: usize = 2048;
+pub const DEFAULT_QUALITY_EMBED_MAX_CHUNK_TOKENS: usize = 512;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbedConfigValues<'a> {
@@ -23,6 +25,7 @@ pub struct EmbedConfigValues<'a> {
     pub truncate: Option<&'a str>,
     pub batch_size: Option<&'a str>,
     pub max_chunk_bytes: Option<&'a str>,
+    pub max_chunk_tokens: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +35,7 @@ pub struct EmbedConfig {
     pub truncate: bool,
     pub batch_size: usize,
     pub max_chunk_bytes: usize,
+    pub max_chunk_tokens: usize,
 }
 
 impl EmbedConfig {
@@ -44,6 +48,10 @@ impl EmbedConfig {
             "SYMDEX_EMBED_MAX_CHUNK_BYTES",
             "symdex_EMBED_MAX_CHUNK_BYTES",
         );
+        let max_chunk_tokens = env_value(
+            "SYMDEX_EMBED_MAX_CHUNK_TOKENS",
+            "symdex_EMBED_MAX_CHUNK_TOKENS",
+        );
 
         Self::from_values(EmbedConfigValues {
             ollama_url: ollama_url.as_deref(),
@@ -51,6 +59,7 @@ impl EmbedConfig {
             truncate: truncate.as_deref(),
             batch_size: batch_size.as_deref(),
             max_chunk_bytes: max_chunk_bytes.as_deref(),
+            max_chunk_tokens: max_chunk_tokens.as_deref(),
         })
     }
 
@@ -70,6 +79,11 @@ impl EmbedConfig {
                 .max_chunk_bytes
                 .and_then(env_usize)
                 .unwrap_or(DEFAULT_EMBED_MAX_CHUNK_BYTES),
+            max_chunk_tokens: chunk_token_budget(
+                values.max_chunk_tokens,
+                values.max_chunk_bytes,
+                DEFAULT_EMBED_MAX_CHUNK_TOKENS,
+            ),
         }
     }
 }
@@ -86,6 +100,8 @@ pub struct LayeredEmbedConfig {
     pub quality_workers: usize,
     pub max_chunk_bytes: usize,
     pub quality_max_chunk_bytes: usize,
+    pub max_chunk_tokens: usize,
+    pub quality_max_chunk_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -101,6 +117,8 @@ pub struct LayeredEmbedConfigValues<'a> {
     pub quality_workers: Option<&'a str>,
     pub max_chunk_bytes: Option<&'a str>,
     pub quality_max_chunk_bytes: Option<&'a str>,
+    pub max_chunk_tokens: Option<&'a str>,
+    pub quality_max_chunk_tokens: Option<&'a str>,
 }
 
 impl LayeredEmbedConfig {
@@ -123,6 +141,14 @@ impl LayeredEmbedConfig {
             "SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES",
             "symdex_QUALITY_EMBED_MAX_CHUNK_BYTES",
         );
+        let max_chunk_tokens = env_value(
+            "SYMDEX_EMBED_MAX_CHUNK_TOKENS",
+            "symdex_EMBED_MAX_CHUNK_TOKENS",
+        );
+        let quality_max_chunk_tokens = env_value(
+            "SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS",
+            "symdex_QUALITY_EMBED_MAX_CHUNK_TOKENS",
+        );
 
         Self::from_values(LayeredEmbedConfigValues {
             ollama_url: ollama_url.as_deref(),
@@ -136,6 +162,8 @@ impl LayeredEmbedConfig {
             quality_workers: quality_workers.as_deref(),
             max_chunk_bytes: max_chunk_bytes.as_deref(),
             quality_max_chunk_bytes: quality_max_chunk_bytes.as_deref(),
+            max_chunk_tokens: max_chunk_tokens.as_deref(),
+            quality_max_chunk_tokens: quality_max_chunk_tokens.as_deref(),
         })
     }
 
@@ -178,6 +206,16 @@ impl LayeredEmbedConfig {
                 .quality_max_chunk_bytes
                 .and_then(env_usize)
                 .unwrap_or(DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES),
+            max_chunk_tokens: chunk_token_budget(
+                values.max_chunk_tokens,
+                values.max_chunk_bytes,
+                DEFAULT_EMBED_MAX_CHUNK_TOKENS,
+            ),
+            quality_max_chunk_tokens: chunk_token_budget(
+                values.quality_max_chunk_tokens,
+                values.quality_max_chunk_bytes,
+                DEFAULT_QUALITY_EMBED_MAX_CHUNK_TOKENS,
+            ),
         }
     }
 
@@ -188,6 +226,7 @@ impl LayeredEmbedConfig {
             truncate: self.truncate,
             batch_size: self.batch_size,
             max_chunk_bytes: self.max_chunk_bytes,
+            max_chunk_tokens: self.max_chunk_tokens,
         }
     }
 
@@ -198,6 +237,7 @@ impl LayeredEmbedConfig {
             truncate: self.truncate,
             batch_size: self.quality_batch_size,
             max_chunk_bytes: self.quality_max_chunk_bytes,
+            max_chunk_tokens: self.quality_max_chunk_tokens,
         }
     }
 }
@@ -443,7 +483,7 @@ impl Display for EmbedError {
                     .to_ascii_lowercase()
                     .contains("exceeds the context length")
                 {
-                    " Reduce SYMDEX_EMBED_MAX_CHUNK_BYTES, or SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES for quality indexing, then re-run indexing."
+                    " Reduce SYMDEX_EMBED_MAX_CHUNK_TOKENS, or SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS for quality indexing, then re-run indexing."
                 } else {
                     ""
                 };
@@ -547,18 +587,34 @@ fn env_usize(value: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+fn chunk_token_budget(
+    token_value: Option<&str>,
+    legacy_byte_value: Option<&str>,
+    default_tokens: usize,
+) -> usize {
+    token_value
+        .and_then(env_usize)
+        .or_else(|| legacy_byte_value.and_then(legacy_byte_limit_to_token_budget))
+        .unwrap_or(default_tokens)
+}
+
+fn legacy_byte_limit_to_token_budget(value: &str) -> Option<usize> {
+    env_usize(value).map(|bytes| (bytes / 4).max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;
 
     use crate::{
-        DEFAULT_EMBED_BATCH_SIZE, DEFAULT_EMBED_MAX_CHUNK_BYTES, DEFAULT_EMBED_TRUNCATE,
-        DEFAULT_FAST_EMBED_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_QUALITY_EMBED_BATCH_SIZE,
-        DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES, DEFAULT_QUALITY_EMBED_MODEL,
+        DEFAULT_EMBED_BATCH_SIZE, DEFAULT_EMBED_MAX_CHUNK_BYTES, DEFAULT_EMBED_MAX_CHUNK_TOKENS,
+        DEFAULT_EMBED_TRUNCATE, DEFAULT_FAST_EMBED_MODEL, DEFAULT_OLLAMA_URL,
+        DEFAULT_QUALITY_EMBED_BATCH_SIZE, DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES,
+        DEFAULT_QUALITY_EMBED_MAX_CHUNK_TOKENS, DEFAULT_QUALITY_EMBED_MODEL,
         DEFAULT_QUALITY_EMBED_WORKERS, EmbedConfig, EmbedConfigValues, EmbedError, EmbedRequest,
         EmbedResponse, LayeredEmbedConfig, LayeredEmbedConfigValues, ModelInfo, OllamaClient,
-        embedding_batch_from_parts, embedding_batch_from_response, env_bool, env_usize,
-        model_available_in,
+        chunk_token_budget, embedding_batch_from_parts, embedding_batch_from_response, env_bool,
+        env_usize, model_available_in,
     };
 
     #[test]
@@ -570,6 +626,7 @@ mod tests {
         assert_eq!(config.truncate, DEFAULT_EMBED_TRUNCATE);
         assert_eq!(config.batch_size, DEFAULT_EMBED_BATCH_SIZE);
         assert_eq!(config.max_chunk_bytes, DEFAULT_EMBED_MAX_CHUNK_BYTES);
+        assert_eq!(config.max_chunk_tokens, DEFAULT_EMBED_MAX_CHUNK_TOKENS);
     }
 
     #[test]
@@ -580,6 +637,7 @@ mod tests {
             truncate: Some("false"),
             batch_size: Some("4"),
             max_chunk_bytes: Some("1024"),
+            max_chunk_tokens: Some("300"),
         });
 
         assert_eq!(config.ollama_url, "http://127.0.0.1:11434");
@@ -587,6 +645,17 @@ mod tests {
         assert!(!config.truncate);
         assert_eq!(config.batch_size, 4);
         assert_eq!(config.max_chunk_bytes, 1024);
+        assert_eq!(config.max_chunk_tokens, 300);
+    }
+
+    #[test]
+    fn embed_config_maps_legacy_byte_limit_to_conservative_token_budget() {
+        let config = EmbedConfig::from_values(EmbedConfigValues {
+            max_chunk_bytes: Some("2048"),
+            ..EmbedConfigValues::default()
+        });
+
+        assert_eq!(config.max_chunk_tokens, 512);
     }
 
     #[test]
@@ -605,6 +674,11 @@ mod tests {
         assert_eq!(
             config.quality_max_chunk_bytes,
             DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES
+        );
+        assert_eq!(config.max_chunk_tokens, DEFAULT_EMBED_MAX_CHUNK_TOKENS);
+        assert_eq!(
+            config.quality_max_chunk_tokens,
+            DEFAULT_QUALITY_EMBED_MAX_CHUNK_TOKENS
         );
     }
 
@@ -680,6 +754,8 @@ mod tests {
             quality_batch_size: Some("6"),
             max_chunk_bytes: Some("4096"),
             quality_max_chunk_bytes: Some("512"),
+            max_chunk_tokens: Some("640"),
+            quality_max_chunk_tokens: Some("320"),
             ..LayeredEmbedConfigValues::default()
         });
 
@@ -691,12 +767,14 @@ mod tests {
         assert!(!fast.truncate);
         assert_eq!(fast.batch_size, 12);
         assert_eq!(fast.max_chunk_bytes, 4096);
+        assert_eq!(fast.max_chunk_tokens, 640);
 
         assert_eq!(quality.ollama_url, "http://127.0.0.1:11434");
         assert_eq!(quality.model, "layer-quality");
         assert!(!quality.truncate);
         assert_eq!(quality.batch_size, 6);
         assert_eq!(quality.max_chunk_bytes, 512);
+        assert_eq!(quality.max_chunk_tokens, 320);
     }
 
     #[test]
@@ -721,6 +799,8 @@ mod tests {
                 .env("SYMDEX_QUALITY_WORKERS", "3")
                 .env("SYMDEX_EMBED_MAX_CHUNK_BYTES", "2048")
                 .env("SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES", "512")
+                .env("SYMDEX_EMBED_MAX_CHUNK_TOKENS", "600")
+                .env("SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS", "300")
                 .output()
                 .expect("child test process should run");
 
@@ -745,6 +825,7 @@ mod tests {
         assert!(!legacy.truncate);
         assert_eq!(legacy.batch_size, 11);
         assert_eq!(legacy.max_chunk_bytes, 2048);
+        assert_eq!(legacy.max_chunk_tokens, 600);
 
         let layered = LayeredEmbedConfig::from_env();
         assert_eq!(layered.ollama_url, "http://127.0.0.1:11435");
@@ -757,6 +838,15 @@ mod tests {
         assert_eq!(layered.quality_workers, 3);
         assert_eq!(layered.max_chunk_bytes, 2048);
         assert_eq!(layered.quality_max_chunk_bytes, 512);
+        assert_eq!(layered.max_chunk_tokens, 600);
+        assert_eq!(layered.quality_max_chunk_tokens, 300);
+    }
+
+    #[test]
+    fn token_budget_prefers_token_value_over_legacy_byte_value() {
+        assert_eq!(chunk_token_budget(Some("128"), Some("4096"), 512), 128);
+        assert_eq!(chunk_token_budget(None, Some("4096"), 512), 1024);
+        assert_eq!(chunk_token_budget(Some("0"), Some("0"), 512), 512);
     }
 
     #[test]
@@ -819,7 +909,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES")
+                .contains("SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS")
         );
     }
 

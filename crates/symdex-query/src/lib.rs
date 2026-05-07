@@ -5624,6 +5624,8 @@ mod tests {
             quality_workers: 1,
             max_chunk_bytes: 32_768,
             quality_max_chunk_bytes: 512,
+            max_chunk_tokens: 2048,
+            quality_max_chunk_tokens: 512,
         }
     }
 
