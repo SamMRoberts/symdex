@@ -46,6 +46,10 @@ runtime observation metadata. Existing legacy vector collections in the
 structural database remain readable as a compatibility fallback until the split
 storage migration is complete.
 
+Relative database paths are resolved from the invoking process's current
+directory for writer coordination, so the default `.symdex/symdex.sqlite`
+creates and uses repo-local state for the directory where `symdex` is run.
+
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
 default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command
 can be launched, `symdex doctor` checks readiness with `rust-analyzer --version`
