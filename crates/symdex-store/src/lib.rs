@@ -11125,7 +11125,12 @@ mod tests {
         job.id = SqliteStore::quality_embedding_job_id("repo", "generation-1", "chunk-1");
 
         let first = store
-            .queue_quality_embedding_jobs(&generation, "nomic-embed-text-v2-moe", &[job.clone()], "200")
+            .queue_quality_embedding_jobs(
+                &generation,
+                "nomic-embed-text-v2-moe",
+                &[job.clone()],
+                "200",
+            )
             .expect("quality jobs should queue");
         job.updated_at = "201".to_owned();
         let second = store

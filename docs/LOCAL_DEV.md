@@ -28,8 +28,8 @@ SYMDEX_QUALITY_BATCH_SIZE=16
 SYMDEX_QUALITY_WORKERS=1
 SYMDEX_EMBED_TRUNCATE=true
 SYMDEX_EMBED_BATCH_SIZE=16
-SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
-SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
+SYMDEX_EMBED_MAX_CHUNK_TOKENS=2048
+SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS=512
 SYMDEX_RUST_ANALYZER_CMD=rust-analyzer
 SYMDEX_DEBUG_DB_LOCKS=1
 ```
@@ -45,6 +45,10 @@ events, and `.symdex/symdex-runtime.sqlite` for short-lived debug-context
 runtime observation metadata. Existing legacy vector collections in the
 structural database remain readable as a compatibility fallback until the split
 storage migration is complete.
+
+Relative database paths are resolved from the invoking process's current
+directory for writer coordination, so the default `.symdex/symdex.sqlite`
+creates and uses repo-local state for the directory where `symdex` is run.
 
 Rust-analyzer enrichment auto-detects the configured rust-analyzer binary by
 default. `SYMDEX_RUST_ANALYZER_CMD` defaults to `rust-analyzer`; if that command
@@ -68,7 +72,8 @@ request payloads while preserving result order.
 Layered semantic indexing helpers also recognize `SYMDEX_FAST_EMBED_MODEL`,
 `SYMDEX_QUALITY_EMBED_MODEL`, `SYMDEX_QUALITY_INDEX`,
 `SYMDEX_QUALITY_BATCH_SIZE`, `SYMDEX_QUALITY_WORKERS`, and
-`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES`. The fast model defaults to
+`SYMDEX_EMBED_MAX_CHUNK_TOKENS` /
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS`. The fast model defaults to
 `nomic-embed-text`; the quality model defaults to `nomic-embed-text-v2-moe`.
 `SYMDEX_EMBED_MODEL` remains the compatibility setting for the current
 single-model path and is used as the fast-model fallback when
@@ -81,11 +86,18 @@ cooperative quality catch-up in semantic watch mode when quality indexing is
 enabled, processing bounded quality batches during post-batch and idle watch
 ticks.
 
-`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `2048` for fast indexing.
-`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` defaults to `512` for quality indexing.
-Chunks larger than the active layer limit are sent to Ollama as multiple
-overlapping segments no larger than the configured byte limit, except that a
-single UTF-8 scalar may exceed a very small limit to avoid invalid text splits.
+`SYMDEX_EMBED_MAX_CHUNK_TOKENS` defaults to `2048` for fast indexing.
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS` defaults to `512` for quality indexing.
+Stored syntax-aware chunks keep their byte ranges and stable IDs; large chunks
+are split only while preparing Ollama embedding inputs. Segmentation uses a
+deterministic local approximate tokenizer, prefers newline boundaries when
+possible, and sends multiple overlapping UTF-8-safe segments for chunks over the
+active token budget. Segment vectors are token-weight averaged into one vector
+for the original structural chunk. Legacy `SYMDEX_EMBED_MAX_CHUNK_BYTES` and
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` values are still accepted when the
+token-budget variables are unset: legacy default byte values map to the current
+token defaults, while custom byte values map to conservative approximate token
+budgets.
 Secret-blocked chunks remain metadata-only structural evidence and are not sent
 to Ollama.
 

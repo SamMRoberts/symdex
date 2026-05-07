@@ -366,7 +366,7 @@ impl WriterClient {
 }
 
 pub fn writer_endpoint_for_config(config: &StoreConfig) -> String {
-    let sqlite_path = config.sqlite_path.display().to_string();
+    let sqlite_path = writer_endpoint_identity_path(&config.sqlite_path);
     let id = stable_id(&["writer", &sqlite_path]);
     ipc::endpoint_for_id(&id)
 }
@@ -375,9 +375,20 @@ pub fn writer_endpoint_for_role(config: &StoreConfig, role: DatabaseRole) -> Str
     if role == DatabaseRole::Structural {
         return writer_endpoint_for_config(config);
     }
-    let database_path = config.database_path(role).display().to_string();
+    let database_path = writer_endpoint_identity_path(&config.database_path(role));
     let id = stable_id(&["writer", role.as_str(), &database_path]);
     ipc::endpoint_for_id(&id)
+}
+
+fn writer_endpoint_identity_path(path: &std::path::Path) -> String {
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 pub fn run_daemon(
@@ -584,7 +595,7 @@ mod ipc {
     pub type Stream = UnixStream;
 
     pub fn endpoint_for_id(id: &str) -> String {
-        std::path::Path::new("/tmp")
+        std::env::temp_dir()
             .join(format!("symdex-writer-{id}.sock"))
             .display()
             .to_string()
@@ -769,6 +780,31 @@ mod tests {
             writer_endpoint_for_config(&first),
             writer_endpoint_for_config(&second)
         );
+    }
+
+    #[test]
+    fn writer_endpoint_resolves_relative_database_paths_against_cwd() {
+        let relative = StoreConfig {
+            sqlite_path: std::path::PathBuf::from(".symdex/symdex.sqlite"),
+        };
+        let absolute = StoreConfig {
+            sqlite_path: std::env::current_dir()
+                .expect("current dir")
+                .join(".symdex/symdex.sqlite"),
+        };
+
+        assert_eq!(
+            writer_endpoint_for_config(&relative),
+            writer_endpoint_for_config(&absolute)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_endpoint_uses_process_temp_dir() {
+        let endpoint = super::ipc::endpoint_for_id("test");
+
+        assert!(endpoint.starts_with(&std::env::temp_dir().display().to_string()));
     }
 
     #[test]

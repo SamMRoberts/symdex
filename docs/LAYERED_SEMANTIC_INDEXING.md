@@ -188,8 +188,9 @@ The quality layer may become active only when all of the following are true:
 - The quality vector dimension is known and stable for that model/collection.
 - Every quality-eligible chunk has a current quality embedding row.
 - Quality-ineligible chunks are explicitly accounted for by terminal
-  `skipped_excluded` jobs, such as chunks over the quality model's context
-  limit.
+  `skipped_excluded` jobs, such as secret-blocked chunks. Oversized structural
+  chunks are normally split into token-aware embedding segments before reaching
+  Ollama rather than being made quality-ineligible solely because of byte size.
 - No current quality jobs for the generation are pending or running.
 - The latest generation has no `failed` or `skipped_stale` quality jobs.
 - A `quality_blocked` generation stays blocked until a later queue retry can
@@ -505,6 +506,7 @@ quality model: nomic-embed-text-v2-moe
 quality indexing: enabled when model is available, otherwise blocked/degraded
 quality workers: 1
 quality batch size: small, e.g. 8-16 chunks
+quality token budget: 512 tokens per embedding segment
 pause quality while fast indexing: true
 ```
 
@@ -516,6 +518,8 @@ SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
 SYMDEX_QUALITY_INDEX=1
 SYMDEX_QUALITY_BATCH_SIZE=16
 SYMDEX_QUALITY_WORKERS=1
+SYMDEX_EMBED_MAX_CHUNK_TOKENS=2048
+SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS=512
 ```
 
 Keep existing `SYMDEX_EMBED_MODEL` behavior as a compatibility path until the

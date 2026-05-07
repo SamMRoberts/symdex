@@ -169,14 +169,21 @@ to `true`, but Symdex also bounds each embedding input because some Ollama/model
 combinations return context-length errors instead of truncating. 
 `SYMDEX_EMBED_BATCH_SIZE` defaults to `16`, so full-repository semantic indexing
 is split into smaller Ollama requests while preserving embedding order.
-`SYMDEX_EMBED_MAX_CHUNK_BYTES` defaults to `2048` for fast indexing, while
-`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` defaults to `512` for quality indexing.
-Chunks larger than the active layer limit are split into overlapping, UTF-8-safe
-embedding segments. Segment vectors are averaged back into one vector point for
-the original structural chunk, preserving chunk-level SQLite and sqlite-vec
-metadata. Secret-blocked chunks are still kept as metadata-only structural
-evidence and are omitted from Ollama/sqlite-vec. Vector dimension probing embeds
-a tiny diagnostic string through the same local model.
+`SYMDEX_EMBED_MAX_CHUNK_TOKENS` defaults to `2048` for fast indexing, while
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_TOKENS` defaults to `512` for quality indexing.
+Stored chunks remain syntax-aware and byte/line-range stable; token awareness is
+applied only while preparing embedding inputs. Chunks larger than the active
+layer token budget are split into overlapping, UTF-8-safe embedding segments
+using a deterministic local approximate tokenizer. Segment boundaries prefer
+newlines when doing so does not create tiny segments. Segment vectors are
+token-weight averaged back into one vector point for the original structural
+chunk, preserving chunk-level SQLite and sqlite-vec metadata. Legacy byte-limit
+environment variables are still parsed when token budgets are not set: legacy
+default byte values map to the current token defaults, while custom byte values
+map to conservative approximate token budgets. Secret-blocked chunks are still
+kept as metadata-only structural evidence and are omitted from Ollama/sqlite-vec.
+Vector dimension probing embeds a tiny diagnostic string through the same local
+model.
 
 Store:
 

@@ -30,6 +30,9 @@ Fixtures should be tiny and purpose-built.
 ## Required test areas
 
 - syntax chunk line ranges
+- deterministic token-aware embedding segmentation, including approximate
+  tokenizer stability, newline-preferred boundaries, token overlap, UTF-8-safe
+  segments, and fast/quality path parity without changing stored chunk IDs
 - partial parse diagnostics for syntax-error files without aborting indexing
 - stable IDs across repeated runs
 - changed file reindex
