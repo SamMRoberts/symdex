@@ -82,6 +82,7 @@ impl EmbedConfig {
             max_chunk_tokens: chunk_token_budget(
                 values.max_chunk_tokens,
                 values.max_chunk_bytes,
+                DEFAULT_EMBED_MAX_CHUNK_BYTES,
                 DEFAULT_EMBED_MAX_CHUNK_TOKENS,
             ),
         }
@@ -209,11 +210,13 @@ impl LayeredEmbedConfig {
             max_chunk_tokens: chunk_token_budget(
                 values.max_chunk_tokens,
                 values.max_chunk_bytes,
+                DEFAULT_EMBED_MAX_CHUNK_BYTES,
                 DEFAULT_EMBED_MAX_CHUNK_TOKENS,
             ),
             quality_max_chunk_tokens: chunk_token_budget(
                 values.quality_max_chunk_tokens,
                 values.quality_max_chunk_bytes,
+                DEFAULT_QUALITY_EMBED_MAX_CHUNK_BYTES,
                 DEFAULT_QUALITY_EMBED_MAX_CHUNK_TOKENS,
             ),
         }
@@ -590,16 +593,31 @@ fn env_usize(value: &str) -> Option<usize> {
 fn chunk_token_budget(
     token_value: Option<&str>,
     legacy_byte_value: Option<&str>,
+    default_bytes: usize,
     default_tokens: usize,
 ) -> usize {
     token_value
         .and_then(env_usize)
-        .or_else(|| legacy_byte_value.and_then(legacy_byte_limit_to_token_budget))
+        .or_else(|| {
+            legacy_byte_value.and_then(|value| {
+                legacy_byte_limit_to_token_budget(value, default_bytes, default_tokens)
+            })
+        })
         .unwrap_or(default_tokens)
 }
 
-fn legacy_byte_limit_to_token_budget(value: &str) -> Option<usize> {
-    env_usize(value).map(|bytes| (bytes / 4).max(1))
+fn legacy_byte_limit_to_token_budget(
+    value: &str,
+    default_bytes: usize,
+    default_tokens: usize,
+) -> Option<usize> {
+    env_usize(value).map(|bytes| {
+        if bytes == default_bytes {
+            default_tokens
+        } else {
+            (bytes / 4).max(1)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -649,13 +667,36 @@ mod tests {
     }
 
     #[test]
-    fn embed_config_maps_legacy_byte_limit_to_conservative_token_budget() {
+    fn embed_config_maps_legacy_default_byte_limit_to_default_token_budget() {
         let config = EmbedConfig::from_values(EmbedConfigValues {
             max_chunk_bytes: Some("2048"),
             ..EmbedConfigValues::default()
         });
 
-        assert_eq!(config.max_chunk_tokens, 512);
+        assert_eq!(config.max_chunk_tokens, DEFAULT_EMBED_MAX_CHUNK_TOKENS);
+    }
+
+    #[test]
+    fn embed_config_maps_custom_legacy_byte_limit_to_conservative_token_budget() {
+        let config = EmbedConfig::from_values(EmbedConfigValues {
+            max_chunk_bytes: Some("1024"),
+            ..EmbedConfigValues::default()
+        });
+
+        assert_eq!(config.max_chunk_tokens, 256);
+    }
+
+    #[test]
+    fn layered_embed_config_maps_legacy_quality_default_byte_limit_to_default_token_budget() {
+        let config = LayeredEmbedConfig::from_values(LayeredEmbedConfigValues {
+            quality_max_chunk_bytes: Some("512"),
+            ..LayeredEmbedConfigValues::default()
+        });
+
+        assert_eq!(
+            config.quality_max_chunk_tokens,
+            DEFAULT_QUALITY_EMBED_MAX_CHUNK_TOKENS
+        );
     }
 
     #[test]
@@ -844,9 +885,12 @@ mod tests {
 
     #[test]
     fn token_budget_prefers_token_value_over_legacy_byte_value() {
-        assert_eq!(chunk_token_budget(Some("128"), Some("4096"), 512), 128);
-        assert_eq!(chunk_token_budget(None, Some("4096"), 512), 1024);
-        assert_eq!(chunk_token_budget(Some("0"), Some("0"), 512), 512);
+        assert_eq!(
+            chunk_token_budget(Some("128"), Some("4096"), 2048, 512),
+            128
+        );
+        assert_eq!(chunk_token_budget(None, Some("4096"), 2048, 512), 1024);
+        assert_eq!(chunk_token_budget(Some("0"), Some("0"), 2048, 512), 512);
     }
 
     #[test]

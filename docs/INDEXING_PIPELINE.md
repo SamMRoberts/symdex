@@ -176,12 +176,14 @@ applied only while preparing embedding inputs. Chunks larger than the active
 layer token budget are split into overlapping, UTF-8-safe embedding segments
 using a deterministic local approximate tokenizer. Segment boundaries prefer
 newlines when doing so does not create tiny segments. Segment vectors are
-averaged back into one vector point for the original structural chunk,
-preserving chunk-level SQLite and sqlite-vec metadata. Legacy byte-limit
-environment variables are still parsed as conservative compatibility fallbacks
-when token budgets are not set. Secret-blocked chunks are still kept as
-metadata-only structural evidence and are omitted from Ollama/sqlite-vec. Vector
-dimension probing embeds a tiny diagnostic string through the same local model.
+token-weight averaged back into one vector point for the original structural
+chunk, preserving chunk-level SQLite and sqlite-vec metadata. Legacy byte-limit
+environment variables are still parsed when token budgets are not set: legacy
+default byte values map to the current token defaults, while custom byte values
+map to conservative approximate token budgets. Secret-blocked chunks are still
+kept as metadata-only structural evidence and are omitted from Ollama/sqlite-vec.
+Vector dimension probing embeds a tiny diagnostic string through the same local
+model.
 
 Store:
 

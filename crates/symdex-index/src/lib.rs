@@ -2737,7 +2737,7 @@ fn process_quality_job(
         return Ok(());
     }
 
-    let vector = match average_embedding(&embeddings.embeddings) {
+    let vector = match weighted_average_embedding(&embeddings.embeddings, &prepared.text_segments) {
         Ok(vector) => vector,
         Err(error) => {
             complete_failed_quality_job(
@@ -3252,16 +3252,29 @@ fn aggregate_segment_embeddings(
     let mut vectors = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let end = offset + chunk.text_segments.len();
-        vectors.push(average_embedding(&segment_embeddings[offset..end])?);
+        vectors.push(weighted_average_embedding(
+            &segment_embeddings[offset..end],
+            &chunk.text_segments,
+        )?);
         offset = end;
     }
     Ok(vectors)
 }
 
-fn average_embedding(embeddings: &[Vec<f32>]) -> Result<Vec<f32>, String> {
+fn weighted_average_embedding(
+    embeddings: &[Vec<f32>],
+    text_segments: &[String],
+) -> Result<Vec<f32>, String> {
     let Some(first) = embeddings.first() else {
         return Err("cannot average an empty embedding set".to_owned());
     };
+    if embeddings.len() != text_segments.len() {
+        return Err(format!(
+            "embedding segment count mismatch: expected {}, got {}",
+            text_segments.len(),
+            embeddings.len()
+        ));
+    }
     let dimension = first.len();
     if embeddings
         .iter()
@@ -3274,14 +3287,16 @@ fn average_embedding(embeddings: &[Vec<f32>]) -> Result<Vec<f32>, String> {
     }
 
     let mut averaged = vec![0.0f32; dimension];
-    for embedding in embeddings {
+    let mut total_weight = 0.0f32;
+    for (embedding, text_segment) in embeddings.iter().zip(text_segments) {
+        let weight = approximate_token_spans(text_segment).len().max(1) as f32;
+        total_weight += weight;
         for (index, value) in embedding.iter().enumerate() {
-            averaged[index] += *value;
+            averaged[index] += *value * weight;
         }
     }
-    let count = embeddings.len() as f32;
     for value in &mut averaged {
-        *value /= count;
+        *value /= total_weight;
     }
     let norm = averaged
         .iter()
@@ -4159,7 +4174,7 @@ mod tests {
     }
 
     #[test]
-    fn embedding_text_segments_overlap_by_tokens_and_aggregate_to_one_vector_per_chunk() {
+    fn embedding_segment_vectors_are_token_weighted_per_chunk() {
         let file = sample_file();
         let chunk = sample_chunk("large", 0, 96, None);
         let report = IndexReport {
@@ -4188,8 +4203,9 @@ mod tests {
             .expect("segments should aggregate");
 
         assert_eq!(vectors.len(), 1);
-        assert!((vectors[0][0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
-        assert!((vectors[0][1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+        let expected_norm = ((16.0f32 * 16.0) + (11.0 * 11.0)).sqrt();
+        assert!((vectors[0][0] - (16.0 / expected_norm)).abs() < 0.0001);
+        assert!((vectors[0][1] - (11.0 / expected_norm)).abs() < 0.0001);
     }
 
     #[test]

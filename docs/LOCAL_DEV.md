@@ -88,10 +88,12 @@ Stored syntax-aware chunks keep their byte ranges and stable IDs; large chunks
 are split only while preparing Ollama embedding inputs. Segmentation uses a
 deterministic local approximate tokenizer, prefers newline boundaries when
 possible, and sends multiple overlapping UTF-8-safe segments for chunks over the
-active token budget. Segment vectors are averaged into one vector for the
-original structural chunk. Legacy `SYMDEX_EMBED_MAX_CHUNK_BYTES` and
-`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` values are still accepted as conservative
-compatibility fallbacks when the token-budget variables are unset.
+active token budget. Segment vectors are token-weight averaged into one vector
+for the original structural chunk. Legacy `SYMDEX_EMBED_MAX_CHUNK_BYTES` and
+`SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES` values are still accepted when the
+token-budget variables are unset: legacy default byte values map to the current
+token defaults, while custom byte values map to conservative approximate token
+budgets.
 Secret-blocked chunks remain metadata-only structural evidence and are not sent
 to Ollama.
 
