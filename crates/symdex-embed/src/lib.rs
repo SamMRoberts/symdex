@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_FAST_EMBED_MODEL: &str = "nomic-embed-text";
-pub const DEFAULT_QUALITY_EMBED_MODEL: &str = "mxbai-embed-large";
+pub const DEFAULT_QUALITY_EMBED_MODEL: &str = "nomic-embed-text-v2-moe";
 pub const DEFAULT_EMBED_TRUNCATE: bool = true;
 pub const DEFAULT_EMBED_BATCH_SIZE: usize = 16;
 pub const DEFAULT_QUALITY_EMBED_BATCH_SIZE: usize = 16;

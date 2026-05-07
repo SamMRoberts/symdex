@@ -4832,7 +4832,7 @@ mod tests {
             "repo",
             "quality",
             "symdex_repo_nomic_embed_text_v2_moe".to_owned(),
-            "mxbai-embed-large".to_owned(),
+            "nomic-embed-text-v2-moe".to_owned(),
             false,
             vec![expected_point(
                 "point-quality",

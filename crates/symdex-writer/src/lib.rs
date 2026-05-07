@@ -388,7 +388,15 @@ pub fn run_daemon(
 
 pub fn run_daemon_for_role(
     role: DatabaseRole,
+    handler: impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
+) -> Result<(), String> {
+    run_daemon_for_role_with_idle_guard(role, handler, || true)
+}
+
+pub fn run_daemon_for_role_with_idle_guard(
+    role: DatabaseRole,
     mut handler: impl FnMut(WriterJob, &mut dyn FnMut(WriterProgress)) -> WriterJobResponse,
+    should_exit_when_idle: impl Fn() -> bool,
 ) -> Result<(), String> {
     let config = StoreConfig::from_env();
     let endpoint = writer_endpoint_for_role(&config, role);
@@ -436,7 +444,7 @@ pub fn run_daemon_for_role(
                     .lock()
                     .map(|last_activity| last_activity.elapsed())
                     .unwrap_or(IDLE_EXIT_AFTER);
-                if idle_for >= IDLE_EXIT_AFTER {
+                if daemon_should_exit_after_idle(idle_for, &should_exit_when_idle) {
                     debug_db_lock_log(
                         "writer-daemon",
                         format_args!(
@@ -477,6 +485,13 @@ pub fn run_daemon_for_role(
         ),
     );
     Ok(())
+}
+
+fn daemon_should_exit_after_idle(
+    idle_for: Duration,
+    should_exit_when_idle: &impl Fn() -> bool,
+) -> bool {
+    idle_for >= IDLE_EXIT_AFTER && should_exit_when_idle()
 }
 
 fn writer_lock_path_for_log(config: &StoreConfig, role: DatabaseRole) -> String {
@@ -723,9 +738,10 @@ mod ipc {
 #[cfg(test)]
 mod tests {
     use super::{
-        WriterIndexScope, WriterJob, WriterJobResponse, writer_endpoint_for_config,
-        writer_endpoint_for_role,
+        IDLE_EXIT_AFTER, WriterIndexScope, WriterJob, WriterJobResponse,
+        daemon_should_exit_after_idle, writer_endpoint_for_config, writer_endpoint_for_role,
     };
+    use std::time::Duration;
     use symdex_store::{DatabaseRole, StoreConfig};
 
     #[test]
@@ -825,5 +841,15 @@ mod tests {
         assert_eq!(success.message, "done");
         assert!(!error.ok);
         assert_eq!(error.message, "failed");
+    }
+
+    #[test]
+    fn writer_daemon_idle_exit_can_be_held_by_background_work() {
+        assert!(!daemon_should_exit_after_idle(IDLE_EXIT_AFTER, &|| false));
+        assert!(daemon_should_exit_after_idle(IDLE_EXIT_AFTER, &|| true));
+        assert!(!daemon_should_exit_after_idle(
+            IDLE_EXIT_AFTER - Duration::from_millis(1),
+            &|| true,
+        ));
     }
 }

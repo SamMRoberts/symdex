@@ -17,7 +17,7 @@ Implemented today:
   provenance, semantic generations, and index runs.
 - sqlite-vec vector storage for semantic search.
 - Fast semantic indexing with `nomic-embed-text`.
-- Deferred quality indexing with `mxbai-embed-large`.
+- Deferred quality indexing with `nomic-embed-text-v2-moe`.
 - Structural queries: symbols, callers, callees, call paths, impact, staleness,
   context packs, and debug context packs.
 - Semantic search with fast/quality layer routing and fallback metadata.
@@ -45,7 +45,7 @@ indexing and search, start Ollama and install the embedding models:
 
 ```bash
 ollama pull nomic-embed-text
-ollama pull mxbai-embed-large
+ollama pull nomic-embed-text-v2-moe
 cargo run -p symdex-cli -- index .
 cargo run -p symdex-cli -- index-quality .
 cargo run -p symdex-cli -- search . "retry logic"
@@ -95,7 +95,7 @@ Index scope is explicit:
 Semantic indexing is layered:
 
 - The fast layer uses `nomic-embed-text`, default max chunk size `2048` bytes.
-- The quality layer uses `mxbai-embed-large`, default max chunk size `512` bytes.
+- The quality layer uses `nomic-embed-text-v2-moe`, default max chunk size `512` bytes.
 - Default semantic search uses fast until quality is complete and current.
 - If quality is missing, stale, partial, failed, or blocked, search falls back
   to fast and reports why.
@@ -106,7 +106,7 @@ Useful environment variables:
 SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
-SYMDEX_QUALITY_EMBED_MODEL=mxbai-embed-large
+SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
 SYMDEX_EMBED_MAX_CHUNK_BYTES=2048
 SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES=512
 SYMDEX_QUALITY_INDEX=1
@@ -201,6 +201,15 @@ freshness, provenance, active semantic layer, quality status, and compact
 relationship evidence. They do not return full source files, vectors, or
 embeddings. `symdex_watch_start` is the explicit local write-capable exception
 for starting or attaching the scoped background watcher.
+
+Use MCP as an evidence oracle before broad source exploration: check freshness,
+search or find the relevant symbol, request a unified context pack before
+nontrivial edits, inspect the returned files and ranges directly, then run impact
+or explain-change before risky changes. For debugging, feed panics, stack traces,
+or failing test names to `symdex_debug_context` and inspect the highlighted
+files/ranges first. See
+[`docs/reference/symdex-mcp-tools-usage.md`](docs/reference/symdex-mcp-tools-usage.md)
+for the recommended coding-agent workflow and standing instruction.
 
 ## Privacy And Safety
 

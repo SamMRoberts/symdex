@@ -680,6 +680,10 @@ fn heartbeat_is_stale(heartbeat_at: Option<&str>) -> bool {
     now.saturating_sub(heartbeat_at) > HEARTBEAT_STALE_SECONDS
 }
 
+pub fn watcher_heartbeat_is_stale(heartbeat_at: Option<&str>) -> bool {
+    heartbeat_is_stale(heartbeat_at)
+}
+
 fn apply_event(status: &mut WatcherStatus, event: &ContinuousIndexEvent) {
     status.heartbeat_at = Some(current_timestamp());
     status.last_error = None;

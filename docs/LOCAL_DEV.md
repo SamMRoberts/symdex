@@ -22,7 +22,7 @@ SYMDEX_DB_PATH=.symdex/symdex.sqlite
 SYMDEX_OLLAMA_URL=http://localhost:11434
 SYMDEX_EMBED_MODEL=nomic-embed-text
 SYMDEX_FAST_EMBED_MODEL=nomic-embed-text
-SYMDEX_QUALITY_EMBED_MODEL=mxbai-embed-large
+SYMDEX_QUALITY_EMBED_MODEL=nomic-embed-text-v2-moe
 SYMDEX_QUALITY_INDEX=1
 SYMDEX_QUALITY_BATCH_SIZE=16
 SYMDEX_QUALITY_WORKERS=1
@@ -69,7 +69,7 @@ Layered semantic indexing helpers also recognize `SYMDEX_FAST_EMBED_MODEL`,
 `SYMDEX_QUALITY_EMBED_MODEL`, `SYMDEX_QUALITY_INDEX`,
 `SYMDEX_QUALITY_BATCH_SIZE`, `SYMDEX_QUALITY_WORKERS`, and
 `SYMDEX_QUALITY_EMBED_MAX_CHUNK_BYTES`. The fast model defaults to
-`nomic-embed-text`; the quality model defaults to `mxbai-embed-large`.
+`nomic-embed-text`; the quality model defaults to `nomic-embed-text-v2-moe`.
 `SYMDEX_EMBED_MODEL` remains the compatibility setting for the current
 single-model path and is used as the fast-model fallback when
 `SYMDEX_FAST_EMBED_MODEL` is unset. `symdex index <repo>` queues quality jobs

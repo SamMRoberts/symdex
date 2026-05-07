@@ -4012,7 +4012,7 @@ mod tests {
             "repo",
             &row,
             vec![0.1, 0.2, 0.3],
-            "mxbai-embed-large",
+            "nomic-embed-text-v2-moe",
             3,
             "700",
         )
@@ -4020,7 +4020,7 @@ mod tests {
         let embedding = quality_chunk_embedding_record(
             "repo",
             &row,
-            "mxbai-embed-large",
+            "nomic-embed-text-v2-moe",
             3,
             "symdex_repo_nomic_embed_text_v2_moe",
             &point.id,
@@ -4030,7 +4030,7 @@ mod tests {
         assert_eq!(point.payload.path, "src/lib.rs");
         assert_eq!(
             point.payload.embedding_model.as_deref(),
-            Some("mxbai-embed-large")
+            Some("nomic-embed-text-v2-moe")
         );
         assert_eq!(point.payload.embedding_dimension, Some(3));
         assert_eq!(
