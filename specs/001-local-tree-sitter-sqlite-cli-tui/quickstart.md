@@ -56,7 +56,15 @@ cargo run -- files with-errors
 cargo run -- tui
 ```
 
-Controls: `q` quit, `/` search, `Enter` open selected item, `Esc` back/dashboard, `r` re-index message, `e` errors, `s` symbols, `c` callers/callees, `i` imports, `?` help.
+Controls: `q` quit, `Tab`/down next view, `Shift+Tab`/up previous view, `/` search, `Enter` open selected item, `Esc` back/dashboard, `r` re-index message, `f` files, `s` symbols, `d` symbol detail, `v` references, `c` callers/callees, `i` imports, `e` errors, `?` help.
+
+Manual TUI verification checklist:
+
+- Dashboard opens after indexing and shows repository, database, file, symbol, relationship, parse-error, and language status.
+- Navigation lists dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search.
+- `Tab` or down arrow advances through views; `Shift+Tab` or up arrow moves backward.
+- `/`, `f`, `s`, `d`, `v`, `c`, `i`, and `e` switch to search, files, symbols, symbol detail, references, callers/callees, imports, and parse-error views.
+- `?` shows help, `Enter` updates the status message for the selected view, `Esc` returns to dashboard, and `q` exits cleanly with the terminal restored.
 
 ## Validate
 

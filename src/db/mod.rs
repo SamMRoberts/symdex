@@ -68,7 +68,7 @@ pub fn finish_parse_run(
 }
 
 pub fn clear_repository_index(conn: &Connection, repository_id: i64) -> Result<()> {
-    conn.execute("DELETE FROM symbol_fts", [])?;
+    clear_symbol_fts(conn)?;
     conn.execute("DELETE FROM symbol_relationships WHERE source_file_id IN (SELECT id FROM files WHERE repository_id = ?1)", params![repository_id])?;
     conn.execute("DELETE FROM symbol_references WHERE file_id IN (SELECT id FROM files WHERE repository_id = ?1)", params![repository_id])?;
     conn.execute(
@@ -287,7 +287,10 @@ pub fn replace_file_index(tx: &Transaction<'_>, input: FileIndexReplacement<'_>)
 
 fn delete_file_children(conn: &Connection, file_id: i64) -> Result<()> {
     conn.execute(
-        "DELETE FROM symbol_fts WHERE rowid IN (SELECT id FROM symbols WHERE file_id = ?1)",
+        "INSERT INTO symbol_fts(symbol_fts, rowid, name, kind, signature, file_path)
+         SELECT 'delete', s.id, s.name, s.kind, s.signature, f.path
+         FROM symbols s JOIN files f ON f.id = s.file_id
+         WHERE s.file_id = ?1",
         params![file_id],
     )?;
     conn.execute(
@@ -304,6 +307,14 @@ fn delete_file_children(conn: &Connection, file_id: i64) -> Result<()> {
         params![file_id],
     )?;
     conn.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+    Ok(())
+}
+
+fn clear_symbol_fts(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO symbol_fts(symbol_fts) VALUES ('delete-all')",
+        [],
+    )?;
     Ok(())
 }
 
@@ -336,6 +347,11 @@ pub fn status(
     db_path: &Path,
     config: &AppConfig,
 ) -> Result<IndexStatus> {
+    let repo_root = if repo_root.exists() {
+        repo_root.canonicalize()?
+    } else {
+        repo_root.to_path_buf()
+    };
     let repo_path = repo_root.to_string_lossy().to_string();
     let repository_id: Option<i64> = conn
         .query_row(

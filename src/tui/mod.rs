@@ -16,6 +16,8 @@ use crate::{
 pub mod app;
 pub mod views;
 
+use app::View;
+
 pub fn run(path: PathBuf) -> Result<()> {
     let root = discover_repo_root(&path)?;
     let config = AppConfig::load(&root)?;
@@ -46,15 +48,25 @@ fn run_loop(
         {
             match key.code {
                 KeyCode::Char('q') => break,
-                KeyCode::Char('?') => app.message = "q quit | / search | r re-index | e errors | s symbols | c callers/callees | i imports".into(),
-                KeyCode::Char('/') => app.message = "Search is available from the CLI with `symdex symbols find <name>` in the MVP".into(),
-                KeyCode::Char('r') => app.message = "Run `symdex index .` to re-index from the MVP TUI".into(),
-                KeyCode::Char('e') => app.selected_view = "Parse errors".into(),
-                KeyCode::Char('s') => app.selected_view = "Symbols".into(),
-                KeyCode::Char('c') => app.selected_view = "Callers/Callees".into(),
-                KeyCode::Char('i') => app.selected_view = "Imports".into(),
-                KeyCode::Esc => app.selected_view = "Dashboard".into(),
-                KeyCode::Enter => app.message = format!("Opened {}", app.selected_view),
+                KeyCode::Char('?') => app.show_help(),
+                KeyCode::Tab | KeyCode::Down => app.next_view(),
+                KeyCode::BackTab | KeyCode::Up => app.previous_view(),
+                KeyCode::Char('/') => {
+                    app.select_view(View::Search);
+                    app.message = "Search is available from the CLI with `symdex symbols find <name>` in the MVP".into();
+                }
+                KeyCode::Char('r') => {
+                    app.message = "Run `symdex index .` to re-index from the MVP TUI".into()
+                }
+                KeyCode::Char('f') => app.select_view(View::Files),
+                KeyCode::Char('s') => app.select_view(View::Symbols),
+                KeyCode::Char('d') => app.select_view(View::SymbolDetail),
+                KeyCode::Char('v') => app.select_view(View::References),
+                KeyCode::Char('c') => app.select_view(View::CallersCallees),
+                KeyCode::Char('i') => app.select_view(View::Imports),
+                KeyCode::Char('e') => app.select_view(View::ParseErrors),
+                KeyCode::Esc => app.select_view(View::Dashboard),
+                KeyCode::Enter => app.message = format!("Opened {}", app.selected_view.label()),
                 _ => {}
             }
         }
