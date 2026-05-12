@@ -1,0 +1,23 @@
+[project]
+name = "symdex"
+
+[index]
+include = ["src/**", "tests/**"]
+exclude = [
+  ".git/**",
+  "target/**",
+  "node_modules/**",
+  "dist/**",
+  "build/**",
+  ".symdex/**"
+]
+max_file_size_bytes = 1048576
+
+[parser]
+languages = ["rust", "typescript", "javascript", "python"]
+
+[storage]
+database_path = ".symdex/index.db"
+
+[search]
+enable_fts = true

@@ -1,2 +1,16 @@
 # MacOS
 .DS_Store
+
+# Rust build output
+target/
+
+# Symdex local runtime data
+.symdex/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local-only config
+symdex.local.toml
