@@ -121,10 +121,11 @@
 
 ### Implementation for User Story 3
 
-- [ ] T048 [US3] Implement TUI app state model with status, selected view, and message fields in src/tui/app.rs
+- [ ] T048 [US3] Implement TUI app state model with status, selected view, search text, selected symbol detail, and required view inventory in src/tui/app.rs
 - [ ] T049 [US3] Implement ratatui layout with navigation pane, dashboard/status pane, details pane, and bottom status pane in src/tui/views.rs
-- [ ] T050 [US3] Implement terminal lifecycle, event loop, keyboard controls, help message, and clean shutdown in src/tui/mod.rs
-- [ ] T051 [US3] Wire `symdex tui [path]` command handler in src/cli/commands.rs
+- [ ] T050 [US3] Implement render helpers for dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search views in src/tui/views.rs
+- [ ] T051 [US3] Implement terminal lifecycle, event loop, keyboard controls, help message, view navigation, and clean shutdown in src/tui/mod.rs
+- [ ] T052 [US3] Wire `symdex tui [path]` command handler in src/cli/commands.rs
 
 **Checkpoint**: User Story 3 provides the MVP TUI without requiring runtime AI integration.
 
@@ -134,13 +135,14 @@
 
 **Purpose**: Final validation, documentation, privacy guardrails, and release readiness across all user stories.
 
-- [ ] T052 [P] Update README.md with final quickstart, supported languages, command list, and MVP scope notes
-- [ ] T053 [P] Update docs/specs/git-safety.md to state generated runtime data and private repository index exports must not be committed
-- [ ] T054 [P] Audit Cargo.toml and source files to confirm no runtime network, telemetry, LLM, embedding, vector DB, Qdrant, cloud sync, or source-upload dependencies were introduced
-- [ ] T055 Run `cargo fmt --check` and fix formatting in Rust source files if needed
-- [ ] T056 Run `cargo clippy --all-targets -- -D warnings` and fix lint findings in Rust source files if needed
-- [ ] T057 Run `cargo test` and fix failing unit/integration tests if needed
-- [ ] T058 Run quickstart smoke commands from specs/001-local-tree-sitter-sqlite-cli-tui/quickstart.md and verify `.symdex/` remains absent from `git status --short`
+- [ ] T053 [P] Update README.md with final quickstart, supported languages, command list, and MVP scope notes
+- [ ] T054 [P] Update docs/specs/git-safety.md to state generated runtime data and private repository index exports must not be committed
+- [ ] T055 [P] Audit Cargo.toml, Cargo.lock, and src/**/*.rs to confirm no runtime network, telemetry, LLM, embedding, vector DB, Qdrant, cloud sync, or source-upload dependencies were introduced
+- [ ] T056 [P] Add generated-fixture performance smoke coverage for the 1,000-file indexing goal in tests/integration.rs
+- [ ] T057 Run `cargo fmt --check` and fix formatting in src/**/*.rs and tests/**/*.rs if needed
+- [ ] T058 Run `cargo clippy --all-targets -- -D warnings` and fix lint findings in src/**/*.rs and tests/**/*.rs if needed
+- [ ] T059 Run `cargo test` and fix failing tests in src/**/*.rs and tests/**/*.rs if needed
+- [ ] T060 Run quickstart smoke commands from specs/001-local-tree-sitter-sqlite-cli-tui/quickstart.md and verify `.symdex/` remains absent from `git status --short`
 
 ---
 
@@ -176,8 +178,8 @@
 - US1 tests T024-T027 can run in parallel before US1 implementation.
 - US2 tests T034-T037 can run in parallel after fixtures and foundational modules exist.
 - US2 query implementations T039-T044 mostly touch separate query paths and can be split carefully once db query helpers are established.
-- US3 tasks T046-T047 can run in parallel; T048-T050 touch separate TUI files and can be split after T048 defines app state.
-- Polish docs/audit tasks T052-T054 can run in parallel before validation commands T055-T058.
+- US3 tasks T046-T047 can run in parallel; T048 and T051 touch separate TUI files, while T049-T050 should be sequenced because both update src/tui/views.rs.
+- Polish docs/audit/performance tasks T053-T056 can run in parallel before validation commands T057-T060.
 
 ---
 
@@ -208,6 +210,7 @@ Task: "Add import and relationship query coverage in tests/integration.rs"
 Task: "Add TUI app state unit coverage in src/tui/app.rs"
 Task: "Add manual TUI verification checklist to quickstart.md"
 Task: "Implement ratatui layout in src/tui/views.rs"
+Task: "Implement render helpers for all required TUI views in src/tui/views.rs"
 ```
 
 ---
@@ -226,7 +229,7 @@ Task: "Implement ratatui layout in src/tui/views.rs"
 1. Deliver local indexing and SQLite cache safety from US1.
 2. Add CLI query surface from US2 and validate against artificial fixtures.
 3. Add basic TUI dashboard from US3 and validate terminal behavior manually.
-4. Run final format, lint, test, smoke, and local-only dependency audit.
+4. Run final format, lint, test, performance smoke, quickstart smoke, and local-only dependency audit.
 
 ### VS Code + Copilot Workflow
 
@@ -237,11 +240,11 @@ Task: "Implement ratatui layout in src/tui/views.rs"
 
 ## Task Summary
 
-- **Total tasks**: 58
+- **Total tasks**: 60
 - **Setup tasks**: 7
 - **Foundational tasks**: 16
 - **US1 tasks**: 10
 - **US2 tasks**: 12
-- **US3 tasks**: 6
-- **Polish tasks**: 7
+- **US3 tasks**: 7
+- **Polish tasks**: 8
 - **Suggested MVP scope**: Complete through Phase 3, User Story 1.

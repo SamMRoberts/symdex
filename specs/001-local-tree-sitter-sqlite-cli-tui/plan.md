@@ -1,6 +1,6 @@
 # Implementation Plan: Local Tree-sitter SQLite CLI/TUI Indexer
 
-**Branch**: `new` with active Spec Kit feature pinned to `001-local-tree-sitter-sqlite-cli-tui` | **Date**: 2026-05-12 | **Spec**: [spec.md](spec.md)
+**Feature**: `001-local-tree-sitter-sqlite-cli-tui` pinned by `.specify/feature.json` for this workspace | **Date**: 2026-05-12 | **Spec**: [spec.md](spec.md)
 **Input**: Feature specification from `specs/001-local-tree-sitter-sqlite-cli-tui/spec.md`
 
 **Note**: This plan is designed for VS Code + GitHub Copilot development. Copilot assists implementation and review only; Symdex has no runtime AI, LLM, embedding, vector database, telemetry, or network dependency.
@@ -54,6 +54,17 @@ Cargo.lock
 README.md
 AGENTS.md
 symdex.toml
+docs/
+└── specs/
+    ├── project-discovery.md
+    ├── parser-pipeline.md
+    ├── symbol-model.md
+    ├── sqlite-schema.md
+    ├── incremental-indexing.md
+    ├── cli-commands.md
+    ├── tui-navigation.md
+    ├── evidence-model.md
+    └── git-safety.md
 migrations/
 ├── 001_initial.sql
 ├── 002_symbols.sql
@@ -105,11 +116,13 @@ tests/
 
 ## Verification Plan
 
-**Automated Tests**: Unit tests for parser extraction and integration tests for config init/load, migration application, fixture indexing, symbol search, reference discovery, parse-error recording, incremental skip behavior, and CLI basics. Use artificial fixtures under `tests/fixtures/` only.
+**Automated Tests**: Unit tests for parser extraction and TUI app state, plus integration tests for config init/load, migration application, fixture indexing, symbol search, reference discovery, parse-error recording, incremental skip behavior, CLI basics, and generated-fixture performance smoke coverage. Use artificial fixtures under `tests/fixtures/` only.
 
-**Manual Verification**: Run `cargo run -- init --force`, `cargo run -- index . --full`, `cargo run -- status`, `cargo run -- symbols find index_repository`, `cargo run -- errors`, and `cargo run -- tui`. Confirm `.symdex/` remains ignored in `git status --short`.
+**Manual Verification**: Run `cargo run -- init --force`, `cargo run -- index . --full`, `cargo run -- status`, `cargo run -- symbols find index_repository`, `cargo run -- errors`, and `cargo run -- tui`. In the TUI, verify dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, search navigation, `?` help, and `q` clean shutdown. Confirm `.symdex/` remains ignored in `git status --short`.
 
-**Operational Checks**: Verify index summary counts, parse-run rows, parse-error rows, source file/line evidence in command output, and TUI dashboard status. Confirm no code path introduces runtime network, AI, embedding, vector DB, or telemetry dependencies.
+**Manual TUI Rationale And Risk**: Full terminal alternate-screen rendering and restoration are manually verified because headless terminal integration tests are brittle for the MVP and would add more harness complexity than product behavior. Residual risk is a regression in real terminal layout or restoration; this is mitigated by automated app-state tests plus the quickstart TUI checklist before release.
+
+**Operational Checks**: Verify index summary counts, parse-run rows, parse-error rows, source file/line evidence in command output, generated-fixture indexing throughput, and TUI dashboard status. Confirm no code path introduces runtime network, AI, embedding, vector DB, or telemetry dependencies.
 
 ## Complexity Tracking
 
