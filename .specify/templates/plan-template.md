@@ -31,7 +31,17 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+1. **Spec-First User Value**: Plan traces to prioritized user journeys,
+   measurable success criteria, assumptions, and non-goals from spec.md.
+2. **Simple, Local Design**: Plan uses existing project structure and justifies
+   every new dependency, persistent store, architectural boundary, or abstraction.
+3. **Testable Quality Gates**: Plan identifies independent tests for each user
+   journey and automated coverage for behavior changes, changed boundaries, and
+   user-facing flows. Any manual-only validation includes rationale and risk.
+4. **Observable, Operable Behavior**: Plan names required logs, errors, metrics,
+   user-visible states, and performance or reliability expectations.
+5. **Secure, Reproducible Changes**: Plan documents secrets handling, permissions,
+   configuration, retention behavior, and repeatable build/test/run commands.
 
 ## Project Structure
 
@@ -93,6 +103,16 @@ ios/ or android/
 
 **Structure Decision**: [Document the selected structure and reference the real
 directories captured above]
+
+## Verification Plan
+
+**Automated Tests**: [List unit, integration, contract, or end-to-end tests tied
+to each user journey, or justify why automation is not practical]
+
+**Manual Verification**: [List manual checks and residual risk, if any]
+
+**Operational Checks**: [List logs, metrics, error states, performance checks, or
+N/A with rationale]
 
 ## Complexity Tracking
 
