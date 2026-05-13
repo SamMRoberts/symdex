@@ -19,6 +19,34 @@ fn config_init_and_loads_defaults() {
 }
 
 #[test]
+fn config_init_refuses_existing_config_unless_forced() {
+    let temp = tempdir().unwrap();
+    init_config(temp.path(), false).unwrap();
+
+    let error = init_config(temp.path(), false).unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+
+    init_config(temp.path(), true).unwrap();
+    assert!(temp.path().join("symdex.toml").is_file());
+}
+
+#[test]
+fn local_config_overrides_project_config() {
+    let temp = tempdir().unwrap();
+    init_config(temp.path(), false).unwrap();
+    fs::write(
+        temp.path().join("symdex.local.toml"),
+        "[storage]\ndatabase_path = '.symdex/local.db'\n\n[search]\nenable_fts = false\n\n[index]\nmax_file_size_bytes = 4\n",
+    )
+    .unwrap();
+
+    let config = AppConfig::load(temp.path()).unwrap();
+    assert_eq!(config.storage.database_path, Path::new(".symdex/local.db"));
+    assert!(!config.search.enable_fts);
+    assert_eq!(config.index.max_file_size_bytes, 4);
+}
+
+#[test]
 fn indexes_rust_fixture_and_skips_unchanged_files() {
     let temp = fixture_project("rust-basic");
     init_config(temp.path(), false).unwrap();
@@ -126,6 +154,110 @@ fn cli_indexes_and_finds_symbols() {
 }
 
 #[test]
+fn cli_structural_query_commands_return_contract_fields() {
+    let temp = fixture_project("rust-basic");
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["init"])
+        .assert()
+        .success();
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["index", ".", "--watch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Watch mode requested"));
+
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Files indexed: 1"));
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["symbols", "in", "src/lib.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("parse_config"));
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["refs", "read_file"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("call -> read_file"));
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["callers", "read_file"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("parse_config"));
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["callees", "parse_config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("read_file"));
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["imports", "src/lib.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("imported_path="));
+}
+
+#[test]
+fn cli_parse_error_and_unindexed_guidance_paths_work() {
+    let python = fixture_project("python-basic");
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(python.path())
+        .args(["init"])
+        .assert()
+        .success();
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(python.path())
+        .args(["index", "."])
+        .assert()
+        .success();
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(python.path())
+        .args(["errors", "--file", "src/bad.py"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tree-sitter parse error"));
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(python.path())
+        .args(["files", "with-errors"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("src/bad.py"));
+
+    let unindexed = tempdir().unwrap();
+    init_config(unindexed.path(), false).unwrap();
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(unindexed.path())
+        .args(["symbols", "find", "parse_config"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "repository has not been indexed yet",
+        ));
+}
+
+#[test]
 fn cli_reports_missing_config_guidance() {
     let temp = tempdir().unwrap();
     Command::cargo_bin("symdex")
@@ -185,6 +317,114 @@ fn queries_imports_relationships_status_and_errors() {
                 .as_deref()
                 .is_some_and(|evidence| evidence.contains("read_file"))
     }));
+}
+
+#[test]
+fn fts_search_is_used_when_enabled_and_sql_search_remains_available() {
+    let temp = fixture_project("rust-basic");
+    init_config(temp.path(), false).unwrap();
+    index_repository(
+        temp.path(),
+        IndexOptions {
+            full: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+
+    let config = AppConfig::load(temp.path()).unwrap();
+    let conn = db::open_database(temp.path(), &config).unwrap();
+    let repo_id = db::repository_id(&conn, temp.path()).unwrap().unwrap();
+
+    let fts_matches = db::find_symbols_with_search(&conn, repo_id, "String", true).unwrap();
+    assert!(fts_matches.iter().any(|row| row.matched_by == "fts"));
+
+    let sql_matches = db::find_symbols_with_search(&conn, repo_id, "parse_config", false).unwrap();
+    assert!(sql_matches.iter().any(|row| row.matched_by == "exact"));
+}
+
+#[test]
+fn relationship_kinds_include_reference_import_and_dependency_evidence() {
+    let temp = fixture_project("rust-basic");
+    init_config(temp.path(), false).unwrap();
+    index_repository(
+        temp.path(),
+        IndexOptions {
+            full: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+
+    let config = AppConfig::load(temp.path()).unwrap();
+    let conn = db::open_database(temp.path(), &config).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT relationship_kind FROM symbol_relationships")
+        .unwrap();
+    let kinds = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()
+        .unwrap();
+
+    assert!(kinds.contains("calls"));
+    assert!(kinds.contains("references"));
+    assert!(kinds.contains("imports"));
+    assert!(kinds.contains("depends_on"));
+}
+
+#[test]
+fn deleted_and_skipped_files_are_excluded_from_active_results() {
+    let temp = fixture_project("rust-basic");
+    init_config(temp.path(), false).unwrap();
+    index_repository(
+        temp.path(),
+        IndexOptions {
+            full: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+
+    fs::remove_file(temp.path().join("src/lib.rs")).unwrap();
+    let summary = index_repository(
+        temp.path(),
+        IndexOptions {
+            full: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.files_deleted, 1);
+
+    let config = AppConfig::load(temp.path()).unwrap();
+    let conn = db::open_database(temp.path(), &config).unwrap();
+    let repo_id = db::repository_id(&conn, temp.path()).unwrap().unwrap();
+    assert!(
+        db::find_symbols(&conn, repo_id, "parse_config")
+            .unwrap()
+            .is_empty()
+    );
+
+    let skipped = tempdir().unwrap();
+    fs::create_dir_all(skipped.path().join("src")).unwrap();
+    fs::write(skipped.path().join("src/lib.rs"), "pub fn too_big() {}\n").unwrap();
+    fs::write(skipped.path().join("src/notes.txt"), "unsupported\n").unwrap();
+    init_config(skipped.path(), false).unwrap();
+    fs::write(
+        skipped.path().join("symdex.local.toml"),
+        "[index]\nmax_file_size_bytes = 4\n",
+    )
+    .unwrap();
+    let skipped_summary = index_repository(
+        skipped.path(),
+        IndexOptions {
+            full: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(skipped_summary.files_scanned, 0);
 }
 
 #[test]

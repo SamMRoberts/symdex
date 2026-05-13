@@ -147,6 +147,23 @@
 
 ---
 
+## Phase 7: Spec Remediation Delta
+
+**Purpose**: Close gaps found during the post-MVP spec audit without weakening the local-only, deterministic scope.
+
+- [x] T062 [P] Add CLI contract and edge-case integration coverage for status, symbols-in-file, refs, callers, callees, imports, errors, files-with-errors, watch-mode messaging, unindexed repository guidance, local config overrides, deleted-file handling, and skipped unsupported/oversized files in tests/integration.rs
+- [x] T063 Wire `[search].enable_fts` into user-facing symbol search while preserving exact/prefix SQL fallback in src/db/mod.rs, src/search/fts.rs, and src/cli/commands.rs
+- [x] T064 Include optional imported path and imported symbol fields in `symdex imports <file>` output in src/cli/commands.rs
+- [x] T065 Make name-based symbol resolution conservative so duplicate symbol names do not receive misleading target IDs in src/db/mod.rs
+- [x] T066 Add remaining relationship kind constants and emit conservative `references`, `imports`, and `depends_on` relationships from existing call/import evidence in src/symbols/relationships.rs and src/parser/extract.rs
+- [ ] T067 Expand relationship extraction tests and parser support for `exports`, `implements`, `extends`, and `tests` where Rust, TypeScript, JavaScript, or Python Tree-sitter evidence is reliable
+- [ ] T068 Wire the internal Evidence model through symbol, reference, import, parse-error, and relationship formatting without adding network, embedding, vector, or source-content storage behavior
+- [ ] T069 Make the TUI render real indexed files, symbols, symbol details, references, callers/callees, imports, parse errors, and search results from shared query services
+- [ ] T070 Update README.md and docs/specs/*.md to describe the remediated search, relationship, evidence, and TUI behavior
+- [ ] T071 Re-run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, quickstart smoke commands, and `git status --short` ignore verification after remediation
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies

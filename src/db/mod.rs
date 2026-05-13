@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use crate::{
     config::AppConfig,
     db::schema::{ErrorRow, ImportRow, IndexStatus, ReferenceRow, RelationshipRow, SymbolRow},
+    search::fts,
     symbols::model::{
         ImportRecord, ParseErrorRecord, ReferenceRecord, RelationshipRecord, SymbolRecord,
     },
@@ -319,16 +320,16 @@ fn clear_symbol_fts(conn: &Connection) -> Result<()> {
 }
 
 fn resolve_symbol_id(conn: &Connection, repository_id: i64, name: &str) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT s.id
+    let mut stmt = conn.prepare(
+        "SELECT s.id
          FROM symbols s JOIN files f ON f.id = s.file_id
          WHERE f.repository_id = ?1 AND f.deleted_at IS NULL AND s.name = ?2
-         ORDER BY s.id LIMIT 1",
-            params![repository_id, name],
-            |row| row.get(0),
-        )
-        .optional()?)
+         ORDER BY s.id LIMIT 2",
+    )?;
+    let ids = stmt
+        .query_map(params![repository_id, name], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(if ids.len() == 1 { Some(ids[0]) } else { None })
 }
 
 fn symbol_file_id(conn: &Connection, symbol_id: i64) -> Result<Option<i64>> {
@@ -393,6 +394,33 @@ pub fn status(
 }
 
 pub fn find_symbols(conn: &Connection, repository_id: i64, name: &str) -> Result<Vec<SymbolRow>> {
+    find_symbols_sql(conn, repository_id, name)
+}
+
+pub fn find_symbols_with_search(
+    conn: &Connection,
+    repository_id: i64,
+    name: &str,
+    enable_fts: bool,
+) -> Result<Vec<SymbolRow>> {
+    let mut rows = find_symbols_sql(conn, repository_id, name)?;
+    if !enable_fts {
+        return Ok(rows);
+    }
+
+    let mut seen = rows
+        .iter()
+        .map(|row| row.id)
+        .collect::<std::collections::HashSet<_>>();
+    for row in fts::search_symbols(conn, repository_id, name)? {
+        if seen.insert(row.id) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+fn find_symbols_sql(conn: &Connection, repository_id: i64, name: &str) -> Result<Vec<SymbolRow>> {
     let prefix = format!("{name}%");
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.kind, s.language, f.path, s.start_line, s.end_line, s.signature, s.visibility,

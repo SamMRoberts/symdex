@@ -8,7 +8,13 @@ pub fn search_symbols(
     repository_id: i64,
     query: &str,
 ) -> Result<Vec<SymbolRow>> {
-    let escaped = query.replace('"', "");
+    let escaped = query
+        .chars()
+        .filter(|character| character.is_alphanumeric() || *character == '_')
+        .collect::<String>();
+    if escaped.is_empty() {
+        return Ok(Vec::new());
+    }
     let fts_query = format!("{escaped}*");
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.kind, s.language, f.path, s.start_line, s.end_line, s.signature, s.visibility, 'fts' AS matched_by

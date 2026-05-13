@@ -64,10 +64,15 @@ pub fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Symbols(args) => {
-            let (root, _config, conn, repository_id) = query_context(Path::new("."))?;
+            let (root, config, conn, repository_id) = query_context(Path::new("."))?;
             match args.command {
                 SymbolsCommand::Find(name) => {
-                    let rows = db::find_symbols(&conn, repository_id, &name.symbol_name)?;
+                    let rows = db::find_symbols_with_search(
+                        &conn,
+                        repository_id,
+                        &name.symbol_name,
+                        config.search.enable_fts,
+                    )?;
                     print_symbols(&rows);
                 }
                 SymbolsCommand::In(file) => {
@@ -128,9 +133,16 @@ pub fn run(cli: Cli) -> Result<()> {
             let (root, _config, conn, repository_id) = query_context(Path::new("."))?;
             let path = normalize_cli_path(&root, &args.file);
             for row in db::imports(&conn, repository_id, &path)? {
+                let imported_path = row.imported_path.as_deref().unwrap_or("");
+                let imported_symbol = row.imported_symbol.as_deref().unwrap_or("");
                 println!(
-                    "{}:{}:{} {}",
-                    row.file_path, row.start_line, row.start_column, row.import_text
+                    "{}:{}:{} {} imported_path={} imported_symbol={}",
+                    row.file_path,
+                    row.start_line,
+                    row.start_column,
+                    row.import_text,
+                    imported_path,
+                    imported_symbol
                 );
             }
         }

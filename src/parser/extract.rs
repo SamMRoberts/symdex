@@ -9,7 +9,7 @@ use crate::{
             ExtractedFile, ImportRecord, ParseErrorRecord, ReferenceRecord, RelationshipRecord,
             SymbolRecord,
         },
-        relationships::{CALLS, CONTAINS, IMPORTS, NAME_MATCH, STRUCTURAL},
+        relationships::{CALLS, CONTAINS, DEPENDS_ON, IMPORTS, NAME_MATCH, REFERENCES, STRUCTURAL},
     },
 };
 
@@ -46,22 +46,36 @@ fn walk(
     stack: &mut Vec<usize>,
 ) {
     if let Some(import) = import_record(node, content, language) {
-        if let Some(source_index) = stack.last().copied() {
-            extracted.relationships.push(RelationshipRecord {
-                source_index: Some(source_index),
-                target_name: import
-                    .imported_symbol
-                    .clone()
-                    .or(import.imported_path.clone()),
-                source_symbol_id: None,
-                target_symbol_id: None,
-                source_file_id: None,
-                target_file_id: None,
-                relationship_kind: IMPORTS.into(),
-                confidence: NAME_MATCH.into(),
-                evidence: Some(format!("{} imports {}", relative_path, import.import_text)),
-            });
-        }
+        let source_index = stack.last().copied();
+        let target_name = import
+            .imported_symbol
+            .clone()
+            .or(import.imported_path.clone());
+        extracted.relationships.push(RelationshipRecord {
+            source_index,
+            target_name: target_name.clone(),
+            source_symbol_id: None,
+            target_symbol_id: None,
+            source_file_id: None,
+            target_file_id: None,
+            relationship_kind: IMPORTS.into(),
+            confidence: NAME_MATCH.into(),
+            evidence: Some(format!("{} imports {}", relative_path, import.import_text)),
+        });
+        extracted.relationships.push(RelationshipRecord {
+            source_index,
+            target_name,
+            source_symbol_id: None,
+            target_symbol_id: None,
+            source_file_id: None,
+            target_file_id: None,
+            relationship_kind: DEPENDS_ON.into(),
+            confidence: NAME_MATCH.into(),
+            evidence: Some(format!(
+                "{} depends on {}",
+                relative_path, import.import_text
+            )),
+        });
         extracted.imports.push(import);
     }
 
@@ -89,6 +103,20 @@ fn walk(
                 confidence: NAME_MATCH.into(),
                 evidence: Some(format!(
                     "{source_name} calls {name} at {relative_path}:{}",
+                    line(start)
+                )),
+            });
+            extracted.relationships.push(RelationshipRecord {
+                source_index: Some(source_index),
+                target_name: Some(name.clone()),
+                source_symbol_id: None,
+                target_symbol_id: None,
+                source_file_id: None,
+                target_file_id: None,
+                relationship_kind: REFERENCES.into(),
+                confidence: NAME_MATCH.into(),
+                evidence: Some(format!(
+                    "{source_name} references {name} at {relative_path}:{}",
                     line(start)
                 )),
             });
