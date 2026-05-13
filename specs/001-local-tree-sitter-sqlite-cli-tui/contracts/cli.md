@@ -72,10 +72,17 @@ All commands are local-only. Commands MUST NOT call external APIs, telemetry, LL
 
 ## `symdex tui [path]`
 
-**Behavior**: Launch ratatui dashboard with required navigation entries and local status details.
+**Behavior**: Launch ratatui dashboard with required navigation entries, local status details, and view-specific detail panes for the MVP dashboard/navigation shell. Detailed source-backed lists remain available through CLI query commands.
 
-**Controls**: `q` quit, `/` search message, `Enter` open selected item, `Esc` dashboard/back, `r` re-index message, `e` errors, `s` symbols, `c` callers/callees, `i` imports, `?` help.
+**Controls**: `q` quit, `Tab`/down next view, `Shift+Tab`/up previous view, `/` search message, `Enter` open selected item, `Esc` dashboard/back, `r` re-index message, `f` files, `s` symbols, `d` symbol detail, `v` references, `c` callers/callees, `i` imports, `e` errors, `?` help.
 
 ## Common Error Contract
 
-Query commands that cannot find an indexed repository MUST tell the user to run `symdex index .`. Fatal errors include database-open failure, migration failure, invalid repository root, and inability to create `.symdex/`.
+- Missing `symdex.toml`: commands that require configuration MUST fail with a recoverable message instructing the user to run `symdex init`.
+- Existing `symdex.toml`: `symdex init` MUST refuse to overwrite it unless `--force` is passed.
+- Unindexed repository: query commands MUST tell the user to run `symdex index .`.
+- Invalid path or repository root: commands MUST fail without creating remote state or uploading source contents.
+- Database open or migration failure: commands MUST fail fatally with the database path in the error context.
+- File parse failures: `symdex index` MUST continue indexing other files, persist parse-error rows, and include parse-error counts in the summary.
+- Unsupported or oversized files: `symdex index` MUST skip them without failing the whole run.
+- TUI startup failures: `symdex tui` MUST surface configuration/database errors before entering alternate-screen mode when possible, and must restore the terminal on clean quit.

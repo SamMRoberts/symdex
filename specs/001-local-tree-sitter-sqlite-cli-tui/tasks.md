@@ -48,7 +48,7 @@
 - [x] T020 [P] Implement supported language detection and Tree-sitter grammar loading for Rust, TypeScript, JavaScript, and Python in src/parser/languages.rs
 - [x] T021 [P] Implement file hashing helper in src/indexer/hashing.rs
 - [x] T022 [P] Implement ignore-aware file discovery with include/exclude glob handling in src/indexer/discovery.rs
-- [x] T023 [P] Create artificial Rust, TypeScript, and Python fixture projects in tests/fixtures/rust-basic/src/lib.rs, tests/fixtures/typescript-basic/src/index.ts, tests/fixtures/python-basic/src/main.py, and tests/fixtures/python-basic/src/bad.py
+- [x] T023 [P] Create artificial Rust, TypeScript, JavaScript, and Python fixture projects in tests/fixtures/rust-basic/src/lib.rs, tests/fixtures/typescript-basic/src/index.ts, tests/fixtures/javascript-basic/src/index.js, tests/fixtures/python-basic/src/main.py, and tests/fixtures/python-basic/src/bad.py
 
 **Checkpoint**: Foundation ready; user story implementation can now begin.
 
@@ -91,7 +91,7 @@
 - [x] T034 [P] [US2] Add CLI smoke test for `symdex init`, `symdex index .`, and `symdex symbols find parse_config` in tests/integration.rs
 - [x] T035 [P] [US2] Add database query test for symbol lookup and reference lookup in tests/integration.rs
 - [x] T036 [P] [US2] Add parse-error CLI/query test for `symdex errors --file src/bad.py` in tests/integration.rs
-- [x] T037 [P] [US2] Add import and relationship query coverage for TypeScript and Rust fixtures in tests/integration.rs
+- [x] T037 [P] [US2] Add import and relationship query coverage for TypeScript, JavaScript, and Rust fixtures in tests/integration.rs
 
 ### Implementation for User Story 2
 

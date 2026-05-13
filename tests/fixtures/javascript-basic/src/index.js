@@ -1,15 +1,11 @@
 import { readFileSync } from "node:fs";
 
-export interface Config {
-    name: string;
-}
-
-export function parseConfig(path: string): Config {
+export function parseConfig(path) {
     return { name: readFileSync(path, "utf8").trim() };
 }
 
 export class ConfigStore {
-    load(path: string): Config {
+    load(path) {
         return parseConfig(path);
     }
 }

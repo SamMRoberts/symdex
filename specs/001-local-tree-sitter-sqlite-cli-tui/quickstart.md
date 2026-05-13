@@ -61,7 +61,7 @@ Controls: `q` quit, `Tab`/down next view, `Shift+Tab`/up previous view, `/` sear
 Manual TUI verification checklist:
 
 - Dashboard opens after indexing and shows repository, database, file, symbol, relationship, parse-error, and language status.
-- Navigation lists dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search.
+- Navigation lists dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search with MVP detail panes that point to source-backed CLI commands.
 - `Tab` or down arrow advances through views; `Shift+Tab` or up arrow moves backward.
 - `/`, `f`, `s`, `d`, `v`, `c`, `i`, and `e` switch to search, files, symbols, symbol detail, references, callers/callees, imports, and parse-error views.
 - `?` shows help, `Enter` updates the status message for the selected view, `Esc` returns to dashboard, and `q` exits cleanly with the terminal restored.

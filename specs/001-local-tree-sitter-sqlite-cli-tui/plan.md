@@ -109,6 +109,7 @@ tests/
 └── fixtures/
     ├── rust-basic/
     ├── typescript-basic/
+    ├── javascript-basic/
     └── python-basic/
 ```
 
@@ -116,7 +117,7 @@ tests/
 
 ## Verification Plan
 
-**Automated Tests**: Unit tests for parser extraction and TUI app state, plus integration tests for config init/load, migration application, fixture indexing, symbol search, reference discovery, parse-error recording, incremental skip behavior, CLI basics, and generated-fixture performance smoke coverage. Use artificial fixtures under `tests/fixtures/` only.
+**Automated Tests**: Unit tests for parser extraction and TUI app state, plus integration tests for config init/load, migration application, Rust/TypeScript/JavaScript/Python fixture indexing, symbol search, reference discovery, parse-error recording, incremental skip behavior, CLI basics, and generated-fixture performance smoke coverage. Use artificial fixtures under `tests/fixtures/` only.
 
 **Manual Verification**: Run `cargo run -- init --force`, `cargo run -- index . --full`, `cargo run -- status`, `cargo run -- symbols find index_repository`, `cargo run -- errors`, and `cargo run -- tui`. In the TUI, verify dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, search navigation, `?` help, and `q` clean shutdown. Confirm `.symdex/` remains ignored in `git status --short`.
 

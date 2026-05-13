@@ -101,6 +101,18 @@ fn cli_indexes_and_finds_symbols() {
 }
 
 #[test]
+fn cli_reports_missing_config_guidance() {
+    let temp = tempdir().unwrap();
+    Command::cargo_bin("symdex")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["status"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("run `symdex init`"));
+}
+
+#[test]
 fn queries_imports_relationships_status_and_errors() {
     let temp = fixture_project("rust-basic");
     init_config(temp.path(), false).unwrap();
@@ -147,6 +159,93 @@ fn queries_imports_relationships_status_and_errors() {
                 .evidence
                 .as_deref()
                 .is_some_and(|evidence| evidence.contains("read_file"))
+    }));
+}
+
+#[test]
+fn indexes_typescript_and_javascript_fixtures() {
+    let type_script = fixture_project("typescript-basic");
+    init_config(type_script.path(), false).unwrap();
+    let type_script_summary = index_repository(
+        type_script.path(),
+        IndexOptions {
+            full: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(type_script_summary.files_parsed, 1);
+    assert!(type_script_summary.symbols_indexed >= 2);
+    assert!(type_script_summary.imports_indexed >= 1);
+
+    let config = AppConfig::load(type_script.path()).unwrap();
+    let conn = db::open_database(type_script.path(), &config).unwrap();
+    let repo_id = db::repository_id(&conn, type_script.path())
+        .unwrap()
+        .unwrap();
+    let symbols = db::find_symbols(&conn, repo_id, "parseConfig").unwrap();
+    assert!(symbols.iter().any(|symbol| symbol.language == "typescript"));
+    let imports = db::imports(&conn, repo_id, "src/index.ts").unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|import| import.import_text.contains("node:fs"))
+    );
+    let callees = db::relationships(
+        &conn,
+        repo_id,
+        "parseConfig",
+        RelationshipDirection::Callees,
+    )
+    .unwrap();
+    assert!(callees.iter().any(|row| {
+        row.relationship_kind == "calls"
+            && row
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("readFileSync"))
+    }));
+
+    let java_script = fixture_project("javascript-basic");
+    init_config(java_script.path(), false).unwrap();
+    let java_script_summary = index_repository(
+        java_script.path(),
+        IndexOptions {
+            full: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(java_script_summary.files_parsed, 1);
+    assert!(java_script_summary.symbols_indexed >= 2);
+    assert!(java_script_summary.imports_indexed >= 1);
+
+    let config = AppConfig::load(java_script.path()).unwrap();
+    let conn = db::open_database(java_script.path(), &config).unwrap();
+    let repo_id = db::repository_id(&conn, java_script.path())
+        .unwrap()
+        .unwrap();
+    let symbols = db::find_symbols(&conn, repo_id, "parseConfig").unwrap();
+    assert!(symbols.iter().any(|symbol| symbol.language == "javascript"));
+    let imports = db::imports(&conn, repo_id, "src/index.js").unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|import| import.import_text.contains("node:fs"))
+    );
+    let callees = db::relationships(
+        &conn,
+        repo_id,
+        "parseConfig",
+        RelationshipDirection::Callees,
+    )
+    .unwrap();
+    assert!(callees.iter().any(|row| {
+        row.relationship_kind == "calls"
+            && row
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("readFileSync"))
     }));
 }
 

@@ -49,7 +49,7 @@ A developer launches a terminal UI to inspect a local dashboard and navigate req
 
 **Acceptance Scenarios**:
 
-1. **Given** an indexed repository, **When** the user runs `symdex tui`, **Then** the TUI displays dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search views.
+1. **Given** an indexed repository, **When** the user runs `symdex tui`, **Then** the TUI displays navigation entries for dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search with local status details.
 2. **Given** the TUI is open, **When** the user presses `?`, **Then** key help is shown.
 3. **Given** the TUI is open, **When** the user presses `q`, **Then** Symdex exits cleanly and restores the terminal.
 
@@ -86,7 +86,7 @@ A developer launches a terminal UI to inspect a local dashboard and navigate req
 - **FR-010**: System MUST provide `symdex status` with repo path, database path, last index time, files indexed, symbols indexed, relationships indexed, parse errors, and supported languages.
 - **FR-011**: System MUST provide `symdex symbols find <name>` and `symdex symbols in <file>`.
 - **FR-012**: System MUST provide `symdex refs <symbol-name>`, `symdex callers <symbol-name>`, `symdex callees <symbol-name>`, `symdex imports <file>`, `symdex errors [--file <file>]`, and `symdex files with-errors`.
-- **FR-013**: System MUST provide `symdex tui` with dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search views.
+- **FR-013**: System MUST provide `symdex tui` with navigation entries for dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search with local status details.
 - **FR-014**: System MUST expose diagnosable output through command summaries, parse-error records, line/column evidence, and TUI status messages.
 - **FR-015**: System MUST protect source privacy by making no network calls, storing no full file contents by default, and keeping generated database/cache files out of Git.
 
@@ -110,7 +110,7 @@ A developer launches a terminal UI to inspect a local dashboard and navigate req
 - **SC-002**: A repeat index over unchanged fixture files reports skipped files rather than reparsing them.
 - **SC-003**: CLI symbol search returns a known fixture symbol with file path and line range.
 - **SC-004**: CLI parse-error search returns a known fixture syntax error with line and column.
-- **SC-005**: `cargo test` passes using artificial Rust, TypeScript, and Python fixtures without depending on private repositories.
+- **SC-005**: `cargo test` passes using artificial Rust, TypeScript, JavaScript, and Python fixtures without depending on private repositories.
 - **SC-006**: Generated `.symdex/` database files are absent from `git status --short` because they are ignored.
 - **SC-007**: No runtime code path calls external APIs, telemetry, LLMs, embeddings, vector databases, or cloud services.
 

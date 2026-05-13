@@ -103,7 +103,14 @@ impl Default for SearchConfig {
 impl AppConfig {
     pub fn load(repo_root: &Path) -> Result<Self> {
         let mut value = toml::Value::try_from(Self::default())?;
-        merge_file(&mut value, &repo_root.join("symdex.toml"))?;
+        let config_path = repo_root.join("symdex.toml");
+        if !config_path.exists() {
+            bail!(
+                "symdex.toml not found at {}; run `symdex init`",
+                config_path.display()
+            );
+        }
+        merge_file(&mut value, &config_path)?;
         merge_file(&mut value, &repo_root.join("symdex.local.toml"))?;
         let mut config: Self = value.try_into()?;
         if config.project.name == "symdex-project" {
