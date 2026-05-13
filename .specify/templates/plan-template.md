@@ -33,15 +33,19 @@
 
 1. **Spec-First User Value**: Plan traces to prioritized user journeys,
    measurable success criteria, assumptions, and non-goals from spec.md.
-2. **Simple, Local Design**: Plan uses existing project structure and justifies
-   every new dependency, persistent store, architectural boundary, or abstraction.
+2. **Simple, Local, Deterministic Design**: Plan uses existing project structure,
+  preserves local-only deterministic runtime behavior, and justifies every new
+  dependency, persistent store, architectural boundary, or abstraction.
 3. **Testable Quality Gates**: Plan identifies independent tests for each user
    journey and automated coverage for behavior changes, changed boundaries, and
-   user-facing flows. Any manual-only validation includes rationale and risk.
+  user-facing flows. Fixture coverage backs every claimed language or parser.
+  Any manual-only validation includes rationale and risk.
 4. **Observable, Operable Behavior**: Plan names required logs, errors, metrics,
-   user-visible states, and performance or reliability expectations.
-5. **Secure, Reproducible Changes**: Plan documents secrets handling, permissions,
-   configuration, retention behavior, and repeatable build/test/run commands.
+  source-backed evidence, user-visible states, and performance or reliability
+  expectations.
+5. **Secure, Reproducible Local Artifacts**: Plan documents secrets handling,
+  generated-cache Git safety, configuration, retention behavior, and repeatable
+  build/test/run commands.
 
 ## Project Structure
 

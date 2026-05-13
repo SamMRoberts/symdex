@@ -97,11 +97,12 @@
 - **FR-005**: System MUST [behavior, e.g., "log all security events"]
 - **FR-006**: System MUST expose [observable state/log/error needed to diagnose success and failure]
 - **FR-007**: System MUST protect [data/configuration/permission boundary relevant to this feature]
+- **FR-008**: System MUST remain local-only and deterministic for [runtime surface], with no network, telemetry, LLM, embedding, vector database, cloud sync, source upload, or automatic code modification behavior unless a later constitution amendment permits it
 
 *Example of marking unclear requirements:*
 
-- **FR-008**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
-- **FR-009**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
+- **FR-009**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
+- **FR-010**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
 
 ### Key Entities *(include if feature involves data)*
 
@@ -127,5 +128,5 @@
 - **User Value**: [How the prioritized journeys and success criteria prove user value]
 - **Simplicity**: [Existing structure reused and complexity avoided]
 - **Testing**: [Independent test for each journey and expected automated coverage]
-- **Operability**: [Logs, errors, metrics, user-visible states, or N/A with rationale]
-- **Security/Reproducibility**: [Configuration, permissions, secrets, retention, and repeatable verification needs]
+- **Operability**: [Logs, errors, metrics, source-backed evidence, user-visible states, or N/A with rationale]
+- **Security/Reproducibility**: [Local-only runtime constraints, generated-cache Git safety, configuration, secrets, retention, and repeatable verification needs]
