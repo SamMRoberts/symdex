@@ -3,33 +3,33 @@
 **Feature**: `001-local-tree-sitter-sqlite-cli-tui` pinned by `.specify/feature.json` for this workspace | **Date**: 2026-05-12 | **Spec**: [spec.md](spec.md)
 **Input**: Feature specification from `specs/001-local-tree-sitter-sqlite-cli-tui/spec.md`
 
-**Note**: This plan is designed for VS Code + GitHub Copilot development. Copilot assists implementation and review only; Symdex has no runtime AI, LLM, embedding, vector database, telemetry, or network dependency.
+**Note**: This plan is designed for VS Code + GitHub Copilot development. Copilot assists implementation and review only; Symdex has no runtime AI, LLM, embedding, vector database, telemetry, source upload, automatic code modification, or network dependency.
 
 ## Summary
 
-Build Symdex as a local-first Rust CLI/TUI that indexes repository structure with Tree-sitter and stores rebuildable evidence in SQLite. The MVP centers on `symdex init`, `symdex index`, status and structural query commands, SQLite migrations, incremental hashing, Rust/TypeScript/JavaScript/Python extraction, artificial fixtures, and a basic ratatui dashboard. The design keeps CLI rendering, TUI rendering, query services, database access, parser/indexer code, and evidence models separated so future MCP tools can call the same core services without changing runtime privacy guarantees.
+Build Symdex as a local-first Rust CLI/TUI that indexes repository structure with Tree-sitter and stores rebuildable structural evidence in SQLite. The MVP centers on `symdex init`, `symdex index`, status and structural query commands, SQLite migrations, incremental hashing, Rust/TypeScript/JavaScript/Python extraction, artificial fixtures, and a basic ratatui dashboard/navigation shell. The design keeps CLI rendering, TUI rendering, query services, database access, parser/indexer code, and evidence models separated so future tools can call the same core services without weakening local-only guarantees.
 
 ## Technical Context
 
 **Language/Version**: Rust 1.95.0, edition 2024  
 **Primary Dependencies**: `clap`, `ratatui`, `crossterm`, `rusqlite` with bundled SQLite, `tree-sitter`, `tree-sitter-rust`, `tree-sitter-typescript`, `tree-sitter-javascript`, `tree-sitter-python`, `ignore`, `globset`, `serde`, `toml`, `sha2`, `anyhow`, `thiserror`, `tracing`, `tracing-subscriber`  
-**Storage**: Local SQLite database at `.symdex/index.db` with WAL/SHM sidecars ignored by Git; FTS5 virtual table for symbol text search  
+**Storage**: Local SQLite database at `.symdex/index.db` with WAL/SHM sidecars ignored by Git; FTS5 virtual table for symbol text search; no full source file contents stored by default
 **Testing**: `cargo test`, focused unit tests, integration tests with artificial fixtures, CLI smoke tests with `assert_cmd`, formatting via `cargo fmt`, linting via `cargo clippy --all-targets -- -D warnings`  
 **Target Platform**: Local developer machines running VS Code and terminal shells; macOS primary for current workspace, Rust crate remains portable where dependencies support it  
 **Project Type**: Single Rust CLI/TUI crate with library modules for reusable query/index services  
-**Performance Goals**: Index 1,000 small/medium files in under 30 seconds on a modern laptop; skip unchanged files on repeat indexing; batch SQLite writes in transactions; avoid storing full file contents by default  
-**Constraints**: Local-only; no network calls; no telemetry; no LLMs; no embeddings; no vector stores; generated `.symdex/` and SQLite files must stay out of Git; individual parse failures must not stop an indexing run  
+**Performance Goals**: Index 1,000 small/medium files in under 30 seconds on a modern laptop; skip unchanged files on repeat indexing; batch SQLite writes in transactions; avoid loading entire large repositories into memory
+**Constraints**: Local-only deterministic runtime; no network calls; no telemetry; no LLMs; no embeddings; no vector stores; no source upload; no automatic code modification; generated `.symdex/` and SQLite files must stay out of Git; individual parse failures must not stop an indexing run
 **Scale/Scope**: MVP supports Rust, TypeScript, JavaScript, and Python; artificial fixtures only for tests; advanced graph visualization, MCP server, production watch mode, CI guardrail mode, and safe JSON export are later-version work
 
 ## Constitution Check
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-1. **Spec-First User Value**: PASS. The spec defines three prioritized journeys: initialize/index, CLI structural queries, and TUI inspection, with measurable success criteria and explicit non-goals.
-2. **Simple, Local Design**: PASS. Single Rust crate, direct SQLite via `rusqlite`, Tree-sitter extraction, and simple module boundaries. Deferred advanced graph, MCP, and watch-daemon features avoid premature architecture.
-3. **Testable Quality Gates**: PASS. Each journey has independent automated tests or smoke checks: init/index, CLI query output, parse-error recording, incremental skip, and TUI launch/manual terminal checks.
-4. **Observable, Operable Behavior**: PASS. Index summaries, parse-run rows, parse-error records, query output line/column evidence, tracing hooks, and TUI status messages provide operational visibility.
-5. **Secure, Reproducible Changes**: PASS. `.symdex/`, SQLite files, and `symdex.local.toml` are ignored; no runtime network/AI dependencies are used; build/test/run commands are documented in quickstart.
+1. **Spec-First User Value**: PASS. The spec defines three prioritized journeys: initialize/index, CLI structural queries, and TUI inspection, with measurable success criteria, assumptions, non-goals, and evidence needs.
+2. **Simple, Local, Deterministic Design**: PASS. Single Rust crate, direct SQLite via `rusqlite`, Tree-sitter extraction, and simple module boundaries preserve local-only deterministic behavior. Deferred advanced graph, MCP, watch-daemon, semantic search, and runtime AI features avoid premature architecture.
+3. **Testable Quality Gates**: PASS. Each journey has independent automated tests or smoke checks: init/index, CLI query output, parse-error recording, incremental skip, parser/language fixture coverage, and TUI launch/manual terminal checks.
+4. **Observable, Operable Behavior**: PASS. Index summaries, parse-run rows, parse-error records, query output line/column evidence, database paths, recovery guidance, tracing hooks, and TUI status messages provide operational visibility.
+5. **Secure, Reproducible Local Artifacts**: PASS. `.symdex/`, SQLite files, and `symdex.local.toml` are ignored; no runtime network/AI dependencies are used; full source contents are not stored by default; build/test/run commands are documented in quickstart.
 
 ## Project Structure
 
@@ -42,8 +42,9 @@ specs/001-local-tree-sitter-sqlite-cli-tui/
 ├── research.md
 ├── data-model.md
 ├── quickstart.md
-└── contracts/
-    └── cli.md
+├── contracts/
+│   └── cli.md
+└── tasks.md
 ```
 
 ### Source Code (repository root)
@@ -98,7 +99,6 @@ src/
 │   └── fts.rs
 ├── symbols/
 │   ├── mod.rs
-│   ├── model.rs
 │   └── relationships.rs
 └── tui/
     ├── mod.rs
@@ -117,13 +117,13 @@ tests/
 
 ## Verification Plan
 
-**Automated Tests**: Unit tests for parser extraction and TUI app state, plus integration tests for config init/load, migration application, Rust/TypeScript/JavaScript/Python fixture indexing, symbol search, reference discovery, parse-error recording, incremental skip behavior, CLI basics, and generated-fixture performance smoke coverage. Use artificial fixtures under `tests/fixtures/` only.
+**Automated Tests**: Unit tests for parser extraction and TUI app state, plus integration tests for config init/load, missing-config guidance, migration application, Rust/TypeScript/JavaScript/Python fixture indexing, symbol search, reference discovery, parse-error recording, incremental skip behavior, import/relationship queries, CLI basics, and generated-fixture performance smoke coverage. Use artificial fixtures under `tests/fixtures/` only.
 
 **Manual Verification**: Run `cargo run -- init --force`, `cargo run -- index . --full`, `cargo run -- status`, `cargo run -- symbols find index_repository`, `cargo run -- errors`, and `cargo run -- tui`. In the TUI, verify dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, search navigation, `?` help, and `q` clean shutdown. Confirm `.symdex/` remains ignored in `git status --short`.
 
 **Manual TUI Rationale And Risk**: Full terminal alternate-screen rendering and restoration are manually verified because headless terminal integration tests are brittle for the MVP and would add more harness complexity than product behavior. Residual risk is a regression in real terminal layout or restoration; this is mitigated by automated app-state tests plus the quickstart TUI checklist before release.
 
-**Operational Checks**: Verify index summary counts, parse-run rows, parse-error rows, source file/line evidence in command output, generated-fixture indexing throughput, and TUI dashboard status. Confirm no code path introduces runtime network, AI, embedding, vector DB, or telemetry dependencies.
+**Operational Checks**: Verify index summary counts, parse-run rows, parse-error rows, missing-config and unindexed-repository recovery guidance, source file/line evidence in command output, generated-fixture indexing throughput, and TUI dashboard status. Confirm no code path introduces runtime network, AI, embedding, vector DB, source upload, automatic code modification, or telemetry dependencies.
 
 ## Complexity Tracking
 
@@ -139,8 +139,8 @@ See [data-model.md](data-model.md), [contracts/cli.md](contracts/cli.md), and [q
 
 ## Constitution Check Post-Design
 
-1. **Spec-First User Value**: PASS. Design artifacts preserve the P1/P2/P3 journey order and map contracts to acceptance scenarios.
-2. **Simple, Local Design**: PASS. Data model uses normalized SQLite tables and local modules without extra services or runtime AI.
-3. **Testable Quality Gates**: PASS. Quickstart and data model identify automated tests and manual TUI checks.
-4. **Observable, Operable Behavior**: PASS. Evidence fields, parse runs, parse errors, summaries, and TUI status are explicit.
-5. **Secure, Reproducible Changes**: PASS. Git safety and local-only constraints are represented in spec, plan, quickstart, and contracts.
+1. **Spec-First User Value**: PASS. Design artifacts preserve the P1/P2/P3 journey order and map contracts to acceptance scenarios and evidence expectations.
+2. **Simple, Local, Deterministic Design**: PASS. Data model uses normalized SQLite tables and local modules without extra services, runtime AI, source upload, telemetry, or network behavior.
+3. **Testable Quality Gates**: PASS. Quickstart, data model, and contracts identify automated tests, artificial fixture coverage for each claimed language, and manual TUI checks with rationale.
+4. **Observable, Operable Behavior**: PASS. Evidence fields, parse runs, parse errors, summaries, recovery guidance, and TUI status are explicit.
+5. **Secure, Reproducible Local Artifacts**: PASS. Git safety and local-only constraints are represented in spec, plan, quickstart, contracts, and repository guidance.
