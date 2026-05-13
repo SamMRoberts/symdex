@@ -17,13 +17,13 @@
 
 **Purpose**: Establish the Rust project, local-only guardrails, configuration template, and documentation skeleton.
 
-- [ ] T001 Create Rust package metadata and dependency set in Cargo.toml
-- [ ] T002 Create Cargo.lock by resolving Rust dependencies with cargo build in Cargo.lock
-- [ ] T003 [P] Add generated runtime data ignores for `.symdex/`, SQLite files, and symdex.local.toml in .gitignore
-- [ ] T004 [P] Add local-only project guidance for agents in AGENTS.md
-- [ ] T005 [P] Add user-facing overview and command list in README.md
-- [ ] T006 [P] Add default project configuration template in symdex.toml
-- [ ] T007 [P] Add quick reference design docs in docs/specs/project-discovery.md, docs/specs/parser-pipeline.md, docs/specs/symbol-model.md, docs/specs/sqlite-schema.md, docs/specs/incremental-indexing.md, docs/specs/cli-commands.md, docs/specs/tui-navigation.md, docs/specs/evidence-model.md, and docs/specs/git-safety.md
+- [x] T001 Create Rust package metadata and dependency set in Cargo.toml
+- [x] T002 Create Cargo.lock by resolving Rust dependencies with cargo build in Cargo.lock
+- [x] T003 [P] Add generated runtime data ignores for `.symdex/`, SQLite files, and symdex.local.toml in .gitignore
+- [x] T004 [P] Add local-only project guidance for agents in AGENTS.md
+- [x] T005 [P] Add user-facing overview and command list in README.md
+- [x] T006 [P] Add default project configuration template in symdex.toml
+- [x] T007 [P] Add quick reference design docs in docs/specs/project-discovery.md, docs/specs/parser-pipeline.md, docs/specs/symbol-model.md, docs/specs/sqlite-schema.md, docs/specs/incremental-indexing.md, docs/specs/cli-commands.md, docs/specs/tui-navigation.md, docs/specs/evidence-model.md, and docs/specs/git-safety.md
 
 ---
 
@@ -33,22 +33,22 @@
 
 **CRITICAL**: No user story work can begin until this phase is complete.
 
-- [ ] T008 Create crate module entrypoints in src/lib.rs and executable bootstrap in src/main.rs
-- [ ] T009 [P] Define CLI argument structures and subcommands in src/cli/mod.rs
-- [ ] T010 [P] Implement configuration defaults, TOML loading, local override merging, required-config errors, config initialization, and repository root discovery in src/config/mod.rs
-- [ ] T011 [P] Add SQLite migration 001 for repositories, files, parse_runs, and parse_errors in migrations/001_initial.sql
-- [ ] T012 [P] Add SQLite migration 002 for symbols in migrations/002_symbols.sql
-- [ ] T013 [P] Add SQLite migration 003 for relationships, references, and imports in migrations/003_relationships.sql
-- [ ] T014 [P] Add SQLite migration 004 for FTS5 and indexes in migrations/004_fts.sql
-- [ ] T015 Implement migration runner and database opening with foreign keys enabled in src/db/migrations.rs and src/db/mod.rs
-- [ ] T016 [P] Define query/status row DTOs in src/db/schema.rs
-- [ ] T017 [P] Define extracted symbol, reference, import, relationship, parse-error, and extracted-file models in src/symbols/model.rs
-- [ ] T018 [P] Define relationship kind and confidence constants in src/symbols/relationships.rs
-- [ ] T019 [P] Define internal evidence model in src/evidence/mod.rs
-- [ ] T020 [P] Implement supported language detection and Tree-sitter grammar loading for Rust, TypeScript, JavaScript, and Python in src/parser/languages.rs
-- [ ] T021 [P] Implement file hashing helper in src/indexer/hashing.rs
-- [ ] T022 [P] Implement ignore-aware file discovery with include/exclude glob handling in src/indexer/discovery.rs
-- [ ] T023 [P] Create artificial Rust, TypeScript, JavaScript, and Python fixture projects in tests/fixtures/rust-basic/src/lib.rs, tests/fixtures/typescript-basic/src/index.ts, tests/fixtures/javascript-basic/src/index.js, tests/fixtures/python-basic/src/main.py, and tests/fixtures/python-basic/src/bad.py
+- [x] T008 Create crate module entrypoints in src/lib.rs and executable bootstrap in src/main.rs
+- [x] T009 [P] Define CLI argument structures and subcommands in src/cli/mod.rs
+- [x] T010 [P] Implement configuration defaults, TOML loading, local override merging, required-config errors, config initialization, and repository root discovery in src/config/mod.rs
+- [x] T011 [P] Add SQLite migration 001 for repositories, files, parse_runs, and parse_errors in migrations/001_initial.sql
+- [x] T012 [P] Add SQLite migration 002 for symbols in migrations/002_symbols.sql
+- [x] T013 [P] Add SQLite migration 003 for relationships, references, and imports in migrations/003_relationships.sql
+- [x] T014 [P] Add SQLite migration 004 for FTS5 and indexes in migrations/004_fts.sql
+- [x] T015 Implement migration runner and database opening with foreign keys enabled in src/db/migrations.rs and src/db/mod.rs
+- [x] T016 [P] Define query/status row DTOs in src/db/schema.rs
+- [x] T017 [P] Define extracted symbol, reference, import, relationship, parse-error, and extracted-file models in src/symbols/model.rs
+- [x] T018 [P] Define relationship kind and confidence constants in src/symbols/relationships.rs
+- [x] T019 [P] Define internal evidence model in src/evidence/mod.rs
+- [x] T020 [P] Implement supported language detection and Tree-sitter grammar loading for Rust, TypeScript, JavaScript, and Python in src/parser/languages.rs
+- [x] T021 [P] Implement file hashing helper in src/indexer/hashing.rs
+- [x] T022 [P] Implement ignore-aware file discovery with include/exclude glob handling in src/indexer/discovery.rs
+- [x] T023 [P] Create artificial Rust, TypeScript, JavaScript, and Python fixture projects in tests/fixtures/rust-basic/src/lib.rs, tests/fixtures/typescript-basic/src/index.ts, tests/fixtures/javascript-basic/src/index.js, tests/fixtures/python-basic/src/main.py, and tests/fixtures/python-basic/src/bad.py
 
 **Checkpoint**: Foundation ready; user story implementation can now begin.
 
@@ -62,20 +62,20 @@
 
 ### Tests for User Story 1
 
-- [ ] T024 [P] [US1] Add config init/load and existing-config refusal integration tests in tests/integration.rs
-- [ ] T025 [P] [US1] Add missing symdex.toml guidance integration tests for config-dependent commands in tests/integration.rs
-- [ ] T026 [P] [US1] Add migration and full indexing integration test for tests/fixtures/rust-basic in tests/integration.rs
-- [ ] T027 [P] [US1] Add incremental skip integration test for unchanged tests/fixtures/rust-basic files in tests/integration.rs
-- [ ] T028 [P] [US1] Add parse-error recording integration test using tests/fixtures/python-basic/src/bad.py in tests/integration.rs
+- [x] T024 [P] [US1] Add config init/load and existing-config refusal integration tests in tests/integration.rs
+- [x] T025 [P] [US1] Add missing symdex.toml guidance integration tests for config-dependent commands in tests/integration.rs
+- [x] T026 [P] [US1] Add migration and full indexing integration test for tests/fixtures/rust-basic in tests/integration.rs
+- [x] T027 [P] [US1] Add incremental skip integration test for unchanged tests/fixtures/rust-basic files in tests/integration.rs
+- [x] T028 [P] [US1] Add parse-error recording integration test using tests/fixtures/python-basic/src/bad.py in tests/integration.rs
 
 ### Implementation for User Story 1
 
-- [ ] T029 [US1] Implement `symdex init` command handler in src/cli/commands.rs using src/config/mod.rs
-- [ ] T030 [US1] Implement repository upsert, parse-run start/finish, file hash lookup, full-index clearing, deleted-file marking, and file index replacement in src/db/mod.rs
-- [ ] T031 [US1] Implement Tree-sitter extraction for symbols, imports, call references, relationships, and parse errors in src/parser/extract.rs
-- [ ] T032 [US1] Implement indexing pipeline orchestration with config loading, discovery, hashing, incremental skip, transactions, extraction, persistence, and summary counts in src/indexer/pipeline.rs
-- [ ] T033 [US1] Wire `symdex index <path> [--full] [--watch]` output and MVP watch-mode message in src/cli/commands.rs
-- [ ] T034 [US1] Ensure generated `.symdex/index.db`, `.symdex/index.db-wal`, `.symdex/index.db-shm`, `.symdex/cache/`, and `.symdex/logs/` remain ignored by .gitignore
+- [x] T029 [US1] Implement `symdex init` command handler in src/cli/commands.rs using src/config/mod.rs
+- [x] T030 [US1] Implement repository upsert, parse-run start/finish, file hash lookup, full-index clearing, deleted-file marking, and file index replacement in src/db/mod.rs
+- [x] T031 [US1] Implement Tree-sitter extraction for symbols, imports, call references, relationships, and parse errors in src/parser/extract.rs
+- [x] T032 [US1] Implement indexing pipeline orchestration with config loading, discovery, hashing, incremental skip, transactions, extraction, persistence, and summary counts in src/indexer/pipeline.rs
+- [x] T033 [US1] Wire `symdex index <path> [--full] [--watch]` output and MVP watch-mode message in src/cli/commands.rs
+- [x] T034 [US1] Ensure generated `.symdex/index.db`, `.symdex/index.db-wal`, `.symdex/index.db-shm`, `.symdex/cache/`, and `.symdex/logs/` remain ignored by .gitignore
 
 **Checkpoint**: User Story 1 is independently functional and testable.
 
@@ -89,21 +89,21 @@
 
 ### Tests for User Story 2
 
-- [ ] T035 [P] [US2] Add CLI smoke test for `symdex init`, `symdex index .`, and `symdex symbols find parse_config` in tests/integration.rs
-- [ ] T036 [P] [US2] Add database query test for symbol lookup and reference lookup in tests/integration.rs
-- [ ] T037 [P] [US2] Add parse-error CLI/query test for `symdex errors --file src/bad.py` in tests/integration.rs
-- [ ] T038 [P] [US2] Add import and relationship query coverage for TypeScript, JavaScript, and Rust fixtures in tests/integration.rs
+- [x] T035 [P] [US2] Add CLI smoke test for `symdex init`, `symdex index .`, and `symdex symbols find parse_config` in tests/integration.rs
+- [x] T036 [P] [US2] Add database query test for symbol lookup and reference lookup in tests/integration.rs
+- [x] T037 [P] [US2] Add parse-error CLI/query test for `symdex errors --file src/bad.py` in tests/integration.rs
+- [x] T038 [P] [US2] Add successful parse, symbol, import, and relationship query coverage for TypeScript, JavaScript, Python, and Rust fixtures in tests/integration.rs
 
 ### Implementation for User Story 2
 
-- [ ] T039 [US2] Implement repository status query in src/db/mod.rs and `symdex status` rendering in src/cli/commands.rs
-- [ ] T040 [US2] Implement exact/prefix symbol lookup and file symbol lookup in src/db/mod.rs and wire `symdex symbols find` and `symdex symbols in` in src/cli/commands.rs
-- [ ] T041 [US2] Implement FTS-backed symbol search helper in src/search/fts.rs without embeddings or vector storage
-- [ ] T042 [US2] Implement reference query in src/db/mod.rs and wire `symdex refs <symbol-name>` in src/cli/commands.rs
-- [ ] T043 [US2] Implement caller and callee relationship queries in src/db/mod.rs and wire `symdex callers` and `symdex callees` in src/cli/commands.rs
-- [ ] T044 [US2] Implement imports query in src/db/mod.rs and wire `symdex imports <file>` in src/cli/commands.rs
-- [ ] T045 [US2] Implement parse-error and files-with-errors queries in src/db/mod.rs and wire `symdex errors [--file]` and `symdex files with-errors` in src/cli/commands.rs
-- [ ] T046 [US2] Add user-facing error handling for unindexed repositories and fatal database/config failures in src/cli/commands.rs
+- [x] T039 [US2] Implement repository status query in src/db/mod.rs and `symdex status` rendering in src/cli/commands.rs
+- [x] T040 [US2] Implement exact/prefix symbol lookup and file symbol lookup in src/db/mod.rs and wire `symdex symbols find` and `symdex symbols in` in src/cli/commands.rs
+- [x] T041 [US2] Implement FTS-backed symbol search helper in src/search/fts.rs without embeddings or vector storage
+- [x] T042 [US2] Implement reference query in src/db/mod.rs and wire `symdex refs <symbol-name>` in src/cli/commands.rs
+- [x] T043 [US2] Implement caller and callee relationship queries in src/db/mod.rs and wire `symdex callers` and `symdex callees` in src/cli/commands.rs
+- [x] T044 [US2] Implement imports query in src/db/mod.rs and wire `symdex imports <file>` in src/cli/commands.rs
+- [x] T045 [US2] Implement parse-error and files-with-errors queries in src/db/mod.rs and wire `symdex errors [--file]` and `symdex files with-errors` in src/cli/commands.rs
+- [x] T046 [US2] Add user-facing error handling for unindexed repositories and fatal database/config failures in src/cli/commands.rs
 
 **Checkpoint**: User Story 2 is independently functional after User Story 1 indexing exists.
 
@@ -117,16 +117,16 @@
 
 ### Tests for User Story 3
 
-- [ ] T047 [P] [US3] Add TUI app state unit coverage for default dashboard selection and status message behavior in src/tui/app.rs
-- [ ] T048 [P] [US3] Add manual TUI verification checklist to specs/001-local-tree-sitter-sqlite-cli-tui/quickstart.md
+- [x] T047 [P] [US3] Add TUI app state unit coverage for default dashboard selection and status message behavior in src/tui/app.rs
+- [x] T048 [P] [US3] Add manual TUI verification checklist to specs/001-local-tree-sitter-sqlite-cli-tui/quickstart.md
 
 ### Implementation for User Story 3
 
-- [ ] T049 [US3] Implement TUI app state model with status, selected view, search text, selected symbol detail, and required view inventory in src/tui/app.rs
-- [ ] T050 [US3] Implement ratatui layout with navigation pane, dashboard/status pane, details pane, and bottom status pane in src/tui/views.rs
-- [ ] T051 [US3] Implement render helpers for dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search views in src/tui/views.rs
-- [ ] T052 [US3] Implement terminal lifecycle, event loop, keyboard controls, help message, view navigation, and clean shutdown in src/tui/mod.rs
-- [ ] T053 [US3] Wire `symdex tui [path]` command handler in src/cli/commands.rs
+- [x] T049 [US3] Implement TUI app state model with status, selected view, search text, selected symbol detail, and required view inventory in src/tui/app.rs
+- [x] T050 [US3] Implement ratatui layout with navigation pane, dashboard/status pane, details pane, and bottom status pane in src/tui/views.rs
+- [x] T051 [US3] Implement render helpers for dashboard, files, symbols, symbol detail, references, callers/callees, imports, parse errors, and search views in src/tui/views.rs
+- [x] T052 [US3] Implement terminal lifecycle, event loop, keyboard controls, help message, view navigation, and clean shutdown in src/tui/mod.rs
+- [x] T053 [US3] Wire `symdex tui [path]` command handler in src/cli/commands.rs
 
 **Checkpoint**: User Story 3 provides the MVP TUI without requiring runtime AI integration.
 
@@ -136,14 +136,14 @@
 
 **Purpose**: Final validation, documentation, privacy guardrails, and release readiness across all user stories.
 
-- [ ] T054 [P] Update README.md with final quickstart, supported languages, command list, and MVP scope notes
-- [ ] T055 [P] Update docs/specs/git-safety.md to state generated runtime data and private repository index exports must not be committed
-- [ ] T056 [P] Audit Cargo.toml, Cargo.lock, and src/**/*.rs to confirm no runtime network, telemetry, LLM, embedding, vector DB, Qdrant, cloud sync, source-upload, or automatic code modification dependencies were introduced
-- [ ] T057 [P] Add generated-fixture performance smoke coverage for the 1,000-file indexing goal in tests/integration.rs
-- [ ] T058 Run `cargo fmt --check` and fix formatting in src/**/*.rs and tests/**/*.rs if needed
-- [ ] T059 Run `cargo clippy --all-targets -- -D warnings` and fix lint findings in src/**/*.rs and tests/**/*.rs if needed
-- [ ] T060 Run `cargo test` and fix failing tests in src/**/*.rs and tests/**/*.rs if needed
-- [ ] T061 Run quickstart smoke commands from specs/001-local-tree-sitter-sqlite-cli-tui/quickstart.md and verify `.symdex/` remains absent from `git status --short`
+- [x] T054 [P] Update README.md with final quickstart, supported languages, command list, and MVP scope notes
+- [x] T055 [P] Update docs/specs/git-safety.md to state generated runtime data and private repository index exports must not be committed
+- [x] T056 [P] Audit Cargo.toml, Cargo.lock, and src/**/*.rs to confirm no runtime network, telemetry, LLM, embedding, vector DB, Qdrant, cloud sync, source-upload, or automatic code modification dependencies were introduced
+- [x] T057 [P] Add generated-fixture performance smoke coverage for the 1,000-file indexing goal in tests/integration.rs
+- [x] T058 Run `cargo fmt --check` and fix formatting in src/**/*.rs and tests/**/*.rs if needed
+- [x] T059 Run `cargo clippy --all-targets -- -D warnings` and fix lint findings in src/**/*.rs and tests/**/*.rs if needed
+- [x] T060 Run `cargo test` and fix failing tests in src/**/*.rs and tests/**/*.rs if needed
+- [x] T061 Run quickstart smoke commands from specs/001-local-tree-sitter-sqlite-cli-tui/quickstart.md and verify `.symdex/` remains absent from `git status --short`
 
 ---
 

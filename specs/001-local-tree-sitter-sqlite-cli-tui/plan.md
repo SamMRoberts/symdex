@@ -99,6 +99,7 @@ src/
 │   └── fts.rs
 ├── symbols/
 │   ├── mod.rs
+│   ├── model.rs
 │   └── relationships.rs
 └── tui/
     ├── mod.rs

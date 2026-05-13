@@ -1,8 +1,20 @@
 # MacOS
 .DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.vscode/
+.idea/
 
 # Rust build output
 target/
+debug/
+release/
+*.rs.bk
+*.rlib
+*.prof*
+*.log
+.env*
 
 # Symdex local runtime data
 .symdex/

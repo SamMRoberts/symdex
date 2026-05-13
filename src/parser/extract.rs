@@ -290,7 +290,7 @@ fn import_path(node: Node<'_>, content: &str) -> Option<String> {
 }
 
 fn call_reference(node: Node<'_>, content: &str) -> Option<(String, Point, Point)> {
-    if node.kind() != "call_expression" {
+    if !matches!(node.kind(), "call_expression" | "call") {
         return None;
     }
     let function = node

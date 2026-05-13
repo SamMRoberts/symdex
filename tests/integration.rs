@@ -74,6 +74,31 @@ fn records_python_parse_errors() {
     let repo_id = db::repository_id(&conn, temp.path()).unwrap().unwrap();
     let errors = db::parse_errors(&conn, repo_id, Some("src/bad.py")).unwrap();
     assert!(!errors.is_empty());
+
+    let symbols = db::find_symbols(&conn, repo_id, "parse_config").unwrap();
+    assert!(symbols.iter().any(|symbol| symbol.language == "python"));
+
+    let imports = db::imports(&conn, repo_id, "src/main.py").unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|import| import.import_text.contains("pathlib"))
+    );
+
+    let callees = db::relationships(
+        &conn,
+        repo_id,
+        "parse_config",
+        RelationshipDirection::Callees,
+    )
+    .unwrap();
+    assert!(callees.iter().any(|row| {
+        row.relationship_kind == "calls"
+            && row
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("read_text"))
+    }));
 }
 
 #[test]
